@@ -150,7 +150,7 @@ async fn doctor(ffmpeg: Option<PathBuf>) -> u8 {
 			Status::Warn => "⚠",
 			Status::Missing => "✗",
 		};
-		println!("{glyph} {:<12} {}", line.label, line.detail);
+		println!("{glyph} {:<16} {}", line.label, line.detail);
 	}
 
 	u8::from(lines.iter().any(|line| line.status == Status::Missing)) * 2
@@ -185,13 +185,23 @@ async fn compress(args: CompressArgs) -> u8 {
 		}
 	};
 
-	let problems = tools.audio_problems();
-	if !problems.is_empty() {
-		for problem in &problems {
+	let universal = tools.universal_problems();
+	if !universal.is_empty() {
+		for problem in &universal {
 			eprintln!("error: {problem}");
 		}
 		eprintln!("run \"cryarchiver doctor\" after changing ffmpeg");
 		return 2;
+	}
+
+	for line in tools.report().iter().filter(|line| line.status == Status::Missing) {
+		let kinds: Vec<String> = line.needed_for.iter().map(ToString::to_string).collect();
+		eprintln!(
+			"warning: {}: {} · {} files will fail",
+			line.label,
+			line.detail,
+			kinds.join(" and ")
+		);
 	}
 
 	let files: Vec<PathBuf> = inputs.files.into_iter().map(absolute).collect();

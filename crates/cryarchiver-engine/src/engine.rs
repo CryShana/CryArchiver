@@ -12,7 +12,7 @@ use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use crate::preset::Speed;
 use crate::probe::{MediaInfo, Stream};
 use crate::text::display_path;
-use crate::toolchain::Toolchain;
+use crate::toolchain::{MediaKind, Toolchain};
 use crate::workspace::Workspace;
 
 #[derive(Debug, Clone)]
@@ -102,7 +102,7 @@ impl Engine {
 			MediaClass::Other(reason) => return Ok(JobOutcome::Skipped { reason }),
 		};
 
-		let problems = self.tools.audio_problems();
+		let problems = self.tools.problems(MediaKind::Audio);
 		if !problems.is_empty() {
 			return Err(ErrorKind::Toolchain(problems.join("; ")).into());
 		}

@@ -2,9 +2,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::process::{self, StdoutMode, ToolCommand, ToolOutput};
@@ -61,6 +62,84 @@ const SVT_PROBE: &[&str] = &[
 	"null",
 	"-",
 ];
+const SVT_SETTINGS_PROBE: &[&str] = &[
+	"-hide_banner",
+	"-nostdin",
+	"-f",
+	"lavfi",
+	"-i",
+	"testsrc2=s=65x33:d=0.2,format=rgb24",
+	"-vf",
+	"format=yuv420p10le,setparams=range=tv:color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+	"-c:v",
+	"libsvtav1",
+	"-preset",
+	"8",
+	"-err_detect",
+	"explode",
+	"-dolbyvision",
+	"0",
+	"-svtav1-params",
+	"tune=0:enable-variance-boost=1:keyint=5s:crf=30.25:film-grain=6:film-grain-denoise=0",
+	"-f",
+	"matroska",
+];
+const PROBE_TAGS: [(&str, &str); 4] = [
+	("color_range", "tv"),
+	("color_space", "bt2020nc"),
+	("color_transfer", "arib-std-b67"),
+	("color_primaries", "bt2020"),
+];
+const VP9_ALPHA_PROBE: &[&str] = &[
+	"-hide_banner",
+	"-nostdin",
+	"-f",
+	"lavfi",
+	"-i",
+	"color=c=red@0.5:s=64x64:d=0.2,format=yuva420p",
+	"-c:v",
+	"libvpx-vp9",
+	"-pix_fmt",
+	"yuva420p",
+	"-f",
+	"webm",
+];
+pub const VIDEO_FILTERS: &[&str] = &[
+	"bwdif",
+	"idet",
+	"fieldmatch",
+	"decimate",
+	"blackdetect",
+	"freezedetect",
+	"hqdn3d",
+	"psnr",
+	"setparams",
+	"scale",
+];
+pub const ALPHA_FILTERS: &[&str] = &["alphaextract", "ssim"];
+const AV1_DECODERS: &[&str] = &["libdav1d", "libaom-av1"];
+const EVERY_KIND: &[MediaKind] = MediaKind::ALL;
+const VIDEO_ONLY: &[MediaKind] = &[MediaKind::Video];
+const OPTIONAL: &[MediaKind] = &[];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+	Audio,
+	Video,
+}
+
+impl MediaKind {
+	pub const ALL: &'static [Self] = &[Self::Audio, Self::Video];
+}
+
+impl fmt::Display for MediaKind {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(match self {
+			Self::Audio => "audio",
+			Self::Video => "video",
+		})
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Version {
@@ -87,15 +166,19 @@ pub struct ToolConfig {
 	pub refresh: bool,
 }
 
-#[allow(clippy::unsafe_derive_deserialize)]
+#[allow(clippy::unsafe_derive_deserialize, clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Toolchain {
 	pub ffmpeg: PathBuf,
 	pub ffprobe: PathBuf,
 	pub build: FfmpegBuild,
 	pub encoders: BTreeSet<String>,
+	pub decoders: BTreeSet<String>,
 	pub filters: BTreeSet<String>,
 	pub svt_av1: Option<Version>,
+	pub svt_settings: bool,
+	pub colour_tags: bool,
+	pub vp9_alpha: bool,
 	pub soxr: bool,
 	pub opus_surround: bool,
 }
@@ -112,6 +195,7 @@ pub struct ReportLine {
 	pub status: Status,
 	pub label: String,
 	pub detail: String,
+	pub needed_for: &'static [MediaKind],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -148,47 +232,73 @@ impl Toolchain {
 	}
 
 	async fn probe(ffmpeg: PathBuf, ffprobe: PathBuf, cancel: &CancellationToken) -> Result<Self, ToolchainError> {
-		let (version, encoders, filters, soxr, opus_surround, svt_av1) = tokio::join!(
+		let (version, encoders, decoders, filters, soxr, opus_surround, svt_av1, video) = tokio::join!(
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-version"], cancel),
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-encoders"], cancel),
+			run_ffmpeg(&ffmpeg, &["-hide_banner", "-decoders"], cancel),
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-filters"], cancel),
 			succeeds(&ffmpeg, SOXR_PROBE, cancel),
 			succeeds(&ffmpeg, OPUS_SURROUND_PROBE, cancel),
 			svt_version(&ffmpeg, cancel),
+			video_probes(&ffmpeg, &ffprobe, cancel),
 		);
 
 		let first_line = stdout_text(&version?).lines().next().unwrap_or_default().to_owned();
 		let build = parse_ffmpeg_version(&first_line).ok_or_else(|| {
 			ToolchainError::Unusable(ffmpeg.clone(), format!("unrecognised version line: {first_line}"))
 		})?;
-		let encoders = parse_encoders(&stdout_text(&encoders?));
+		let encoders = parse_codecs(&stdout_text(&encoders?));
+		let decoders = parse_codecs(&stdout_text(&decoders?));
 		let filters = parse_filters(&stdout_text(&filters?));
 
 		let soxr = soxr?;
 		let opus_surround = opus_surround? && encoders.contains("libopus");
 		let svt_av1 = svt_av1?.filter(|_| encoders.contains("libsvtav1"));
+		let VideoProbes {
+			svt_settings,
+			colour_tags,
+			vp9_alpha,
+		} = video?;
+		let vp9_alpha = vp9_alpha && ALPHA_FILTERS.iter().all(|name| filters.contains(*name));
 		Ok(Self {
 			ffmpeg,
 			ffprobe,
 			build,
 			encoders,
+			decoders,
 			filters,
 			svt_av1,
+			svt_settings,
+			colour_tags,
+			vp9_alpha,
 			soxr,
 			opus_surround,
 		})
 	}
 
-	pub fn audio_problems(&self) -> Vec<String> {
+	pub fn problems(&self, kind: MediaKind) -> Vec<String> {
+		self.missing(|line| line.needed_for.contains(&kind))
+	}
+
+	pub fn universal_problems(&self) -> Vec<String> {
+		self.missing(|line| EVERY_KIND.iter().all(|kind| line.needed_for.contains(kind)))
+	}
+
+	pub fn has_av1_decoder(&self) -> bool {
+		AV1_DECODERS.iter().any(|name| self.decoders.contains(*name))
+	}
+
+	fn missing(&self, selected: impl Fn(&ReportLine) -> bool) -> Vec<String> {
 		self.report()
 			.into_iter()
-			.filter(|line| line.status == Status::Missing)
+			.filter(|line| line.status == Status::Missing && selected(line))
 			.map(|line| format!("{}: {}; {FULL_BUILD_HINT}", line.label, line.detail))
 			.collect()
 	}
 
+	#[allow(clippy::too_many_lines)]
 	pub fn report(&self) -> Vec<ReportLine> {
-		let check = |label: &str, present: bool, missing: Status, purpose: &str| ReportLine {
+		let check = |label: &str, present: bool, missing: Status, needed_for, purpose: &str| ReportLine {
 			status: if present { Status::Ok } else { missing },
 			label: label.to_owned(),
 			detail: if present {
@@ -196,7 +306,13 @@ impl Toolchain {
 			} else {
 				format!("{purpose} · not available")
 			},
+			needed_for,
 		};
+		let missing_filters: Vec<&str> = VIDEO_FILTERS
+			.iter()
+			.copied()
+			.filter(|name| !self.filters.contains(*name))
+			.collect();
 
 		vec![
 			self.ffmpeg_line(),
@@ -204,38 +320,85 @@ impl Toolchain {
 				status: Status::Ok,
 				label: "ffprobe".into(),
 				detail: display_path(&self.ffprobe),
+				needed_for: EVERY_KIND,
 			},
 			check(
 				"libopus",
 				self.encoders.contains("libopus"),
 				Status::Missing,
+				EVERY_KIND,
 				"audio encoder",
 			),
-			check("soxr", self.soxr, Status::Missing, "high-quality resampler"),
-			check("Opus 5.1", self.opus_surround, Status::Missing, "surround audio"),
+			check("soxr", self.soxr, Status::Missing, EVERY_KIND, "high-quality resampler"),
+			check(
+				"Opus 5.1",
+				self.opus_surround,
+				Status::Missing,
+				EVERY_KIND,
+				"surround audio",
+			),
 			self.svt_line(),
 			check(
+				"SVT-AV1 settings",
+				self.svt_settings,
+				Status::Missing,
+				VIDEO_ONLY,
+				"tune, variance boost, quarter-step CRF, odd sizes",
+			),
+			check(
+				"colour tags",
+				self.colour_tags,
+				Status::Missing,
+				VIDEO_ONLY,
+				"tags reach the container and the bitstream",
+			),
+			check(
+				"AV1 decoder",
+				self.has_av1_decoder(),
+				Status::Missing,
+				VIDEO_ONLY,
+				"checks encoded video",
+			),
+			ReportLine {
+				status: if missing_filters.is_empty() {
+					Status::Ok
+				} else {
+					Status::Missing
+				},
+				label: "video filters".into(),
+				detail: if missing_filters.is_empty() {
+					"deinterlacing and analysis".to_owned()
+				} else {
+					format!("deinterlacing and analysis · missing {}", missing_filters.join(", "))
+				},
+				needed_for: VIDEO_ONLY,
+			},
+			check(
 				"libvpx-vp9",
-				self.encoders.contains("libvpx-vp9"),
+				self.vp9_alpha,
 				Status::Warn,
+				OPTIONAL,
 				"transparent video",
 			),
 			check(
 				"libaom-av1",
 				self.encoders.contains("libaom-av1"),
 				Status::Warn,
-				"animated images with alpha",
+				OPTIONAL,
+				"animated images with alpha, video larger than 16384×8704",
 			),
 			check(
 				"libjxl",
 				self.encoders.contains("libjxl"),
 				Status::Warn,
+				OPTIONAL,
 				"large and high-bit-depth images",
 			),
 			check(
 				"libvmaf",
 				self.filters.contains("libvmaf"),
 				Status::Warn,
+				OPTIONAL,
 				"video quality checks",
 			),
 		]
@@ -255,22 +418,25 @@ impl Toolchain {
 			status,
 			label: "ffmpeg".into(),
 			detail,
+			needed_for: EVERY_KIND,
 		}
 	}
 
 	fn svt_line(&self) -> ReportLine {
-		let (status, detail) = match self.svt_av1 {
+		let available = self.svt_av1.filter(|_| self.encoders.contains("libsvtav1"));
+		let (status, detail) = match available {
 			Some(version) if version >= MIN_SVT_AV1 => (Status::Ok, format!("{version} · needed for video")),
 			Some(version) => (
-				Status::Warn,
+				Status::Missing,
 				format!("{version} · needed for video, {MIN_SVT_AV1} or newer required"),
 			),
-			None => (Status::Warn, "not available · needed for video".to_owned()),
+			None => (Status::Missing, "not available · needed for video".to_owned()),
 		};
 		ReportLine {
 			status,
 			label: "libsvtav1".into(),
 			detail,
+			needed_for: VIDEO_ONLY,
 		}
 	}
 }
@@ -302,7 +468,7 @@ fn parse_svt_version(line: &str) -> Option<Version> {
 	})
 }
 
-fn parse_encoders(text: &str) -> BTreeSet<String> {
+fn parse_codecs(text: &str) -> BTreeSet<String> {
 	text.lines()
 		.filter_map(|line| {
 			let mut parts = line.split_whitespace();
@@ -401,10 +567,13 @@ fn write_cache(cache: &Path, fingerprint: String, toolchain: &Toolchain) {
 async fn run_ffmpeg(ffmpeg: &Path, args: &[&str], cancel: &CancellationToken) -> Result<ToolOutput, ToolchainError> {
 	let mut cmd = ToolCommand::new(ffmpeg, PROBE_TIMEOUT);
 	cmd.args(args);
+	run_command(&cmd, cancel).await
+}
 
-	process::run(&cmd, StdoutMode::Capture, |_| {}, cancel)
+async fn run_command(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<ToolOutput, ToolchainError> {
+	process::run(cmd, StdoutMode::Capture, |_| {}, cancel)
 		.await
-		.map_err(|err| ToolchainError::Unusable(ffmpeg.to_path_buf(), err.to_string()))
+		.map_err(|err| ToolchainError::Unusable(cmd.program.clone(), err.to_string()))
 }
 
 async fn succeeds(ffmpeg: &Path, args: &[&str], cancel: &CancellationToken) -> Result<bool, ToolchainError> {
@@ -419,6 +588,112 @@ async fn svt_version(ffmpeg: &Path, cancel: &CancellationToken) -> Result<Option
 
 fn stdout_text(out: &ToolOutput) -> String {
 	String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+struct VideoProbes {
+	svt_settings: bool,
+	colour_tags: bool,
+	vp9_alpha: bool,
+}
+
+async fn video_probes(
+	ffmpeg: &Path,
+	ffprobe: &Path,
+	cancel: &CancellationToken,
+) -> Result<VideoProbes, ToolchainError> {
+	let Some(scratch) = ScratchDir::create() else {
+		return Ok(VideoProbes {
+			svt_settings: false,
+			colour_tags: false,
+			vp9_alpha: false,
+		});
+	};
+
+	let (svt, vp9_alpha) = tokio::join!(
+		svt_settings(ffmpeg, ffprobe, &scratch.0, cancel),
+		vp9_alpha(ffmpeg, &scratch.0, cancel),
+	);
+	let (svt_settings, colour_tags) = svt?;
+	Ok(VideoProbes {
+		svt_settings,
+		colour_tags,
+		vp9_alpha: vp9_alpha?,
+	})
+}
+
+async fn svt_settings(
+	ffmpeg: &Path,
+	ffprobe: &Path,
+	dir: &Path,
+	cancel: &CancellationToken,
+) -> Result<(bool, bool), ToolchainError> {
+	let clip = dir.join("svt.mkv");
+	let mut encode = ToolCommand::new(ffmpeg, PROBE_TIMEOUT);
+	encode.args(SVT_SETTINGS_PROBE).arg(&clip);
+	let out = run_command(&encode, cancel).await?;
+
+	let confirmed = |marker: &str| out.stderr_tail.iter().any(|line| line.contains(marker));
+	if !(out.status.success() && confirmed(": 8 / VQ") && confirmed("CRF / 30.25")) {
+		return Ok((false, false));
+	}
+
+	let mut check = ToolCommand::new(ffprobe, PROBE_TIMEOUT);
+	check
+		.args([
+			"-v",
+			"error",
+			"-threads",
+			"0",
+			"-print_format",
+			"json",
+			"-show_streams",
+			"-show_frames",
+			"-read_intervals",
+			"%+#1",
+			"-i",
+		])
+		.arg(&clip);
+	let out = run_command(&check, cancel).await?;
+
+	let json: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+	let tagged = |entry: &Value| PROBE_TAGS.iter().all(|(key, value)| entry[key] == *value);
+	Ok((
+		true,
+		json["streams"][0]["width"] == 65 && tagged(&json["streams"][0]) && tagged(&json["frames"][0]),
+	))
+}
+
+async fn vp9_alpha(ffmpeg: &Path, dir: &Path, cancel: &CancellationToken) -> Result<bool, ToolchainError> {
+	let clip = dir.join("alpha.webm");
+	let mut encode = ToolCommand::new(ffmpeg, PROBE_TIMEOUT);
+	encode.args(VP9_ALPHA_PROBE).arg(&clip);
+	if !run_command(&encode, cancel).await?.status.success() {
+		return Ok(false);
+	}
+
+	let mut decode = ToolCommand::new(ffmpeg, PROBE_TIMEOUT);
+	decode
+		.args(["-hide_banner", "-nostdin", "-c:v", "libvpx-vp9", "-i"])
+		.arg(&clip)
+		.args(["-vf", "alphaextract", "-f", "null", "-"]);
+	Ok(run_command(&decode, cancel).await?.status.success())
+}
+
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+	fn create() -> Option<Self> {
+		let nanos = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_nanos();
+		let dir = std::env::temp_dir().join(format!("cryarchiver-probe-{}-{nanos}", std::process::id()));
+		fs::create_dir_all(&dir).ok()?;
+		Some(Self(dir))
+	}
+}
+
+impl Drop for ScratchDir {
+	fn drop(&mut self) {
+		let _ = fs::remove_dir_all(&self.0);
+	}
 }
 
 #[cfg(test)]
@@ -466,7 +741,7 @@ mod tests {
 		let filters = "Filters:\n  T.. = Timeline support\n TS bwdif             V->V       Deinterlace the input image.\n .. channelmap        A->A       Remap audio channels.\n .. abuffer           |->A       Buffer audio frames\n";
 
 		assert_eq!(
-			parse_encoders(encoders),
+			parse_codecs(encoders),
 			BTreeSet::from(["libopus".to_owned(), "libsvtav1".to_owned()])
 		);
 		assert_eq!(
@@ -475,36 +750,109 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn missing_report_rows_are_the_audio_problems() {
-		let tools = Toolchain {
+	fn complete_toolchain() -> Toolchain {
+		Toolchain {
 			ffmpeg: PathBuf::from("ffmpeg"),
 			ffprobe: PathBuf::from("ffprobe"),
-			build: FfmpegBuild::Release(Version { major: 7, minor: 1 }),
-			encoders: BTreeSet::new(),
-			filters: BTreeSet::new(),
-			svt_av1: None,
+			build: FfmpegBuild::Release(Version { major: 9, minor: 0 }),
+			encoders: ["libopus", "libsvtav1", "libvpx-vp9", "libaom-av1", "libjxl"]
+				.into_iter()
+				.map(String::from)
+				.collect(),
+			decoders: BTreeSet::from(["libdav1d".to_owned()]),
+			filters: VIDEO_FILTERS
+				.iter()
+				.chain(ALPHA_FILTERS)
+				.chain(&["libvmaf"])
+				.map(|name| (*name).to_owned())
+				.collect(),
+			svt_av1: Some(Version { major: 4, minor: 2 }),
+			svt_settings: true,
+			colour_tags: true,
+			vp9_alpha: true,
 			soxr: true,
-			opus_surround: false,
-		};
+			opus_surround: true,
+		}
+	}
 
-		let problems = tools.audio_problems();
+	#[test]
+	fn a_complete_toolchain_has_no_problems() {
+		let tools = complete_toolchain();
 
 		assert!(
-			problems
+			tools.report().iter().all(|line| line.status == Status::Ok),
+			"{:?}",
+			tools.report()
+		);
+		assert!(tools.problems(MediaKind::Audio).is_empty());
+		assert!(tools.problems(MediaKind::Video).is_empty());
+	}
+
+	#[test]
+	fn problems_are_split_by_media_kind() {
+		let tools = Toolchain {
+			svt_av1: None,
+			decoders: BTreeSet::new(),
+			vp9_alpha: false,
+			..complete_toolchain()
+		};
+
+		let video = tools.problems(MediaKind::Video);
+
+		assert!(tools.problems(MediaKind::Audio).is_empty());
+		assert!(tools.universal_problems().is_empty());
+		assert!(
+			video.iter().any(|problem| problem.starts_with("libsvtav1:")),
+			"{video:?}"
+		);
+		assert!(
+			video.iter().any(|problem| problem.starts_with("AV1 decoder:")),
+			"{video:?}"
+		);
+		assert!(
+			!video.iter().any(|problem| problem.starts_with("libvpx-vp9:")),
+			"{video:?}"
+		);
+	}
+
+	#[test]
+	fn an_old_ffmpeg_stops_every_kind() {
+		let tools = Toolchain {
+			build: FfmpegBuild::Release(Version { major: 7, minor: 1 }),
+			encoders: BTreeSet::new(),
+			..complete_toolchain()
+		};
+
+		let universal = tools.universal_problems();
+
+		assert!(
+			universal
 				.iter()
 				.any(|p| p.starts_with("ffmpeg: 7.1") && p.contains("8.1 or newer required"))
 		);
-		assert!(problems.iter().any(|p| p.starts_with("libopus:")));
-		assert!(!problems.iter().any(|p| p.starts_with("soxr:")));
-		assert_eq!(
+		assert!(universal.iter().any(|p| p.starts_with("libopus:")));
+		assert!(
 			tools
-				.report()
+				.problems(MediaKind::Video)
 				.iter()
-				.find(|line| line.label == "libsvtav1")
-				.map(|line| line.status),
-			Some(Status::Warn)
+				.any(|p| p.starts_with("libsvtav1:"))
 		);
+	}
+
+	#[test]
+	fn missing_video_filters_are_named() {
+		let mut tools = complete_toolchain();
+		tools.filters.remove("bwdif");
+		tools.filters.remove("idet");
+
+		let line = tools
+			.report()
+			.into_iter()
+			.find(|line| line.label == "video filters")
+			.unwrap();
+
+		assert_eq!(line.status, Status::Missing);
+		assert!(line.detail.contains("bwdif, idet"), "{}", line.detail);
 	}
 
 	fn cached_fake_ffmpeg(dir: &Path) -> (ToolConfig, PathBuf) {
@@ -517,12 +865,7 @@ mod tests {
 		let stale = Toolchain {
 			ffmpeg: ffmpeg.clone(),
 			ffprobe: PathBuf::from("/nonexistent/ffprobe"),
-			build: FfmpegBuild::Release(Version { major: 9, minor: 0 }),
-			encoders: BTreeSet::new(),
-			filters: BTreeSet::new(),
-			svt_av1: None,
-			soxr: true,
-			opus_surround: true,
+			..complete_toolchain()
 		};
 		let entry = CacheEntry {
 			fingerprint: fingerprint(&ffmpeg).unwrap(),
