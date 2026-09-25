@@ -28,6 +28,7 @@ pub struct ToolCommand {
 	pub program: PathBuf,
 	pub args: Vec<OsString>,
 	pub stall_timeout: Duration,
+	pub counted: &'static [&'static str],
 }
 
 impl ToolCommand {
@@ -36,6 +37,7 @@ impl ToolCommand {
 			program: program.to_path_buf(),
 			args: Vec::new(),
 			stall_timeout,
+			counted: &[],
 		}
 	}
 
@@ -46,6 +48,11 @@ impl ToolCommand {
 
 	pub fn args<S: Into<OsString>>(&mut self, args: impl IntoIterator<Item = S>) -> &mut Self {
 		self.args.extend(args.into_iter().map(Into::into));
+		self
+	}
+
+	pub fn count_lines_containing(&mut self, patterns: &'static [&'static str]) -> &mut Self {
+		self.counted = patterns;
 		self
 	}
 }
@@ -61,6 +68,7 @@ pub struct ToolOutput {
 	pub status: ExitStatus,
 	pub stdout: Vec<u8>,
 	pub stderr_tail: Vec<String>,
+	pub counted_lines: usize,
 	pub last_progress: Option<Progress>,
 }
 
@@ -94,7 +102,10 @@ pub async fn run(
 
 	let mut child = spawn(cmd, mode).map_err(RunError::Spawn)?;
 	let mut stdout = child.stdout().take().expect("stdout is piped");
-	let stderr = tokio::spawn(collect_stderr(child.stderr().take().expect("stderr is piped")));
+	let stderr = tokio::spawn(collect_stderr(
+		child.stderr().take().expect("stderr is piped"),
+		cmd.counted,
+	));
 
 	let mut captured = Vec::new();
 	let mut splitter = LineSplitter::default();
@@ -138,11 +149,12 @@ pub async fn run(
 		return Err(RunError::Cancelled);
 	}
 
-	let stderr_tail = stderr.await.unwrap_or_default();
+	let (stderr_tail, counted_lines) = stderr.await.unwrap_or_default();
 	Ok(ToolOutput {
 		status,
 		stdout: captured,
 		stderr_tail,
+		counted_lines,
 		last_progress,
 	})
 }
@@ -200,28 +212,58 @@ fn die_with_parent(command: &mut tokio::process::Command) {
 	}
 }
 
-async fn collect_stderr(mut stderr: ChildStderr) -> Vec<String> {
+async fn collect_stderr(mut stderr: ChildStderr, counted: &'static [&'static str]) -> (Vec<String>, usize) {
 	let mut splitter = LineSplitter::default();
-	let mut ring = RingBuffer::new(STDERR_LINES);
+	let mut log = StderrLog {
+		ring: RingBuffer::new(STDERR_LINES),
+		counted,
+		matches: 0,
+	};
 	let mut buf = [0u8; 8192];
 
 	while let Ok(n) = stderr.read(&mut buf).await {
 		if n == 0 {
 			break;
 		}
-		splitter.push(&buf[..n]).into_iter().for_each(|line| ring.push(line));
+		splitter.push(&buf[..n]).into_iter().for_each(|line| log.push(line));
 	}
 
 	if let Some(line) = splitter.finish() {
-		ring.push(line);
+		log.push(line);
 	}
-	ring.into_vec()
+	(log.ring.into_vec(), log.matches)
+}
+
+struct StderrLog {
+	ring: RingBuffer,
+	counted: &'static [&'static str],
+	matches: usize,
+}
+
+impl StderrLog {
+	fn push(&mut self, line: String) {
+		if line.starts_with('[') && self.counted.iter().any(|pattern| line.contains(pattern)) {
+			self.matches += 1;
+		}
+		self.ring.push(line);
+	}
 }
 
 async fn stop(child: &mut dyn ChildWrapper, error: RunError) -> RunError {
 	let _ = child.start_kill();
 	let _ = child.wait().await;
 	error
+}
+
+const GENERIC_TRAILERS: &[&str] = &["Conversion failed!", "Error closing file", "Exiting normally"];
+
+pub fn failure_reason(stderr: &[String]) -> String {
+	stderr
+		.iter()
+		.rev()
+		.find(|line| !line.trim().is_empty() && !GENERIC_TRAILERS.iter().any(|generic| line.contains(generic)))
+		.cloned()
+		.unwrap_or_else(|| "ffmpeg exited with an error".into())
 }
 
 #[cfg(test)]
@@ -238,5 +280,26 @@ mod tests {
 		assert!(resolved.is_absolute(), "{}", resolved.display());
 		assert!(resolved.ends_with(&relative), "{}", resolved.display());
 		assert_eq!(tool_path(&absolute), absolute);
+	}
+
+	#[test]
+	fn failure_reason_skips_generic_trailers() {
+		let stderr = [
+			"[dec:flac @ 0x1] Decoding error: Invalid data found when processing input",
+			"[out#0/opus @ 0x2] Error closing file: Invalid argument",
+			"Conversion failed!",
+			"",
+		]
+		.map(str::to_owned);
+
+		assert_eq!(
+			failure_reason(&stderr),
+			"[dec:flac @ 0x1] Decoding error: Invalid data found when processing input"
+		);
+		assert_eq!(failure_reason(&[]), "ffmpeg exited with an error");
+		assert_eq!(
+			failure_reason(&["Conversion failed!".to_owned()]),
+			"ffmpeg exited with an error"
+		);
 	}
 }

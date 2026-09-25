@@ -9,7 +9,6 @@ use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
 
 const RESAMPLE: &str = "aresample=resampler=soxr:osr=48000";
-const GENERIC_TRAILERS: &[&str] = &["Conversion failed!", "Error closing file", "Exiting normally"];
 
 pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
@@ -61,7 +60,7 @@ pub async fn run(
 	.await?;
 
 	if !out.completed() {
-		let reason = failure_reason(&out.stderr_tail);
+		let reason = process::failure_reason(&out.stderr_tail);
 		return Err(JobError::with_log(ErrorKind::EncodeFailed(reason), out.stderr_tail));
 	}
 
@@ -77,15 +76,6 @@ pub async fn run(
 			out.stderr_tail,
 		)
 	})
-}
-
-fn failure_reason(stderr: &[String]) -> String {
-	stderr
-		.iter()
-		.rev()
-		.find(|line| !line.trim().is_empty() && !GENERIC_TRAILERS.iter().any(|generic| line.contains(generic)))
-		.cloned()
-		.unwrap_or_else(|| "ffmpeg exited with an error".into())
 }
 
 fn push_encode(cmd: &mut ToolCommand, out: usize, plan: &EncodePlan) {
@@ -183,27 +173,6 @@ mod tests {
 			output.display()
 		)));
 		assert!(args.contains("-filter:a:1 astats@s1="));
-	}
-
-	#[test]
-	fn failure_reason_skips_generic_trailers() {
-		let stderr = [
-			"[dec:flac @ 0x1] Decoding error: Invalid data found when processing input",
-			"[out#0/opus @ 0x2] Error closing file: Invalid argument",
-			"Conversion failed!",
-			"",
-		]
-		.map(str::to_owned);
-
-		assert_eq!(
-			failure_reason(&stderr),
-			"[dec:flac @ 0x1] Decoding error: Invalid data found when processing input"
-		);
-		assert_eq!(failure_reason(&[]), "ffmpeg exited with an error");
-		assert_eq!(
-			failure_reason(&["Conversion failed!".to_owned()]),
-			"ffmpeg exited with an error"
-		);
 	}
 
 	#[test]

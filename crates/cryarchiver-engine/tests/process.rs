@@ -164,3 +164,60 @@ async fn already_cancelled_never_spawns() {
 
 	assert!(matches!(result, Err(RunError::Cancelled)));
 }
+
+#[tokio::test]
+async fn counts_matching_stderr_lines_beyond_the_tail() {
+	let mut cmd = tool(
+		"ffmpeg",
+		&[
+			"-hide_banner",
+			"-nostdin",
+			"-f",
+			"lavfi",
+			"-i",
+			"sine=duration=20",
+			"-af",
+			"ashowinfo",
+			"-f",
+			"null",
+			"-",
+		],
+		PATIENT,
+	);
+	cmd.count_lines_containing(&["Parsed_ashowinfo_0"]);
+
+	let out = run(&cmd, StdoutMode::Progress, |_| {}, &CancellationToken::new())
+		.await
+		.unwrap();
+
+	assert!(out.completed());
+	assert!(out.counted_lines >= 800, "{}", out.counted_lines);
+	assert!(out.stderr_tail.len() <= 500);
+}
+
+#[tokio::test]
+async fn counts_nothing_without_patterns() {
+	let cmd = tool(
+		"ffmpeg",
+		&[
+			"-hide_banner",
+			"-nostdin",
+			"-f",
+			"lavfi",
+			"-i",
+			"sine=duration=1",
+			"-af",
+			"ashowinfo",
+			"-f",
+			"null",
+			"-",
+		],
+		PATIENT,
+	);
+
+	let out = run(&cmd, StdoutMode::Progress, |_| {}, &CancellationToken::new())
+		.await
+		.unwrap();
+
+	assert_eq!(out.counted_lines, 0);
+}

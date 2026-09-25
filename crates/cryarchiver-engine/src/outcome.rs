@@ -76,6 +76,12 @@ impl JobError {
 		Self { kind, log_tail }
 	}
 
+	pub fn is_disk_full(&self) -> bool {
+		self.log_tail
+			.iter()
+			.any(|line| line.contains("No space left on device"))
+	}
+
 	pub fn io(side: IoSide<'_>, err: &io::Error) -> Self {
 		let kind = match (side, err.kind()) {
 			_ if is_sharing_violation(err) => ErrorKind::Locked,
@@ -217,5 +223,16 @@ mod tests {
 			JobError::io(IoSide::Source(Path::new("a.flac")), &err).kind,
 			ErrorKind::Locked
 		);
+	}
+
+	#[test]
+	fn full_disks_are_recognised_from_the_log() {
+		let full = JobError::with_log(
+			ErrorKind::EncodeFailed("x".into()),
+			vec!["[out#0/matroska @ 0000020f] Error writing trailer: No space left on device".into()],
+		);
+
+		assert!(full.is_disk_full());
+		assert!(!JobError::from(ErrorKind::EncodeFailed("x".into())).is_disk_full());
 	}
 }
