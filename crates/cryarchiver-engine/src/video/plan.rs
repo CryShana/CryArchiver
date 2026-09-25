@@ -1,0 +1,526 @@
+use crate::outcome::KeepReason;
+use crate::preset::Speed;
+use crate::probe::{Frame, MediaInfo, Stream};
+use crate::video::analyze::{Analysis, NoiseClass, ScanType, forced_decoder};
+use crate::video::colour::{ColourTags, conversion, output_tags, setparams};
+
+const SVT_MAX_WIDTH: u32 = 16_384;
+const SVT_MAX_HEIGHT: u32 = 8_704;
+const OUTPUT_PIX_FMT: &str = "yuv420p10le";
+const ALPHA_PIX_FMT: &str = "yuva420p";
+const ALPHA_PIX_FMT_PREFIXES: &[&str] = &["yuva", "gbrap", "rgba", "bgra", "argb", "abgr", "ya"];
+const EFFICIENT_CODECS: &[&str] = &["av1", "vp9"];
+const EFFICIENCY_HEADROOM: f64 = 1.2;
+const EXPECTED_BPP: [f64; 6] = [0.08, 0.06, 0.045, 0.035, 0.025, 0.02];
+const SVT_CRF: [[f64; 6]; 3] = [
+	[24.0, 25.0, 25.0, 26.0, 28.0, 30.0],
+	[28.0, 29.0, 29.0, 30.0, 32.0, 34.0],
+	[32.0, 32.0, 32.0, 34.0, 36.0, 38.0],
+];
+const VP9_CRF: [u8; 6] = [33, 32, 31, 30, 28, 28];
+const MASTERING_DISPLAY: &str = "Mastering display metadata";
+const HDR10_PLUS: &str = "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoCaps {
+	pub vp9_alpha: bool,
+	pub libaom: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+	Sd,
+	Hd720,
+	Hd1080,
+	Qhd1440,
+	Uhd4k,
+	Uhd8k,
+}
+
+impl Resolution {
+	pub fn of(width: u32, height: u32) -> Self {
+		match u64::from(width) * u64::from(height) {
+			..500_000 => Self::Sd,
+			500_000..1_300_000 => Self::Hd720,
+			1_300_000..2_800_000 => Self::Hd1080,
+			2_800_000..5_000_000 => Self::Qhd1440,
+			5_000_000..10_000_000 => Self::Uhd4k,
+			_ => Self::Uhd8k,
+		}
+	}
+
+	fn index(self) -> usize {
+		self as usize
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Encoder {
+	SvtAv1 { preset: u8, params: String },
+	Aom { cpu_used: u8, crf: u8 },
+	Vp9Alpha { cpu_used: u8, crf: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoPlan {
+	pub streams: Vec<u32>,
+	pub decoder: Option<&'static str>,
+	pub filters: String,
+	pub encoder: Encoder,
+	pub expected_frames: Option<u64>,
+	pub width: u32,
+	pub height: u32,
+	pub colour: ColourTags,
+	pub alpha: bool,
+	pub hdr10: bool,
+	pub warnings: Vec<String>,
+}
+
+pub fn main_stream(info: &MediaInfo) -> Option<&Stream> {
+	let mut real = info.streams.iter().filter(|stream| stream.is_real_video());
+	info.streams
+		.iter()
+		.find(|stream| stream.is_real_video() && stream.disposition.get("default") == Some(&1))
+		.or_else(|| real.next())
+}
+
+pub fn precheck<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream, KeepReason> {
+	let main = main_stream(info).ok_or_else(|| KeepReason::Unsupported("no video stream to encode".into()))?;
+
+	if let Some((profile, compatibility)) = dolby_vision(main)
+		&& (profile == 5 || compatibility == 0)
+	{
+		return Err(KeepReason::Unsupported(
+			"Dolby Vision without a compatible base layer (profile 5)".into(),
+		));
+	}
+
+	if has_alpha(main) && !caps.vp9_alpha {
+		return Err(KeepReason::Unsupported(
+			"transparent video needs libvpx-vp9 with alpha support".into(),
+		));
+	}
+
+	let (width, height) = display_size(main);
+	if too_large_for_svt(width, height) && !has_alpha(main) && !caps.libaom {
+		return Err(KeepReason::Unsupported(format!(
+			"{width}×{height} is larger than SVT-AV1 supports and libaom-av1 is not available"
+		)));
+	}
+
+	if let Some(reason) = already_efficient(info, main) {
+		return Err(KeepReason::AlreadyEfficient(reason));
+	}
+	Ok(main)
+}
+
+pub fn plan_video(
+	info: &MediaInfo,
+	frames: &[Frame],
+	analysis: &Analysis,
+	speed: Speed,
+	caps: &VideoCaps,
+) -> Result<VideoPlan, KeepReason> {
+	let main = precheck(info, caps)?;
+	let (width, height) = display_size(main);
+	let resolution = Resolution::of(width, height);
+	let alpha = has_alpha(main);
+
+	let encoder = if alpha {
+		Encoder::Vp9Alpha {
+			cpu_used: pick(speed, [1, 2, 4]),
+			crf: VP9_CRF[resolution.index()],
+		}
+	} else if too_large_for_svt(width, height) {
+		Encoder::Aom {
+			cpu_used: pick(speed, [3, 4, 6]),
+			crf: rounded_crf(svt_crf(speed, resolution)),
+		}
+	} else {
+		let grain = speed != Speed::Fast && analysis.noise == NoiseClass::Light;
+		Encoder::SvtAv1 {
+			preset: pick(speed, [3, 5, 8]),
+			params: svt_params(svt_crf(speed, resolution), grain),
+		}
+	};
+
+	let colour = output_tags(main);
+	let target = if alpha { ALPHA_PIX_FMT } else { OUTPUT_PIX_FMT };
+	let mut filters: Vec<String> = Vec::new();
+	match analysis.scan {
+		ScanType::Progressive => {}
+		ScanType::Interlaced { top_first } => filters.push(format!(
+			"bwdif=mode=send_field:parity={}:deint=all",
+			if top_first { "tff" } else { "bff" }
+		)),
+		ScanType::Telecined => filters.push("fieldmatch,decimate".into()),
+	}
+	filters.extend(conversion(main, &colour, target));
+	filters.push(setparams(&colour));
+
+	let mut warnings = Vec::new();
+	if dolby_vision(main).is_some() {
+		warnings.push("Dolby Vision metadata dropped; the compatible base layer is kept".to_owned());
+	}
+	if has_side_data(frames, HDR10_PLUS) {
+		warnings.push("HDR10+ dynamic metadata dropped; the static HDR10 metadata is kept".to_owned());
+	}
+
+	let mut streams = vec![main.index];
+	streams.extend(
+		info.streams
+			.iter()
+			.filter(|stream| stream.is_real_video() && stream.index != main.index)
+			.map(|stream| stream.index),
+	);
+
+	Ok(VideoPlan {
+		streams,
+		decoder: forced_decoder(main),
+		filters: filters.join(","),
+		hdr10: matches!(encoder, Encoder::SvtAv1 { .. }) && has_side_data(frames, MASTERING_DISPLAY),
+		encoder,
+		expected_frames: main.nb_read_packets.map(|packets| match analysis.scan {
+			ScanType::Progressive => packets,
+			ScanType::Interlaced { .. } => packets * 2,
+			ScanType::Telecined => packets - packets / 5,
+		}),
+		width,
+		height,
+		colour,
+		alpha,
+		warnings,
+	})
+}
+
+fn svt_params(crf: f64, grain: bool) -> String {
+	let grain = if grain {
+		":film-grain=6:film-grain-denoise=0"
+	} else {
+		""
+	};
+	format!("tune=0:enable-variance-boost=1:keyint=5s:crf={crf}{grain}")
+}
+
+fn svt_crf(speed: Speed, resolution: Resolution) -> f64 {
+	SVT_CRF[pick(speed, [0, 1, 2])][resolution.index()]
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn rounded_crf(crf: f64) -> u8 {
+	crf.round().clamp(0.0, 63.0) as u8
+}
+
+fn pick<T>(speed: Speed, [slow, moderate, fast]: [T; 3]) -> T {
+	match speed {
+		Speed::Slow => slow,
+		Speed::Moderate => moderate,
+		Speed::Fast => fast,
+	}
+}
+
+fn display_size(stream: &Stream) -> (u32, u32) {
+	let (width, height) = (stream.width.unwrap_or(0), stream.height.unwrap_or(0));
+	if stream.rotation().rem_euclid(180) == 90 {
+		(height, width)
+	} else {
+		(width, height)
+	}
+}
+
+fn too_large_for_svt(width: u32, height: u32) -> bool {
+	width > SVT_MAX_WIDTH || height > SVT_MAX_HEIGHT
+}
+
+fn has_alpha(stream: &Stream) -> bool {
+	stream.tag("alpha_mode") == Some("1")
+		|| stream
+			.pix_fmt
+			.as_deref()
+			.is_some_and(|format| ALPHA_PIX_FMT_PREFIXES.iter().any(|prefix| format.starts_with(prefix)))
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn dolby_vision(stream: &Stream) -> Option<(u8, u8)> {
+	let record = stream.side_data("DOVI configuration record")?;
+	let profile = record.number("dv_profile")? as u8;
+	let compatibility = record.number("dv_bl_signal_compatibility_id").unwrap_or(0.0) as u8;
+	Some((profile, compatibility))
+}
+
+fn has_side_data(frames: &[Frame], kind: &str) -> bool {
+	frames
+		.iter()
+		.flat_map(|frame| &frame.side_data_list)
+		.any(|data| data.side_data_type == kind)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn already_efficient(info: &MediaInfo, main: &Stream) -> Option<String> {
+	if !EFFICIENT_CODECS.contains(&main.codec_name.as_str()) {
+		return None;
+	}
+
+	let bits_per_second = main.bit_rate.or_else(|| {
+		let single_video = info.streams.iter().filter(|stream| stream.is_real_video()).count() == 1;
+		let audio: u64 = info.audio_streams().filter_map(|stream| stream.bit_rate).sum();
+		info.format
+			.bit_rate
+			.filter(|_| single_video)
+			.map(|total| total.saturating_sub(audio))
+	})?;
+	let (width, height) = (main.width?, main.height?);
+	let fps = main.fps()?;
+
+	let bpp = bits_per_second as f64 / (f64::from(width) * f64::from(height) * fps);
+	let expected = EXPECTED_BPP[Resolution::of(width, height).index()];
+	(bpp <= expected * EFFICIENCY_HEADROOM)
+		.then(|| format!("already {} at {bpp:.3} bits per pixel", main.codec_name.to_uppercase()))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const CAPS: VideoCaps = VideoCaps {
+		vp9_alpha: true,
+		libaom: true,
+	};
+	const PROGRESSIVE_CLEAN: Analysis = Analysis {
+		scan: ScanType::Progressive,
+		noise: NoiseClass::Clean,
+	};
+
+	fn info(json: &str) -> MediaInfo {
+		MediaInfo::parse(json.as_bytes()).unwrap()
+	}
+
+	fn h264(extra: &str) -> MediaInfo {
+		info(&format!(
+			r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,
+			"pix_fmt":"yuv420p","color_range":"tv","color_space":"bt709","color_transfer":"bt709",
+			"color_primaries":"bt709","avg_frame_rate":"25/1","nb_read_packets":"250"{extra}}}]}}"#
+		))
+	}
+
+	#[test]
+	fn progressive_hd_uses_svt_at_the_table_crf() {
+		let plan = plan_video(&h264(""), &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+
+		assert_eq!(plan.streams, [0]);
+		assert_eq!(plan.decoder, None);
+		assert_eq!(
+			plan.filters,
+			"scale=in_range=tv:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709,format=yuv420p10le,\
+			 setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+		);
+		assert_eq!(
+			plan.encoder,
+			Encoder::SvtAv1 {
+				preset: 5,
+				params: "tune=0:enable-variance-boost=1:keyint=5s:crf=29".into(),
+			}
+		);
+		assert_eq!(plan.expected_frames, Some(250));
+		assert_eq!((plan.width, plan.height), (1920, 1080));
+		assert!(!plan.alpha && !plan.hdr10);
+	}
+
+	#[test]
+	fn speeds_pick_presets_and_crfs() {
+		let fast = plan_video(&h264(""), &[], &PROGRESSIVE_CLEAN, Speed::Fast, &CAPS).unwrap();
+		let slow = plan_video(&h264(""), &[], &PROGRESSIVE_CLEAN, Speed::Slow, &CAPS).unwrap();
+
+		assert!(matches!(fast.encoder, Encoder::SvtAv1 { preset: 8, ref params } if params.ends_with("crf=32")));
+		assert!(matches!(slow.encoder, Encoder::SvtAv1 { preset: 3, ref params } if params.ends_with("crf=25")));
+	}
+
+	#[test]
+	fn scan_type_picks_the_deinterlacer_and_frame_count() {
+		let tff = Analysis {
+			scan: ScanType::Interlaced { top_first: true },
+			noise: NoiseClass::Clean,
+		};
+		let telecined = Analysis {
+			scan: ScanType::Telecined,
+			noise: NoiseClass::Clean,
+		};
+
+		let deinterlaced = plan_video(&h264(""), &[], &tff, Speed::Moderate, &CAPS).unwrap();
+		let inverse_telecined = plan_video(&h264(""), &[], &telecined, Speed::Moderate, &CAPS).unwrap();
+
+		assert!(
+			deinterlaced
+				.filters
+				.starts_with("bwdif=mode=send_field:parity=tff:deint=all,scale=")
+		);
+		assert_eq!(deinterlaced.expected_frames, Some(500));
+		assert!(inverse_telecined.filters.starts_with("fieldmatch,decimate,scale="));
+		assert_eq!(inverse_telecined.expected_frames, Some(200));
+	}
+
+	#[test]
+	fn natural_noise_adds_film_grain_except_at_fast() {
+		let grainy = Analysis {
+			scan: ScanType::Progressive,
+			noise: NoiseClass::Light,
+		};
+
+		let moderate = plan_video(&h264(""), &[], &grainy, Speed::Moderate, &CAPS).unwrap();
+		let fast = plan_video(&h264(""), &[], &grainy, Speed::Fast, &CAPS).unwrap();
+
+		assert!(matches!(moderate.encoder, Encoder::SvtAv1 { ref params, .. }
+			if params == "tune=0:enable-variance-boost=1:keyint=5s:crf=29:film-grain=6:film-grain-denoise=0"));
+		assert!(matches!(fast.encoder, Encoder::SvtAv1 { ref params, .. } if !params.contains("film-grain")));
+	}
+
+	#[test]
+	fn rotation_swaps_the_output_size() {
+		let rotated = h264(r#","side_data_list":[{"side_data_type":"Display Matrix","rotation":-90}]"#);
+
+		let plan = plan_video(&rotated, &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+
+		assert_eq!((plan.width, plan.height), (1080, 1920));
+	}
+
+	#[test]
+	fn transparent_video_goes_to_vp9_or_is_kept() {
+		let vp9_alpha = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"vp9","width":640,"height":360,
+			"pix_fmt":"yuv420p","tags":{"ALPHA_MODE":"1"}}]}"#,
+		);
+		let prores = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"prores","width":640,"height":360,
+			"pix_fmt":"yuva444p12le"}]}"#,
+		);
+		let without_libvpx = VideoCaps {
+			vp9_alpha: false,
+			libaom: true,
+		};
+
+		let plan = plan_video(&vp9_alpha, &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+		assert_eq!(plan.decoder, Some("libvpx-vp9"));
+		assert!(plan.alpha);
+		assert_eq!(plan.encoder, Encoder::Vp9Alpha { cpu_used: 2, crf: 33 });
+		assert!(plan.filters.contains("format=yuva420p"), "{}", plan.filters);
+
+		let plan = plan_video(&prores, &[], &PROGRESSIVE_CLEAN, Speed::Fast, &CAPS).unwrap();
+		assert_eq!(plan.decoder, None);
+		assert_eq!(plan.encoder, Encoder::Vp9Alpha { cpu_used: 4, crf: 33 });
+
+		assert!(matches!(
+			precheck(&prores, &without_libvpx),
+			Err(KeepReason::Unsupported(_))
+		));
+	}
+
+	#[test]
+	fn dolby_vision_profile_5_is_kept_and_profile_8_warns() {
+		let dovi = |profile: u8, compat: u8| {
+			h264(&format!(
+				r#","side_data_list":[{{"side_data_type":"DOVI configuration record","dv_profile":{profile},
+				"dv_bl_signal_compatibility_id":{compat}}}]"#
+			))
+		};
+
+		assert!(matches!(precheck(&dovi(5, 0), &CAPS), Err(KeepReason::Unsupported(_))));
+		let plan = plan_video(&dovi(8, 4), &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+		assert!(
+			plan.warnings.iter().any(|warning| warning.contains("Dolby Vision")),
+			"{:?}",
+			plan.warnings
+		);
+	}
+
+	#[test]
+	fn oversize_video_needs_libaom() {
+		let wide = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"mjpeg","width":17000,"height":960,
+			"pix_fmt":"yuvj420p","avg_frame_rate":"5/1"}]}"#,
+		);
+		let without_libaom = VideoCaps {
+			vp9_alpha: true,
+			libaom: false,
+		};
+
+		let plan = plan_video(&wide, &[], &PROGRESSIVE_CLEAN, Speed::Fast, &CAPS).unwrap();
+
+		assert_eq!(plan.encoder, Encoder::Aom { cpu_used: 6, crf: 38 });
+		assert!(matches!(
+			precheck(&wide, &without_libaom),
+			Err(KeepReason::Unsupported(_))
+		));
+	}
+
+	#[test]
+	fn efficient_sources_are_kept_by_the_bitrate_pre_gate() {
+		let av1 = |kbps: u32| {
+			info(&format!(
+				r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"av1","width":1920,"height":1080,
+				"avg_frame_rate":"30/1","bit_rate":"{}"}},
+				{{"index":1,"codec_type":"audio","codec_name":"opus","bit_rate":"128000"}}]}}"#,
+				kbps * 1000
+			))
+		};
+
+		assert!(matches!(
+			precheck(&av1(3_000), &CAPS),
+			Err(KeepReason::AlreadyEfficient(_))
+		));
+		assert!(precheck(&av1(34_000), &CAPS).is_ok());
+		assert!(precheck(&h264(r#","bit_rate":"1000000""#), &CAPS).is_ok());
+	}
+
+	#[test]
+	fn container_bitrate_stands_in_for_a_single_video_stream() {
+		let webm = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"vp9","width":1920,"height":1080,
+			"avg_frame_rate":"24/1"},{"index":1,"codec_type":"audio","codec_name":"opus"}],
+			"format":{"bit_rate":"2500000"}}"#,
+		);
+
+		assert!(matches!(precheck(&webm, &CAPS), Err(KeepReason::AlreadyEfficient(_))));
+	}
+
+	#[test]
+	fn hdr_side_data_is_recorded_and_hdr10_plus_warns() {
+		let frames: Vec<Frame> = serde_json::from_str(
+			r#"[{"side_data_list":[{"side_data_type":"Mastering display metadata"},
+			{"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}]}]"#,
+		)
+		.unwrap();
+
+		let plan = plan_video(&h264(""), &frames, &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+
+		assert!(plan.hdr10);
+		assert!(
+			plan.warnings.iter().any(|warning| warning.starts_with("HDR10+")),
+			"{:?}",
+			plan.warnings
+		);
+	}
+
+	#[test]
+	fn every_real_video_stream_is_encoded_main_first() {
+		let angles = info(
+			r#"{"streams":[
+			{"index":0,"codec_type":"video","codec_name":"h264","width":640,"height":360},
+			{"index":1,"codec_type":"video","codec_name":"h264","width":640,"height":360,"disposition":{"default":1}},
+			{"index":2,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}}]}"#,
+		);
+
+		assert_eq!(main_stream(&angles).unwrap().index, 1);
+		let plan = plan_video(&angles, &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+		assert_eq!(plan.streams, [1, 0]);
+	}
+
+	#[test]
+	fn resolution_buckets_follow_pixel_counts() {
+		assert_eq!(Resolution::of(854, 480), Resolution::Sd);
+		assert_eq!(Resolution::of(1280, 720), Resolution::Hd720);
+		assert_eq!(Resolution::of(1920, 1080), Resolution::Hd1080);
+		assert_eq!(Resolution::of(3440, 1440), Resolution::Qhd1440);
+		assert_eq!(Resolution::of(3840, 2160), Resolution::Uhd4k);
+		assert_eq!(Resolution::of(7680, 4320), Resolution::Uhd8k);
+	}
+}
