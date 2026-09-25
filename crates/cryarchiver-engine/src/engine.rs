@@ -10,7 +10,7 @@ use crate::container::Cover;
 use crate::detect::{self, Detection, MediaClass};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use crate::preset::Speed;
-use crate::probe::MediaInfo;
+use crate::probe::{MediaInfo, Stream};
 use crate::text::display_path;
 use crate::toolchain::Toolchain;
 use crate::workspace::Workspace;
@@ -91,14 +91,14 @@ impl Engine {
 		}
 
 		on_event(JobEvent::Stage(Stage::Detect));
-		let Detection { meta, class } = detect::detect(&self.tools, &job.source, cancel).await?;
+		let Detection { meta, class, probe_log } = detect::detect(&self.tools, &job.source, cancel).await?;
 		let info = match class {
 			MediaClass::Audio(info) => info,
 			MediaClass::Video(_) => return Ok(skipped("video support is not implemented yet")),
 			MediaClass::StillImage(_) | MediaClass::AnimatedImage(_) => {
 				return Ok(skipped("image support is not implemented yet"));
 			}
-			MediaClass::Damaged(reason) => return Err(ErrorKind::SourceDamaged(reason).into()),
+			MediaClass::Damaged(reason) => return Err(JobError::with_log(ErrorKind::SourceDamaged(reason), probe_log)),
 			MediaClass::Other(reason) => return Ok(JobOutcome::Skipped { reason }),
 		};
 
@@ -116,6 +116,7 @@ impl Engine {
 		let before =
 			SourceTimes::from_metadata(&meta).map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
 		let work_root = sink.work_root(&job.source);
+		// Must outlive `finish`: dropping the workspace deletes the staged output.
 		let workspace = open_workspace(&work_root, &job.source, meta.len())?;
 
 		let cx = Context {
@@ -155,9 +156,8 @@ impl Engine {
 		(cx.on_event)(JobEvent::Stage(Stage::Metadata));
 		let mut warnings = Vec::new();
 		if plan.container.cover == Cover::VorbisPicture
-			&& let Err(err) = cover::add_pictures(&output, cover::source_pictures(&cx.job.source))
+			&& let Some(warning) = copy_cover(&cx.job.source, &output, info)
 		{
-			let warning = format!("cover art not copied: {err}");
 			(cx.on_event)(JobEvent::Warning(warning.clone()));
 			warnings.push(warning);
 		}
@@ -195,6 +195,17 @@ impl Engine {
 			warnings,
 		}))
 	}
+}
+
+fn copy_cover(source: &Path, output: &Path, info: &MediaInfo) -> Option<String> {
+	let pictures = cover::source_pictures(source);
+	if pictures.is_empty() && info.streams.iter().any(Stream::is_attached_pic) {
+		return Some("cover art not copied: covers in this format can't be read yet".to_owned());
+	}
+
+	cover::add_pictures(output, pictures)
+		.err()
+		.map(|err| format!("cover art not copied: {err}"))
 }
 
 fn open_workspace(work_root: &Path, source: &Path, source_bytes: u64) -> Result<Workspace, JobError> {

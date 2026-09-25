@@ -17,6 +17,10 @@ fn stdout(out: &Output) -> String {
 	String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn stderr(out: &Output) -> String {
+	String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 fn flac(dir: &Path, name: &str, seconds: u32) -> PathBuf {
 	support::tone(dir, name, "stereo", 2, seconds, &["-c:a", "flac"])
 }
@@ -139,12 +143,36 @@ fn damaged_sources_fail_with_exit_code_one() {
 }
 
 #[test]
+fn missing_inputs_fail_the_run() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "a.flac", 5);
+
+	let out = cryarchiver(dir.path(), &["a.flac", "typo.flac"]);
+
+	assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+	assert!(dir.path().join("a.cry.opus").is_file());
+	assert!(stderr(&out).contains("typo.flac: not found"), "{}", stderr(&out));
+}
+
+#[test]
 fn no_inputs_is_a_usage_error() {
 	let dir = tempfile::tempdir().unwrap();
 
 	let out = cryarchiver(dir.path(), &["missing.flac"]);
 
 	assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn leading_dash_names_work_through_wildcards() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "-intro.flac", 5);
+
+	let out = cryarchiver(dir.path(), &["*.flac"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+	assert!(dir.path().join("-intro.cry.opus").is_file());
+	assert!(stdout(&out).contains("✓ -intro.flac"));
 }
 
 #[test]

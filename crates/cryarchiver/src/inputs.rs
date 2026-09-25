@@ -10,6 +10,14 @@ use globset::{GlobBuilder, escape};
 pub struct Inputs {
 	pub files: Vec<PathBuf>,
 	pub notes: Vec<String>,
+	pub problems: usize,
+}
+
+impl Inputs {
+	fn problem(&mut self, note: String) {
+		self.notes.push(note);
+		self.problems += 1;
+	}
 }
 
 pub fn expand(args: &[PathBuf]) -> Inputs {
@@ -25,16 +33,12 @@ pub fn expand(args: &[PathBuf]) -> Inputs {
 						.files
 						.extend(files.into_iter().filter(|file| !is_cli_output(file)));
 				}
-				Err(err) => {
-					inputs
-						.notes
-						.push(format!("{}: cannot read the folder: {err}", display_path(arg)));
-				}
+				Err(err) => inputs.problem(format!("{}: cannot read the folder: {err}", display_path(arg))),
 			}
 		} else if has_wildcard(arg) {
 			expand_wildcard(&mut inputs, arg);
 		} else {
-			inputs.notes.push(format!("{}: not found", display_path(arg)));
+			inputs.problem(format!("{}: not found", display_path(arg)));
 		}
 	}
 
@@ -74,14 +78,12 @@ fn expand_wildcard(inputs: &mut Inputs, arg: &Path) {
 	let shown = display_path(arg);
 	let parent = arg.parent().unwrap_or(Path::new(""));
 	if has_wildcard(parent) && !parent.is_dir() {
-		inputs
-			.notes
-			.push(format!("{shown}: wildcards work only in the file name"));
+		inputs.problem(format!("{shown}: wildcards work only in the file name"));
 		return;
 	}
 
 	let Some(pattern) = arg.file_name().and_then(|name| name.to_str()) else {
-		inputs.notes.push(format!("{shown}: the pattern is not valid text"));
+		inputs.problem(format!("{shown}: the pattern is not valid text"));
 		return;
 	};
 
@@ -91,7 +93,7 @@ fn expand_wildcard(inputs: &mut Inputs, arg: &Path) {
 		.literal_separator(true)
 		.build()
 	else {
-		inputs.notes.push(format!("{shown}: invalid wildcard pattern"));
+		inputs.problem(format!("{shown}: invalid wildcard pattern"));
 		return;
 	};
 	let matcher = glob.compile_matcher();
@@ -105,7 +107,7 @@ fn expand_wildcard(inputs: &mut Inputs, arg: &Path) {
 			}));
 		}
 		Err(err) => {
-			inputs.notes.push(format!("{shown}: cannot read the folder: {err}"));
+			inputs.problem(format!("{shown}: cannot read the folder: {err}"));
 			return;
 		}
 	}
@@ -152,6 +154,7 @@ mod tests {
 
 		assert_eq!(inputs.files, vec![dir.path().join("a.flac"), dir.path().join("b.mp3")]);
 		assert!(inputs.notes.is_empty());
+		assert_eq!(inputs.problems, 0);
 	}
 
 	#[test]
@@ -185,6 +188,7 @@ mod tests {
 		assert!(inputs.notes[0].contains("not found"));
 		assert!(inputs.notes[1].contains("only in the file name"));
 		assert!(inputs.notes[2].contains("no files match"));
+		assert_eq!(inputs.problems, 2);
 	}
 
 	#[test]
@@ -222,6 +226,7 @@ mod tests {
 		assert!(inputs.files.is_empty());
 		assert_eq!(inputs.notes.len(), 1);
 		assert!(inputs.notes[0].contains("not found"));
+		assert_eq!(inputs.problems, 1);
 	}
 
 	#[test]

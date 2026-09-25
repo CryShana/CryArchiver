@@ -12,6 +12,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::ChildStderr;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 use lines::{LineSplitter, RingBuffer};
 pub use progress::Progress;
@@ -131,6 +133,11 @@ pub async fn run(
 		}
 	};
 
+	// After a cancel the exit status proves nothing about the file: the same interruption may have ended the tool.
+	if cancel.is_cancelled() {
+		return Err(RunError::Cancelled);
+	}
+
 	let stderr_tail = stderr.await.unwrap_or_default();
 	Ok(ToolOutput {
 		status,
@@ -138,6 +145,10 @@ pub async fn run(
 		stderr_tail,
 		last_progress,
 	})
+}
+
+pub fn tool_path(path: &Path) -> PathBuf {
+	std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn spawn(cmd: &ToolCommand, mode: StdoutMode) -> io::Result<Box<dyn ChildWrapper>> {
@@ -156,8 +167,11 @@ fn spawn(cmd: &ToolCommand, mode: StdoutMode) -> io::Result<Box<dyn ChildWrapper
 	});
 	command.wrap(KillOnDrop);
 
+	// The console sends Ctrl+C to every process attached to it; in a new process group the tools ignore it.
 	#[cfg(windows)]
-	command.wrap(process_wrap::tokio::JobObject);
+	command
+		.wrap(process_wrap::tokio::CreationFlags(CREATE_NEW_PROCESS_GROUP))
+		.wrap(process_wrap::tokio::JobObject);
 
 	#[cfg(unix)]
 	command.wrap(process_wrap::tokio::ProcessGroup::leader());
@@ -169,10 +183,18 @@ fn spawn(cmd: &ToolCommand, mode: StdoutMode) -> io::Result<Box<dyn ChildWrapper
 // long-lived worker threads, never from `spawn_blocking`.
 #[cfg(target_os = "linux")]
 fn die_with_parent(command: &mut tokio::process::Command) {
-	// SAFETY: prctl is async-signal-safe and only affects the forked child.
+	// SAFETY: getpid has no preconditions.
+	let parent = unsafe { libc::getpid() };
+
+	// SAFETY: prctl, getppid and _exit are async-signal-safe and only affect the forked child.
 	unsafe {
-		command.pre_exec(|| {
+		command.pre_exec(move || {
 			libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+
+			// If the parent died before prctl ran, the death signal will never come.
+			if libc::getppid() != parent {
+				libc::_exit(1);
+			}
 			Ok(())
 		});
 	}
@@ -200,4 +222,21 @@ async fn stop(child: &mut dyn ChildWrapper, error: RunError) -> RunError {
 	let _ = child.start_kill();
 	let _ = child.wait().await;
 	error
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn tool_paths_are_absolute() {
+		let relative = Path::new("music").join("-intro.flac");
+		let absolute = std::env::temp_dir().join("a.flac");
+
+		let resolved = tool_path(&relative);
+
+		assert!(resolved.is_absolute(), "{}", resolved.display());
+		assert!(resolved.ends_with(&relative), "{}", resolved.display());
+		assert_eq!(tool_path(&absolute), absolute);
+	}
 }

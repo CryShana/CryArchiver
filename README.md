@@ -30,8 +30,8 @@ cryarchiver album/ --speed slow        # slower, higher quality
 
 - Sources are never modified.
 - An existing output is skipped, so running the same command again is safe.
-- Files that would share an output name (song.flac and song.wav) are not merged: the first is compressed, the second is skipped with a note.
-- Cover art and music tags are kept.
+- Files that would share an output name (song.flac and song.wav) are not merged: the first in name order is compressed, the second is skipped with a note.
+- Cover art and common music tags are kept. MusicBrainz IDs and lyrics keep their ID3-style names for now.
 - `--keep-metadata` also keeps each file's timestamps.
 
 | Option | Meaning | Default |
@@ -40,7 +40,7 @@ cryarchiver album/ --speed slow        # slower, higher quality
 | `-s, --speed slow\|moderate\|fast` | Trade speed for quality | moderate |
 | `--keep-metadata` | Keep personal metadata and file timestamps | off |
 | `--overwrite` | Replace existing outputs (never sources) | off |
-| `--min-savings PERCENT` | Keep the original unless the output is at least this much smaller | 10 |
+| `--min-savings PERCENT` | Keep the original unless the output is at least this much smaller (0–90) | 10 |
 | `-j, --jobs N` | Files processed in parallel | half the CPU cores, at most 4 |
 | `--ffmpeg PATH` | ffmpeg binary or its folder | from PATH |
 | `-q, --quiet` | Only print failures and the summary | off |

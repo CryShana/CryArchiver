@@ -14,6 +14,7 @@ pub fn cli_output_path(source: &Path, output_dir: Option<&Path>, extension: impl
 	let mut name = OsString::from(source.file_stem().unwrap_or_default());
 	name.push(format!(".{CLI_MARKER}."));
 	name.push(extension);
+
 	cli_output_dir(source, output_dir).join(name)
 }
 

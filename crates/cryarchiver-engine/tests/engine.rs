@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::Speed;
+use cryarchiver_engine::probe::{Stream, probe};
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
 use tokio_util::sync::CancellationToken;
@@ -142,6 +143,53 @@ async fn truncated_flac_is_source_damaged() {
 		"{outcome:?}"
 	);
 	assert!(!dir.path().join("cut.cry.opus").exists());
+}
+
+#[tokio::test]
+async fn unreadable_covers_are_warned() {
+	let dir = tempfile::tempdir().unwrap();
+	let tone = support::tone(dir.path(), "tone.flac", "stereo", 2, 5, &["-c:a", "flac"]);
+	let cover = dir.path().join("cover.png");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=red:s=64x64",
+		"-frames:v",
+		"1",
+		"-update",
+		"1",
+		cover.to_str().unwrap(),
+	]);
+	let mka = dir.path().join("x.mka");
+	support::ffmpeg(&[
+		"-i",
+		tone.to_str().unwrap(),
+		"-attach",
+		cover.to_str().unwrap(),
+		"-metadata:s:t",
+		"mimetype=image/png",
+		"-map",
+		"0:a",
+		"-c:a",
+		"flac",
+		mka.to_str().unwrap(),
+	]);
+
+	let info = probe(&support::toolchain().await, &mka, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!(info.streams.iter().any(Stream::is_attached_pic), "{info:?}");
+
+	let outcome = run(&job(&mka), dir.path()).await;
+
+	let JobOutcome::Encoded { warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings.iter().any(|warning| warning.contains("cover art")),
+		"{warnings:?}"
+	);
 }
 
 #[tokio::test]

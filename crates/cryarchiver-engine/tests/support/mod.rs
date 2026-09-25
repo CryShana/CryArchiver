@@ -10,6 +10,7 @@ pub async fn toolchain() -> Toolchain {
 	let config = ToolConfig {
 		ffmpeg: None,
 		cache_dir: Some(std::env::temp_dir().join("cryarchiver-test-cache")),
+		refresh: false,
 	};
 	Toolchain::detect(&config, &CancellationToken::new())
 		.await

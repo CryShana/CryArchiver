@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::fmt::Write;
+use std::io::{self, Write as _};
 use std::path::Path;
 
 use cryarchiver_engine::engine::{JobEvent, Stage};
@@ -37,7 +38,9 @@ impl Report {
 
 	pub fn print(&self, line: &str, failed: bool) {
 		if !self.quiet || failed {
-			self.multi.suspend(|| println!("{line}"));
+			self.multi.suspend(|| {
+				let _ = writeln!(io::stdout(), "{line}");
+			});
 		}
 	}
 }

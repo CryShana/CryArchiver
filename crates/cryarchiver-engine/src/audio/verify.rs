@@ -58,7 +58,8 @@ pub async fn measure_output(
 ) -> Result<Vec<Levels>, JobError> {
 	let streams: Vec<String> = (0..plan.tracks.len()).map(|track| format!("0:a:{track}")).collect();
 	let mut cmd = ToolCommand::new(&tools.ffmpeg, STALL_TIMEOUT);
-	cmd.args(["-hide_banner", "-nostdin", "-i"]).arg(output);
+	cmd.args(["-hide_banner", "-nostdin", "-i"])
+		.arg(process::tool_path(output));
 	push_stats_output(&mut cmd, &streams);
 
 	let out = process::run(&cmd, StdoutMode::Progress, |_| {}, cancel).await?;

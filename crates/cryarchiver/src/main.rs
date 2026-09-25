@@ -2,7 +2,9 @@ mod inputs;
 mod report;
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -128,6 +130,7 @@ async fn doctor(ffmpeg: Option<PathBuf>) -> u8 {
 		&ToolConfig {
 			ffmpeg,
 			cache_dir: None,
+			refresh: true,
 		},
 		&CancellationToken::new(),
 	)
@@ -169,6 +172,7 @@ async fn compress(args: CompressArgs) -> u8 {
 		&ToolConfig {
 			ffmpeg: args.ffmpeg,
 			cache_dir: None,
+			refresh: false,
 		},
 		&cancel,
 	)
@@ -186,19 +190,20 @@ async fn compress(args: CompressArgs) -> u8 {
 		for problem in &problems {
 			eprintln!("error: {problem}");
 		}
+		eprintln!("run \"cryarchiver doctor\" after changing ffmpeg");
 		return 2;
 	}
 
+	let files: Vec<PathBuf> = inputs.files.into_iter().map(absolute).collect();
 	let sink = Arc::new(CliSink {
-		output_dir: args.output,
+		output_dir: args.output.map(absolute),
 		overwrite: args.overwrite,
 	});
-	prepare_work_roots(&inputs.files, sink.as_ref());
+	prepare_work_roots(&files, sink.as_ref());
 	cancel_on_ctrl_c(&cancel);
 
 	let min_savings = f64::from(args.min_savings) / 100.0;
-	let jobs = inputs
-		.files
+	let jobs = files
 		.into_iter()
 		.map(|source| Job {
 			source,
@@ -211,8 +216,8 @@ async fn compress(args: CompressArgs) -> u8 {
 	let report = Report::new(args.quiet);
 
 	let totals = run_all(&Arc::new(Engine::new(tools)), &sink, jobs, parallel, &report, &cancel).await;
-	println!("{}", totals.line());
-	totals.exit_code()
+	let _ = writeln!(io::stdout(), "{}", totals.line());
+	totals.exit_code().max(u8::from(inputs.problems > 0))
 }
 
 async fn run_all(
@@ -226,7 +231,7 @@ async fn run_all(
 	let mut totals = Totals::default();
 	let mut running = JoinSet::new();
 	let mut queue = jobs.into_iter();
-	let mut claimed: HashMap<String, PathBuf> = HashMap::new();
+	let mut claimed: HashMap<OsString, PathBuf> = HashMap::new();
 
 	while let Some(job) = queue.next() {
 		if cancel.is_cancelled() {
@@ -254,6 +259,11 @@ async fn run_all(
 			}
 		}
 
+		if cancel.is_cancelled() {
+			eprintln!("cancelled: {} files were not started", queue.len() + 1);
+			break;
+		}
+
 		let bar = report.bar(&job.source);
 		let (engine, sink, cancel) = (engine.clone(), sink.clone(), cancel.clone());
 		running.spawn(async move {
@@ -271,9 +281,17 @@ async fn run_all(
 	totals
 }
 
-fn output_key(source: &Path, output_dir: Option<&Path>) -> String {
-	let key = cli_output_path(source, output_dir, "").to_string_lossy().into_owned();
-	if cfg!(windows) { key.to_lowercase() } else { key }
+fn output_key(source: &Path, output_dir: Option<&Path>) -> OsString {
+	let key = cli_output_path(source, output_dir, "").into_os_string();
+	if cfg!(windows) {
+		key.to_string_lossy().to_lowercase().into()
+	} else {
+		key
+	}
+}
+
+fn absolute(path: PathBuf) -> PathBuf {
+	std::path::absolute(&path).unwrap_or(path)
 }
 
 fn record(report: &Report, totals: &mut Totals, source: &Path, outcome: &JobOutcome) {
@@ -312,8 +330,15 @@ fn prepare_work_roots(files: &[PathBuf], sink: &dyn OutputSink) {
 fn cancel_on_ctrl_c(cancel: &CancellationToken) {
 	let cancel = cancel.clone();
 	tokio::spawn(async move {
+		if tokio::signal::ctrl_c().await.is_err() {
+			return;
+		}
+		cancel.cancel();
+
+		// Exiting here is safe: the job object and the parent-death signal end the tools, and the next run's sweep
+		// removes the leftover workspaces.
 		if tokio::signal::ctrl_c().await.is_ok() {
-			cancel.cancel();
+			std::process::exit(130);
 		}
 	});
 }

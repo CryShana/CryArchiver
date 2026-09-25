@@ -89,8 +89,9 @@ pub fn commit_file(artifact: &Artifact, target: &Path, replace: Replace) -> Resu
 		}
 	}
 
+	// Best effort: the output is already in place, and some filesystems (older CIFS) refuse to fsync a directory.
 	#[cfg(unix)]
-	sync_parent(target)?;
+	let _ = sync_parent(target);
 	Ok(())
 }
 
@@ -122,7 +123,8 @@ pub fn check_space(dir: &Path, source_bytes: u64) -> Result<(), ErrorKind> {
 }
 
 pub fn free_space(path: &Path) -> io::Result<u64> {
-	let existing = path.ancestors().find(|dir| dir.exists()).unwrap_or(path);
+	let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+	let existing = absolute.ancestors().find(|dir| dir.exists()).unwrap_or(&absolute);
 	native::free_space(existing)
 }
 

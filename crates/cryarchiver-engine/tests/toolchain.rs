@@ -7,6 +7,7 @@ async fn detects_the_installed_toolchain_and_caches_it() {
 	let config = ToolConfig {
 		ffmpeg: None,
 		cache_dir: Some(cache.path().to_path_buf()),
+		refresh: false,
 	};
 	let cancel = CancellationToken::new();
 

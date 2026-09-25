@@ -27,6 +27,7 @@ impl CliSink {
 
 impl OutputSink for CliSink {
 	fn work_root(&self, source: &Path) -> PathBuf {
+		// The workspace must be on the output's filesystem so the commit is a rename.
 		cli_output_dir(source, self.output_dir.as_deref()).join(CLI_WORK_DIR)
 	}
 

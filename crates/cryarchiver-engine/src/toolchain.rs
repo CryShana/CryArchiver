@@ -84,6 +84,7 @@ pub enum FfmpegBuild {
 pub struct ToolConfig {
 	pub ffmpeg: Option<PathBuf>,
 	pub cache_dir: Option<PathBuf>,
+	pub refresh: bool,
 }
 
 #[allow(clippy::unsafe_derive_deserialize)]
@@ -133,7 +134,9 @@ impl Toolchain {
 		let cache = cache_file(config);
 		let fingerprint = fingerprint(&ffmpeg);
 
-		if let Some(cached) = read_cache(cache.as_deref(), fingerprint.as_deref()) {
+		if !config.refresh
+			&& let Some(cached) = read_cache(cache.as_deref(), fingerprint.as_deref())
+		{
 			return Ok(Self { ffprobe, ..cached });
 		}
 
@@ -504,12 +507,10 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
-	async fn cache_hit_returns_the_freshly_located_ffprobe() {
-		let dir = tempfile::tempdir().unwrap();
+	fn cached_fake_ffmpeg(dir: &Path) -> (ToolConfig, PathBuf) {
 		let exe_suffix = std::env::consts::EXE_SUFFIX;
-		let ffmpeg = dir.path().join(format!("ffmpeg{exe_suffix}"));
-		let ffprobe = dir.path().join(format!("ffprobe{exe_suffix}"));
+		let ffmpeg = dir.join(format!("ffmpeg{exe_suffix}"));
+		let ffprobe = dir.join(format!("ffprobe{exe_suffix}"));
 		fs::write(&ffmpeg, b"").unwrap();
 		fs::write(&ffprobe, b"").unwrap();
 
@@ -527,14 +528,37 @@ mod tests {
 			fingerprint: fingerprint(&ffmpeg).unwrap(),
 			toolchain: stale,
 		};
-		fs::write(dir.path().join("toolchain.json"), serde_json::to_vec(&entry).unwrap()).unwrap();
+		fs::write(dir.join("toolchain.json"), serde_json::to_vec(&entry).unwrap()).unwrap();
 
 		let config = ToolConfig {
 			ffmpeg: Some(ffmpeg),
-			cache_dir: Some(dir.path().to_path_buf()),
+			cache_dir: Some(dir.to_path_buf()),
+			refresh: false,
 		};
+		(config, ffprobe)
+	}
+
+	#[tokio::test]
+	async fn cache_hit_returns_the_freshly_located_ffprobe() {
+		let dir = tempfile::tempdir().unwrap();
+		let (config, ffprobe) = cached_fake_ffmpeg(dir.path());
+
 		let tools = Toolchain::detect(&config, &CancellationToken::new()).await.unwrap();
 
 		assert_eq!(tools.ffprobe, ffprobe);
+	}
+
+	#[tokio::test]
+	async fn refresh_probes_instead_of_reading_the_cache() {
+		let dir = tempfile::tempdir().unwrap();
+		let (config, _) = cached_fake_ffmpeg(dir.path());
+		let config = ToolConfig {
+			refresh: true,
+			..config
+		};
+
+		let result = Toolchain::detect(&config, &CancellationToken::new()).await;
+
+		assert!(result.is_err(), "{result:?}");
 	}
 }

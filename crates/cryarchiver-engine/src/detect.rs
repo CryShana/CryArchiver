@@ -28,6 +28,14 @@ const TEXT_LIKE_FORMATS: &[&str] = &[
 	"vplayer",
 	"aqtitle",
 ];
+// Any unreadable signature not listed here must stay Damaged: archival mode copies Other files as they are.
+const UNSUPPORTED_MIME_TYPES: &[&str] = &[
+	"audio/midi",
+	"image/vnd.dwg",
+	"image/vnd.djvu",
+	"image/openraster",
+	"image/vnd.ms-photo",
+];
 
 #[derive(Debug)]
 pub enum MediaClass {
@@ -43,23 +51,29 @@ pub enum MediaClass {
 pub struct Detection {
 	pub meta: Metadata,
 	pub class: MediaClass,
+	pub probe_log: Vec<String>,
 }
 
 pub async fn detect(tools: &Toolchain, path: &Path, cancel: &CancellationToken) -> Result<Detection, JobError> {
 	let (meta, header) = read_header(path).map_err(|err| JobError::io(IoSide::Source(path), &err))?;
 	if let Some(class) = classify_header(meta.len(), &header) {
-		return Ok(Detection { meta, class });
+		return Ok(Detection {
+			meta,
+			class,
+			probe_log: Vec::new(),
+		});
 	}
 
-	let info = match probe::probe(tools, path, cancel).await {
-		Ok(info) => Some(info),
-		Err(ProbeError::Failed(_)) => None,
+	let (info, probe_log) = match probe::probe(tools, path, cancel).await {
+		Ok(info) => (Some(info), Vec::new()),
+		Err(ProbeError::Failed(log)) => (None, log),
 		Err(ProbeError::Run(err)) => return Err(err.into()),
 		Err(err @ ProbeError::Json(_)) => return Err(ErrorKind::Toolchain(err.to_string()).into()),
 	};
 	Ok(Detection {
 		class: classify(&header, info),
 		meta,
+		probe_log,
 	})
 }
 
@@ -89,6 +103,9 @@ pub fn classify(header: &[u8], info: Option<MediaInfo>) -> MediaClass {
 	let magic = infer::get(header);
 	let Some(info) = info else {
 		return match magic {
+			Some(kind) if UNSUPPORTED_MIME_TYPES.contains(&kind.mime_type()) => {
+				MediaClass::Other(format!("not supported: {}", kind.mime_type()))
+			}
 			Some(kind) => MediaClass::Damaged(format!("{} signature but the file cannot be read", kind.mime_type())),
 			None => MediaClass::Other("not a readable media file".into()),
 		};
@@ -139,6 +156,7 @@ mod tests {
 	const HEIC: &[u8] = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic";
 	const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 	const HTML: &[u8] = b"<html>\r\n<head><title>503 Service Temporarily Unavailable</title></head>";
+	const MIDI: &[u8] = b"MThd\0\0\0\x06\0\x01\0\x02\x01\xe0MTrk";
 
 	#[allow(clippy::unnecessary_wraps)]
 	fn info(json: &str) -> Option<MediaInfo> {
@@ -157,6 +175,12 @@ mod tests {
 	fn media_signature_without_probe_is_damaged() {
 		assert!(matches!(classify(MP4, None), MediaClass::Damaged(_)));
 		assert!(matches!(classify(b"This is plain text", None), MediaClass::Other(_)));
+	}
+
+	#[test]
+	fn formats_ffmpeg_cannot_decode_are_not_supported_but_unreadable_audio_is_damaged() {
+		assert!(matches!(classify(MIDI, None), MediaClass::Other(reason) if reason.contains("not supported")));
+		assert!(matches!(classify(FLAC, None), MediaClass::Damaged(_)));
 	}
 
 	#[test]

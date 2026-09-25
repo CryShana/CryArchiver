@@ -14,7 +14,7 @@ const GENERIC_TRAILERS: &[&str] = &["Conversion failed!", "Error closing file", 
 pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-i"])
-		.arg(source)
+		.arg(process::tool_path(source))
 		.args(["-map_metadata", "0", "-map_chapters", "0"]);
 
 	for (out, track) in plan.tracks.iter().enumerate() {
@@ -30,7 +30,7 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 	if plan.container.cover == Cover::Stream {
 		cmd.args(["-map", "0:v?", "-c:v", "copy"]);
 	}
-	cmd.args(["-f", plan.container.muxer]).arg(output);
+	cmd.args(["-f", plan.container.muxer]).arg(process::tool_path(output));
 
 	let sources: Vec<String> = plan
 		.tracks
@@ -111,6 +111,7 @@ mod tests {
 	use super::*;
 	use crate::audio::plan::TrackJob;
 	use crate::container::{MATROSKA_AUDIO, OGG_OPUS};
+	use crate::process::tool_path;
 
 	fn joined(cmd: &ToolCommand) -> String {
 		cmd.args
@@ -142,12 +143,17 @@ mod tests {
 
 		let cmd = command(Path::new("ffmpeg"), Path::new("in.ac3"), Path::new("out.opus"), &file);
 
+		let (source, output) = (tool_path(Path::new("in.ac3")), tool_path(Path::new("out.opus")));
 		assert_eq!(
 			joined(&cmd),
-			"-hide_banner -nostdin -y -i in.ac3 -map_metadata 0 -map_chapters 0 -map 0:0 -c:a:0 libopus -b:a:0 256k \
-			 -filter:a:0 channelmap=channel_layout=5.1,aresample=resampler=soxr:osr=48000 -mapping_family:a:0 1 \
-			 -f opus out.opus -map 0:0 -filter:a:0 astats@s0=measure_overall=Number_of_samples:measure_perchannel=RMS_level \
-			 -f null -"
+			format!(
+				"-hide_banner -nostdin -y -i {} -map_metadata 0 -map_chapters 0 -map 0:0 -c:a:0 libopus -b:a:0 256k \
+				 -filter:a:0 channelmap=channel_layout=5.1,aresample=resampler=soxr:osr=48000 -mapping_family:a:0 1 \
+				 -f opus {} -map 0:0 -filter:a:0 astats@s0=measure_overall=Number_of_samples:measure_perchannel=RMS_level \
+				 -f null -",
+				source.display(),
+				output.display()
+			)
 		);
 	}
 
@@ -170,8 +176,12 @@ mod tests {
 			&file,
 		));
 
+		let output = tool_path(Path::new("out.mka"));
 		assert!(args.contains("-map 0:1 -c:a:1 copy"));
-		assert!(args.contains("-map 0:v? -c:v copy -f matroska out.mka -map 0:0 -map 0:1 -filter:a:0 astats@s0="));
+		assert!(args.contains(&format!(
+			"-map 0:v? -c:v copy -f matroska {} -map 0:0 -map 0:1 -filter:a:0 astats@s0=",
+			output.display()
+		)));
 		assert!(args.contains("-filter:a:1 astats@s1="));
 	}
 

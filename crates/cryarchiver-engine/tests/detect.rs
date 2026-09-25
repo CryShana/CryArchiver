@@ -27,6 +27,7 @@ async fn flac_signature_with_junk_is_damaged() {
 	let detection = detect(&tools, &path, &CancellationToken::new()).await.unwrap();
 
 	assert!(matches!(detection.class, MediaClass::Damaged(_)));
+	assert!(!detection.probe_log.is_empty());
 }
 
 #[tokio::test]

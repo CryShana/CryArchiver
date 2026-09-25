@@ -130,6 +130,19 @@ fn space_checks_use_the_110_percent_rule() {
 }
 
 #[test]
+fn space_checks_work_for_relative_folders_that_do_not_exist_yet() {
+	let missing = Path::new("no-such-dir-cryarchiver-test");
+
+	let result = check_space(&missing.join(".cry-work"), u64::MAX / 4);
+
+	assert!(
+		matches!(result, Err(JobErrorKind::InsufficientSpace { .. })),
+		"{result:?}"
+	);
+	assert!(!missing.exists());
+}
+
+#[test]
 fn identifies_the_same_file_through_different_paths() {
 	let dir = tempfile::tempdir().unwrap();
 	let a = dir.path().join("a.flac");

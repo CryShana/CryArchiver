@@ -104,8 +104,9 @@ pub async fn probe(tools: &Toolchain, path: &Path, cancel: &CancellationToken) -
 		"json",
 		"-show_format",
 		"-show_streams",
+		"-i",
 	])
-	.arg(path);
+	.arg(process::tool_path(path));
 
 	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
 	if !out.status.success() {
