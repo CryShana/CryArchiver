@@ -1,0 +1,129 @@
+mod support;
+
+use std::path::Path;
+
+use cryarchiver_engine::video::colour::{ColourTags, Range};
+use cryarchiver_engine::video::plan::{Encoder, VideoPlan};
+use cryarchiver_engine::video::streams::StreamPlan;
+use cryarchiver_engine::video::verify::{Expected, alpha_ssim, check_alpha, verify_output};
+use tokio_util::sync::CancellationToken;
+
+fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan {
+	VideoPlan {
+		streams: vec![0],
+		decoder,
+		filters: filters.into(),
+		encoder: if alpha {
+			Encoder::Vp9Alpha { cpu_used: 4, crf: 33 }
+		} else {
+			Encoder::SvtAv1 {
+				preset: 10,
+				params: String::new(),
+			}
+		},
+		expected_frames: None,
+		width: 320,
+		height: 240,
+		colour: ColourTags {
+			primaries: "bt709".into(),
+			transfer: "bt709".into(),
+			matrix: "bt709".into(),
+			range: Range::Limited,
+		},
+		alpha,
+		hdr10: false,
+		warnings: Vec::new(),
+	}
+}
+
+const TAGS: &str = "setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709";
+
+fn alpha_source(dir: &Path) -> std::path::PathBuf {
+	let source = dir.join("alpha.webm");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=2,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(lt(X,160),255,40)'",
+		"-c:v",
+		"libvpx-vp9",
+		"-pix_fmt",
+		"yuva420p",
+		source.to_str().unwrap(),
+	]);
+	source
+}
+
+#[tokio::test]
+async fn a_tagged_av1_output_passes_and_a_mislabelled_one_fails() {
+	let dir = tempfile::tempdir().unwrap();
+	let output = dir.path().join("mux.mkv");
+	let filters = format!("format=yuv420p10le,{TAGS}");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=1",
+		"-vf",
+		&filters,
+		"-c:v",
+		"libsvtav1",
+		"-preset",
+		"12",
+		output.to_str().unwrap(),
+	]);
+	let tools = support::toolchain().await;
+	let good = plan(false, "", None);
+	let mut wrong = plan(false, "", None);
+	wrong.colour.transfer = "smpte2084".into();
+	let streams = StreamPlan::default();
+	let passes = Expected {
+		video: &good,
+		streams: &streams,
+		source_chapters: 0,
+		attached_files: 0,
+	};
+	let fails = Expected {
+		video: &wrong,
+		streams: &streams,
+		source_chapters: 0,
+		attached_files: 0,
+	};
+
+	verify_output(&tools, &output, &passes, &CancellationToken::new())
+		.await
+		.unwrap();
+	let err = verify_output(&tools, &output, &fails, &CancellationToken::new())
+		.await
+		.unwrap_err();
+	assert!(err.to_string().contains("colour tags"), "{err}");
+}
+
+#[tokio::test]
+async fn alpha_survives_a_libvpx_round_trip_and_an_opaque_encode_is_caught() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = alpha_source(dir.path());
+	let (good, opaque) = (dir.path().join("good.mkv"), dir.path().join("opaque.mkv"));
+	let s = source.to_str().unwrap();
+	let encode = ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-crf", "32", "-b:v", "0"];
+	let mut args = vec!["-c:v", "libvpx-vp9", "-i", s];
+	args.extend_from_slice(&encode);
+	args.push(good.to_str().unwrap());
+	support::ffmpeg(&args);
+	let mut args = vec!["-i", s];
+	args.extend_from_slice(&encode);
+	args.push(opaque.to_str().unwrap());
+	support::ffmpeg(&args);
+	let tools = support::toolchain().await;
+	let video = plan(true, "format=yuva420p", Some("libvpx-vp9"));
+
+	let kept = alpha_ssim(&tools, &good, &source, &video, &CancellationToken::new())
+		.await
+		.unwrap();
+	let lost = alpha_ssim(&tools, &opaque, &source, &video, &CancellationToken::new())
+		.await
+		.unwrap();
+
+	assert!(check_alpha(kept).is_ok(), "{kept}");
+	assert!(check_alpha(lost).is_err(), "{lost}");
+}

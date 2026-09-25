@@ -4,6 +4,7 @@ pub mod encode;
 pub mod mux;
 pub mod plan;
 pub mod streams;
+pub mod verify;
 
 use tokio_util::sync::CancellationToken;
 
