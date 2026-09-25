@@ -1,0 +1,16 @@
+pub mod audio;
+pub mod commit;
+pub mod container;
+pub mod detect;
+pub mod engine;
+pub mod naming;
+pub mod outcome;
+pub mod preset;
+pub mod probe;
+pub mod process;
+pub mod sink;
+pub mod text;
+pub mod toolchain;
+pub mod workspace;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
