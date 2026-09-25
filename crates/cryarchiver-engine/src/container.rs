@@ -3,6 +3,7 @@ pub enum Cover {
 	Stream,
 	// ffmpeg's Ogg muxer rejects cover streams, so the picture is added after the encode.
 	VorbisPicture,
+	Attachment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
