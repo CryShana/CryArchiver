@@ -12,6 +12,7 @@ pub mod process;
 pub mod sink;
 pub mod text;
 pub mod toolchain;
+pub mod video;
 pub mod workspace;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
