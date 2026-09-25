@@ -1,6 +1,7 @@
 pub mod analyze;
 pub mod colour;
 pub mod encode;
+pub mod mux;
 pub mod plan;
 pub mod streams;
 
