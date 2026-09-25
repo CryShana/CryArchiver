@@ -3,6 +3,7 @@ pub mod commit;
 pub mod container;
 pub mod detect;
 pub mod engine;
+pub mod integrity;
 pub mod naming;
 pub mod outcome;
 pub mod preset;
