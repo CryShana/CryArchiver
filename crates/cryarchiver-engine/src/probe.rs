@@ -4,9 +4,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
+use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::process::{self, RunError, StdoutMode, ToolCommand};
+use crate::process::{self, RunError, STALL_TIMEOUT, StdoutMode, ToolCommand};
 use crate::toolchain::Toolchain;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -18,6 +19,8 @@ pub struct MediaInfo {
 	pub streams: Vec<Stream>,
 	#[serde(default)]
 	pub format: Format,
+	#[serde(default)]
+	pub chapters: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -28,6 +31,8 @@ pub struct Format {
 	pub duration: Option<f64>,
 	#[serde(default, deserialize_with = "number")]
 	pub bit_rate: Option<u64>,
+	#[serde(default)]
+	pub tags: BTreeMap<String, String>,
 	#[serde(skip)]
 	pub duration_estimated: bool,
 }
@@ -40,6 +45,8 @@ pub struct Stream {
 	#[serde(default)]
 	pub codec_name: String,
 	#[serde(default)]
+	pub codec_tag_string: String,
+	#[serde(default)]
 	pub profile: Option<String>,
 	#[serde(default, deserialize_with = "number")]
 	pub sample_rate: Option<u32>,
@@ -50,7 +57,63 @@ pub struct Stream {
 	#[serde(default, deserialize_with = "number")]
 	pub bit_rate: Option<u64>,
 	#[serde(default)]
+	pub width: Option<u32>,
+	#[serde(default)]
+	pub height: Option<u32>,
+	#[serde(default)]
+	pub pix_fmt: Option<String>,
+	#[serde(default)]
+	pub color_range: Option<String>,
+	#[serde(default)]
+	pub color_space: Option<String>,
+	#[serde(default)]
+	pub color_transfer: Option<String>,
+	#[serde(default)]
+	pub color_primaries: Option<String>,
+	#[serde(default)]
+	pub field_order: Option<String>,
+	#[serde(default, deserialize_with = "rational")]
+	pub r_frame_rate: Option<f64>,
+	#[serde(default, deserialize_with = "rational")]
+	pub avg_frame_rate: Option<f64>,
+	#[serde(default, deserialize_with = "number")]
+	pub nb_read_packets: Option<u64>,
+	#[serde(default, deserialize_with = "number")]
+	pub duration: Option<f64>,
+	#[serde(default)]
 	pub disposition: BTreeMap<String, u8>,
+	#[serde(default)]
+	pub tags: BTreeMap<String, String>,
+	#[serde(default)]
+	pub side_data_list: Vec<SideData>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SideData {
+	#[serde(default)]
+	pub side_data_type: String,
+	#[serde(flatten)]
+	pub fields: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Frame {
+	#[serde(default)]
+	pub color_range: Option<String>,
+	#[serde(default)]
+	pub color_space: Option<String>,
+	#[serde(default)]
+	pub color_transfer: Option<String>,
+	#[serde(default)]
+	pub color_primaries: Option<String>,
+	#[serde(default)]
+	pub side_data_list: Vec<SideData>,
+}
+
+#[derive(Deserialize)]
+struct Frames {
+	#[serde(default)]
+	frames: Vec<Frame>,
 }
 
 impl Stream {
@@ -65,6 +128,71 @@ impl Stream {
 	pub fn is_attached_pic(&self) -> bool {
 		self.disposition.get("attached_pic") == Some(&1)
 	}
+
+	pub fn is_real_video(&self) -> bool {
+		self.is_video() && !self.is_attached_pic() && self.disposition.get("timed_thumbnails") != Some(&1)
+	}
+
+	pub fn tag(&self, key: &str) -> Option<&str> {
+		self.tags
+			.iter()
+			.find(|(name, _)| name.eq_ignore_ascii_case(key))
+			.map(|(_, value)| value.as_str())
+	}
+
+	pub fn side_data(&self, kind: &str) -> Option<&SideData> {
+		self.side_data_list.iter().find(|data| data.side_data_type == kind)
+	}
+
+	#[allow(clippy::cast_possible_truncation)]
+	pub fn rotation(&self) -> i32 {
+		self.side_data("Display Matrix")
+			.and_then(|matrix| matrix.number("rotation"))
+			.map_or(0, |degrees| degrees.round() as i32)
+	}
+
+	pub fn declared_duration(&self) -> Option<f64> {
+		self.duration.or_else(|| self.tag("DURATION").and_then(parse_clock))
+	}
+
+	pub fn fps(&self) -> Option<f64> {
+		self.avg_frame_rate.or(self.r_frame_rate)
+	}
+}
+
+impl SideData {
+	pub fn number(&self, key: &str) -> Option<f64> {
+		match self.fields.get(key)? {
+			Value::Number(value) => value.as_f64(),
+			Value::String(text) => parse_ratio(text),
+			_ => None,
+		}
+	}
+}
+
+fn parse_ratio(text: &str) -> Option<f64> {
+	let Some((numerator, denominator)) = text.split_once('/') else {
+		return text.parse().ok();
+	};
+
+	let (numerator, denominator): (f64, f64) = (numerator.trim().parse().ok()?, denominator.trim().parse().ok()?);
+	(denominator != 0.0).then(|| numerator / denominator)
+}
+
+fn parse_clock(text: &str) -> Option<f64> {
+	let mut parts = text.split(':');
+	let (hours, minutes, seconds) = (parts.next()?, parts.next()?, parts.next()?);
+	Some(hours.parse::<f64>().ok()? * 3600.0 + minutes.parse::<f64>().ok()? * 60.0 + seconds.parse::<f64>().ok()?)
+}
+
+fn rational<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	Ok(Option::<String>::deserialize(deserializer)?
+		.as_deref()
+		.and_then(parse_ratio)
+		.filter(|rate| *rate > 0.0))
 }
 
 impl MediaInfo {
@@ -104,6 +232,7 @@ pub async fn probe(tools: &Toolchain, path: &Path, cancel: &CancellationToken) -
 		"json",
 		"-show_format",
 		"-show_streams",
+		"-show_chapters",
 		"-i",
 	])
 	.arg(process::tool_path(path));
@@ -116,6 +245,73 @@ pub async fn probe(tools: &Toolchain, path: &Path, cancel: &CancellationToken) -
 	let mut info = MediaInfo::parse(&out.stdout)?;
 	info.format.duration_estimated = out.stderr_tail.iter().any(|line| line.contains(ESTIMATED_DURATION));
 	Ok(info)
+}
+
+pub async fn probe_video(
+	tools: &Toolchain,
+	path: &Path,
+	cancel: &CancellationToken,
+) -> Result<(MediaInfo, Vec<u8>), ProbeError> {
+	let mut cmd = ToolCommand::new(&tools.ffprobe, STALL_TIMEOUT);
+	cmd.args([
+		"-v",
+		"warning",
+		"-hide_banner",
+		"-print_format",
+		"json",
+		"-show_format",
+		"-show_streams",
+		"-show_chapters",
+		"-show_programs",
+		"-count_packets",
+		"-i",
+	])
+	.arg(process::tool_path(path));
+
+	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
+	if !out.status.success() {
+		return Err(ProbeError::Failed(out.stderr_tail));
+	}
+
+	let info = MediaInfo::parse(&out.stdout)?;
+	Ok((info, out.stdout))
+}
+
+pub async fn first_frames(
+	tools: &Toolchain,
+	path: &Path,
+	stream_index: u32,
+	count: u32,
+	cancel: &CancellationToken,
+) -> Result<Vec<Frame>, ProbeError> {
+	let mut cmd = ToolCommand::new(&tools.ffprobe, PROBE_TIMEOUT);
+	cmd.args([
+		"-v",
+		"error",
+		"-hide_banner",
+		"-threads",
+		"0",
+		"-print_format",
+		"json",
+		"-select_streams",
+	])
+	.arg(stream_index.to_string())
+	.args(["-show_frames", "-read_intervals"])
+	.arg(format!("%+#{count}"))
+	.args([
+		"-show_entries",
+		"frame=color_range,color_space,color_transfer,color_primaries,side_data_list",
+		"-i",
+	])
+	.arg(process::tool_path(path));
+
+	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
+	if !out.status.success() {
+		return Err(ProbeError::Failed(out.stderr_tail));
+	}
+
+	let frames: Frames = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))?;
+	Ok(frames.frames)
 }
 
 fn number<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -187,5 +383,100 @@ mod tests {
 
 		info.format.duration_estimated = true;
 		assert_eq!(info.duration_shortfall(10.0), None);
+	}
+
+	const IPHONE_VIDEO: &str = r#"{
+		"streams": [
+			{ "index": 0, "codec_name": "hevc", "codec_type": "video", "codec_tag_string": "hvc1", "width": 1920,
+			  "height": 1080, "pix_fmt": "yuv420p10le", "color_range": "tv", "color_space": "bt2020nc",
+			  "color_transfer": "arib-std-b67", "color_primaries": "bt2020", "r_frame_rate": "30000/1001",
+			  "avg_frame_rate": "233850/7801", "duration": "52.005000", "nb_read_packets": "1559",
+			  "disposition": { "default": 1, "attached_pic": 0, "timed_thumbnails": 0 },
+			  "tags": { "handler_name": "Core Media Video" },
+			  "side_data_list": [
+				{ "side_data_type": "DOVI configuration record", "dv_profile": 8, "dv_level": 4,
+				  "dv_bl_signal_compatibility_id": 4 },
+				{ "side_data_type": "Display Matrix", "displaymatrix": "\n00000000: 0 65536 0\n", "rotation": -90 }
+			  ] },
+			{ "index": 2, "codec_type": "data", "codec_tag_string": "mebx", "tags": { "handler_name": "Core Media Metadata" } }
+		],
+		"chapters": [ { "id": 1, "start_time": "0.000000" } ],
+		"format": { "format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "52.005000",
+		            "tags": { "com.apple.quicktime.make": "Apple" } }
+	}"#;
+
+	#[test]
+	fn parses_video_fields_side_data_and_chapters() {
+		let info = MediaInfo::parse(IPHONE_VIDEO.as_bytes()).unwrap();
+		let video = &info.streams[0];
+
+		assert!(video.is_real_video());
+		assert_eq!((video.width, video.height), (Some(1920), Some(1080)));
+		assert_eq!(video.color_transfer.as_deref(), Some("arib-std-b67"));
+		assert!((video.fps().unwrap() - 29.977).abs() < 0.001);
+		assert_eq!(video.nb_read_packets, Some(1559));
+		assert_eq!(video.rotation(), -90);
+		let dovi = video.side_data("DOVI configuration record").unwrap();
+		assert_eq!(dovi.number("dv_profile"), Some(8.0));
+		assert_eq!(info.streams[1].codec_name, "");
+		assert_eq!(info.streams[1].codec_tag_string, "mebx");
+		assert_eq!(info.chapters.len(), 1);
+		assert_eq!(
+			info.format.tags.get("com.apple.quicktime.make").map(String::as_str),
+			Some("Apple")
+		);
+	}
+
+	#[test]
+	fn untagged_colour_and_missing_rates_are_none() {
+		let info = MediaInfo::parse(
+			br#"{ "streams": [ { "index": 0, "codec_type": "video", "codec_name": "mpeg2video",
+			      "color_range": "tv", "r_frame_rate": "0/0" } ] }"#,
+		)
+		.unwrap();
+		let video = &info.streams[0];
+
+		assert_eq!(video.color_space, None);
+		assert_eq!(video.color_range.as_deref(), Some("tv"));
+		assert_eq!(video.r_frame_rate, None);
+		assert_eq!(video.rotation(), 0);
+	}
+
+	#[test]
+	fn tags_are_case_insensitive_and_matroska_durations_parse() {
+		let info = MediaInfo::parse(
+			br#"{ "streams": [ { "index": 0, "codec_type": "video", "codec_name": "vp9",
+			      "tags": { "ALPHA_MODE": "1", "DURATION": "00:01:02.500000000" } } ] }"#,
+		)
+		.unwrap();
+		let video = &info.streams[0];
+
+		assert_eq!(video.tag("alpha_mode"), Some("1"));
+		assert_eq!(video.declared_duration(), Some(62.5));
+	}
+
+	#[test]
+	fn cover_streams_are_not_real_video() {
+		let info = MediaInfo::parse(
+			br#"{ "streams": [ { "index": 2, "codec_type": "video", "codec_name": "mjpeg",
+			      "disposition": { "attached_pic": 1 } } ] }"#,
+		)
+		.unwrap();
+
+		assert!(!info.streams[0].is_real_video());
+	}
+
+	#[test]
+	fn side_data_fractions_become_numbers() {
+		let frame: Frame = serde_json::from_str(
+			r#"{ "color_transfer": "smpte2084", "side_data_list": [ { "side_data_type": "Mastering display metadata",
+			     "red_x": "34000/50000", "max_luminance": "10000000/10000" } ] }"#,
+		)
+		.unwrap();
+		let mastering = &frame.side_data_list[0];
+
+		assert_eq!(mastering.number("red_x"), Some(0.68));
+		assert_eq!(mastering.number("max_luminance"), Some(1000.0));
+		assert_eq!(mastering.number("missing"), None);
 	}
 }

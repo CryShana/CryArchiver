@@ -233,6 +233,7 @@ mod tests {
 				bit_rate,
 				..Format::default()
 			},
+			..MediaInfo::default()
 		}
 	}
 

@@ -41,6 +41,18 @@ pub fn tone(dir: &Path, name: &str, layout: &str, channels: u32, seconds: u32, c
 	path
 }
 
+pub fn video(dir: &Path, name: &str, seconds: u32, args: &[&str]) -> PathBuf {
+	let video = format!("testsrc2=s=320x240:r=25:d={seconds}");
+	let audio = format!("sine=frequency=440:duration={seconds}");
+	let path = dir.join(name);
+
+	let mut all = vec!["-f", "lavfi", "-i", video.as_str(), "-f", "lavfi", "-i", audio.as_str()];
+	all.extend_from_slice(args);
+	all.push(path.to_str().unwrap());
+	ffmpeg(&all);
+	path
+}
+
 pub fn mp3_with_cover(dir: &Path, name: &str, title: &str) -> PathBuf {
 	let path = dir.join(name);
 	let title_tag = format!("title={title}");
