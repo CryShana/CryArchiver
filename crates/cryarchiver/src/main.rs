@@ -333,6 +333,7 @@ fn cancel_on_ctrl_c(cancel: &CancellationToken) {
 		if tokio::signal::ctrl_c().await.is_err() {
 			return;
 		}
+
 		cancel.cancel();
 
 		// Exiting here is safe: the job object and the parent-death signal end the tools, and the next run's sweep
