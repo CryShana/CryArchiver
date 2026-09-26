@@ -145,20 +145,32 @@ pub async fn encode_samples(
 	samples: &[Sample],
 	cancel: &CancellationToken,
 ) -> Result<u64, JobError> {
-	let encode = |index: usize| async move {
-		let Some(sample) = samples.get(index) else {
-			return Ok(0);
-		};
-
+	let mut total = 0;
+	for (index, sample) in samples.iter().enumerate() {
 		let output = workspace.file(&format!("sample-{index}.mkv"));
-		run_ffmpeg(&sample_command(ffmpeg, source, &output, plan, sample), |_| {}, cancel).await?;
-		fs::metadata(&output)
-			.map(|meta| meta.len())
-			.map_err(|err| JobError::io(IoSide::Destination(&output), &err))
-	};
+		let cmd = sample_command(ffmpeg, source, &output, plan, sample);
+		let out = process::run(&cmd, StdoutMode::Progress, |_| {}, cancel).await?;
+		if !out.completed() {
+			return Err(failed_encode(out));
+		}
 
-	let (first, second, third, fourth) = tokio::try_join!(encode(0), encode(1), encode(2), encode(3))?;
-	Ok(first + second + third + fourth)
+		total += fs::metadata(&output)
+			.map_err(|err| JobError::io(IoSide::Destination(&output), &err))?
+			.len();
+	}
+	Ok(total)
+}
+
+fn failed_encode(out: process::ToolOutput) -> JobError {
+	let kind = if out.counted_lines > 0 {
+		ErrorKind::SourceDamaged(format!(
+			"the video cannot be decoded ({} decoding errors)",
+			out.counted_lines
+		))
+	} else {
+		ErrorKind::EncodeFailed(process::failure_reason(&out.stderr_tail))
+	};
+	JobError::with_log(kind, out.stderr_tail)
 }
 
 pub fn other_bitrate(info: &MediaInfo, streams: &StreamPlan) -> u64 {
@@ -183,11 +195,14 @@ pub fn other_bitrate(info: &MediaInfo, streams: &StreamPlan) -> u64 {
 		.iter()
 		.map(|track| source_rate(track.stream_index))
 		.sum();
+
 	audio + subtitles
 }
 
 fn stream_bitrate(stream: &Stream) -> Option<u64> {
-	stream.bit_rate.or_else(|| stream.tag("BPS")?.parse().ok())
+	stream
+		.bit_rate
+		.or_else(|| stream.tag("BPS").or_else(|| stream.tag("BPS-eng"))?.parse().ok())
 }
 
 #[allow(
@@ -235,15 +250,7 @@ pub async fn encode_video(
 	.await?;
 
 	if !out.completed() {
-		let kind = if out.counted_lines > 0 {
-			ErrorKind::SourceDamaged(format!(
-				"the video cannot be decoded ({} decoding errors)",
-				out.counted_lines
-			))
-		} else {
-			ErrorKind::EncodeFailed(process::failure_reason(&out.stderr_tail))
-		};
-		return Err(JobError::with_log(kind, out.stderr_tail));
+		return Err(failed_encode(out));
 	}
 
 	let last = out.last_progress.unwrap_or_default();

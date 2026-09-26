@@ -632,7 +632,11 @@ async fn cancel_while_sampling_leaves_nothing_behind() {
 	let trigger = cancel.clone();
 	let on_event = move |event: JobEvent| {
 		if event == JobEvent::Stage(Stage::Sample) {
-			trigger.cancel();
+			let trigger = trigger.clone();
+			tokio::spawn(async move {
+				tokio::time::sleep(Duration::from_millis(300)).await;
+				trigger.cancel();
+			});
 		}
 	};
 

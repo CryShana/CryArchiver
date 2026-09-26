@@ -145,7 +145,7 @@ fn keep_reason(reason: &KeepReason) -> String {
 			predicted_bytes,
 		} => {
 			format!(
-				"encoding would save too little (predicted {} → {})",
+				"encoding would save too little ({} → predicted {})",
 				DecimalBytes(*src_bytes),
 				DecimalBytes(*predicted_bytes)
 			)
@@ -221,7 +221,7 @@ mod tests {
 		assert_eq!(outcome_line(source, &kept), "= 02. 試験曲.flac  kept: already Opus");
 		assert_eq!(
 			outcome_line(source, &predicted),
-			"= 02. 試験曲.flac  kept: encoding would save too little (predicted 5.80 MB → 7.10 MB)"
+			"= 02. 試験曲.flac  kept: encoding would save too little (5.80 MB → predicted 7.10 MB)"
 		);
 		assert!(outcome_line(source, &failed).starts_with("✗ 02. 試験曲.flac  failed: source damaged"));
 	}
