@@ -3,10 +3,12 @@ use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::audio::plan::FilePlan;
+use crate::audio::plan::{FilePlan, TrackPlan};
 use crate::container::{Container, Cover, MATROSKA_AUDIO};
-use crate::outcome::{ErrorKind, JobError};
+use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
+use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
+use crate::video::analyze;
 use crate::video::plan::{Encoder, VideoPlan};
 use crate::video::run_ffmpeg;
 use crate::video::streams::{Extracted, StreamPlan};
@@ -22,8 +24,10 @@ pub const DECODE_ERRORS: &[&str] = &[
 	"corrupt",
 	"decode_slice_header error",
 ];
+pub const MIN_PREDICTED_DURATION_S: f64 = 120.0;
 
 const DURATION_TOLERANCE_S: f64 = 0.1;
+const PREDICTION_MARGIN: f64 = 0.05;
 const AUDIO_TEMP: Container = Container {
 	cover: Cover::Attachment,
 	..MATROSKA_AUDIO
@@ -36,23 +40,64 @@ pub struct EncodedVideo {
 	pub decode_errors: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sample {
+	pub start_s: f64,
+	pub length_s: f64,
+}
+
 pub fn video_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan) -> ToolCommand {
+	encode_command(ffmpeg, source, output, plan, None)
+}
+
+pub fn sample_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan, sample: &Sample) -> ToolCommand {
+	encode_command(ffmpeg, source, output, plan, Some(sample))
+}
+
+fn encode_command(
+	ffmpeg: &Path,
+	source: &Path,
+	output: &Path,
+	plan: &VideoPlan,
+	sample: Option<&Sample>,
+) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	cmd.count_lines_containing(DECODE_ERRORS);
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "repeat+info"]);
+
+	if let Some(sample) = sample {
+		cmd.arg("-ss")
+			.arg(format!("{:.3}", sample.start_s))
+			.arg("-t")
+			.arg(format!("{:.3}", sample.length_s));
+	}
+
 	if let Some(decoder) = plan.decoder {
 		cmd.arg("-c:v").arg(decoder);
 	}
 	cmd.arg("-i").arg(process::tool_path(source));
 
-	for index in &plan.streams {
+	let streams = if sample.is_some() {
+		plan.streams.get(..1).unwrap_or_default()
+	} else {
+		plan.streams.as_slice()
+	};
+	for index in streams {
 		cmd.arg("-map").arg(format!("0:{index}"));
 	}
-	for ordinal in 0..plan.streams.len() {
+	for ordinal in 0..streams.len() {
 		cmd.arg(format!("-filter:v:{ordinal}")).arg(&plan.filters);
 	}
 
-	match &plan.encoder {
+	encoder_args(&mut cmd, &plan.encoder);
+
+	cmd.args(["-fps_mode", "passthrough", "-f", "matroska"])
+		.arg(process::tool_path(output));
+	cmd
+}
+
+fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder) {
+	match encoder {
 		Encoder::SvtAv1 { preset, params } => {
 			cmd.args(["-c:v", "libsvtav1", "-preset"])
 				.arg(preset.to_string())
@@ -73,10 +118,97 @@ pub fn video_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPl
 				.arg(cpu_used.to_string());
 		}
 	}
+}
 
-	cmd.args(["-fps_mode", "passthrough", "-f", "matroska"])
-		.arg(process::tool_path(output));
-	cmd
+pub fn samples(declared_s: Option<f64>) -> Vec<Sample> {
+	let Some(duration) = declared_s.filter(|&duration| duration >= MIN_PREDICTED_DURATION_S) else {
+		return Vec::new();
+	};
+
+	analyze::segments(Some(duration))
+		.into_iter()
+		.map(|segment| {
+			segment.length_s.map(|length_s| Sample {
+				start_s: segment.start_s,
+				length_s,
+			})
+		})
+		.collect::<Option<Vec<_>>>()
+		.unwrap_or_default()
+}
+
+pub async fn encode_samples(
+	ffmpeg: &Path,
+	source: &Path,
+	workspace: &Workspace,
+	plan: &VideoPlan,
+	samples: &[Sample],
+	cancel: &CancellationToken,
+) -> Result<u64, JobError> {
+	let encode = |index: usize| async move {
+		let Some(sample) = samples.get(index) else {
+			return Ok(0);
+		};
+
+		let output = workspace.file(&format!("sample-{index}.mkv"));
+		run_ffmpeg(&sample_command(ffmpeg, source, &output, plan, sample), |_| {}, cancel).await?;
+		fs::metadata(&output)
+			.map(|meta| meta.len())
+			.map_err(|err| JobError::io(IoSide::Destination(&output), &err))
+	};
+
+	let (first, second, third, fourth) = tokio::try_join!(encode(0), encode(1), encode(2), encode(3))?;
+	Ok(first + second + third + fourth)
+}
+
+pub fn other_bitrate(info: &MediaInfo, streams: &StreamPlan) -> u64 {
+	let source_rate = |index: u32| {
+		info.streams
+			.iter()
+			.find(|stream| stream.index == index)
+			.and_then(stream_bitrate)
+			.unwrap_or(0)
+	};
+
+	let audio: u64 = streams
+		.audio
+		.iter()
+		.map(|track| match &track.plan {
+			TrackPlan::Encode(plan) => u64::from(plan.bitrate_kbps) * 1000,
+			TrackPlan::Copy => source_rate(track.stream_index),
+		})
+		.sum();
+	let subtitles: u64 = streams
+		.subtitles
+		.iter()
+		.map(|track| source_rate(track.stream_index))
+		.sum();
+	audio + subtitles
+}
+
+fn stream_bitrate(stream: &Stream) -> Option<u64> {
+	stream.bit_rate.or_else(|| stream.tag("BPS")?.parse().ok())
+}
+
+#[allow(
+	clippy::cast_precision_loss,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss
+)]
+pub fn predicted_bytes(sample_bytes: u64, samples: &[Sample], duration_s: f64, other_bits_per_s: u64) -> u64 {
+	let total_s: f64 = samples.iter().map(|sample| sample.length_s).sum();
+	let video = sample_bytes as f64 / total_s * duration_s;
+	let other = other_bits_per_s as f64 * duration_s / 8.0;
+	(video + other).round() as u64
+}
+
+#[allow(clippy::cast_precision_loss)]
+pub fn predicted_keep(src_bytes: u64, predicted_bytes: u64, min_savings: f64) -> Option<KeepReason> {
+	let limit = src_bytes as f64 * (1.0 - min_savings + PREDICTION_MARGIN);
+	(predicted_bytes as f64 >= limit).then_some(KeepReason::PredictedNotSmaller {
+		src_bytes,
+		predicted_bytes,
+	})
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -206,9 +338,10 @@ pub async fn extract(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::audio::plan::{EncodePlan, LayoutFix, TrackJob, TrackPlan};
+	use crate::audio::plan::{EncodePlan, LayoutFix, TrackJob};
 	use crate::video::joined;
 	use crate::video::plan::test_plan;
+	use crate::video::streams::SubtitleTrack;
 
 	fn plan(encoder: Encoder, expected_frames: Option<u64>) -> VideoPlan {
 		VideoPlan {
@@ -224,6 +357,18 @@ mod tests {
 		Encoder::SvtAv1 {
 			preset: 8,
 			params: "tune=0:crf=32".into(),
+		}
+	}
+
+	fn opus(stream_index: u32, bitrate_kbps: u32) -> TrackJob {
+		TrackJob {
+			stream_index,
+			sample_rate: 48_000,
+			plan: TrackPlan::Encode(EncodePlan {
+				bitrate_kbps,
+				channels: 2,
+				layout: LayoutFix::Keep("stereo"),
+			}),
 		}
 	}
 
@@ -291,6 +436,115 @@ mod tests {
 			vp9.contains("-c:v libvpx-vp9 -crf 33 -b:v 0 -row-mt 1 -deadline good -cpu-used 2"),
 			"{vp9}"
 		);
+	}
+
+	#[test]
+	fn samples_seek_the_source_and_encode_only_the_main_stream_like_the_full_encode() {
+		let mut video = plan(svt(), None);
+		video.decoder = Some("libvpx-vp9");
+		let sample = Sample {
+			start_s: 12.5,
+			length_s: 3.0,
+		};
+
+		let full = joined(&video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.webm"),
+			Path::new("v.mkv"),
+			&video,
+		));
+		let sampled = joined(&sample_command(
+			Path::new("ffmpeg"),
+			Path::new("in.webm"),
+			Path::new("v.mkv"),
+			&video,
+			&sample,
+		));
+
+		assert!(
+			sampled
+				.starts_with("-hide_banner -nostdin -y -loglevel repeat+info -ss 12.500 -t 3.000 -c:v libvpx-vp9 -i "),
+			"{sampled}"
+		);
+		assert!(
+			sampled.contains(" -map 0:0 -filter:v:0 format=yuv420p10le,setparams=field_mode=prog -c:v libsvtav1 "),
+			"{sampled}"
+		);
+		assert_eq!(sampled.matches("-map").count(), 1, "{sampled}");
+		assert_eq!(
+			sampled.rsplit_once("-c:v ").map(|(_, encoder)| encoder),
+			full.rsplit_once("-c:v ").map(|(_, encoder)| encoder)
+		);
+	}
+
+	#[test]
+	fn only_long_files_with_a_known_duration_are_sampled() {
+		let long = samples(Some(200.0));
+
+		assert_eq!(long.len(), 4);
+		assert!((long[0].start_s - 10.0).abs() < 1e-9, "{long:?}");
+		assert!(long.iter().all(|sample| (sample.length_s - 3.0).abs() < 1e-9));
+		assert_eq!(samples(Some(MIN_PREDICTED_DURATION_S)).len(), 4);
+		assert!(samples(Some(119.9)).is_empty());
+		assert!(samples(None).is_empty());
+	}
+
+	#[test]
+	fn the_prediction_scales_the_samples_and_adds_the_other_streams() {
+		let info = MediaInfo::parse(
+			br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"audio","codec_name":"flac","bit_rate":"900000"},
+			{"index":2,"codec_type":"audio","codec_name":"ac3","bit_rate":"64000"},
+			{"index":3,"codec_type":"subtitle","codec_name":"subrip","tags":{"BPS":"800"}},
+			{"index":4,"codec_type":"subtitle","codec_name":"ass"}]}"#,
+		)
+		.unwrap();
+		let streams = StreamPlan {
+			audio: vec![
+				opus(1, 128),
+				TrackJob {
+					stream_index: 2,
+					sample_rate: 48_000,
+					plan: TrackPlan::Copy,
+				},
+			],
+			subtitles: vec![
+				SubtitleTrack {
+					stream_index: 3,
+					to_srt: false,
+				},
+				SubtitleTrack {
+					stream_index: 4,
+					to_srt: false,
+				},
+			],
+			..StreamPlan::default()
+		};
+
+		let other = other_bitrate(&info, &streams);
+
+		assert_eq!(other, 128_000 + 64_000 + 800);
+		assert_eq!(
+			predicted_bytes(120_000, &samples(Some(240.0)), 240.0, other),
+			2_400_000 + 5_784_000
+		);
+		assert_eq!(predicted_bytes(120_000, &samples(Some(240.0)), 240.0, 0), 2_400_000);
+	}
+
+	#[test]
+	fn a_prediction_within_five_points_of_the_savings_target_keeps_the_original() {
+		let kept = |predicted_bytes: u64, min_savings: f64| predicted_keep(1_000_000, predicted_bytes, min_savings);
+
+		assert_eq!(
+			kept(950_001, 0.10),
+			Some(KeepReason::PredictedNotSmaller {
+				src_bytes: 1_000_000,
+				predicted_bytes: 950_001,
+			})
+		);
+		assert_eq!(kept(949_999, 0.10), None);
+		assert!(kept(1_050_001, 0.0).is_some());
+		assert_eq!(kept(1_049_999, 0.0), None);
 	}
 
 	#[test]

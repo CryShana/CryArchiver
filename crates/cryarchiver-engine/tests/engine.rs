@@ -596,7 +596,9 @@ async fn cancel_mid_video_encode_leaves_nothing_behind() {
 		dir.path(),
 		"long.mkv",
 		120,
-		&["-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-c:a", "flac"],
+		&[
+			"-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-q:v", "2", "-c:a", "flac",
+		],
 	);
 	let engine = Engine::new(support::toolchain().await);
 	let cancel = CancellationToken::new();
@@ -619,6 +621,29 @@ async fn cancel_mid_video_encode_leaves_nothing_behind() {
 	);
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
 	assert!(!dir.path().join("long.cry.mkv").exists());
+}
+
+#[tokio::test]
+async fn cancel_while_sampling_leaves_nothing_behind() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 125);
+	let engine = Engine::new(support::toolchain().await);
+	let cancel = CancellationToken::new();
+	let trigger = cancel.clone();
+	let on_event = move |event: JobEvent| {
+		if event == JobEvent::Stage(Stage::Sample) {
+			trigger.cancel();
+		}
+	};
+
+	let outcome = engine.run(&fast(&clip), &sink(dir.path()), &on_event, &cancel).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.kind == ErrorKind::Cancelled),
+		"{outcome:?}"
+	);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+	assert!(!dir.path().join("clip.cry.mkv").exists());
 }
 
 #[tokio::test]
@@ -720,4 +745,59 @@ async fn trimmed_mp4_is_encoded() {
 	let outcome = run(&fast_keeping_any_saving(&trimmed), dir.path()).await;
 
 	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_video_that_would_not_shrink_is_kept_before_encoding() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::video(
+		dir.path(),
+		"low.mp4",
+		125,
+		&["-map", "0:v", "-c:v", "libx264", "-crf", "45", "-preset", "veryslow"],
+	);
+	let stages = std::sync::Mutex::new(Vec::new());
+
+	let outcome = Engine::new(support::toolchain().await)
+		.run(
+			&fast(&clip),
+			&sink(dir.path()),
+			&|event| stages.lock().unwrap().push(event),
+			&CancellationToken::new(),
+		)
+		.await;
+
+	assert!(
+		matches!(
+			outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::PredictedNotSmaller { .. }
+			}
+		),
+		"{outcome:?}"
+	);
+	let stages = stages.lock().unwrap();
+	assert!(stages.contains(&JobEvent::Stage(Stage::Sample)), "{stages:?}");
+	assert!(!stages.contains(&JobEvent::Stage(Stage::Encode)), "{stages:?}");
+	assert!(!dir.path().join("low.cry.mkv").exists());
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn a_video_that_shrinks_passes_the_prediction() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 125);
+	let stages = std::sync::Mutex::new(Vec::new());
+
+	let outcome = Engine::new(support::toolchain().await)
+		.run(
+			&fast(&clip),
+			&sink(dir.path()),
+			&|event| stages.lock().unwrap().push(event),
+			&CancellationToken::new(),
+		)
+		.await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	assert!(stages.lock().unwrap().contains(&JobEvent::Stage(Stage::Sample)));
 }

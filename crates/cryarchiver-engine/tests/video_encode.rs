@@ -18,7 +18,7 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 			.into(),
 		encoder: Encoder::SvtAv1 {
 			preset: 12,
-			params: "tune=0:enable-variance-boost=1:keyint=5s:crf=40".into(),
+			params: "tune=0:keyint=5s:crf=40".into(),
 		},
 		expected_frames,
 		frame_tolerance: 2,

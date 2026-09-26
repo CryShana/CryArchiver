@@ -115,6 +115,7 @@ pub(crate) fn is_sharing_violation(err: &io::Error) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeepReason {
 	NotSmaller { src_bytes: u64, out_bytes: u64 },
+	PredictedNotSmaller { src_bytes: u64, predicted_bytes: u64 },
 	AlreadyEfficient(String),
 	Unsupported(String),
 }

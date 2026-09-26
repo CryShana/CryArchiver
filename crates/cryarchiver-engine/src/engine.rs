@@ -41,6 +41,7 @@ pub enum Stage {
 	Plan,
 	Queued,
 	Analyze,
+	Sample,
 	Encode,
 	Mux,
 	Metadata,
@@ -298,6 +299,10 @@ impl Engine {
 		let analysis = Box::pin(analyze::analyze(&self.tools, source, main, declared_s, cx.cancel)).await?;
 		let video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
 
+		if let Some(reason) = Box::pin(self.sample_gate(cx, workspace, &info, &video, &streams, declared_s)).await? {
+			return Ok(Produced::Kept(reason));
+		}
+
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &streams, declared_s)).await?;
 
@@ -310,6 +315,40 @@ impl Engine {
 			streams: &streams,
 		};
 		Box::pin(self.mux_and_verify(cx, workspace, &job, temps)).await
+	}
+
+	async fn sample_gate(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		info: &MediaInfo,
+		video: &VideoPlan,
+		streams: &StreamPlan,
+		declared_s: Option<f64>,
+	) -> Result<Option<KeepReason>, JobError> {
+		let samples = video_encode::samples(declared_s);
+		let Some(duration_s) = declared_s.filter(|_| !samples.is_empty()) else {
+			return Ok(None);
+		};
+
+		(cx.on_event)(JobEvent::Stage(Stage::Sample));
+		let sample_bytes = Box::pin(video_encode::encode_samples(
+			&self.tools.ffmpeg,
+			&cx.job.source,
+			workspace,
+			video,
+			&samples,
+			cx.cancel,
+		))
+		.await?;
+
+		let other_bits_per_s = video_encode::other_bitrate(info, streams);
+		let predicted = video_encode::predicted_bytes(sample_bytes, &samples, duration_s, other_bits_per_s);
+		Ok(video_encode::predicted_keep(
+			cx.source_bytes,
+			predicted,
+			cx.job.min_savings,
+		))
 	}
 
 	async fn mux_and_verify(

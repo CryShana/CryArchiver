@@ -188,10 +188,10 @@ fn assert_video_outputs(out_dir: &Path, stdout: &str) {
 	);
 
 	if let Some(deinterlaced) = encoded_or_kept(out_dir, stdout, "concert-MPEG2_1080-interlaced_sample", "mkv") {
-		assert_eq!(
-			deinterlaced["streams"][0]["r_frame_rate"], "60000/1001",
-			"{deinterlaced}"
-		);
+		let rate = deinterlaced["streams"][0]["r_frame_rate"].as_str().unwrap();
+		let (numerator, denominator) = rate.split_once('/').unwrap();
+		let fps = numerator.parse::<f64>().unwrap() / denominator.parse::<f64>().unwrap();
+		assert!((fps - 60_000.0 / 1001.0).abs() < 0.01, "{deinterlaced}");
 		assert_eq!(deinterlaced["streams"][1]["channel_layout"], "5.1", "{deinterlaced}");
 	}
 

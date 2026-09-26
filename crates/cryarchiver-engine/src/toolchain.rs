@@ -80,7 +80,7 @@ const SVT_SETTINGS_PROBE: &[&str] = &[
 	"-dolbyvision",
 	"0",
 	"-svtav1-params",
-	"tune=0:enable-variance-boost=1:keyint=5s:crf=30.25:film-grain=6:film-grain-denoise=0",
+	"tune=0:keyint=5s:crf=30.25:film-grain=8:film-grain-denoise=1",
 	"-f",
 	"matroska",
 ];
@@ -348,7 +348,7 @@ impl Toolchain {
 				self.svt_settings,
 				Status::Missing,
 				VIDEO_ONLY,
-				"tune, variance boost, quarter-step CRF, odd sizes",
+				"tune, film grain, quarter-step CRF, odd sizes",
 			),
 			check(
 				"colour tags",
@@ -638,7 +638,9 @@ async fn svt_settings(
 	let out = run_command(&encode, cancel).await?;
 
 	let confirmed = |marker: &str| out.stderr_tail.iter().any(|line| line.contains(marker));
-	if !(out.status.success() && confirmed(": 8 / VQ") && confirmed("CRF / 30.25")) {
+	// At the probe's tiny size SVT turns AQ off and reports the rate control as CQP; the value is still the CRF.
+	let quarter_step = confirmed("CRF / 30.25") || confirmed("CQP / 30.25");
+	if !(out.status.success() && confirmed(": 8 / VQ") && quarter_step) {
 		return Ok((false, false));
 	}
 

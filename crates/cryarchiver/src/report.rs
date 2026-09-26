@@ -140,6 +140,16 @@ fn keep_reason(reason: &KeepReason) -> String {
 				DecimalBytes(*out_bytes)
 			)
 		}
+		KeepReason::PredictedNotSmaller {
+			src_bytes,
+			predicted_bytes,
+		} => {
+			format!(
+				"encoding would save too little (predicted {} → {})",
+				DecimalBytes(*src_bytes),
+				DecimalBytes(*predicted_bytes)
+			)
+		}
 		KeepReason::AlreadyEfficient(why) | KeepReason::Unsupported(why) => why.clone(),
 	}
 }
@@ -151,6 +161,7 @@ fn stage_label(stage: Stage) -> &'static str {
 		Stage::Plan => "planning",
 		Stage::Queued => "queued",
 		Stage::Analyze => "analysing",
+		Stage::Sample => "sampling",
 		Stage::Encode => "encoding",
 		Stage::Mux => "muxing",
 		Stage::Metadata => "cover art",
@@ -193,6 +204,12 @@ mod tests {
 		let kept = JobOutcome::KeptOriginal {
 			reason: KeepReason::AlreadyEfficient("already Opus".into()),
 		};
+		let predicted = JobOutcome::KeptOriginal {
+			reason: KeepReason::PredictedNotSmaller {
+				src_bytes: 5_800_000,
+				predicted_bytes: 7_100_000,
+			},
+		};
 		let failed = JobOutcome::Failed(JobError::from(ErrorKind::SourceDamaged(
 			"decodes to 4.0 s but declares 10.0 s".into(),
 		)));
@@ -202,6 +219,10 @@ mod tests {
 			"✓ 02. 試験曲.flac → 02. 試験曲.cry.opus  20.00 MB → 2.00 MB (−90 %)"
 		);
 		assert_eq!(outcome_line(source, &kept), "= 02. 試験曲.flac  kept: already Opus");
+		assert_eq!(
+			outcome_line(source, &predicted),
+			"= 02. 試験曲.flac  kept: encoding would save too little (predicted 5.80 MB → 7.10 MB)"
+		);
 		assert!(outcome_line(source, &failed).starts_with("✗ 02. 試験曲.flac  failed: source damaged"));
 	}
 
@@ -236,6 +257,7 @@ mod tests {
 			Stage::Plan,
 			Stage::Queued,
 			Stage::Analyze,
+			Stage::Sample,
 			Stage::Encode,
 			Stage::Mux,
 			Stage::Metadata,

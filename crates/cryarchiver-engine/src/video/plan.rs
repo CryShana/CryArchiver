@@ -15,7 +15,7 @@ const EXPECTED_BPP: [f64; 6] = [0.08, 0.06, 0.045, 0.035, 0.025, 0.02];
 const SVT_CRF: [[f64; 6]; 3] = [
 	[24.0, 25.0, 25.0, 26.0, 28.0, 30.0],
 	[28.0, 29.0, 29.0, 30.0, 32.0, 34.0],
-	[32.0, 32.0, 32.0, 34.0, 36.0, 38.0],
+	[35.0, 35.0, 35.0, 37.0, 36.0, 38.0],
 ];
 const VP9_CRF: [u8; 6] = [33, 32, 31, 30, 28, 28];
 const MASTERING_DISPLAY: &str = "Mastering display metadata";
@@ -219,11 +219,11 @@ fn frame_tolerance(scan: ScanType) -> u64 {
 
 fn svt_params(crf: f64, grain: bool) -> String {
 	let grain = if grain {
-		":film-grain=6:film-grain-denoise=0"
+		":film-grain=8:film-grain-denoise=1"
 	} else {
 		""
 	};
-	format!("tune=0:enable-variance-boost=1:keyint=5s:crf={crf}{grain}")
+	format!("tune=0:keyint=5s:crf={crf}{grain}")
 }
 
 fn svt_crf(speed: Speed, resolution: Resolution) -> f64 {
@@ -374,7 +374,7 @@ mod tests {
 			plan.encoder,
 			Encoder::SvtAv1 {
 				preset: 5,
-				params: "tune=0:enable-variance-boost=1:keyint=5s:crf=29".into(),
+				params: "tune=0:keyint=5s:crf=29".into(),
 			}
 		);
 		assert_eq!(plan.expected_frames, Some(250));
@@ -430,8 +430,25 @@ mod tests {
 		let fast = plan(&h264(""), &[], PROGRESSIVE_CLEAN, Speed::Fast);
 		let slow = plan(&h264(""), &[], PROGRESSIVE_CLEAN, Speed::Slow);
 
-		assert!(matches!(fast.encoder, Encoder::SvtAv1 { preset: 8, ref params } if params.ends_with("crf=32")));
+		assert!(matches!(fast.encoder, Encoder::SvtAv1 { preset: 8, ref params } if params.ends_with("crf=35")));
 		assert!(matches!(slow.encoder, Encoder::SvtAv1 { preset: 3, ref params } if params.ends_with("crf=25")));
+	}
+
+	#[test]
+	fn fast_crfs_follow_the_tuned_row() {
+		let buckets = [
+			Resolution::Sd,
+			Resolution::Hd720,
+			Resolution::Hd1080,
+			Resolution::Qhd1440,
+			Resolution::Uhd4k,
+			Resolution::Uhd8k,
+		];
+
+		assert_eq!(
+			buckets.map(|resolution| rounded_crf(svt_crf(Speed::Fast, resolution))),
+			[35, 35, 35, 37, 36, 38]
+		);
 	}
 
 	#[test]
@@ -468,10 +485,13 @@ mod tests {
 		};
 
 		let moderate = plan(&h264(""), &[], grainy, Speed::Moderate);
+		let slow = plan(&h264(""), &[], grainy, Speed::Slow);
 		let fast = plan(&h264(""), &[], grainy, Speed::Fast);
 
 		assert!(matches!(moderate.encoder, Encoder::SvtAv1 { ref params, .. }
-			if params == "tune=0:enable-variance-boost=1:keyint=5s:crf=29:film-grain=6:film-grain-denoise=0"));
+			if params == "tune=0:keyint=5s:crf=29:film-grain=8:film-grain-denoise=1"));
+		assert!(matches!(slow.encoder, Encoder::SvtAv1 { ref params, .. }
+			if params == "tune=0:keyint=5s:crf=25:film-grain=8:film-grain-denoise=1"));
 		assert!(matches!(fast.encoder, Encoder::SvtAv1 { ref params, .. } if !params.contains("film-grain")));
 	}
 
