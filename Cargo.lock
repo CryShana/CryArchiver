@@ -220,6 +220,7 @@ dependencies = [
  "globset",
  "indicatif",
  "lofty",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
