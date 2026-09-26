@@ -25,6 +25,17 @@ fn flac(dir: &Path, name: &str, seconds: u32) -> PathBuf {
 	support::tone(dir, name, "stereo", 2, seconds, &["-c:a", "flac"])
 }
 
+fn clip(dir: &Path, name: &str) -> PathBuf {
+	support::video(
+		dir,
+		name,
+		3,
+		&[
+			"-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-q:v", "2", "-c:a", "aac", "-b:a", "192k",
+		],
+	)
+}
+
 #[test]
 fn prints_version() {
 	let dir = tempfile::tempdir().unwrap();
@@ -186,4 +197,45 @@ fn same_stem_inputs_do_not_share_an_output() {
 	assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
 	assert!(stdout(&out).contains("· song.wav  skipped: same output name as"));
 	assert!(dir.path().join("song.cry.opus").is_file());
+}
+
+#[test]
+fn compresses_a_video_next_to_the_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = clip(dir.path(), "clip.mp4");
+	let before = fs::read(&source).unwrap();
+
+	let out = cryarchiver(dir.path(), &["-s", "fast", "clip.mp4"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	assert!(stdout(&out).contains("✓ clip.mp4 → clip.cry.mkv"), "{}", stdout(&out));
+	assert_eq!(fs::read(&source).unwrap(), before);
+	assert!(!dir.path().join(".cry-work").exists());
+}
+
+#[test]
+fn rerun_skips_existing_video_outputs() {
+	let dir = tempfile::tempdir().unwrap();
+	clip(dir.path(), "clip.mp4");
+	assert!(cryarchiver(dir.path(), &["-s", "fast", "clip.mp4"]).status.success());
+
+	let out = cryarchiver(dir.path(), &["-s", "fast", "clip.mp4"]);
+
+	assert!(out.status.success());
+	assert!(stdout(&out).contains("already exists"), "{}", stdout(&out));
+}
+
+#[test]
+fn mixed_audio_and_video_batches_run_together() {
+	let dir = tempfile::tempdir().unwrap();
+	clip(dir.path(), "a.mp4");
+	clip(dir.path(), "b.mp4");
+	flac(dir.path(), "c.flac", 5);
+
+	let out = cryarchiver(dir.path(), &["-s", "fast", "."]);
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	assert!(dir.path().join("a.cry.mkv").is_file());
+	assert!(dir.path().join("b.cry.mkv").is_file());
+	assert!(dir.path().join("c.cry.opus").is_file());
 }

@@ -223,9 +223,10 @@ async fn compress(args: CompressArgs) -> u8 {
 		})
 		.collect();
 	let parallel = args.jobs.unwrap_or_else(default_jobs).max(1);
+	let engine = Engine::new(tools).with_video_jobs(args.jobs.unwrap_or(1));
 	let report = Report::new(args.quiet);
 
-	let totals = run_all(&Arc::new(Engine::new(tools)), &sink, jobs, parallel, &report, &cancel).await;
+	let totals = run_all(&Arc::new(engine), &sink, jobs, parallel, &report, &cancel).await;
 	let _ = writeln!(io::stdout(), "{}", totals.line());
 	totals.exit_code().max(u8::from(inputs.problems > 0))
 }

@@ -227,4 +227,22 @@ mod tests {
 		totals.add(&JobOutcome::Failed(JobError::from(ErrorKind::Cancelled)));
 		assert_eq!(totals.exit_code(), 1);
 	}
+
+	#[test]
+	fn every_stage_has_a_label() {
+		for stage in [
+			Stage::Detect,
+			Stage::Probe,
+			Stage::Plan,
+			Stage::Queued,
+			Stage::Analyze,
+			Stage::Encode,
+			Stage::Mux,
+			Stage::Metadata,
+			Stage::Verify,
+			Stage::Commit,
+		] {
+			assert!(!stage_label(stage).is_empty());
+		}
+	}
 }
