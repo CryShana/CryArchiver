@@ -224,11 +224,13 @@ fn check_start_offsets(output: &MediaInfo, expected: &Expected<'_>) -> Result<()
 		.source_fps
 		.map_or(MIN_START_TOLERANCE_S, |fps| (1.0 / fps).max(MIN_START_TOLERANCE_S));
 
-	// ffprobe reports a Matroska subtitle stream as starting at 0 whenever other streams do, whatever its first cue.
 	for (stream, wanted) in output.streams.iter().zip(&expected.start_offsets) {
 		let (Some(start), Some(wanted)) = (stream.start_time, wanted) else {
 			continue;
 		};
+
+		// ffprobe reports a Matroska subtitle stream as starting at 0 whenever other streams do, whatever its first
+		// cue.
 		if stream.codec_type == "subtitle" {
 			continue;
 		}

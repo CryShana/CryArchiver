@@ -100,6 +100,10 @@ impl VideoQueue {
 	fn waiting(&self) -> usize {
 		self.waiting.load(Ordering::SeqCst)
 	}
+
+	fn busy(&self, running: usize, parallel: usize) -> usize {
+		running.saturating_sub(self.waiting().min(parallel))
+	}
 }
 
 struct QueueSeat {
@@ -318,7 +322,7 @@ async fn run_all(
 			continue;
 		}
 
-		while running.len().saturating_sub(videos.waiting()) >= parallel {
+		while videos.busy(running.len(), parallel) >= parallel {
 			tokio::select! {
 				Some(joined) = running.join_next() => record_joined(report, &mut totals, joined),
 				() = videos.joined.notified() => {}
@@ -440,6 +444,15 @@ mod tests {
 	use std::time::Duration;
 
 	use super::*;
+
+	#[test]
+	fn at_most_one_batch_of_queued_videos_is_discounted() {
+		let videos = VideoQueue::default();
+		videos.waiting.store(10, Ordering::SeqCst);
+
+		assert_eq!(videos.busy(12, 4), 8);
+		assert_eq!(videos.busy(3, 4), 0);
+	}
 
 	#[test]
 	fn queued_videos_count_until_they_move_on_or_end() {

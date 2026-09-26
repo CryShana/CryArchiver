@@ -100,8 +100,8 @@ fn snapshot(files: &[PathBuf]) -> Vec<(u64, std::time::SystemTime)> {
 		.collect()
 }
 
-// Synthetic sources can end up smaller than any output. Verification runs only on outputs that are kept, so a file
-// kept for that reason has no output to inspect.
+// A synthetic source can be smaller than any output. The original is then kept, and since only a smaller output
+// is verified and written, there is nothing to inspect.
 fn encoded_or_kept(out_dir: &Path, stdout: &str, stem: &str, extension: &str) -> Option<serde_json::Value> {
 	let output = out_dir.join(format!("{stem}.cry.mkv"));
 	if output.exists() {

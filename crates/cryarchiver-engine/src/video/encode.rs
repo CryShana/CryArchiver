@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
@@ -188,7 +189,8 @@ pub async fn extract(
 		return Ok(());
 	}
 
-	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
+	let source_bytes = fs::metadata(source).map_or(0, |meta| meta.len());
+	let mut cmd = ToolCommand::new(ffmpeg, process::scaled_timeout(source_bytes));
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-i"])
 		.arg(process::tool_path(source));
 	for stream in extracted {
