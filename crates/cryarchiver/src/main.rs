@@ -144,14 +144,14 @@ impl Drop for QueueSeat {
 }
 
 enum Launch {
-	Tui,
+	Tui(Option<PathBuf>),
 	Doctor(Option<PathBuf>),
 	Compress(CompressArgs),
 }
 
 fn main() -> ExitCode {
 	let code = match launch() {
-		Launch::Tui => return ExitCode::from(open_tui()),
+		Launch::Tui(project) => return ExitCode::from(open_tui(project.as_deref())),
 		Launch::Doctor(ffmpeg) => block_on(doctor(ffmpeg)),
 		Launch::Compress(args) => block_on(compress(args)),
 	};
@@ -162,14 +162,14 @@ fn main() -> ExitCode {
 
 fn launch() -> Launch {
 	if std::env::args_os().len() == 1 {
-		return Launch::Tui;
+		return Launch::Tui(None);
 	}
 
 	let cli = Cli::parse();
 	match cli.command {
 		Some(Command::Doctor { ffmpeg }) => Launch::Doctor(ffmpeg),
-		Some(Command::Tui { .. }) => Launch::Tui,
-		None if opens_project(&cli.compress.inputs) => Launch::Tui,
+		Some(Command::Tui { project }) => Launch::Tui(project),
+		None if opens_project(&cli.compress.inputs) => Launch::Tui(cli.compress.inputs.into_iter().next()),
 		None => Launch::Compress(cli.compress),
 	}
 }
@@ -186,7 +186,14 @@ fn opens_project(inputs: &[PathBuf]) -> bool {
 		.is_some_and(|input| input.extension().is_some_and(|ext| ext == "cryarchive"))
 }
 
-fn open_tui() -> u8 {
+fn open_tui(project: Option<&Path>) -> u8 {
+	if let Some(project) = project {
+		eprintln!(
+			"note: opening projects arrives with the project layer; {} is ignored and the dashboard shows demo data",
+			display_path(project)
+		);
+	}
+
 	match cryarchiver_tui::run(MockSource::default()) {
 		Ok(()) => 0,
 		Err(err) => {

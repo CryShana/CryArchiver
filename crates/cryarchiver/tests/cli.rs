@@ -49,7 +49,19 @@ fn tui_without_a_terminal_explains_and_exits_with_2() {
 			stderr(&out)
 		);
 		assert!(stdout(&out).is_empty(), "{args:?}");
+		assert_eq!(
+			stderr(&out).contains("is ignored"),
+			!args.is_empty() && args != ["tui"],
+			"{args:?}"
+		);
 	}
+
+	let out = cryarchiver(dir.path(), &["tui", "family.cryarchive"]);
+	assert!(
+		stderr(&out).contains("family.cryarchive is ignored"),
+		"{}",
+		stderr(&out)
+	);
 }
 
 #[test]
