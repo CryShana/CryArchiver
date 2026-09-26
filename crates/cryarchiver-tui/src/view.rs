@@ -9,6 +9,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArchiveView {
 	pub header: Header,
+	pub settings: Settings,
 	pub overall: Overall,
 	pub workers: Workers,
 	pub system: SystemStats,
@@ -21,25 +22,65 @@ pub struct ArchiveView {
 pub struct Header {
 	pub source: String,
 	pub destination: String,
-	pub speed: String,
 	pub codecs: String,
-	pub performance_limit: Option<u8>,
+	pub performance_limit: Option<Limit>,
 	pub run_state: RunState,
+	pub deleting_originals: bool,
 	/// The data is made up, as with the mock source.
 	pub demo: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limit {
+	pub cap: u8,
+	/// Part of the limit can't reach running jobs yet; the workers it affects carry `over_limit`.
+	pub pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
 	Running,
 	Paused,
+	PausedLowDisk,
+	/// Everything is done and watch mode waits for new files.
+	Watching,
 	Stopping,
 	Finished,
 }
 
+/// The project settings of the project layer spec §4, as currently stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settings {
+	pub speed: Speed,
+	pub min_savings: u8,
+	pub watch: bool,
+	/// The CPU cap in percent while the performance limit is on.
+	pub performance_limit: Option<u8>,
+	pub stability_window: Duration,
+	pub keep_auxiliary_images: bool,
+	pub delete_originals: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speed {
+	Slow,
+	Moderate,
+	Fast,
+}
+
+impl Speed {
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Slow => "SLOW",
+			Self::Moderate => "MODERATE",
+			Self::Fast => "FAST",
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overall {
-	/// Done or resolved by the user, as in the engine spec §22.1.
+	/// Done or resolved by the user, as in the project layer spec §10.2.
 	pub files_done: u64,
 	pub files_active: u64,
 	pub files_queued: u64,
@@ -76,11 +117,36 @@ pub struct Workers {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerJob {
-	pub file: NodeId,
+	pub file: FileId,
+	pub folder: NodeId,
+	pub work: WorkKind,
 	pub codec: String,
 	pub name: String,
 	pub state: FileState,
 	pub activity: JobActivity,
+	/// The pending performance limit would not let this job run; restarting cancels it.
+	pub over_limit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkKind {
+	Encode,
+	Copy,
+	Hash,
+	Placeholder,
+	Delete,
+}
+
+impl WorkKind {
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Encode => "encode",
+			Self::Copy => "copy",
+			Self::Hash => "hash",
+			Self::Placeholder => "placeholder",
+			Self::Delete => "delete",
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,31 +187,39 @@ impl NodeId {
 	}
 }
 
+/// Identifies one source file for the whole session. The source hands them out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileId(pub u64);
+
+/// A folder of the archive tree. Files are not nodes; a folder's files come from `ArchiveSource::files`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
 	pub name: String,
 	pub parent: Option<NodeId>,
 	pub children: Vec<NodeId>,
-	pub entry: Entry,
+	pub stats: FolderStats,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Entry {
-	Folder(FolderStats),
-	File(FileStatus),
-}
-
-/// Rolled up from the folder's direct children, so every file below it weighs the same (engine spec §22.1).
+/// Rolled up from the folder's direct children, so every file below it weighs the same (project layer spec §10.2).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct FolderStats {
 	pub files_done: u64,
 	pub files_total: u64,
 	pub progress: f64,
+	/// Of the files finished so far.
 	pub bytes_in: u64,
+	/// Of the files finished so far.
 	pub bytes_out: u64,
 	pub open_issues: u32,
 	/// Every descendant is done or resolved and the whole subtree has been scanned.
 	pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileRow {
+	pub id: FileId,
+	pub name: String,
+	pub status: FileStatus,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +245,10 @@ pub enum FileState {
 	SourceDamaged,
 	Failed,
 	Warning,
+	SourceGone,
+	DeletePending,
+	OriginalDeleted,
+	Excluded,
 }
 
 impl FileState {
@@ -179,7 +257,7 @@ impl FileState {
 	}
 }
 
-/// The archive tree as an arena. Nodes are only ever added, so a [`NodeId`] stays valid for the whole session.
+/// The folder tree as an arena. Folders are only ever added, so a [`NodeId`] stays valid for the whole session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Library {
 	nodes: Vec<Node>,
@@ -193,7 +271,7 @@ impl Library {
 				name: root_name.into(),
 				parent: None,
 				children: Vec::new(),
-				entry: Entry::Folder(FolderStats::default()),
+				stats: FolderStats::default(),
 			}],
 			structure_version: 0,
 		}
@@ -211,7 +289,7 @@ impl Library {
 		self.nodes.is_empty()
 	}
 
-	/// Changes whenever a node is added. Values inside nodes can change without bumping it.
+	/// Changes whenever a folder is added. Values inside folders can change without bumping it.
 	pub const fn structure_version(&self) -> u64 {
 		self.structure_version
 	}
@@ -224,51 +302,35 @@ impl Library {
 		&mut self.nodes[id.index()]
 	}
 
-	/// Ascending ids. A node is always added after its parent, so its id is greater and a reverse walk visits
+	/// Ascending ids. A folder is always added after its parent, so its id is greater and a reverse walk visits
 	/// children before their parents.
 	pub fn ids(&self) -> impl DoubleEndedIterator<Item = NodeId> + use<> {
-		(0..u32::try_from(self.nodes.len()).expect("fewer than 2^32 nodes")).map(NodeId)
+		(0..u32::try_from(self.nodes.len()).expect("fewer than 2^32 folders")).map(NodeId)
 	}
 
 	pub fn add_folder(&mut self, parent: NodeId, name: impl Into<String>) -> NodeId {
-		self.add(parent, name.into(), Entry::Folder(FolderStats::default()))
+		let id = NodeId(u32::try_from(self.nodes.len()).expect("fewer than 2^32 folders"));
+		self.nodes.push(Node {
+			name: name.into(),
+			parent: Some(parent),
+			children: Vec::new(),
+			stats: FolderStats::default(),
+		});
+		self.nodes[parent.index()].children.push(id);
+		self.structure_version += 1;
+		id
 	}
 
-	pub fn add_file(&mut self, parent: NodeId, name: impl Into<String>, status: FileStatus) -> NodeId {
-		self.add(parent, name.into(), Entry::File(status))
-	}
-
-	pub fn is_folder(&self, id: NodeId) -> bool {
-		matches!(self.node(id).entry, Entry::Folder(_))
-	}
-
-	pub fn file(&self, id: NodeId) -> Option<&FileStatus> {
-		match &self.node(id).entry {
-			Entry::File(status) => Some(status),
-			Entry::Folder(_) => None,
-		}
-	}
-
-	pub fn file_mut(&mut self, id: NodeId) -> Option<&mut FileStatus> {
-		match &mut self.node_mut(id).entry {
-			Entry::File(status) => Some(status),
-			Entry::Folder(_) => None,
-		}
-	}
-
-	pub fn folder(&self, id: NodeId) -> Option<&FolderStats> {
-		match &self.node(id).entry {
-			Entry::Folder(stats) => Some(stats),
-			Entry::File(_) => None,
-		}
+	pub fn stats(&self, id: NodeId) -> &FolderStats {
+		&self.node(id).stats
 	}
 
 	/// Path from the root's first child down to `id`, joined with `/`.
 	pub fn relative_path(&self, id: NodeId) -> String {
 		let mut names = Vec::new();
 		let mut current = Some(id);
-		while let Some(node_id) = current {
-			let node = self.node(node_id);
+		while let Some(folder) = current {
+			let node = self.node(folder);
 			if node.parent.is_some() {
 				names.push(node.name.as_str());
 			}
@@ -279,18 +341,29 @@ impl Library {
 		names.join("/")
 	}
 
-	fn add(&mut self, parent: NodeId, name: String, entry: Entry) -> NodeId {
-		let id = NodeId(u32::try_from(self.nodes.len()).expect("fewer than 2^32 nodes"));
-		self.nodes.push(Node {
-			name,
-			parent: Some(parent),
-			children: Vec::new(),
-			entry,
-		});
-		self.nodes[parent.index()].children.push(id);
-		self.structure_version += 1;
-		id
+	pub fn ancestors(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+		std::iter::successors(self.node(id).parent, |&folder| self.node(folder).parent)
 	}
+}
+
+/// The tree narrowed to a name filter: matches plus their ancestors, in display order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterResult {
+	pub query: String,
+	pub rows: Vec<FilterRow>,
+	pub matching_files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterRow {
+	pub depth: u16,
+	pub entry: FilterEntry,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterEntry {
+	Folder(NodeId),
+	File { folder: NodeId, row: FileRow },
 }
 
 /// Seconds since midnight, shown as `hh:mm:ss`.
@@ -356,15 +429,78 @@ impl Log {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+	pub level: NoticeLevel,
+	pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+	Info,
+	Warning,
+	Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IssueId(pub u64);
+
+/// The issue kinds of the project layer spec §10.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueKind {
+	SourceDamaged,
+	EncodeFailed,
+	SourceUnreadable,
+	OutputMissing,
+	UnknownFile,
+	DirectoryCycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issue {
-	pub file: NodeId,
-	/// One of `Failed`, `SourceDamaged`, `Waiting` or `Warning`.
-	pub state: FileState,
+	pub id: IssueId,
+	pub kind: IssueKind,
+	/// `None` for issues without a source file: unknown destination files and directory cycles.
+	pub file: Option<FileId>,
+	pub folder: Option<NodeId>,
 	pub name: String,
-	pub folder: String,
+	/// Where the issue is, relative to the source or the destination root.
+	pub location: String,
 	pub reason: String,
 	pub resolution: String,
-	pub log: Vec<String>,
+	pub verbs: IssueVerbs,
+	/// Oldest first; may be empty.
+	pub attempts: Vec<AttemptLog>,
+}
+
+/// The resolutions an issue kind allows. A `Some` label is the kind's own name for the verb, such as "Copy original".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueVerbs {
+	pub retry: Option<String>,
+	pub accept: Option<String>,
+	pub exclude: bool,
+}
+
+impl IssueVerbs {
+	pub fn label(&self, verb: Verb) -> Option<&str> {
+		match verb {
+			Verb::Retry => self.retry.as_deref(),
+			Verb::Accept => self.accept.as_deref(),
+			Verb::Exclude => self.exclude.then_some("Exclude"),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+	Retry,
+	Accept,
+	Exclude,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptLog {
+	pub attempt: u32,
+	pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -421,12 +557,16 @@ pub enum Duplicates {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathLink {
-	pub file: NodeId,
+	pub file: FileId,
+	pub folder: NodeId,
 	pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueSummary {
+	pub id: IssueId,
+	pub kind: IssueKind,
 	pub reason: String,
 	pub resolution: String,
+	pub verbs: IssueVerbs,
 }

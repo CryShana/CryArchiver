@@ -10,7 +10,7 @@ use throbber_widgets_tui::{Set, Throbber, ThrobberState};
 use super::widgets::{Chrome, Parts, block_gauge, bold, fg, gauge, pad_left, panel, put, put_line, to_u16, wrap};
 use crate::format::{bytes, duration, fit, fit_middle, fps, fraction, percent, round_to_u32, speed, thousands};
 use crate::theme::{Theme, label};
-use crate::view::{ArchiveView, JobActivity, Overall, Parity, RunState, SystemStats, WorkerJob};
+use crate::view::{ArchiveView, JobActivity, Overall, Parity, RunState, SystemStats, WorkKind, WorkerJob};
 
 const SPINNER: Set = Set {
 	full: "⠿",
@@ -217,6 +217,8 @@ fn render_workers(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 		let idle = match view.header.run_state {
 			RunState::Running => "idle",
 			RunState::Paused => "paused · no job running",
+			RunState::PausedLowDisk => "paused until disk space frees",
+			RunState::Watching => "idle · watching for new files",
 			RunState::Stopping => "stopping…",
 			RunState::Finished => "all work finished",
 		};
@@ -231,14 +233,23 @@ fn render_workers(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 
 fn worker_line(buf: &mut Buffer, area: Rect, number: usize, job: &WorkerJob, theme: &Theme) {
 	let (y, right) = (area.y, area.right());
-	let state_color = theme.state(job.state);
+	let state_color = if job.over_limit {
+		theme.warn
+	} else {
+		theme.state(job.state)
+	};
 	let name_share = if area.width >= 60 { 30 } else { 38 };
 	let name_width = (usize::from(area.width) * name_share / 100).max(10);
 
 	let mut x = put(buf, area.x, y, &format!("#{number} "), fg(theme.dim), right);
 	x = put(buf, x, y, &fit(&job.codec, 5), bold(theme.accent), right);
 	x = put(buf, x, y, &fit_middle(&job.name, name_width), fg(theme.text), right);
-	x = put(buf, x + 1, y, &fit(label(job.state), 7), fg(state_color), right);
+	let status = match (job.over_limit, job.work) {
+		(true, _) => "limit",
+		(false, WorkKind::Encode) => label(job.state),
+		(false, work) => work.label(),
+	};
+	x = put(buf, x + 1, y, &fit(status, 7), fg(state_color), right);
 
 	let rest = usize::from(right.saturating_sub(x));
 	match &job.activity {
@@ -324,7 +335,7 @@ fn render_system(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme
 	};
 	let body = content(panel(buf, area, theme, &chrome));
 	let system = &view.system;
-	let limit = view.header.performance_limit;
+	let limit = view.header.performance_limit.map(|limit| limit.cap);
 	let cells = body.width.saturating_sub(11).max(6);
 	let (x, right) = (body.x, body.right());
 	let rows: Vec<u16> = (body.y..body.bottom()).collect();

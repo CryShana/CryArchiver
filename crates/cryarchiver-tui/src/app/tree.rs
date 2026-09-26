@@ -1,49 +1,119 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
-use crate::format::find_ignore_case;
-use crate::view::{Library, NodeId};
+use crate::source::{Action, ArchiveSource};
+use crate::view::{FileId, FileRow, FilterEntry, Library, NodeId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expansion {
+	/// Subfolders only, as "Expand all" opens them; the file rows are never requested.
+	Folders,
+	Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fold {
+	Closed,
+	FoldersOnly,
+	Open,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+	Listed(usize),
+	Filtered(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+	Folder(NodeId, Fold),
+	File { folder: NodeId, file: FileId, slot: Slot },
+	Loading(NodeId),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Row {
-	pub id: NodeId,
 	pub depth: u16,
-	pub open: bool,
+	pub kind: RowKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+	Folder(NodeId),
+	File { file: FileId, folder: NodeId },
+}
+
+impl Row {
+	fn selection(self) -> Option<Selection> {
+		match self.kind {
+			RowKind::Folder(folder, _) => Some(Selection::Folder(folder)),
+			RowKind::File { folder, file, .. } => Some(Selection::File { file, folder }),
+			RowKind::Loading(_) => None,
+		}
+	}
+
+	fn shows(self, selection: Selection) -> bool {
+		self.selection() == Some(selection)
+	}
+}
+
+/// The file row a tree row stands for, looked up in the source's current lists.
+pub fn file_row(source: &dyn ArchiveSource, kind: RowKind) -> Option<&FileRow> {
+	match kind {
+		RowKind::File {
+			folder,
+			slot: Slot::Listed(index),
+			..
+		} => source.files(folder)?.get(index),
+		RowKind::File {
+			slot: Slot::Filtered(index),
+			..
+		} => match &source.filter()?.rows.get(index)?.entry {
+			FilterEntry::File { row, .. } => Some(row),
+			FilterEntry::Folder(_) => None,
+		},
+		RowKind::Folder(..) | RowKind::Loading(_) => None,
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RowsKey {
 	structure_version: u64,
+	rows_version: u64,
 	expansion: u64,
 	filter: String,
 }
 
-/// The Library's visible rows. They are rebuilt only when the tree's structure, the expansion or the filter
-/// changes, never per frame; values inside the rows are read from the view when drawing.
+/// The Library's visible rows. They are rebuilt only when the folder tree, the loaded file lists, the expansion or
+/// the filter change, never per frame; values inside the rows are read from the source when drawing.
 #[derive(Debug)]
 pub struct TreeState {
-	expanded: HashSet<NodeId>,
+	expanded: HashMap<NodeId, Expansion>,
 	expansion: u64,
 	key: Option<RowsKey>,
 	rows: Vec<Row>,
-	matching_files: usize,
-	selected: Option<NodeId>,
+	matching_files: Option<usize>,
+	selected: Option<Selection>,
+	pending: Option<FileId>,
 	selected_index: usize,
 	scroll: usize,
 	page: usize,
+	outbox: Vec<Action>,
 }
 
 impl TreeState {
-	pub fn new(expanded: impl IntoIterator<Item = NodeId>, selected: Option<NodeId>) -> Self {
+	pub fn new() -> Self {
 		Self {
-			expanded: expanded.into_iter().collect(),
+			expanded: HashMap::new(),
 			expansion: 0,
 			key: None,
 			rows: Vec::new(),
-			matching_files: 0,
-			selected,
+			matching_files: None,
+			selected: None,
+			pending: None,
 			selected_index: 0,
 			scroll: 0,
 			page: 10,
+			outbox: Vec::new(),
 		}
 	}
 
@@ -51,29 +121,37 @@ impl TreeState {
 		&self.rows
 	}
 
-	pub fn matching_files(&self) -> usize {
+	/// `None` while the source hasn't answered the current filter yet.
+	pub fn matching_files(&self) -> Option<usize> {
 		self.matching_files
 	}
 
-	pub fn selected(&self) -> Option<NodeId> {
-		self.selected.filter(|_| !self.rows.is_empty())
+	pub fn selected(&self) -> Option<Selection> {
+		self.rows.get(self.selected_index).and_then(|row| row.selection())
 	}
 
 	pub fn selected_index(&self) -> Option<usize> {
-		self.selected().map(|_| self.selected_index)
+		(!self.rows.is_empty()).then_some(self.selected_index)
 	}
 
 	pub fn scroll(&self) -> usize {
 		self.scroll
 	}
 
-	pub fn is_expanded(&self, id: NodeId) -> bool {
-		self.expanded.contains(&id)
+	pub fn expansion(&self, folder: NodeId) -> Option<Expansion> {
+		self.expanded.get(&folder).copied()
 	}
 
-	pub fn sync(&mut self, library: &Library, filter: &str) {
+	/// The `Expanded` actions the tree has produced since the last call.
+	pub fn take_actions(&mut self) -> Vec<Action> {
+		std::mem::take(&mut self.outbox)
+	}
+
+	pub fn sync(&mut self, source: &dyn ArchiveSource, filter: &str) {
+		let library = &source.view().library;
 		let key = RowsKey {
 			structure_version: library.structure_version(),
+			rows_version: source.rows_version(),
 			expansion: self.expansion,
 			filter: filter.to_owned(),
 		};
@@ -81,7 +159,7 @@ impl TreeState {
 			return;
 		}
 
-		self.rebuild(library, filter);
+		self.rebuild(source, filter);
 		self.key = Some(key);
 		self.reselect();
 	}
@@ -97,7 +175,8 @@ impl TreeState {
 			return;
 		};
 		self.selected_index = index.min(last);
-		self.selected = Some(self.rows[self.selected_index].id);
+		self.selected = self.rows[self.selected_index].selection().or(self.selected);
+		self.pending = None;
 		self.ensure_visible();
 	}
 
@@ -119,125 +198,185 @@ impl TreeState {
 		self.clamp_scroll();
 	}
 
-	pub fn select_file_step(&mut self, library: &Library, forward: bool) {
-		let candidates: Box<dyn Iterator<Item = usize>> = if forward {
-			Box::new(self.selected_index + 1..self.rows.len())
+	pub fn select_file_step(&mut self, forward: bool) {
+		let is_file = |row: &Row| matches!(row.kind, RowKind::File { .. });
+		let found = if forward {
+			(self.selected_index + 1..self.rows.len()).find(|&index| is_file(&self.rows[index]))
 		} else {
-			Box::new((0..self.selected_index).rev())
+			(0..self.selected_index).rev().find(|&index| is_file(&self.rows[index]))
 		};
 
-		let found = candidates
-			.into_iter()
-			.find(|&index| !library.is_folder(self.rows[index].id));
 		if let Some(index) = found {
 			self.select_index(index);
 		}
 	}
 
-	pub fn toggle(&mut self, id: NodeId) {
-		if !self.expanded.remove(&id) {
-			self.expanded.insert(id);
+	/// Closed or folders-only opens fully; fully open closes.
+	pub fn toggle(&mut self, folder: NodeId) {
+		let open = self.expansion(folder) != Some(Expansion::Full);
+		self.set_expanded(folder, open);
+	}
+
+	pub fn set_expanded(&mut self, folder: NodeId, open: bool) {
+		let was_full = self.expansion(folder) == Some(Expansion::Full);
+		if open {
+			self.expanded.insert(folder, Expansion::Full);
+		} else {
+			self.expanded.remove(&folder);
+		}
+
+		if open != was_full {
+			self.outbox.push(Action::Expanded(folder, open));
 		}
 		self.expansion += 1;
 	}
 
-	pub fn set_expanded(&mut self, id: NodeId, open: bool) {
-		let changed = if open {
-			self.expanded.insert(id)
-		} else {
-			self.expanded.remove(&id)
-		};
-		if changed {
-			self.expansion += 1;
-		}
-	}
-
-	pub fn set_expanded_below(&mut self, library: &Library, folder: NodeId, open: bool) {
+	pub fn expand_folders_below(&mut self, library: &Library, folder: NodeId) {
 		let mut stack = vec![folder];
-		while let Some(id) = stack.pop() {
-			if !library.is_folder(id) {
-				continue;
-			}
-
-			if open {
-				self.expanded.insert(id);
-			} else {
-				self.expanded.remove(&id);
-			}
-			stack.extend(&library.node(id).children);
+		while let Some(current) = stack.pop() {
+			self.expanded.entry(current).or_insert(Expansion::Folders);
+			stack.extend(&library.node(current).children);
 		}
 		self.expansion += 1;
 	}
 
-	/// Opens every ancestor of `id` and selects it. The caller clears any filter that would hide it.
-	pub fn reveal(&mut self, library: &Library, id: NodeId, filter: &str) {
-		let mut parent = library.node(id).parent;
-		while let Some(folder) = parent {
-			self.expanded.insert(folder);
-			parent = library.node(folder).parent;
+	pub fn collapse_below(&mut self, library: &Library, folder: NodeId) {
+		let mut stack = vec![folder];
+		while let Some(current) = stack.pop() {
+			if self.expanded.remove(&current) == Some(Expansion::Full) {
+				self.outbox.push(Action::Expanded(current, false));
+			}
+			stack.extend(&library.node(current).children);
 		}
-
 		self.expansion += 1;
-		self.selected = Some(id);
-		self.sync(library, filter);
-		self.ensure_visible();
 	}
 
-	fn rebuild(&mut self, library: &Library, filter: &str) {
-		let kept = if filter.is_empty() {
-			None
-		} else {
-			Some(self.matches(library, filter))
+	pub fn reveal_folder(&mut self, library: &Library, folder: NodeId) {
+		self.open_ancestors(library, folder);
+		self.selected = Some(Selection::Folder(folder));
+		self.pending = None;
+	}
+
+	/// Opens the file's folder and selects the file once its rows have loaded.
+	pub fn reveal_file(&mut self, library: &Library, folder: NodeId, file: FileId) {
+		self.open_ancestors(library, folder);
+		if self.expansion(folder) != Some(Expansion::Full) {
+			self.set_expanded(folder, true);
+		}
+
+		self.selected = Some(Selection::File { file, folder });
+		self.pending = Some(file);
+		self.key = None;
+	}
+
+	fn open_ancestors(&mut self, library: &Library, folder: NodeId) {
+		for ancestor in library.ancestors(folder) {
+			self.expanded.entry(ancestor).or_insert(Expansion::Folders);
+		}
+		self.expansion += 1;
+	}
+
+	fn rebuild(&mut self, source: &dyn ArchiveSource, filter: &str) {
+		self.rows.clear();
+		self.matching_files = Some(0);
+
+		if filter.is_empty() {
+			self.push_folder(source, source.view().library.root(), 0);
+			return;
+		}
+
+		let Some(result) = source.filter().filter(|result| result.query == filter) else {
+			self.matching_files = None;
+			return;
 		};
 
-		self.rows.clear();
-		let mut stack = vec![(library.root(), 0u16)];
-		while let Some((id, depth)) = stack.pop() {
-			if kept.as_ref().is_some_and(|kept| !kept[id.index()]) {
-				continue;
-			}
+		self.matching_files = Some(result.matching_files);
+		self.rows.extend(result.rows.iter().enumerate().map(|(index, row)| Row {
+			depth: row.depth,
+			kind: match &row.entry {
+				FilterEntry::Folder(folder) => RowKind::Folder(*folder, Fold::Open),
+				FilterEntry::File { folder, row: file } => RowKind::File {
+					folder: *folder,
+					file: file.id,
+					slot: Slot::Filtered(index),
+				},
+			},
+		}));
+	}
 
-			let node = library.node(id);
-			let open = library.is_folder(id) && (kept.is_some() || self.expanded.contains(&id));
-			self.rows.push(Row { id, depth, open });
+	fn push_folder(&mut self, source: &dyn ArchiveSource, folder: NodeId, depth: u16) {
+		let expansion = self.expansion(folder);
+		let fold = match expansion {
+			None => Fold::Closed,
+			Some(Expansion::Folders) => Fold::FoldersOnly,
+			Some(Expansion::Full) => Fold::Open,
+		};
+		self.rows.push(Row {
+			depth,
+			kind: RowKind::Folder(folder, fold),
+		});
 
-			if open {
-				stack.extend(node.children.iter().rev().map(|&child| (child, depth + 1)));
-			}
+		if expansion.is_none() {
+			return;
+		}
+
+		for &child in &source.view().library.node(folder).children {
+			self.push_folder(source, child, depth + 1);
+		}
+
+		if expansion == Some(Expansion::Full) {
+			self.push_files(source, folder, depth + 1);
 		}
 	}
 
-	fn matches(&mut self, library: &Library, filter: &str) -> Vec<bool> {
-		let mut kept = vec![false; library.len()];
-		self.matching_files = 0;
+	fn push_files(&mut self, source: &dyn ArchiveSource, folder: NodeId, depth: u16) {
+		let Some(files) = source.files(folder) else {
+			self.rows.push(Row {
+				depth,
+				kind: RowKind::Loading(folder),
+			});
+			return;
+		};
 
-		for id in library.ids().rev() {
-			let node = library.node(id);
-			if find_ignore_case(&node.name, filter).is_some() {
-				kept[id.index()] = true;
-				if !library.is_folder(id) {
-					self.matching_files += 1;
-				}
-			}
-
-			if kept[id.index()]
-				&& let Some(parent) = node.parent
-			{
-				kept[parent.index()] = true;
-			}
-		}
-		kept
+		self.rows.extend(files.iter().enumerate().map(|(index, row)| Row {
+			depth,
+			kind: RowKind::File {
+				folder,
+				file: row.id,
+				slot: Slot::Listed(index),
+			},
+		}));
 	}
 
 	fn reselect(&mut self) {
-		let found = self
-			.selected
-			.and_then(|selected| self.rows.iter().position(|row| row.id == selected));
-		match found {
-			Some(index) => self.selected_index = index,
-			None => self.select_index(0),
+		if let Some(file) = self.pending
+			&& let Some(index) = self.position(|row| matches!(row.kind, RowKind::File { file: id, .. } if id == file))
+		{
+			self.selected_index = index;
+			self.pending = None;
+			self.ensure_visible();
+			return;
 		}
-		self.clamp_scroll();
+
+		let target = self.selected;
+		let found = target.and_then(|selection| self.position(|row| row.shows(selection)));
+		match (found, target) {
+			(Some(index), _) => self.selected_index = index,
+			(None, Some(Selection::File { folder, .. })) if self.pending.is_some() => {
+				if let Some(index) = self.position(|row| row.shows(Selection::Folder(folder))) {
+					self.selected_index = index;
+				}
+			}
+			_ => {
+				self.selected_index = 0;
+				self.selected = self.rows.first().and_then(|row| row.selection());
+			}
+		}
+		self.ensure_visible();
+	}
+
+	fn position(&self, wanted: impl Fn(&Row) -> bool) -> Option<usize> {
+		self.rows.iter().position(wanted)
 	}
 
 	fn ensure_visible(&mut self) {

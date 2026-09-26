@@ -1,6 +1,6 @@
 use ratatui::style::{Color, Style};
 
-use crate::view::{FileState, LogMarker};
+use crate::view::{FileState, IssueKind, LogMarker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorDepth {
@@ -44,6 +44,7 @@ pub struct Theme {
 	pub error: Color,
 	pub search: Color,
 	pub verify: Color,
+	pub danger: Color,
 }
 
 impl Theme {
@@ -67,6 +68,7 @@ impl Theme {
 			error: color(0xEF, 0x5B, 0x53),
 			search: color(0xB9, 0x8C, 0xF0),
 			verify: color(0x5C, 0x9F, 0xF0),
+			danger: color(0x4A, 0x16, 0x19),
 		}
 	}
 
@@ -79,10 +81,17 @@ impl Theme {
 			FileState::Done => self.done,
 			FileState::Encoding => self.accent,
 			FileState::QualitySearch | FileState::Duplicate => self.search,
-			FileState::Verifying => self.verify,
-			FileState::Queued | FileState::Copied => self.dim,
-			FileState::KeptOriginal | FileState::Waiting | FileState::Warning => self.warn,
+			FileState::Verifying | FileState::OriginalDeleted => self.verify,
+			FileState::Queued | FileState::Copied | FileState::SourceGone | FileState::Excluded => self.dim,
+			FileState::KeptOriginal | FileState::Waiting | FileState::Warning | FileState::DeletePending => self.warn,
 			FileState::SourceDamaged | FileState::Failed => self.error,
+		}
+	}
+
+	pub fn issue(&self, kind: IssueKind) -> Color {
+		match kind {
+			IssueKind::SourceDamaged | IssueKind::EncodeFailed | IssueKind::SourceUnreadable => self.error,
+			IssueKind::OutputMissing | IssueKind::UnknownFile | IssueKind::DirectoryCycle => self.warn,
 		}
 	}
 
@@ -96,6 +105,10 @@ impl Theme {
 
 pub const fn glyph(state: FileState) -> &'static str {
 	match state {
+		FileState::SourceGone => "⌀",
+		FileState::DeletePending => "⊖",
+		FileState::OriginalDeleted => "⊗",
+		FileState::Excluded => "−",
 		FileState::Done => "✓",
 		FileState::Encoding => "●",
 		FileState::QualitySearch => "◌",
@@ -111,6 +124,17 @@ pub const fn glyph(state: FileState) -> &'static str {
 	}
 }
 
+pub const fn issue_glyph(kind: IssueKind) -> &'static str {
+	match kind {
+		IssueKind::SourceDamaged => "!",
+		IssueKind::EncodeFailed => "✗",
+		IssueKind::SourceUnreadable => "⊘",
+		IssueKind::OutputMissing => "⚠",
+		IssueKind::UnknownFile => "?",
+		IssueKind::DirectoryCycle => "↻",
+	}
+}
+
 pub const fn marker_glyph(marker: LogMarker) -> &'static str {
 	match marker {
 		LogMarker::State(state) => glyph(state),
@@ -120,6 +144,10 @@ pub const fn marker_glyph(marker: LogMarker) -> &'static str {
 
 pub const fn label(state: FileState) -> &'static str {
 	match state {
+		FileState::SourceGone => "gone",
+		FileState::DeletePending => "deleting",
+		FileState::OriginalDeleted => "deleted",
+		FileState::Excluded => "excluded",
 		FileState::Done => "done",
 		FileState::Encoding => "encode",
 		FileState::QualitySearch => "search",
@@ -204,6 +232,10 @@ mod tests {
 			FileState::SourceDamaged,
 			FileState::Failed,
 			FileState::Warning,
+			FileState::SourceGone,
+			FileState::DeletePending,
+			FileState::OriginalDeleted,
+			FileState::Excluded,
 		];
 		let glyphs: std::collections::HashSet<_> = states.iter().map(|&state| glyph(state)).collect();
 

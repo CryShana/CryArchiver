@@ -8,8 +8,34 @@ use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use crate::format::{filled_cells, filled_eighths, fit, width};
 use crate::theme::Theme;
+use crate::view::{IssueVerbs, Verb};
 
 const EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+
+/// The keys that resolve issues. They stay the same for every kind; only the labels change.
+pub const VERB_KEYS: [(Verb, char); 3] = [(Verb::Retry, 'r'), (Verb::Accept, 'c'), (Verb::Exclude, 'x')];
+
+/// `r Retry · c Copy original · x Exclude`, limited to the verbs the issue allows.
+pub fn verb_spans(verbs: &IssueVerbs, theme: &Theme) -> Vec<Span<'static>> {
+	let mut spans = Vec::new();
+	for (verb, key) in VERB_KEYS {
+		let Some(label) = verbs.label(verb) else { continue };
+		if !spans.is_empty() {
+			spans.push(Span::styled(" · ", fg(theme.dim)));
+		}
+		spans.push(Span::styled(key.to_string(), bold(theme.accent)));
+		spans.push(Span::styled(format!(" {label}"), fg(theme.dim)));
+	}
+	spans
+}
+
+pub fn verb_hint(verbs: &IssueVerbs) -> String {
+	let parts: Vec<String> = VERB_KEYS
+		.iter()
+		.filter_map(|&(verb, key)| verbs.label(verb).map(|label| format!("{key} {label}")))
+		.collect();
+	format!(" {} ", parts.join(" · "))
+}
 
 pub fn fg(color: Color) -> Style {
 	Style::new().fg(color)

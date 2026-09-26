@@ -3,9 +3,10 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
+use super::tree::Selection;
 use super::{Outcome, Overlay, Ui, ViewMode};
 use crate::source::ArchiveSource;
-use crate::view::NodeId;
+use crate::view::{FileId, NodeId};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const WHEEL_ROWS: isize = 3;
@@ -20,7 +21,9 @@ pub enum Hit {
 	Issue(usize),
 	Menu,
 	MenuItem(usize),
-	Link(NodeId),
+	Link { file: FileId, folder: NodeId },
+	Modal,
+	SettingsRow(usize),
 }
 
 /// Clickable regions of the frame that is on screen. Later regions sit on top of earlier ones.
@@ -88,7 +91,7 @@ impl Ui {
 				return match hit {
 					Some(Hit::MenuItem(index)) => {
 						self.overlay = None;
-						self.activate(source, items[index], target)
+						self.activate(source, items[index].0, target)
 					}
 					Some(Hit::Menu) => Outcome::Ignored,
 					_ => {
@@ -97,6 +100,20 @@ impl Ui {
 					}
 				};
 			}
+			Some(Overlay::Settings(_)) => {
+				return match hit {
+					Some(Hit::SettingsRow(index)) => {
+						self.overlay = Some(Overlay::Settings(index));
+						Outcome::Done
+					}
+					Some(Hit::Modal) => Outcome::Ignored,
+					_ => {
+						self.overlay = None;
+						Outcome::Done
+					}
+				};
+			}
+			Some(Overlay::ConfirmDelete(_) | Overlay::ConfirmRestart) => return Outcome::Ignored,
 			Some(Overlay::Help) => {
 				self.overlay = None;
 				return Outcome::Done;
@@ -113,50 +130,52 @@ impl Ui {
 	fn on_hit(&mut self, source: &dyn ArchiveSource, hit: Hit, position: Position, double: bool) -> Outcome {
 		match hit {
 			Hit::Footer(code) => return self.on_key(source, KeyEvent::new(code, KeyModifiers::NONE)),
-			Hit::Row { index, arrow_x } => self.on_row_click(source, index, arrow_x, position, double),
+			Hit::Row { index, arrow_x } => self.on_row_click(index, arrow_x, position, double),
 			Hit::LibraryTitle if double => self.layout.maximized = !self.layout.maximized,
 			Hit::Maximize => self.layout.maximized = !self.layout.maximized,
 			Hit::LogToggle => self.layout.log_open = !self.layout.log_open,
 			Hit::Issue(index) => {
-				self.issue_selected = index;
-				if double && let Some(issue) = source.view().issues.get(index) {
-					self.open_details(source, issue.file);
+				self.select_issue(index);
+				let located = source
+					.view()
+					.issues
+					.get(index)
+					.and_then(|issue| issue.file.zip(issue.folder));
+				if double && let Some((file, folder)) = located {
+					self.open_details(source, folder, file);
 				}
 			}
-			Hit::Link(file) => {
-				self.reveal(source, file);
+			Hit::Link { file, folder } => {
+				self.reveal_file(source, folder, file);
 				self.mode = ViewMode::Library;
 			}
-			Hit::LibraryTitle | Hit::Menu | Hit::MenuItem(_) => return Outcome::Ignored,
+			Hit::LibraryTitle | Hit::Menu | Hit::MenuItem(_) | Hit::Modal | Hit::SettingsRow(_) => {
+				return Outcome::Ignored;
+			}
 		}
 		Outcome::Done
 	}
 
-	fn on_row_click(
-		&mut self,
-		source: &dyn ArchiveSource,
-		index: usize,
-		arrow_x: u16,
-		position: Position,
-		double: bool,
-	) {
+	fn on_row_click(&mut self, index: usize, arrow_x: u16, position: Position, double: bool) {
 		self.tree.select_index(index);
-		let Some(selected) = self.tree.selected() else { return };
-		let folder = source.view().library.is_folder(selected);
-
 		let on_arrow = (arrow_x..arrow_x + 2).contains(&position.x);
-		if folder && (on_arrow || double) {
-			self.tree.toggle(selected);
-		} else if double {
-			self.mode = ViewMode::Details;
+
+		match self.tree.selected() {
+			Some(Selection::Folder(folder)) if on_arrow || double => self.tree.toggle(folder),
+			Some(Selection::File { .. }) if double => self.mode = ViewMode::Details,
+			_ => {}
 		}
 	}
 
 	fn on_right_click(&mut self, source: &dyn ArchiveSource, position: Position) -> Outcome {
+		if matches!(self.overlay, Some(Overlay::ConfirmDelete(_) | Overlay::ConfirmRestart)) {
+			return Outcome::Ignored;
+		}
+
 		self.overlay = None;
 		match self.hits.at(position) {
 			Some(Hit::Row { index, .. }) => self.tree.select_index(index),
-			Some(Hit::Issue(index)) => self.issue_selected = index,
+			Some(Hit::Issue(index)) => self.select_issue(index),
 			_ => {}
 		}
 
@@ -169,9 +188,9 @@ impl Ui {
 		}
 
 		if self.issues_area.is_some_and(|area| area.contains(position)) {
-			let step = rows.signum();
 			let last = source.view().issues.len().saturating_sub(1);
-			self.issue_selected = self.issue_selected.saturating_add_signed(step).min(last);
+			let index = self.issue_selected.saturating_add_signed(rows.signum()).min(last);
+			self.select_issue(index);
 			return Outcome::Done;
 		}
 

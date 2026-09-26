@@ -9,19 +9,32 @@ use crate::view::{ArchiveView, RunState};
 
 const BADGE: &str = " CryArchiver ";
 const DEMO: &str = " DEMO ";
+const DELETING: &str = " ⚠ DELETING ORIGINALS ";
 
 pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
-	buf.set_style(area, Style::new().bg(theme.panel));
-	let (y, right) = (area.y, area.right());
 	let header = &view.header;
+	let background = if header.deleting_originals {
+		theme.danger
+	} else {
+		theme.panel
+	};
+	buf.set_style(area, Style::new().bg(background));
+	let (y, right) = (area.y, area.right());
 
-	let preset = format!(" {} · {} ", header.speed, header.codecs);
-	let limit = header.performance_limit.map(|limit| format!("⚡ limit {limit} %"));
+	let preset = format!(" {} · {} ", view.settings.speed.label(), header.codecs);
+	let limit = header.performance_limit.map(|limit| {
+		let applying = if limit.pending { " · applying…" } else { "" };
+		format!("⚡ limit {} %{applying}", limit.cap)
+	});
 	let (run, run_color) = run_state(header.run_state, theme);
 
 	let fixed = width(BADGE)
 		+ if header.demo { width(DEMO) + 1 } else { 0 }
-		+ width(&preset)
+		+ if header.deleting_originals {
+			width(DELETING) + 1
+		} else {
+			0
+		} + width(&preset)
 		+ limit.as_deref().map_or(0, |limit| width(limit) + 1)
 		+ width(run)
 		+ 5;
@@ -32,6 +45,9 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	if header.demo {
 		x = put(buf, x + 1, y, DEMO, bold(theme.background).bg(theme.warn), right);
 	}
+	if header.deleting_originals {
+		x = put(buf, x + 1, y, DELETING, bold(theme.bright).bg(theme.error), right);
+	}
 
 	let route = format!("{} → {}", header.source, header.destination);
 	x = put(buf, x + 1, y, &fit_middle(&route, route_width), fg(theme.bright), right);
@@ -40,27 +56,28 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 		x = put(buf, x + 1, y, limit, fg(theme.warn), right);
 	}
 
-	render_status(
-		buf,
-		Rect::new(x, y, right.saturating_sub(x), 1),
-		view,
-		run,
-		run_color,
-		theme,
-	);
+	let status = Status { run, color: run_color };
+	render_status(buf, Rect::new(x, y, right.saturating_sub(x), 1), view, &status, theme);
+}
+
+struct Status {
+	run: &'static str,
+	color: Color,
 }
 
 fn run_state(state: RunState, theme: &Theme) -> (&'static str, Color) {
 	match state {
 		RunState::Running => ("▶ running", theme.done),
 		RunState::Paused => ("‖ paused", theme.warn),
+		RunState::PausedLowDisk => ("‖ paused: low disk space", theme.error),
+		RunState::Watching => ("◉ watching for new files", theme.accent),
 		RunState::Stopping => ("■ stopping…", theme.warn),
 		RunState::Finished => ("✓ complete", theme.done),
 	}
 }
 
 /// The run state always shows; the ETA and then the saving join it only when they fit.
-fn render_status(buf: &mut Buffer, area: Rect, view: &ArchiveView, run: &str, run_color: Color, theme: &Theme) {
+fn render_status(buf: &mut Buffer, area: Rect, view: &ArchiveView, status: &Status, theme: &Theme) {
 	let overall = &view.overall;
 	let saved = format!(
 		"saved {} ({} %) · ",
@@ -69,12 +86,12 @@ fn render_status(buf: &mut Buffer, area: Rect, view: &ArchiveView, run: &str, ru
 	);
 	let eta = overall
 		.eta
-		.filter(|_| view.header.run_state != RunState::Finished)
+		.filter(|_| !matches!(view.header.run_state, RunState::Finished | RunState::Watching))
 		.map(|eta| format!("ETA {} · ", duration(eta)))
 		.unwrap_or_default();
 
 	let room = usize::from(area.width).saturating_sub(2);
-	let run_width = width(run) + 1;
+	let run_width = width(status.run) + 1;
 	let with_eta = run_width + width(&eta) <= room;
 	let with_saved = with_eta && run_width + width(&eta) + width(&saved) <= room;
 
@@ -89,5 +106,12 @@ fn render_status(buf: &mut Buffer, area: Rect, view: &ArchiveView, run: &str, ru
 	let total = to_u16(width(&extras) + run_width);
 	let start = area.right().saturating_sub(total);
 	let x = put(buf, start, area.y, &extras, fg(theme.dim), area.right());
-	put(buf, x, area.y, &format!("{run} "), bold(run_color), area.right());
+	put(
+		buf,
+		x,
+		area.y,
+		&format!("{} ", status.run),
+		bold(status.color),
+		area.right(),
+	);
 }

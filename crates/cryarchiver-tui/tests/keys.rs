@@ -2,8 +2,8 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use cryarchiver_tui::view::RunState;
-use cryarchiver_tui::{ArchiveSource, OverlayKind, ViewMode};
+use cryarchiver_tui::view::{IssueKind, Limit, RunState};
+use cryarchiver_tui::{ArchiveSource, OverlayKind, Selection, ViewMode};
 use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 
 use support::{app, click, draw, find_on_row, find_row, mouse, press, press_with, release, type_text};
@@ -86,11 +86,12 @@ fn menu_offers_issue_actions_only_for_issues() {
 	press(&mut app, KeyCode::Char('m'));
 	let items = app.menu_items();
 	assert_eq!(app.overlay(), Some(OverlayKind::Menu));
-	assert!(items.contains(&"Show details"));
-	assert!(!items.contains(&"Retry"));
+	assert!(items.iter().any(|item| item == "Show details"));
+	assert!(!items.iter().any(|item| item == "Retry"));
 
 	press(&mut app, KeyCode::Esc);
 	press(&mut app, KeyCode::Char('i'));
+	press(&mut app, KeyCode::Down);
 	press(&mut app, KeyCode::Char('m'));
 	let items = app.menu_items();
 	assert_eq!(&items[..3], ["Retry", "Copy original", "Exclude"]);
@@ -106,8 +107,13 @@ fn folder_menu_expands_everything_below() {
 	assert_eq!(app.menu_items()[0], "Expand all");
 	press(&mut app, KeyCode::Enter);
 
+	let folders = app.source().view().library.len();
 	assert_eq!(app.overlay(), None);
-	assert!(app.visible_rows() > before + 40_000);
+	assert!(app.visible_rows() >= folders && app.visible_rows() > before);
+	assert!(
+		app.visible_rows() < 1_000,
+		"expand all opens folders only, never every file list"
+	);
 }
 
 #[test]
@@ -141,11 +147,12 @@ fn issues_view_opens_details_of_the_selected_issue() {
 
 	press(&mut app, KeyCode::Down);
 	assert_eq!(app.selected_issue(), 1);
-	let file = app.source().view().issues[1].file;
+	let issue = &app.source().view().issues[1];
+	let (file, folder) = (issue.file.unwrap(), issue.folder.unwrap());
 
 	press(&mut app, KeyCode::Enter);
 	assert_eq!(app.mode(), ViewMode::Details);
-	assert_eq!(app.selected(), Some(file));
+	assert_eq!(app.selected(), Some(Selection::File { file, folder }));
 
 	press(&mut app, KeyCode::Char('i'));
 	press(&mut app, KeyCode::Char('i'));
@@ -156,11 +163,18 @@ fn issues_view_opens_details_of_the_selected_issue() {
 fn issue_actions_reach_the_source() {
 	let mut app = app();
 	let issues = app.source().view().issues.len();
+	assert_eq!(app.source().view().issues[0].kind, IssueKind::OutputMissing);
 
 	press(&mut app, KeyCode::Char('i'));
 	press(&mut app, KeyCode::Char('x'));
+	assert_eq!(
+		app.source().view().issues.len(),
+		issues,
+		"a missing output can't be excluded"
+	);
 
-	assert_eq!(app.source().view().issues.len(), issues - 1);
+	press(&mut app, KeyCode::Char('c'));
+	assert_eq!(app.source().view().issues.len(), issues - 1, "c accepts it as is");
 }
 
 #[test]
@@ -171,10 +185,9 @@ fn details_step_through_files_and_skip_folders() {
 
 	press(&mut app, KeyCode::Down);
 	let second = app.selected().unwrap();
-	let library = &app.source().view().library;
 
 	assert_ne!(first, second);
-	assert!(!library.is_folder(second));
+	assert!(matches!(second, Selection::File { .. }));
 	assert_eq!(app.mode(), ViewMode::Details);
 
 	press(&mut app, KeyCode::Backspace);
@@ -258,7 +271,7 @@ fn p_and_e_reach_the_source() {
 
 	let header = &app.source().view().header;
 	assert_eq!(header.run_state, RunState::Paused);
-	assert_eq!(header.performance_limit, None);
+	assert_eq!(header.performance_limit, Some(Limit { cap: 25, pending: true }));
 }
 
 #[test]
@@ -295,11 +308,7 @@ fn right_click_selects_the_row_and_opens_the_menu() {
 		Instant::now(),
 	);
 
-	let selected = app.selected().unwrap();
-	assert_eq!(
-		app.source().view().library.node(selected).name,
-		"comic-veryTallImage.jpg"
-	);
+	assert_eq!(app.selected_name().as_deref(), Some("comic-veryTallImage.jpg"));
 	assert_eq!(app.overlay(), Some(OverlayKind::Menu));
 
 	draw(&mut app, 120, 36);
@@ -326,15 +335,7 @@ fn clicking_the_arrow_folds_and_double_click_opens_details() {
 
 	click(&mut app, 30, file_row, now + Duration::from_millis(150));
 	assert_eq!(app.mode(), ViewMode::Details);
-	let selected = app.selected().unwrap();
-	assert!(
-		app.source()
-			.view()
-			.library
-			.node(selected)
-			.name
-			.starts_with("2018 - HOLIDAY")
-	);
+	assert!(app.selected_name().unwrap().starts_with("2018 - HOLIDAY"));
 }
 
 #[test]

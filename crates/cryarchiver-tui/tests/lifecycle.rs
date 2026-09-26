@@ -29,12 +29,14 @@ fn header_keeps_the_run_state_at_every_size() {
 
 #[test]
 fn header_adds_eta_before_the_saving_as_room_grows() {
+	let mut limited = app();
+	press(&mut limited, KeyCode::Char('e'));
+	let crowded = row_text(&draw(&mut limited, 100, 30), 0);
 	let narrow = row_text(&draw(&mut app(), 100, 30), 0);
-	let medium = row_text(&draw(&mut app(), 120, 36), 0);
 	let wide = row_text(&draw(&mut app(), 160, 45), 0);
 
-	assert!(!narrow.contains("ETA"));
-	assert!(medium.contains("ETA") && !medium.contains("saved"));
+	assert!(crowded.contains("applying…") && crowded.contains("▶ running") && !crowded.contains("ETA"));
+	assert!(narrow.contains("ETA") && !narrow.contains("saved"));
 	assert!(wide.contains("ETA") && wide.contains("saved"));
 }
 
@@ -114,7 +116,9 @@ fn wheel_in_the_issues_list_stays_on_the_last_issue() {
 
 #[test]
 fn issues_survive_first_on_a_narrow_overall_panel() {
-	let terminal = draw(&mut app(), 100, 30);
+	let mut app = app();
+	let issues = app.source().view().issues.len();
+	let terminal = draw(&mut app, 100, 30);
 
-	assert!(support::find_row(&terminal, "! 4 issues").is_some());
+	assert!(support::find_row(&terminal, &format!("! {issues} issues")).is_some());
 }

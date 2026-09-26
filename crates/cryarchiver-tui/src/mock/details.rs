@@ -3,17 +3,22 @@ use std::time::Duration;
 use super::sim::PROBES;
 use super::{MediaKind, MockSource, Phase};
 use crate::format::{as_f64, bytes, round_to_u64};
+use crate::source::Target;
 use crate::view::{
-	Duplicates, FileDetails, FileState, FileStatus, IssueSummary, LiveProgress, NodeId, PathLink, PlanLine, StageMark,
-	StageProgress,
+	Duplicates, FileDetails, FileId, FileState, FileStatus, IssueSummary, LiveProgress, PathLink, PlanLine, StageMark,
+	StageProgress, WorkKind,
 };
 
 const STAGES: [&str; 10] = [
 	"detect", "probe", "analyze", "plan", "search", "encode", "verify", "mux", "meta", "commit",
 ];
 
-pub fn build(source: &MockSource, file: NodeId) -> Option<FileDetails> {
-	let status = source.view.library.file(file)?;
+pub fn build(source: &MockSource, file: FileId) -> Option<FileDetails> {
+	if usize::try_from(file.0).ok()? >= source.files.len() {
+		return None;
+	}
+
+	let status = &source.files.get(file).status;
 	let kind = source.kind(file);
 	let showcase = source.showcase.get(&file);
 
@@ -38,49 +43,57 @@ pub fn build(source: &MockSource, file: NodeId) -> Option<FileDetails> {
 			.view
 			.issues
 			.iter()
-			.find(|issue| issue.file == file)
+			.find(|issue| issue.file == Some(file))
 			.map(|issue| IssueSummary {
+				id: issue.id,
+				kind: issue.kind,
 				reason: issue.reason.clone(),
 				resolution: issue.resolution.clone(),
+				verbs: issue.verbs.clone(),
 			}),
 	})
 }
 
 impl MockSource {
-	pub(super) fn source_path(&self, id: NodeId) -> String {
-		join_windows(&self.view.header.source, &self.view.library.relative_path(id))
-	}
-
-	pub(super) fn source_folder(&self, id: NodeId) -> String {
-		self.folder_of(id, &self.view.header.source)
-	}
-
-	pub(super) fn output_folder(&self, id: NodeId) -> String {
-		self.folder_of(id, &self.view.header.destination)
-	}
-
-	fn folder_of(&self, id: NodeId, root: &str) -> String {
-		let library = &self.view.library;
-		let folder = if library.is_folder(id) {
-			Some(id)
+	fn file_path(&self, file: FileId) -> String {
+		let folder = self.view.library.relative_path(self.files.folder(file));
+		let name = &self.files.get(file).name;
+		if folder.is_empty() {
+			name.clone()
 		} else {
-			library.node(id).parent
-		};
-		join_windows(
-			root,
-			&folder.map(|folder| library.relative_path(folder)).unwrap_or_default(),
-		)
+			format!("{folder}/{name}")
+		}
 	}
 
-	fn destination_path(&self, id: NodeId, state: FileState) -> String {
-		let relative = self.view.library.relative_path(id);
-		let (folder, name) = relative.rsplit_once('/').unwrap_or(("", relative.as_str()));
+	pub(super) fn source_path(&self, file: FileId) -> String {
+		join_windows(&self.view.header.source, &self.file_path(file))
+	}
+
+	pub(super) fn source_folder(&self, target: Target) -> String {
+		self.folder_of(target, &self.view.header.source)
+	}
+
+	pub(super) fn output_folder(&self, target: Target) -> String {
+		self.folder_of(target, &self.view.header.destination)
+	}
+
+	fn folder_of(&self, target: Target, root: &str) -> String {
+		let folder = match target {
+			Target::Folder(folder) => folder,
+			Target::File(file) => self.files.folder(file),
+		};
+		join_windows(root, &self.view.library.relative_path(folder))
+	}
+
+	fn destination_path(&self, file: FileId, state: FileState) -> String {
+		let folder = self.view.library.relative_path(self.files.folder(file));
+		let name = self.files.get(file).name.as_str();
 		let output_name = match state {
 			FileState::Duplicate => format!("placeholder_{name}.txt"),
 			FileState::KeptOriginal | FileState::Copied | FileState::SourceDamaged | FileState::Failed => {
 				name.to_owned()
 			}
-			_ => with_extension(name, self.kind(id)),
+			_ => with_extension(name, self.kind(file)),
 		};
 
 		let joined = if folder.is_empty() {
@@ -91,13 +104,13 @@ impl MockSource {
 		join_windows(&self.view.header.destination, &joined)
 	}
 
-	fn live(&self, file: NodeId) -> Option<LiveProgress> {
+	fn live(&self, file: FileId) -> Option<LiveProgress> {
 		let job = self.jobs.iter().find(|job| job.file == file)?;
-		let video = self.kind(file).is_video();
+		let video = self.kind(file).is_video() && job.work == WorkKind::Encode;
 		let (fraction, rate) = match job.phase {
 			Phase::Search { .. } => return None,
 			Phase::Encode { fraction } => (fraction, if video { 0.026 } else { 0.21 }),
-			Phase::Verify { fraction } => (fraction, if video { 0.11 } else { 0.47 }),
+			Phase::Verify { fraction } => (fraction.min(0.99), if video { 0.11 } else { 0.47 }),
 		};
 		let remaining_ticks = (1.0 - fraction) / rate;
 
@@ -109,19 +122,21 @@ impl MockSource {
 		})
 	}
 
-	fn log_tail(&self, file: NodeId, status: &FileStatus) -> Vec<String> {
-		if let Some(issue) = self.view.issues.iter().find(|issue| issue.file == file) {
-			return issue.log.clone();
+	fn log_tail(&self, file: FileId, status: &FileStatus) -> Vec<String> {
+		let issue = self.view.issues.iter().find(|issue| issue.file == Some(file));
+		if let Some(last) = issue.and_then(|issue| issue.attempts.last()) {
+			return last.lines.clone();
 		}
 
 		let job = self.jobs.iter().find(|job| job.file == file);
-		match job.map(|job| (job.phase, job.fps)) {
-			Some((Phase::Search { probe }, _)) => probe_lines(probe),
-			Some((Phase::Encode { fraction }, fps)) => encode_lines(fraction, fps, status.bytes_in),
-			Some((Phase::Verify { fraction }, _)) => vec![
+		match job.map(|job| (job.work, job.phase, job.fps)) {
+			Some((WorkKind::Encode, Phase::Search { probe }, _)) => probe_lines(probe),
+			Some((WorkKind::Encode, Phase::Encode { fraction }, fps)) => encode_lines(fraction, fps, status.bytes_in),
+			Some((WorkKind::Encode, Phase::Verify { fraction }, _)) => vec![
 				"metric pass: comparing against the source".to_owned(),
-				format!("frames compared: {:.0} %", fraction * 100.0),
+				format!("frames compared: {:.0} %", fraction.min(0.99) * 100.0),
 			],
+			Some((work, _, _)) => vec![format!("{} job running", work.label())],
 			None => {
 				let note = self.showcase.get(&file).and_then(|showcase| showcase.note);
 				vec![
@@ -132,7 +147,7 @@ impl MockSource {
 		}
 	}
 
-	fn duplicates(&self, file: NodeId) -> Duplicates {
+	fn duplicates(&self, file: FileId) -> Duplicates {
 		if let Some(&canonical) = self.duplicate_of.get(&file) {
 			return Duplicates::PlaceholderOf(self.link(canonical));
 		}
@@ -151,15 +166,16 @@ impl MockSource {
 		}
 	}
 
-	fn link(&self, file: NodeId) -> PathLink {
+	fn link(&self, file: FileId) -> PathLink {
 		PathLink {
 			file,
-			path: self.view.library.relative_path(file),
+			folder: self.files.folder(file),
+			path: self.file_path(file),
 		}
 	}
 }
 
-fn plan(source: &MockSource, file: NodeId, kind: MediaKind) -> Vec<PlanLine> {
+fn plan(source: &MockSource, file: FileId, kind: MediaKind) -> Vec<PlanLine> {
 	let line = |label: &str, value: &str| PlanLine {
 		label: label.to_owned(),
 		value: value.to_owned(),
@@ -179,7 +195,7 @@ fn plan(source: &MockSource, file: NodeId, kind: MediaKind) -> Vec<PlanLine> {
 	lines
 }
 
-fn quality(source: &MockSource, file: NodeId, status: &FileStatus, kind: MediaKind) -> Option<String> {
+fn quality(source: &MockSource, file: FileId, status: &FileStatus, kind: MediaKind) -> Option<String> {
 	if let Some(quality) = source.showcase.get(&file).and_then(|showcase| showcase.quality) {
 		return Some(quality.to_owned());
 	}
@@ -199,17 +215,23 @@ fn quality(source: &MockSource, file: NodeId, status: &FileStatus, kind: MediaKi
 
 fn stages(state: FileState) -> Vec<StageMark> {
 	let current = match state {
-		FileState::Done | FileState::KeptOriginal | FileState::Copied | FileState::Duplicate | FileState::Warning => {
-			STAGES.len()
-		}
+		FileState::Done
+		| FileState::KeptOriginal
+		| FileState::Copied
+		| FileState::Duplicate
+		| FileState::Warning
+		| FileState::SourceGone
+		| FileState::DeletePending
+		| FileState::OriginalDeleted => STAGES.len(),
 		FileState::QualitySearch => 4,
 		FileState::Encoding | FileState::Failed => 5,
 		FileState::Verifying => 6,
 		FileState::SourceDamaged => 1,
 		FileState::Waiting => 3,
-		FileState::Queued => 0,
+		FileState::Queued | FileState::Excluded => 0,
 	};
-	let has_current = !matches!(state, FileState::Queued | FileState::Waiting) && current < STAGES.len();
+	let has_current =
+		!matches!(state, FileState::Queued | FileState::Waiting | FileState::Excluded) && current < STAGES.len();
 
 	(0..STAGES.len())
 		.map(|index| StageMark {
@@ -256,6 +278,9 @@ fn finished_note(state: FileState) -> &'static str {
 		FileState::Copied => "copied as-is",
 		FileState::Duplicate => "placeholder written",
 		FileState::Queued => "queued · not started yet",
+		FileState::Excluded => "excluded from the archive by your choice",
+		FileState::OriginalDeleted => "archive verified · original deleted",
+		FileState::SourceGone => "the source was deleted · the archived copy stays",
 		_ => "no output yet",
 	}
 }

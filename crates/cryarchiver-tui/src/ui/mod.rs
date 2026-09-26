@@ -6,14 +6,17 @@ mod library;
 mod log;
 mod overlay;
 mod panels;
+mod settings;
 mod small;
 mod widgets;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
+use crate::app::tree::file_row;
 use crate::app::{Lifecycle, Overlay, Ui, ViewMode};
-use crate::view::{ArchiveView, FileDetails};
+use crate::source::ArchiveSource;
+use crate::view::{ArchiveView, FileDetails, Notification};
 
 pub const MIN_WIDTH: u16 = 100;
 pub const MIN_HEIGHT: u16 = 30;
@@ -78,7 +81,14 @@ impl Areas {
 	}
 }
 
-pub fn draw(frame: &mut Frame, view: &ArchiveView, details: Option<&FileDetails>, ui: &mut Ui) {
+pub fn draw(
+	frame: &mut Frame,
+	source: &dyn ArchiveSource,
+	details: Option<&FileDetails>,
+	toast: Option<&Notification>,
+	ui: &mut Ui,
+) {
+	let view = source.view();
 	let area = frame.area();
 	let buf = frame.buffer_mut();
 	buf.set_style(area, ui.theme.base());
@@ -99,31 +109,38 @@ pub fn draw(frame: &mut Frame, view: &ArchiveView, details: Option<&FileDetails>
 	}
 
 	match ui.mode {
-		ViewMode::Library => library::render(buf, areas.main, view, ui),
+		ViewMode::Library => library::render(buf, areas.main, source, ui),
 		ViewMode::Details => {
 			let name = ui
 				.tree
-				.selected()
-				.map(|id| view.library.node(id).name.as_str())
-				.unwrap_or_default();
-			details::render(buf, areas.main, name, details, &ui.theme, &mut ui.hits);
+				.selected_index()
+				.and_then(|index| ui.tree.rows().get(index))
+				.and_then(|row| file_row(source, row.kind).map(|file| file.name.as_str()));
+			details::render(
+				buf,
+				areas.main,
+				name.unwrap_or_default(),
+				details,
+				&ui.theme,
+				&mut ui.hits,
+			);
 		}
 		ViewMode::Issues => issues::render(buf, areas.main, &view.issues, ui),
 	}
 
 	if let Some(log) = areas.log {
-		log::render(buf, log, &view.log, &ui.theme, &mut ui.hits);
+		log::render(buf, log, &view.log, toast, &ui.theme, &mut ui.hits);
 	}
 
 	footer::render(buf, areas.footer, view, details, ui);
-	draw_overlay(buf, area, areas.main, ui);
+	draw_overlay(buf, area, areas.main, view, ui);
 
 	if ui.lifecycle == Lifecycle::Stopping {
 		overlay::stopping(buf, area, &ui.theme);
 	}
 }
 
-fn draw_overlay(buf: &mut ratatui::buffer::Buffer, screen: Rect, main: Rect, ui: &mut Ui) {
+fn draw_overlay(buf: &mut ratatui::buffer::Buffer, screen: Rect, main: Rect, view: &ArchiveView, ui: &mut Ui) {
 	match &ui.overlay {
 		Some(Overlay::Help) => overlay::help(buf, screen, &ui.theme),
 		Some(Overlay::Menu(menu)) => {
@@ -132,6 +149,9 @@ fn draw_overlay(buf: &mut ratatui::buffer::Buffer, screen: Rect, main: Rect, ui:
 			let default_anchor = (screen.x + 24, row.min(main.bottom()));
 			overlay::menu(buf, screen, menu, default_anchor, &ui.theme, &mut ui.hits);
 		}
+		Some(Overlay::Settings(selected)) => settings::render(buf, screen, view, *selected, &ui.theme, &mut ui.hits),
+		Some(Overlay::ConfirmDelete(input)) => settings::confirm_delete(buf, screen, input, &ui.theme, &mut ui.hits),
+		Some(Overlay::ConfirmRestart) => settings::confirm_restart(buf, screen, view, &ui.theme, &mut ui.hits),
 		None => {}
 	}
 }

@@ -2,10 +2,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
-use super::widgets::{Chrome, bold, fg, panel, put, to_u16};
+use super::widgets::{Chrome, bold, fg, panel, put, to_u16, verb_hint};
 use crate::app::{Hit, Ui};
 use crate::format::{fit, fit_middle, width};
-use crate::theme::{Theme, glyph};
+use crate::theme::{Theme, issue_glyph};
 use crate::view::Issue;
 
 const ROWS_PER_ISSUE: u16 = 3;
@@ -47,7 +47,8 @@ pub fn render(buf: &mut Buffer, area: Rect, issues: &[Issue], ui: &mut Ui) {
 		render_list(buf, list, issues, ui);
 	}
 
-	render_log(buf, log_area, issues.get(ui.issue_selected), &theme);
+	let attempt_back = ui.attempt_back;
+	render_log(buf, log_area, issues.get(ui.issue_selected), attempt_back, &theme);
 }
 
 fn render_list(buf: &mut Buffer, area: Rect, issues: &[Issue], ui: &mut Ui) {
@@ -68,10 +69,16 @@ fn render_issue(buf: &mut Buffer, area: Rect, issue: &Issue, selected: bool, the
 
 	let (x, right) = (area.x + 1, area.right().saturating_sub(1));
 	let cells = usize::from(right.saturating_sub(x + 2));
-	let color = theme.state(issue.state);
 
-	put(buf, x, area.y, glyph(issue.state), bold(color), right);
-	let name_width = cells.saturating_sub(width(&issue.folder) + 1);
+	put(
+		buf,
+		x,
+		area.y,
+		issue_glyph(issue.kind),
+		bold(theme.issue(issue.kind)),
+		right,
+	);
+	let name_width = cells.saturating_sub(width(&issue.location) + 1);
 	put(
 		buf,
 		x + 2,
@@ -80,8 +87,8 @@ fn render_issue(buf: &mut Buffer, area: Rect, issue: &Issue, selected: bool, the
 		bold(theme.bright),
 		right,
 	);
-	let folder_x = right.saturating_sub(to_u16(width(&issue.folder)));
-	put(buf, folder_x, area.y, &issue.folder, fg(theme.dim), right);
+	let location_x = right.saturating_sub(to_u16(width(&issue.location)));
+	put(buf, location_x, area.y, &issue.location, fg(theme.dim), right);
 
 	if area.height > 1 {
 		put(
@@ -105,10 +112,20 @@ fn render_issue(buf: &mut Buffer, area: Rect, issue: &Issue, selected: bool, the
 	}
 }
 
-fn render_log(buf: &mut Buffer, area: Rect, issue: Option<&Issue>, theme: &Theme) {
+/// Shows one attempt's log, the latest unless the user stepped back with ←.
+fn render_log(buf: &mut Buffer, area: Rect, issue: Option<&Issue>, attempt_back: usize, theme: &Theme) {
+	let attempts = issue.map_or(0, |issue| issue.attempts.len());
+	let shown = attempts.checked_sub(1 + attempt_back.min(attempts.saturating_sub(1)));
+	let title = match (shown, issue) {
+		(Some(index), Some(issue)) if attempts > 1 => {
+			format!("ffmpeg log · attempt {} of {attempts}", issue.attempts[index].attempt)
+		}
+		_ => "ffmpeg log".to_owned(),
+	};
+	let hint = issue.map(|issue| verb_hint(&issue.verbs));
 	let chrome = Chrome {
-		title: "ffmpeg log",
-		right: Some(" r retry · c copy · x exclude "),
+		title: &title,
+		right: hint.as_deref(),
 		focused: false,
 	};
 	let inner = panel(buf, area, theme, &chrome);
@@ -125,8 +142,26 @@ fn render_log(buf: &mut Buffer, area: Rect, issue: Option<&Issue>, theme: &Theme
 		right,
 	);
 
-	for (row, line) in (inner.y + 2..inner.bottom()).zip(&issue.log) {
+	let Some(index) = shown else {
+		put(
+			buf,
+			x,
+			inner.y + 2,
+			"no log for this kind of issue",
+			fg(theme.dim),
+			right,
+		);
+		return;
+	};
+
+	for (row, line) in (inner.y + 2..inner.bottom()).zip(&issue.attempts[index].lines) {
 		let color = if line.starts_with('[') { theme.warn } else { theme.text };
 		put(buf, x, row, &fit(line, cells), fg(color), right);
+	}
+
+	if attempts > 1 && inner.height > 1 {
+		let hint = "← → other attempts";
+		let hint_x = right.saturating_sub(to_u16(width(hint)));
+		put(buf, hint_x, inner.bottom() - 1, hint, fg(theme.dim), right);
 	}
 }

@@ -3,10 +3,10 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::widgets::{Chrome, bold, fg, gauge, panel, put, put_line, to_u16};
+use super::widgets::{Chrome, bold, fg, gauge, panel, put, put_line, to_u16, verb_spans};
 use crate::app::{Hit, HitMap};
 use crate::format::{bytes, duration, fit, fit_middle, fps, percent, saving, speed, width};
-use crate::theme::{Theme, glyph, label};
+use crate::theme::{Theme, glyph, issue_glyph, label};
 use crate::view::{Duplicates, FileDetails, IssueSummary, PathLink, StageProgress};
 
 const LABEL: usize = 9;
@@ -179,7 +179,7 @@ fn render_side(buf: &mut Buffer, area: Rect, details: &FileDetails, theme: &Them
 
 	y = render_duplicates(buf, Rect { y: y + 1, ..area }, &details.duplicates, theme, hits);
 	if let Some(issue) = &details.issue {
-		render_issue(buf, Rect { y: y + 1, ..area }, issue, details, theme);
+		render_issue(buf, Rect { y: y + 1, ..area }, issue, theme);
 	}
 }
 
@@ -216,29 +216,28 @@ fn render_duplicates(buf: &mut Buffer, area: Rect, duplicates: &Duplicates, them
 			Span::styled(text.trim_end().to_owned(), link_style),
 		]);
 		let end = put_line(buf, area.x, y, &line, area.right());
-		hits.push(Rect::new(area.x, y, end - area.x, 1), Hit::Link(link.file));
+		hits.push(
+			Rect::new(area.x, y, end - area.x, 1),
+			Hit::Link {
+				file: link.file,
+				folder: link.folder,
+			},
+		);
 		y += 1;
 	}
 	y
 }
 
-fn render_issue(buf: &mut Buffer, area: Rect, issue: &IssueSummary, details: &FileDetails, theme: &Theme) {
-	let color = theme.state(details.state);
+fn render_issue(buf: &mut Buffer, area: Rect, issue: &IssueSummary, theme: &Theme) {
+	let color = theme.issue(issue.kind);
 	let lines = vec![
 		Line::styled("Issue", bold(theme.dim)),
 		Line::from(vec![
-			Span::styled(format!("{} ", glyph(details.state)), bold(color)),
+			Span::styled(format!("{} ", issue_glyph(issue.kind)), bold(color)),
 			Span::styled(issue.reason.clone(), fg(theme.text)),
 		]),
 		Line::styled(issue.resolution.clone(), fg(theme.dim)),
-		Line::from(vec![
-			Span::styled("r", bold(theme.accent)),
-			Span::styled(" retry · ", fg(theme.dim)),
-			Span::styled("c", bold(theme.accent)),
-			Span::styled(" copy original · ", fg(theme.dim)),
-			Span::styled("x", bold(theme.accent)),
-			Span::styled(" exclude", fg(theme.dim)),
-		]),
+		Line::from(verb_spans(&issue.verbs, theme)),
 	];
 	draw_lines(buf, area, &lines);
 }

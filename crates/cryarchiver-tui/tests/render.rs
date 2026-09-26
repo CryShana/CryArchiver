@@ -1,6 +1,7 @@
 mod support;
 
-use cryarchiver_tui::{App, ColorDepth, MockSource};
+use cryarchiver_tui::source::SettingsChange;
+use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, MockSource};
 use insta::assert_snapshot;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::style::Color;
@@ -106,6 +107,121 @@ fn completed_run_at_120x36() {
 	let mut app = App::new(MockSource::completed(support::SEED), ColorDepth::TrueColor);
 
 	assert_snapshot!(draw(&mut app, 120, 36).backend());
+}
+
+#[test]
+fn settings_at_120x36() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('s'));
+
+	assert_snapshot!(draw(&mut app, 120, 36).backend());
+}
+
+#[test]
+fn delete_confirmation_at_120x36() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('s'));
+	for _ in 0..6 {
+		press(&mut app, KeyCode::Down);
+	}
+	press(&mut app, KeyCode::Enter);
+	type_text(&mut app, "DEL");
+
+	assert_snapshot!(draw(&mut app, 120, 36).backend());
+}
+
+#[test]
+fn deleting_originals_and_a_pending_limit_at_120x36() {
+	let mut source = support::source();
+	let confirm = SettingsChange::DeleteOriginals {
+		enabled: true,
+		confirmation: "DELETE".to_owned(),
+	};
+	source.perform(Action::ChangeSettings(confirm));
+	source.perform(Action::ChangeSettings(SettingsChange::PerformanceLimit(Some(25))));
+	let mut app = App::new(source, ColorDepth::TrueColor);
+	let terminal = draw(&mut app, 120, 36);
+
+	assert_eq!(
+		terminal.backend().buffer()[(70, 0)].bg,
+		Color::Rgb(0x4A, 0x16, 0x19),
+		"the header turns red"
+	);
+	assert_snapshot!(terminal.backend());
+}
+
+#[test]
+fn low_disk_pause_at_100x30() {
+	let mut source = support::source();
+	for _ in support::WARM_UP_STEPS..80 {
+		source.step();
+	}
+	let mut app = App::new(source, ColorDepth::TrueColor);
+
+	assert_snapshot!(draw(&mut app, 100, 30).backend());
+}
+
+#[test]
+fn issue_without_a_source_file_at_120x36() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('i'));
+	press(&mut app, KeyCode::Down);
+	press(&mut app, KeyCode::Down);
+	press(&mut app, KeyCode::Down);
+
+	assert_snapshot!(draw(&mut app, 120, 36).backend());
+}
+
+#[test]
+fn loading_rows_show_until_the_source_answers() {
+	let mut source = support::source().with_load_latency(3);
+	source.step();
+	let mut app = App::new(source, ColorDepth::TrueColor);
+
+	let terminal = draw(&mut app, 120, 36);
+	assert!(find_row(&terminal, "… loading…").is_some());
+
+	for _ in 0..3 {
+		app.source_mut().step();
+	}
+	let terminal = draw(&mut app, 120, 36);
+	assert!(find_row(&terminal, "loading…").is_none());
+	assert!(
+		find_row(&terminal, "● IMG_0001 2.MOV").is_some(),
+		"the pending selection lands once rows load"
+	);
+}
+
+#[test]
+fn notifications_show_as_a_toast_in_the_log() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('e'));
+
+	let terminal = draw(&mut app, 120, 36);
+	let log_title = find_row(&terminal, "─ Log ").unwrap();
+
+	assert!(support::row_text(&terminal, log_title).contains("◆ performance limit 25 %"));
+	assert!(app.toast().is_some());
+}
+
+#[test]
+fn limit_marker_stays_inside_the_gauge_at_100_percent() {
+	let mut source = support::source();
+	source.perform(Action::ChangeSettings(SettingsChange::PerformanceLimit(Some(100))));
+	let mut app = App::new(source, ColorDepth::TrueColor);
+
+	let terminal = draw(&mut app, 120, 36);
+	let row = find_row(&terminal, "│ CPU ").unwrap();
+	let text = support::row_text(&terminal, row);
+	let marker = text.find('┃').unwrap();
+	let percent = text[marker..].find('%').unwrap();
+
+	assert!(
+		text[marker + '┃'.len_utf8()..marker + percent]
+			.trim_start()
+			.chars()
+			.all(|c| c.is_ascii_digit())
+	);
 }
 
 #[test]

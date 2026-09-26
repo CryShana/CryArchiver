@@ -2,9 +2,10 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
+use super::tree::{Expansion, RowKind, Selection};
 use super::{Lifecycle, Outcome, Overlay, Ui, ViewMode};
 use crate::source::{Action, ArchiveSource};
-use crate::view::Duplicates;
+use crate::view::{Duplicates, FileId, IssueVerbs, RunState, Verb};
 
 impl Ui {
 	pub(super) fn on_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
@@ -14,7 +15,7 @@ impl Ui {
 		}
 
 		if self.search.is_some() {
-			return self.on_search_key(source, key);
+			return self.on_search_key(key);
 		}
 
 		if self.overlay.is_some() {
@@ -23,7 +24,7 @@ impl Ui {
 
 		match self.on_global_key(source, key) {
 			Outcome::Ignored => {}
-			handled => return handled,
+			handled @ Outcome::Done => return handled,
 		}
 
 		match self.mode {
@@ -33,24 +34,27 @@ impl Ui {
 		}
 	}
 
-	pub(super) fn on_paste(&mut self, source: &dyn ArchiveSource, text: &str) -> Outcome {
-		let Some(input) = &mut self.search else {
-			return Outcome::Ignored;
+	/// Bracketed paste only reaches text inputs, so pasted text never fires shortcuts.
+	pub(super) fn on_paste(&mut self, text: &str) {
+		let ((Some(input), _) | (None, Some(Overlay::ConfirmDelete(input)))) = (&mut self.search, &mut self.overlay)
+		else {
+			return;
 		};
 
 		for c in text.chars().filter(|c| !c.is_control()) {
 			input.handle(tui_input::InputRequest::InsertChar(c));
 		}
-		self.filter = input.value().to_owned();
-		self.tree.sync(&source.view().library, &self.filter);
-		Outcome::Done
+
+		if let Some(query) = self.search.as_ref().map(|input| input.value().to_owned()) {
+			self.set_filter(query);
+		}
 	}
 
-	fn on_search_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
+	fn on_search_key(&mut self, key: KeyEvent) -> Outcome {
 		match key.code {
 			KeyCode::Esc => {
 				self.search = None;
-				self.filter.clear();
+				self.set_filter(String::new());
 			}
 			KeyCode::Enter => self.search = None,
 			KeyCode::Up => self.tree.move_by(-1),
@@ -62,35 +66,38 @@ impl Ui {
 					return Outcome::Ignored;
 				};
 				input.handle_event(&Event::Key(key));
-				self.filter = input.value().to_owned();
+				let query = input.value().to_owned();
+				self.set_filter(query);
 			}
 		}
-
-		self.tree.sync(&source.view().library, &self.filter);
 		Outcome::Done
 	}
 
 	fn on_overlay_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
-		let Some(Overlay::Menu(menu)) = &mut self.overlay else {
-			match key.code {
+		match &mut self.overlay {
+			Some(Overlay::Menu(menu)) => match key.code {
+				KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
+				KeyCode::Down | KeyCode::Char('j') => menu.selected = (menu.selected + 1).min(menu.items.len() - 1),
+				KeyCode::Enter => {
+					let (item, target) = (menu.items[menu.selected].0, menu.target);
+					self.overlay = None;
+					return self.activate(source, item, target);
+				}
+				KeyCode::Esc | KeyCode::Char('m') => self.overlay = None,
+				KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
+				_ => {}
+			},
+			Some(Overlay::Settings(selected)) => {
+				let selected = *selected;
+				return self.on_settings_key(source, key, selected);
+			}
+			Some(Overlay::ConfirmDelete(_)) => return self.on_confirm_delete_key(key),
+			Some(Overlay::ConfirmRestart) => return self.on_confirm_restart_key(key),
+			Some(Overlay::Help) | None => match key.code {
 				KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
 				KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => self.overlay = None,
 				_ => {}
-			}
-			return Outcome::Done;
-		};
-
-		match key.code {
-			KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
-			KeyCode::Down | KeyCode::Char('j') => menu.selected = (menu.selected + 1).min(menu.items.len() - 1),
-			KeyCode::Enter => {
-				let (item, target) = (menu.items[menu.selected], menu.target);
-				self.overlay = None;
-				return self.activate(source, item, target);
-			}
-			KeyCode::Esc | KeyCode::Char('m') => self.overlay = None,
-			KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
-			_ => {}
+			},
 		}
 		Outcome::Done
 	}
@@ -100,8 +107,12 @@ impl Ui {
 			KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
 			KeyCode::F(2) => self.mouse_capture = !self.mouse_capture,
 			KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
-			KeyCode::Char('p') => return Outcome::Perform(Action::TogglePause),
-			KeyCode::Char('e') => return Outcome::Perform(Action::TogglePerformanceLimit),
+			KeyCode::Char('s') => self.overlay = Some(Overlay::Settings(0)),
+			KeyCode::Char('p') => {
+				let paused = source.view().header.run_state == RunState::Paused;
+				self.actions.push(if paused { Action::Start } else { Action::Pause });
+			}
+			KeyCode::Char('e') => self.toggle_limit(source),
 			KeyCode::Char('z') => self.layout.maximized = !self.layout.maximized,
 			KeyCode::Char('l') => self.layout.log_open = !self.layout.log_open,
 			KeyCode::Char('/') => {
@@ -122,89 +133,115 @@ impl Ui {
 		Outcome::Done
 	}
 
-	fn on_library_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
-		let library = &source.view().library;
-		let Some(selected) = self.tree.selected() else {
-			return Outcome::Ignored;
-		};
+	fn toggle_limit(&mut self, source: &dyn ArchiveSource) {
+		const DEFAULT_CAP: u8 = 25;
 
-		match key.code {
-			KeyCode::Up | KeyCode::Char('k') => self.tree.move_by(-1),
-			KeyCode::Down | KeyCode::Char('j') => self.tree.move_by(1),
-			KeyCode::PageUp => self.tree.page_by(-1),
-			KeyCode::PageDown => self.tree.page_by(1),
-			KeyCode::Home => self.tree.select_index(0),
-			KeyCode::End => self.tree.select_last(),
-			KeyCode::Left => self.collapse_or_parent(source),
-			KeyCode::Right => self.expand_or_child(source),
-			KeyCode::Enter if library.is_folder(selected) => self.tree.toggle(selected),
-			KeyCode::Enter => self.mode = ViewMode::Details,
-			KeyCode::Char('r') if library.is_folder(selected) => {
-				return Outcome::Perform(Action::RetryFailedIn(selected));
+		let cap = match source.view().settings.performance_limit {
+			Some(_) => None,
+			None => Some(DEFAULT_CAP),
+		};
+		self.actions
+			.push(Action::ChangeSettings(crate::source::SettingsChange::PerformanceLimit(
+				cap,
+			)));
+	}
+
+	fn on_library_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
+		let selection = self.tree.selected();
+
+		match (key.code, selection) {
+			(KeyCode::Up | KeyCode::Char('k'), _) => self.tree.move_by(-1),
+			(KeyCode::Down | KeyCode::Char('j'), _) => self.tree.move_by(1),
+			(KeyCode::PageUp, _) => self.tree.page_by(-1),
+			(KeyCode::PageDown, _) => self.tree.page_by(1),
+			(KeyCode::Home, _) => self.tree.select_index(0),
+			(KeyCode::End, _) => self.tree.select_last(),
+			(KeyCode::Left, _) => self.collapse_or_parent(source),
+			(KeyCode::Right, Some(Selection::Folder(folder))) => self.expand_or_child(folder),
+			(KeyCode::Enter, Some(Selection::Folder(folder))) => self.tree.toggle(folder),
+			(KeyCode::Enter, Some(Selection::File { .. })) => self.mode = ViewMode::Details,
+			(KeyCode::Char('r'), Some(Selection::Folder(folder))) => self.actions.push(Action::RetryFailedIn(folder)),
+			(KeyCode::Char('r'), Some(Selection::File { file, .. })) => {
+				return self.resolve_file(source, file, Verb::Retry);
 			}
-			KeyCode::Char('r') => return Outcome::Perform(Action::Retry(selected)),
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done
+	}
+
+	fn resolve_file(&mut self, source: &dyn ArchiveSource, file: FileId, verb: Verb) -> Outcome {
+		let issue = source.view().issues.iter().find(|issue| issue.file == Some(file));
+		match issue.filter(|issue| issue.verbs.label(verb).is_some()) {
+			Some(issue) => {
+				self.actions.push(Action::Resolve(issue.id, verb));
+				Outcome::Done
+			}
+			None => Outcome::Ignored,
+		}
 	}
 
 	fn collapse_or_parent(&mut self, source: &dyn ArchiveSource) {
 		let library = &source.view().library;
-		let Some(selected) = self.tree.selected() else { return };
-		let open_folder = self.tree.rows().iter().any(|row| row.id == selected && row.open);
+		let parent = match self.tree.selected() {
+			Some(Selection::Folder(folder)) if self.filter.is_empty() && self.tree.expansion(folder).is_some() => {
+				self.tree.set_expanded(folder, false);
+				return;
+			}
+			Some(Selection::Folder(folder)) => library.node(folder).parent,
+			Some(Selection::File { folder, .. }) => Some(folder),
+			None => None,
+		};
 
-		if open_folder && self.filter.is_empty() {
-			self.tree.set_expanded(selected, false);
-		} else if let Some(parent) = library.node(selected).parent
-			&& let Some(index) = self.tree.rows().iter().position(|row| row.id == parent)
-		{
+		let Some(parent) = parent else { return };
+		let index = self
+			.tree
+			.rows()
+			.iter()
+			.position(|row| matches!(row.kind, RowKind::Folder(id, _) if id == parent));
+		if let Some(index) = index {
 			self.tree.select_index(index);
 		}
 	}
 
-	fn expand_or_child(&mut self, source: &dyn ArchiveSource) {
-		let library = &source.view().library;
-		let Some(selected) = self.tree.selected() else { return };
-		if !library.is_folder(selected) {
-			return;
-		}
-
-		if self.tree.is_expanded(selected) || !self.filter.is_empty() {
+	fn expand_or_child(&mut self, folder: crate::view::NodeId) {
+		if self.tree.expansion(folder) == Some(Expansion::Full) || !self.filter.is_empty() {
 			self.tree.move_by(1);
 		} else {
-			self.tree.set_expanded(selected, true);
+			self.tree.set_expanded(folder, true);
 		}
 	}
 
 	fn on_details_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
-		let library = &source.view().library;
-		let selected = self.tree.selected();
+		let file = match self.tree.selected() {
+			Some(Selection::File { file, .. }) => Some(file),
+			_ => None,
+		};
 
-		match (key.code, selected) {
+		match (key.code, file) {
 			(KeyCode::Enter | KeyCode::Backspace, _) => self.mode = ViewMode::Library,
-			(KeyCode::Up | KeyCode::Char('k'), _) => self.tree.select_file_step(library, false),
-			(KeyCode::Down | KeyCode::Char('j'), _) => self.tree.select_file_step(library, true),
+			(KeyCode::Up | KeyCode::Char('k'), _) => self.tree.select_file_step(false),
+			(KeyCode::Down | KeyCode::Char('j'), _) => self.tree.select_file_step(true),
 			(KeyCode::Char('g'), Some(file)) => return self.jump_to_duplicate(source, file),
-			(KeyCode::Char('r'), Some(file)) => return Outcome::Perform(Action::Retry(file)),
-			(KeyCode::Char('c'), Some(file)) => return Outcome::Perform(Action::CopyOriginal(file)),
-			(KeyCode::Char('x'), Some(file)) => return Outcome::Perform(Action::Exclude(file)),
+			(KeyCode::Char('r'), Some(file)) => return self.resolve_file(source, file, Verb::Retry),
+			(KeyCode::Char('c'), Some(file)) => return self.resolve_file(source, file, Verb::Accept),
+			(KeyCode::Char('x'), Some(file)) => return self.resolve_file(source, file, Verb::Exclude),
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done
 	}
 
-	fn jump_to_duplicate(&mut self, source: &dyn ArchiveSource, file: crate::view::NodeId) -> Outcome {
+	fn jump_to_duplicate(&mut self, source: &dyn ArchiveSource, file: FileId) -> Outcome {
 		let target = match source.details(file).map(|details| details.duplicates) {
-			Some(Duplicates::PlaceholderOf(link)) => link.file,
+			Some(Duplicates::PlaceholderOf(link)) => link,
 			Some(Duplicates::CanonicalOf(links)) if !links.is_empty() => {
-				let link = &links[self.duplicate_cursor % links.len()];
+				let link = links[self.duplicate_cursor % links.len()].clone();
 				self.duplicate_cursor += 1;
-				link.file
+				link
 			}
 			_ => return Outcome::Ignored,
 		};
 
-		self.reveal(source, target);
+		self.reveal_file(source, target.folder, target.file);
 		Outcome::Done
 	}
 
@@ -212,19 +249,40 @@ impl Ui {
 		let issues = &source.view().issues;
 		let last = issues.len().saturating_sub(1);
 		self.issue_selected = self.issue_selected.min(last);
-		let file = issues.get(self.issue_selected).map(|issue| issue.file);
+		let issue = issues.get(self.issue_selected);
+		let attempts = issue.map_or(0, |issue| issue.attempts.len());
 
-		match (key.code, file) {
-			(KeyCode::Up | KeyCode::Char('k'), _) => self.issue_selected = self.issue_selected.saturating_sub(1),
-			(KeyCode::Down | KeyCode::Char('j'), _) => self.issue_selected = (self.issue_selected + 1).min(last),
-			(KeyCode::Home, _) => self.issue_selected = 0,
-			(KeyCode::End, _) => self.issue_selected = last,
-			(KeyCode::Enter, Some(file)) => self.open_details(source, file),
-			(KeyCode::Char('r'), Some(file)) => return Outcome::Perform(Action::Retry(file)),
-			(KeyCode::Char('c'), Some(file)) => return Outcome::Perform(Action::CopyOriginal(file)),
-			(KeyCode::Char('x'), Some(file)) => return Outcome::Perform(Action::Exclude(file)),
+		match key.code {
+			KeyCode::Up | KeyCode::Char('k') => self.select_issue(self.issue_selected.saturating_sub(1)),
+			KeyCode::Down | KeyCode::Char('j') => self.select_issue((self.issue_selected + 1).min(last)),
+			KeyCode::Home => self.select_issue(0),
+			KeyCode::End => self.select_issue(last),
+			KeyCode::Left => self.attempt_back = (self.attempt_back + 1).min(attempts.saturating_sub(1)),
+			KeyCode::Right => self.attempt_back = self.attempt_back.saturating_sub(1),
+			KeyCode::Enter => match issue.and_then(|issue| issue.file.zip(issue.folder)) {
+				Some((file, folder)) => self.open_details(source, folder, file),
+				None => return Outcome::Ignored,
+			},
+			KeyCode::Char(key) => return self.resolve_selected_issue(issue.map(|issue| (issue.id, &issue.verbs)), key),
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done
+	}
+
+	fn resolve_selected_issue(&mut self, issue: Option<(crate::view::IssueId, &IssueVerbs)>, key: char) -> Outcome {
+		let verb = match key {
+			'r' => Verb::Retry,
+			'c' => Verb::Accept,
+			'x' => Verb::Exclude,
+			_ => return Outcome::Ignored,
+		};
+
+		match issue.filter(|(_, verbs)| verbs.label(verb).is_some()) {
+			Some((id, _)) => {
+				self.actions.push(Action::Resolve(id, verb));
+				Outcome::Done
+			}
+			None => Outcome::Ignored,
+		}
 	}
 }

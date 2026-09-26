@@ -6,11 +6,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Table, Widget};
 
 use super::widgets::{Chrome, bold, fg, gauge, pad_left, panel, put, to_u16};
-use crate::app::tree;
+use crate::app::tree::{self, Fold, RowKind};
 use crate::app::{Hit, Ui};
 use crate::format::{bytes, find_ignore_case, fit, fit_middle, percent, saving, short_count, thousands, width};
+use crate::source::ArchiveSource;
 use crate::theme::{Theme, glyph, label};
-use crate::view::{ArchiveView, Entry, FileStatus, FolderStats, Library};
+use crate::view::{ArchiveView, FileState, FileStatus, FolderStats};
 
 const STATUS: usize = 11;
 const PROGRESS: usize = 15;
@@ -61,7 +62,8 @@ fn to_length(cells: usize) -> Constraint {
 	Constraint::Length(to_u16(cells))
 }
 
-pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, ui: &mut Ui) {
+pub fn render(buf: &mut Buffer, area: Rect, source: &dyn ArchiveSource, ui: &mut Ui) {
+	let view = source.view();
 	let theme = ui.theme;
 	let title = library_title(ui);
 	let chrome = Chrome {
@@ -82,7 +84,10 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, ui: &mut Ui) {
 	let columns = Columns::for_width(usize::from(inner.width));
 	let rows = ui.tree.rows();
 	if rows.is_empty() {
-		let message = format!("No files match “{}”", ui.filter);
+		let message = match ui.tree.matching_files() {
+			None => "searching…".to_owned(),
+			Some(_) => format!("No files match “{}”", ui.filter),
+		};
 		put(buf, body.x + 1, body.y, &message, fg(theme.dim), body.right());
 		return;
 	}
@@ -93,7 +98,7 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, ui: &mut Ui) {
 	let table_rows: Vec<Row> = (start..end)
 		.map(|index| {
 			let context = RowContext {
-				library: &view.library,
+				source,
 				row: rows[index],
 				selected: selected == Some(index),
 				filter: &ui.filter,
@@ -168,7 +173,7 @@ fn header_row(columns: Columns, theme: &Theme) -> Row<'static> {
 }
 
 struct RowContext<'a> {
-	library: &'a Library,
+	source: &'a dyn ArchiveSource,
 	row: tree::Row,
 	selected: bool,
 	filter: &'a str,
@@ -176,48 +181,97 @@ struct RowContext<'a> {
 }
 
 fn table_row(context: &RowContext, columns: Columns) -> Row<'static> {
-	let node = context.library.node(context.row.id);
+	let theme = context.theme;
 	let mut cells = vec![Cell::from(name_cell(context, columns.name))];
 
-	match &node.entry {
-		Entry::Folder(stats) => cells.extend(folder_cells(stats, columns, context.theme)),
-		Entry::File(status) => cells.extend(file_cells(status, columns, context.theme)),
+	match context.row.kind {
+		RowKind::Folder(folder, _) => {
+			let stats = context.source.view().library.stats(folder);
+			cells.extend(folder_cells(stats, columns, theme));
+		}
+		kind => {
+			if let Some(file) = tree::file_row(context.source, kind) {
+				cells.extend(file_cells(&file.status, columns, theme));
+			}
+		}
 	}
 
 	let row = Row::new(cells);
 	if context.selected {
-		row.style(Style::new().bg(context.theme.selection))
+		row.style(Style::new().bg(theme.selection))
 	} else {
 		row
 	}
 }
 
+struct Lead {
+	text: String,
+	style: Style,
+	name: String,
+	folder: bool,
+	issues: bool,
+}
+
+fn lead(context: &RowContext) -> Lead {
+	let theme = context.theme;
+	match context.row.kind {
+		RowKind::Folder(folder, fold) => {
+			let node = context.source.view().library.node(folder);
+			let arrow = match fold {
+				Fold::Closed => "▸ ",
+				Fold::FoldersOnly => "▿ ",
+				Fold::Open => "▾ ",
+			};
+			Lead {
+				text: arrow.to_owned(),
+				style: fg(theme.dim),
+				name: node.name.clone(),
+				folder: true,
+				issues: node.stats.open_issues > 0,
+			}
+		}
+		RowKind::Loading(_) => Lead {
+			text: "… ".to_owned(),
+			style: fg(theme.dim),
+			name: "loading…".to_owned(),
+			folder: false,
+			issues: false,
+		},
+		kind @ RowKind::File { .. } => {
+			let file = tree::file_row(context.source, kind);
+			let state = file.map_or(FileState::Queued, |file| file.status.state);
+			let color = theme.state(state);
+			Lead {
+				text: format!("{} ", glyph(state)),
+				style: if color == theme.dim { fg(color) } else { bold(color) },
+				name: file.map(|file| file.name.clone()).unwrap_or_default(),
+				folder: false,
+				issues: false,
+			}
+		}
+	}
+}
+
 fn name_cell(context: &RowContext, cells: usize) -> Line<'static> {
 	let theme = context.theme;
-	let node = context.library.node(context.row.id);
 	let indent = "  ".repeat(usize::from(context.row.depth));
+	let lead = lead(context);
 
-	let (lead, lead_style) = match &node.entry {
-		Entry::Folder(_) => (if context.row.open { "▾ " } else { "▸ " }.to_owned(), fg(theme.dim)),
-		Entry::File(status) => {
-			let color = theme.state(status.state);
-			let style = if color == theme.dim { fg(color) } else { bold(color) };
-			(format!("{} ", glyph(status.state)), style)
-		}
-	};
+	let marker = if lead.issues { " !" } else { "" };
+	let name_width = cells.saturating_sub(width(&indent) + width(&lead.text) + width(marker) + 1);
 
-	let folder = matches!(node.entry, Entry::Folder(_));
-	let has_issues = matches!(node.entry, Entry::Folder(stats) if stats.open_issues > 0);
-	let marker = if has_issues { " !" } else { "" };
-	let name_width = cells.saturating_sub(width(&indent) + width(&lead) + width(marker) + 1);
-
-	let mut name_style = fg(if folder { theme.bright } else { theme.text });
-	if folder || context.selected {
+	let loading = matches!(context.row.kind, RowKind::Loading(_));
+	let mut name_style = fg(match (lead.folder, loading) {
+		(true, _) => theme.bright,
+		(false, true) => theme.dim,
+		(false, false) => theme.text,
+	});
+	if lead.folder || context.selected {
 		name_style = name_style.add_modifier(Modifier::BOLD);
 	}
 
-	let shown = fit_middle(&node.name, name_width);
-	let mut spans = vec![Span::raw(indent), Span::styled(lead, lead_style)];
+	let shown = fit_middle(&lead.name, name_width);
+	let mut spans = vec![Span::raw(indent), Span::styled(lead.text, lead.style)];
 	spans.extend(highlighted(shown.trim_end(), context.filter, name_style, theme));
 	spans.push(Span::styled(marker, bold(theme.error)));
 	Line::from(spans)

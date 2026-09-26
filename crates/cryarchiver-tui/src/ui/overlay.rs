@@ -18,7 +18,8 @@ const HELP_LEFT: [(&str, &str); 8] = [
 	("z", "maximize library"),
 ];
 
-const HELP_RIGHT: [(&str, &str); 9] = [
+const HELP_RIGHT: [(&str, &str); 10] = [
+	("s", "settings"),
 	("l", "toggle log"),
 	("i", "issues"),
 	("m", "context menu"),
@@ -79,7 +80,7 @@ fn help_column(buf: &mut Buffer, area: Rect, entries: &[(&str, &str)], theme: &T
 }
 
 pub fn menu(buf: &mut Buffer, screen: Rect, menu: &Menu, default_anchor: (u16, u16), theme: &Theme, hits: &mut HitMap) {
-	let longest = menu.items.iter().map(|item| width(item.label())).max().unwrap_or(0);
+	let longest = menu.items.iter().map(|(_, label)| width(label)).max().unwrap_or(0);
 	let width = to_u16(longest.max(22) + 4);
 	let height = to_u16(menu.items.len() + 2);
 
@@ -91,7 +92,7 @@ pub fn menu(buf: &mut Buffer, screen: Rect, menu: &Menu, default_anchor: (u16, u
 	let inner = modal(buf, area, screen, theme, "");
 	hits.push(area, Hit::Menu);
 
-	for (index, (item, row)) in menu.items.iter().zip(inner.y..inner.bottom()).enumerate() {
+	for (index, ((_, label), row)) in menu.items.iter().zip(inner.y..inner.bottom()).enumerate() {
 		let hot = index == menu.selected;
 		let row_area = Rect::new(inner.x, row, inner.width, 1);
 		let (style, background) = if hot {
@@ -101,7 +102,7 @@ pub fn menu(buf: &mut Buffer, screen: Rect, menu: &Menu, default_anchor: (u16, u
 		};
 
 		buf.set_style(row_area, Style::new().bg(background));
-		put(buf, inner.x + 1, row, item.label(), style, inner.right());
+		put(buf, inner.x + 1, row, label, style, inner.right());
 		hits.push(row_area, Hit::MenuItem(index));
 	}
 }

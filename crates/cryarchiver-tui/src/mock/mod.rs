@@ -1,17 +1,26 @@
 //! A fake archive run for developing the TUI before the project layer exists. Seeded, so the same seed and the
 //! same number of [`MockSource::step`] calls always produce the same view.
 
+mod actions;
 mod build;
 mod details;
+mod filter;
+mod issues;
 mod rng;
 mod sim;
+mod store;
+mod summary;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use self::rng::Rng;
+use self::store::FileStore;
 use crate::source::{Action, ArchiveSource};
-use crate::view::{ArchiveView, FileDetails, Header, Log, NodeId, Overall, RunState, SystemStats, Workers};
+use crate::view::{
+	ArchiveView, FileDetails, FileId, FileRow, FilterResult, Header, IssueId, Log, NodeId, Notification, Overall,
+	RunState, Settings, Speed, SystemStats, WorkKind, Workers,
+};
 
 const TICK: Duration = Duration::from_millis(500);
 const START_CLOCK: u32 = 14 * 3600 + 2 * 60 + 7;
@@ -22,21 +31,28 @@ const VIDEO_SLOTS: usize = 3;
 const IMAGE_SLOTS: usize = 3;
 const SCAN_BATCH_INDEX: u64 = 29_000;
 const SCAN_EXTRA: u64 = 2_200;
+const LOW_DISK_TICKS: (u64, u64) = (80, 120);
 
 pub struct MockSource {
 	rng: Rng,
 	tick: u64,
 	view: ArchiveView,
-	kinds: Vec<Option<MediaKind>>,
-	showcase: BTreeMap<NodeId, Showcase>,
-	queue: VecDeque<NodeId>,
+	files: FileStore,
+	showcase: BTreeMap<FileId, Showcase>,
+	queue: VecDeque<FileId>,
 	jobs: Vec<Job>,
-	duplicate_of: BTreeMap<NodeId, NodeId>,
-	excluded: BTreeSet<NodeId>,
-	waiting: Vec<(NodeId, u64)>,
+	duplicate_of: BTreeMap<FileId, FileId>,
+	next_issue: u64,
 	scan_target: NodeId,
 	scan_remaining: u64,
 	scan_discovered: u64,
+	loaded: BTreeSet<NodeId>,
+	loading: Vec<(NodeId, u64)>,
+	load_latency: u64,
+	rows_version: u64,
+	filter: Option<FilterResult>,
+	notifications: Vec<Notification>,
+	delete_cursor: u64,
 	recent_savings: VecDeque<u64>,
 	last_refresh: Option<Instant>,
 }
@@ -61,9 +77,11 @@ struct Showcase {
 
 #[derive(Debug, Clone, Copy)]
 struct Job {
-	file: NodeId,
+	file: FileId,
+	work: WorkKind,
 	phase: Phase,
 	fps: f64,
+	over_limit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,11 +97,9 @@ impl MockSource {
 	pub fn new(seed: u64) -> Self {
 		let mut rng = Rng::new(seed);
 		let built = build::build(Rng::new(rng.next_u64()));
-		let waiting = built
-			.issues
-			.iter()
-			.filter(|issue| issue.state == crate::view::FileState::Waiting)
-			.map(|issue| (issue.file, 90))
+		let issues: Vec<_> = (0u64..)
+			.zip(built.issues)
+			.map(|(id, issue)| issue.into_issue(IssueId(id)))
 			.collect();
 
 		let mut source = Self {
@@ -91,62 +107,63 @@ impl MockSource {
 				header: Header {
 					source: r"D:\Archive\Family".to_owned(),
 					destination: r"E:\Archive-AV1\Family".to_owned(),
-					speed: "MODERATE".to_owned(),
 					codecs: "LATEST".to_owned(),
-					performance_limit: Some(50),
+					performance_limit: None,
 					run_state: RunState::Running,
+					deleting_originals: false,
 					demo: true,
 				},
-				overall: Overall {
-					files_done: 0,
-					files_active: 0,
-					files_queued: 0,
-					files_total: 0,
-					scan_complete: false,
-					progress: 0.0,
-					kept: 0,
-					duplicates: 0,
-					open_issues: 0,
-					saved_bytes: 0,
-					saved_fraction: 0.0,
-					savings_history: initial_history(&mut rng, 60, 400),
-					eta: None,
-					parity: None,
+				settings: Settings {
+					speed: Speed::Moderate,
+					min_savings: 10,
+					watch: false,
+					performance_limit: None,
+					stability_window: Duration::from_secs(30),
+					keep_auxiliary_images: true,
+					delete_originals: false,
 				},
+				overall: initial_overall(&mut rng),
 				workers: Workers {
 					jobs: Vec::new(),
 					slots: format!("{VIDEO_SLOTS} video + {IMAGE_SLOTS} image slots"),
 				},
 				system: SystemStats {
-					cpu_percent: 46,
-					cpu_history: initial_history(&mut rng, 38, 54),
+					cpu_percent: 72,
+					cpu_history: initial_history(&mut rng, 60, 92),
 					ram_used: 11_200_000_000,
 					ram_total: 32_000_000_000,
 					disk_label: "E:".to_owned(),
 					disk_free: 1_200_000_000_000,
-					low_priority: true,
+					low_priority: false,
 					toolchain: "ffmpeg 9.0.1 · SVT-AV1 4.2".to_owned(),
 				},
 				library: built.library,
 				log: Log::with_capacity(LOG_CAPACITY),
-				issues: built.issues,
+				issues,
 			},
 			rng,
 			tick: 0,
-			kinds: built.kinds,
+			next_issue: 0,
+			files: built.files,
 			showcase: built.showcase,
 			queue: built.queue,
 			jobs: built.jobs,
 			duplicate_of: built.duplicate_of,
-			excluded: BTreeSet::new(),
-			waiting,
 			scan_target: built.scan_target,
 			scan_remaining: SCAN_EXTRA,
 			scan_discovered: 0,
+			loaded: BTreeSet::new(),
+			loading: Vec::new(),
+			load_latency: 0,
+			rows_version: 0,
+			filter: None,
+			notifications: Vec::new(),
+			delete_cursor: 0,
 			recent_savings: VecDeque::new(),
 			last_refresh: None,
 		};
 
+		source.next_issue = source.view.issues.len() as u64;
 		source.seed_log();
 		source.summarize();
 		source
@@ -159,20 +176,40 @@ impl MockSource {
 		source
 	}
 
+	/// Folder rows then take this many ticks to load after [`Action::Expanded`], as a slow project would.
+	#[must_use]
+	pub fn with_load_latency(mut self, ticks: u64) -> Self {
+		self.load_latency = ticks;
+		self
+	}
+
 	/// Advances the simulation by one tick of half a second.
 	pub fn step(&mut self) {
 		let saved_before = self.view.overall.saved_bytes;
 		self.tick += 1;
 		self.update_system();
+		self.finish_loading();
+		self.update_disk_pause();
+
+		if self.view.header.run_state == RunState::Watching {
+			self.watch_for_new_files();
+		}
 
 		if self.view.header.run_state == RunState::Running {
 			self.discover();
+		}
+
+		if matches!(self.view.header.run_state, RunState::Running | RunState::PausedLowDisk) {
 			self.advance_jobs();
-			self.retry_waiting();
+		}
+
+		if self.view.header.run_state == RunState::Running {
 			self.start_jobs();
+			self.delete_originals();
 		}
 
 		self.summarize();
+		self.refresh_filter();
 		self.record_savings(saved_before);
 	}
 }
@@ -207,8 +244,24 @@ impl ArchiveSource for MockSource {
 		&self.view
 	}
 
-	fn details(&self, file: NodeId) -> Option<FileDetails> {
+	fn files(&self, folder: NodeId) -> Option<&[FileRow]> {
+		self.loaded.contains(&folder).then(|| self.files.in_folder(folder))
+	}
+
+	fn rows_version(&self) -> u64 {
+		self.rows_version
+	}
+
+	fn filter(&self) -> Option<&FilterResult> {
+		self.filter.as_ref()
+	}
+
+	fn details(&self, file: FileId) -> Option<FileDetails> {
 		details::build(self, file)
+	}
+
+	fn take_notifications(&mut self) -> Vec<Notification> {
+		std::mem::take(&mut self.notifications)
 	}
 
 	fn perform(&mut self, action: Action) {
@@ -219,6 +272,25 @@ impl ArchiveSource for MockSource {
 	fn shutdown(&mut self) {
 		self.stop_now();
 		self.summarize();
+	}
+}
+
+fn initial_overall(rng: &mut Rng) -> Overall {
+	Overall {
+		files_done: 0,
+		files_active: 0,
+		files_queued: 0,
+		files_total: 0,
+		scan_complete: false,
+		progress: 0.0,
+		kept: 0,
+		duplicates: 0,
+		open_issues: 0,
+		saved_bytes: 0,
+		saved_fraction: 0.0,
+		savings_history: initial_history(rng, 60, 400),
+		eta: None,
+		parity: None,
 	}
 }
 
