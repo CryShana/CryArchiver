@@ -3,7 +3,7 @@ source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app, 160, 45).backend()"
 ---
 " CryArchiver   DEMO  D:\Archive\Family → E:\Archive-AV1\Family         MODERATE · LATEST                            saved 223 GB (65 %) · ETA 9h 8m · ▶ running "
-"╭─ Library · maximized ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 44,558+ files [⤡]─╮"
+"╭─ Library · maximized ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 44,559+ files [⤡]─╮"
 "│Name                                                                                                 Status     Progress       Codec Size               Saved │"
 "│▾ Family !                                                                                           17k/44k    ━━━───── 38.6%       346 GB → 123 GB     −65% ┃"
 "│  ▿ Photos !                                                                                         8.8k/12k   ━━━━━━── 70.6%       93.6 GB → 22.8 GB   −76% ┃"

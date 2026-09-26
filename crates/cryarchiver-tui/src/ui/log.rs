@@ -12,7 +12,7 @@ use crate::view::{Log, NoticeLevel, Notification};
 
 pub fn render(buf: &mut Buffer, area: Rect, log: &Log, toast: Option<&Notification>, theme: &Theme, hits: &mut HitMap) {
 	if area.height <= 1 {
-		render_collapsed(buf, area, log, toast, theme);
+		render_collapsed(buf, area, log, theme);
 		hits.push(area, Hit::LogToggle);
 		return;
 	}
@@ -60,7 +60,7 @@ pub fn render(buf: &mut Buffer, area: Rect, log: &Log, toast: Option<&Notificati
 	List::new(items).render(inner, buf);
 }
 
-fn toast_color(level: NoticeLevel, theme: &Theme) -> Color {
+pub fn toast_color(level: NoticeLevel, theme: &Theme) -> Color {
 	match level {
 		NoticeLevel::Info => theme.accent,
 		NoticeLevel::Warning => theme.warn,
@@ -68,29 +68,24 @@ fn toast_color(level: NoticeLevel, theme: &Theme) -> Color {
 	}
 }
 
-/// The collapsed row shows a fresh notification in place of the latest log line.
-fn render_collapsed(buf: &mut Buffer, area: Rect, log: &Log, toast: Option<&Notification>, theme: &Theme) {
+fn render_collapsed(buf: &mut Buffer, area: Rect, log: &Log, theme: &Theme) {
 	buf.set_style(area, Style::new().bg(theme.panel));
 	let (y, right) = (area.y, area.right());
 	let hint = "l to expand ";
 	let hint_x = right.saturating_sub(to_u16(hint.len()) + 2);
 
 	let mut x = put(buf, area.x + 1, y, "▸ Log", bold(theme.bright), hint_x);
-	let latest = match (toast, log.latest()) {
-		(Some(toast), _) => Some(("◆", toast_color(toast.level, theme), toast.text.as_str())),
-		(None, Some(line)) => Some((
-			marker_glyph(line.marker),
-			theme.marker(line.marker),
-			line.message.as_str(),
-		)),
-		(None, None) => None,
-	};
-
-	if let Some((glyph, color, message)) = latest {
-		x = put(buf, x + 2, y, glyph, fg(color), hint_x);
+	if let Some(latest) = log.latest() {
+		x = put(
+			buf,
+			x + 2,
+			y,
+			marker_glyph(latest.marker),
+			fg(theme.marker(latest.marker)),
+			hint_x,
+		);
 		let room = usize::from(hint_x.saturating_sub(x + 3));
-		let style = if toast.is_some() { bold(color) } else { fg(theme.dim) };
-		put(buf, x + 1, y, &fit(message, room), style, hint_x);
+		put(buf, x + 1, y, &fit(&latest.message, room), fg(theme.dim), hint_x);
 	}
 
 	put(buf, hint_x, y, hint, fg(theme.dim), right);

@@ -15,11 +15,24 @@ impl MockSource {
 		self.rows_version += 1;
 	}
 
-	/// Statuses inside the result are copies, so an active filter is recomputed after every tick.
-	pub(super) fn refresh_filter(&mut self) {
-		if let Some(query) = self.filter.as_ref().map(|filter| filter.query.clone()) {
+	/// New files can add matches, so the result is rebuilt and the version bumped only after an insert. Otherwise
+	/// the statuses are patched into the rows in place, as `ArchiveSource::rows_version` promises.
+	pub(super) fn refresh_filter(&mut self, inserted: bool) {
+		let Some(query) = self.filter.as_ref().map(|filter| filter.query.clone()) else {
+			return;
+		};
+
+		if inserted {
 			self.filter = Some(self.compute_filter(query));
 			self.rows_version += 1;
+			return;
+		}
+
+		let files = &self.files;
+		for row in self.filter.iter_mut().flat_map(|filter| filter.rows.iter_mut()) {
+			if let FilterEntry::File { row, .. } = &mut row.entry {
+				row.status.clone_from(&files.get(row.id).status);
+			}
 		}
 	}
 

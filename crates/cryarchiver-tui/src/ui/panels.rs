@@ -335,7 +335,7 @@ fn render_system(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme
 	};
 	let body = content(panel(buf, area, theme, &chrome));
 	let system = &view.system;
-	let limit = view.header.performance_limit.map(|limit| limit.cap);
+	let limit = view.settings.performance_limit;
 	let cells = body.width.saturating_sub(11).max(6);
 	let (x, right) = (body.x, body.right());
 	let rows: Vec<u16> = (body.y..body.bottom()).collect();

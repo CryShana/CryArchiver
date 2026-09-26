@@ -65,32 +65,20 @@ fn deleting_originals_needs_delete_typed() {
 fn restarting_pending_jobs_asks_first() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('e'));
-	assert!(
-		app.source()
-			.view()
-			.header
-			.performance_limit
-			.is_some_and(|limit| limit.pending)
-	);
+	assert!(app.source().view().limit().is_some_and(|limit| limit.pending));
 
 	open_row(&mut app, 8);
 	press(&mut app, KeyCode::Enter);
 	assert_eq!(app.overlay(), Some(OverlayKind::ConfirmRestart));
 
 	press(&mut app, KeyCode::Esc);
-	assert!(
-		app.source()
-			.view()
-			.header
-			.performance_limit
-			.is_some_and(|limit| limit.pending)
-	);
+	assert!(app.source().view().limit().is_some_and(|limit| limit.pending));
 
 	open_row(&mut app, 8);
 	press(&mut app, KeyCode::Enter);
 	press(&mut app, KeyCode::Enter);
 	assert_eq!(
-		app.source().view().header.performance_limit,
+		app.source().view().limit(),
 		Some(Limit {
 			cap: 25,
 			pending: false

@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 
-use crate::app::App;
+use crate::app::{App, BURST_GAP};
 use crate::source::ArchiveSource;
 use crate::theme::ColorDepth;
 
@@ -41,6 +41,7 @@ pub fn run<S: ArchiveSource>(source: S) -> Result<(), RunError> {
 		Ok(terminal) => terminal,
 		Err(err) => {
 			ratatui::restore();
+			app.shutdown();
 			return Err(err.into());
 		}
 	};
@@ -88,7 +89,7 @@ fn event_loop<S: ArchiveSource>(terminal: &mut DefaultTerminal, app: &mut App<S>
 fn pump<S: ArchiveSource>(
 	terminal: &mut DefaultTerminal,
 	app: &mut App<S>,
-	events: &Receiver<io::Result<Event>>,
+	events: &Receiver<io::Result<(Event, Instant)>>,
 ) -> Result<(), RunError> {
 	let mut dirty = true;
 	let mut captured = app.mouse_capture();
@@ -97,11 +98,8 @@ fn pump<S: ArchiveSource>(
 
 	loop {
 		match events.recv_timeout(next_frame.saturating_duration_since(Instant::now())) {
-			Ok(event) => {
-				app.handle_event(&event?, Instant::now());
-				while let Ok(event) = events.try_recv() {
-					app.handle_event(&event?, Instant::now());
-				}
+			Ok(first) => {
+				app.handle_batch(&gather(first?, events)?);
 				dirty = true;
 			}
 			Err(RecvTimeoutError::Timeout) => {}
@@ -136,6 +134,19 @@ fn pump<S: ArchiveSource>(
 	}
 }
 
+/// Collects the events that follow the first one closely. A paste arrives as a quick run of key presses, and the app
+/// can only keep it out of the shortcuts when it sees the whole run at once.
+fn gather(
+	first: (Event, Instant),
+	events: &Receiver<io::Result<(Event, Instant)>>,
+) -> io::Result<Vec<(Event, Instant)>> {
+	let mut batch = vec![first];
+	while let Ok(next) = events.recv_timeout(BURST_GAP) {
+		batch.push(next?);
+	}
+	Ok(batch)
+}
+
 /// A terminal that refuses the change keeps its current mode, and the app is told so.
 fn apply_mouse_capture<S: ArchiveSource>(app: &mut App<S>, captured: bool) -> bool {
 	let wanted = app.mouse_capture();
@@ -154,13 +165,13 @@ fn apply_mouse_capture<S: ArchiveSource>(app: &mut App<S>, captured: bool) -> bo
 }
 
 /// Crossterm's blocking read runs on its own thread, so the UI thread only ever waits on the channel.
-fn spawn_input(stop: Arc<AtomicBool>) -> (Receiver<io::Result<Event>>, JoinHandle<()>) {
+fn spawn_input(stop: Arc<AtomicBool>) -> (Receiver<io::Result<(Event, Instant)>>, JoinHandle<()>) {
 	let (sender, receiver) = mpsc::channel();
 	let reader = thread::spawn(move || {
 		while !stop.load(Ordering::Relaxed) {
 			let next = match event::poll(INPUT_POLL) {
 				Ok(false) => continue,
-				Ok(true) => event::read(),
+				Ok(true) => event::read().map(|event| (event, Instant::now())),
 				Err(err) => Err(err),
 			};
 

@@ -124,8 +124,11 @@ impl MockSource {
 
 	fn log_tail(&self, file: FileId, status: &FileStatus) -> Vec<String> {
 		let issue = self.view.issues.iter().find(|issue| issue.file == Some(file));
-		if let Some(last) = issue.and_then(|issue| issue.attempts.last()) {
-			return last.lines.clone();
+		if let Some(last) = issue
+			.and_then(|issue| self.issue_logs.get(&issue.id))
+			.and_then(|logs| logs.last())
+		{
+			return last.clone();
 		}
 
 		let job = self.jobs.iter().find(|job| job.file == file);

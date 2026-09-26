@@ -157,7 +157,7 @@ impl Builder {
 		file: FileId,
 		kind: IssueKind,
 		reason: &'static str,
-		attempts: Vec<crate::view::AttemptLog>,
+		attempts: Vec<super::issues::AttemptLog>,
 	) {
 		let folder = self.files.folder(file);
 		self.issues.push(NewIssue {
@@ -252,10 +252,10 @@ impl Builder {
 			file,
 			IssueKind::OutputMissing,
 			"Destination output missing: DSC_1004.avif was deleted outside CryArchiver",
-			vec![attempt(
-				1,
-				&["full reconcile: DSC_1004.avif not found", "recorded size 2.31 MB"],
-			)],
+			vec![attempt(&[
+				"full reconcile: DSC_1004.avif not found",
+				"recorded size 2.31 MB",
+			])],
 		);
 	}
 
@@ -338,15 +338,12 @@ impl Builder {
 			damaged,
 			IssueKind::SourceDamaged,
 			"Source damaged: JPEG has no EOI marker",
-			vec![attempt(
-				1,
-				&[
-					"[mjpeg] EOI missing, emulating",
-					"[mjpeg] overread 8",
-					"decoded 900 of 1800 rows",
-					"structural check: EOI not found after last SOS",
-				],
-			)],
+			vec![attempt(&[
+				"[mjpeg] EOI missing, emulating",
+				"[mjpeg] overread 8",
+				"decoded 900 of 1800 rows",
+				"structural check: EOI not found after last SOS",
+			])],
 		);
 
 		self.generate(
@@ -477,17 +474,14 @@ impl Builder {
 			IssueKind::EncodeFailed,
 			"Encode failed the same way 3 times",
 			vec![
-				attempt(1, &[failure[0], failure[1], "Conversion failed!", "exit code 1"]),
-				attempt(2, &[failure[0], "Conversion failed!", "exit code 1 (retry after 30 s)"]),
-				attempt(
-					3,
-					&[
-						failure[0],
-						failure[1],
-						"Conversion failed!",
-						"exit code 1 (attempt 3/3)",
-					],
-				),
+				attempt(&[failure[0], failure[1], "Conversion failed!", "exit code 1"]),
+				attempt(&[failure[0], "Conversion failed!", "exit code 1 (retry after 30 s)"]),
+				attempt(&[
+					failure[0],
+					failure[1],
+					"Conversion failed!",
+					"exit code 1 (attempt 3/3)",
+				]),
 			],
 		);
 
@@ -567,8 +561,12 @@ impl Builder {
 			},
 		);
 
+		let copy = "battle-music (copy).mp3";
+		let second = self.file(ost, copy, MediaKind::Audio, FileState::Duplicate, 1_150_000);
+
 		let canonical = self.file(music, name, MediaKind::Audio, FileState::Done, 1_150_000);
 		self.duplicate_of.insert(duplicate, canonical);
+		self.duplicate_of.insert(second, canonical);
 	}
 
 	fn screenshots(&mut self, screenshots: NodeId) -> NodeId {
@@ -662,13 +660,10 @@ impl Builder {
 			locked,
 			IssueKind::SourceUnreadable,
 			"Source unreadable: access is denied",
-			vec![attempt(
-				1,
-				&[
-					"open D:\\Archive\\Family\\Documents\\locked_contract.pdf",
-					"os error 5: access is denied",
-				],
-			)],
+			vec![attempt(&[
+				"open D:\\Archive\\Family\\Documents\\locked_contract.pdf",
+				"os error 5: access is denied",
+			])],
 		);
 
 		self.generate(

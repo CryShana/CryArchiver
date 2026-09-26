@@ -1,18 +1,18 @@
 ---
 source: crates/cryarchiver-tui/tests/render.rs
-expression: "draw(&mut app, 120, 36).backend()"
+expression: terminal.backend()
 ---
-" CryArchiver   DEMO   ⚠ DELETING ORIGINALS  D:\Archive\Fa…mily  MODERATE · LATEST  ⚡ limit 25 % · applying…  ▶ running " Hidden by multi-width symbols: [(84, " ")]
+" CryArchiver   DEMO   ⚠ DELETING ORIGINALS  D:\Archive\Fam…mily  MODERATE · LATEST  ⚡ limit 25 % · applying… ▶ running " Hidden by multi-width symbols: [(85, " ")]
 "╭─ Overall ────────────────────────╮╭─ Workers ─── 6 active · 3 video + 3 image slots ─╮╭─ System ─────────────────────╮"
-"│ 38.6% of 44,558+ files           ││ #1 AV1  IMG_0001 2.MOV     limit   ━━━━━── 64.9% ││ CPU ████┃█████████▊    87%   │"
+"│ 38.6% of 44,559+ files           ││ #1 AV1  IMG_0001 2.MOV     limit   ━━━━━── 64.9% ││ CPU ████┃█████████▊    87%   │"
 "│ ████████████▍                    ││ #2 AV1  2018 - UT…oPro.mkv encode  ━━━━━━━ 98.6% ││     ▅▅▆█▇▆▆▆▇▇▇▇▇▇▇▇▇        │"
-"│ ✓ 17,240 done  ● 6 active        ││ #3 AV1  Concertos…mple.mkv limit   ━━───── 24.0% ││ RAM █████▉            11/32G │"
+"│ ✓ 17,241 done  ● 6 active        ││ #3 AV1  Concertos…mple.mkv limit   ━━───── 24.0% ││ RAM █████▉            11/32G │"
 "│ ! 6 issues  = 520 kept           ││ #4 AVIF DSC_4704.JPG       limit   ━━━━─── 61.9% ││ Disk E: · 1.20 TB free       │"
 "│ Saved 223 GB (65 %)    ▃▃▃▃▃▇▇▇█ ││ #5 AVIF DSC_4705.JPG       limit   ━━━━━── 74.0% ││ ⚡ limit 25 % · priority low │" Hidden by multi-width symbols: [(91, " ")]
 "│ ETA 9h 8m · grows while scanning ││ #6 AVIF DSC_4706.JPG       limit   ───────  0.0% ││ ffmpeg 9.0.1 · SVT-AV1 4.2   │"
 "│                                  ││                                                  ││                              │"
 "╰──────────────────────────────────╯╰──────────────────────────────────────────────────╯╰──────────────────────────────╯"
-"╭─ Library ───────────────────────────────────────────────────────────────────────────────────────── 44,558+ files [⤢]─╮"
+"╭─ Library ───────────────────────────────────────────────────────────────────────────────────────── 44,559+ files [⤢]─╮"
 "│Name                                                         Status     Progress       Codec Size               Saved │"
 "│▾ Family !                                                   17k/44k    ━━━───── 38.6%       346 GB → 123 GB     −65% ┃"
 "│  ▿ Photos !                                                 8.8k/12k   ━━━━━━── 70.6%       93.6 GB → 22.8 GB   −76% ┃"

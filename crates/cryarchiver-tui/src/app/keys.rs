@@ -3,19 +3,25 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use super::tree::{Expansion, RowKind, Selection};
-use super::{Lifecycle, Outcome, Overlay, Ui, ViewMode};
+use super::{DuplicateCycle, Lifecycle, Outcome, Overlay, Ui, ViewMode};
 use crate::source::{Action, ArchiveSource};
 use crate::view::{Duplicates, FileId, IssueVerbs, RunState, Verb};
 
 impl Ui {
-	pub(super) fn on_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
+	/// `burst` marks a key that belongs to a paste delivered as key presses: it may only type into a text field.
+	pub(super) fn on_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent, burst: bool) -> Outcome {
 		if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
 			self.lifecycle = Lifecycle::Quitting;
 			return Outcome::Done;
 		}
 
+		let typing = self.search.is_some() || matches!(self.overlay, Some(Overlay::ConfirmDelete(_)));
+		if burst && (!typing || key.code == KeyCode::Enter) {
+			return Outcome::Ignored;
+		}
+
 		if self.search.is_some() {
-			return self.on_search_key(key);
+			return self.on_search_key(source, key);
 		}
 
 		if self.overlay.is_some() {
@@ -35,7 +41,7 @@ impl Ui {
 	}
 
 	/// Bracketed paste only reaches text inputs, so pasted text never fires shortcuts.
-	pub(super) fn on_paste(&mut self, text: &str) {
+	pub(super) fn on_paste(&mut self, source: &dyn ArchiveSource, text: &str) {
 		let ((Some(input), _) | (None, Some(Overlay::ConfirmDelete(input)))) = (&mut self.search, &mut self.overlay)
 		else {
 			return;
@@ -46,15 +52,16 @@ impl Ui {
 		}
 
 		if let Some(query) = self.search.as_ref().map(|input| input.value().to_owned()) {
-			self.set_filter(query);
+			self.set_filter(&source.view().library, query);
 		}
 	}
 
-	fn on_search_key(&mut self, key: KeyEvent) -> Outcome {
+	fn on_search_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
+		let library = &source.view().library;
 		match key.code {
 			KeyCode::Esc => {
 				self.search = None;
-				self.set_filter(String::new());
+				self.set_filter(library, String::new());
 			}
 			KeyCode::Enter => self.search = None,
 			KeyCode::Up => self.tree.move_by(-1),
@@ -67,7 +74,7 @@ impl Ui {
 				};
 				input.handle_event(&Event::Key(key));
 				let query = input.value().to_owned();
-				self.set_filter(query);
+				self.set_filter(library, query);
 			}
 		}
 		Outcome::Done
@@ -85,6 +92,7 @@ impl Ui {
 				}
 				KeyCode::Esc | KeyCode::Char('m') => self.overlay = None,
 				KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
+				KeyCode::F(2) => self.mouse_capture = !self.mouse_capture,
 				_ => {}
 			},
 			Some(Overlay::Settings(selected)) => {
@@ -95,6 +103,7 @@ impl Ui {
 			Some(Overlay::ConfirmRestart) => return self.on_confirm_restart_key(key),
 			Some(Overlay::Help) | None => match key.code {
 				KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
+				KeyCode::F(2) => self.mouse_capture = !self.mouse_capture,
 				KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => self.overlay = None,
 				_ => {}
 			},
@@ -127,7 +136,7 @@ impl Ui {
 				};
 			}
 			KeyCode::Char('m') => return self.open_menu(source, None),
-			KeyCode::Esc => return self.escape(),
+			KeyCode::Esc => return self.escape(source),
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done
@@ -158,7 +167,7 @@ impl Ui {
 			(KeyCode::End, _) => self.tree.select_last(),
 			(KeyCode::Left, _) => self.collapse_or_parent(source),
 			(KeyCode::Right, Some(Selection::Folder(folder))) => self.expand_or_child(folder),
-			(KeyCode::Enter, Some(Selection::Folder(folder))) => self.tree.toggle(folder),
+			(KeyCode::Enter, Some(Selection::Folder(folder))) if self.filter.is_empty() => self.tree.toggle(folder),
 			(KeyCode::Enter, Some(Selection::File { .. })) => self.mode = ViewMode::Details,
 			(KeyCode::Char('r'), Some(Selection::Folder(folder))) => self.actions.push(Action::RetryFailedIn(folder)),
 			(KeyCode::Char('r'), Some(Selection::File { file, .. })) => {
@@ -232,10 +241,27 @@ impl Ui {
 
 	fn jump_to_duplicate(&mut self, source: &dyn ArchiveSource, file: FileId) -> Outcome {
 		let target = match source.details(file).map(|details| details.duplicates) {
-			Some(Duplicates::PlaceholderOf(link)) => link,
+			Some(Duplicates::PlaceholderOf(link)) => {
+				self.duplicate_cycle = self
+					.duplicate_cycle
+					.filter(|cycle| cycle.original == link.file)
+					.map(|cycle| DuplicateCycle {
+						landed: link.file,
+						..cycle
+					});
+				link
+			}
 			Some(Duplicates::CanonicalOf(links)) if !links.is_empty() => {
-				let link = links[self.duplicate_cursor % links.len()].clone();
-				self.duplicate_cursor += 1;
+				let next = self
+					.duplicate_cycle
+					.filter(|cycle| cycle.original == file)
+					.map_or(0, |cycle| cycle.next);
+				let link = links[next % links.len()].clone();
+				self.duplicate_cycle = Some(DuplicateCycle {
+					original: file,
+					next: next + 1,
+					landed: link.file,
+				});
 				link
 			}
 			_ => return Outcome::Ignored,
@@ -250,7 +276,7 @@ impl Ui {
 		let last = issues.len().saturating_sub(1);
 		self.issue_selected = self.issue_selected.min(last);
 		let issue = issues.get(self.issue_selected);
-		let attempts = issue.map_or(0, |issue| issue.attempts.len());
+		let attempts = issue.map_or(0, |issue| usize::try_from(issue.attempts).unwrap_or(usize::MAX));
 
 		match key.code {
 			KeyCode::Up | KeyCode::Char('k') => self.select_issue(self.issue_selected.saturating_sub(1)),

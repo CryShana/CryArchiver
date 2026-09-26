@@ -23,18 +23,28 @@ pub struct Header {
 	pub source: String,
 	pub destination: String,
 	pub codecs: String,
-	pub performance_limit: Option<Limit>,
+	/// Part of the performance limit can't reach running jobs yet; the workers it affects carry `over_limit`.
+	pub limit_pending: bool,
 	pub run_state: RunState,
 	pub deleting_originals: bool,
 	/// The data is made up, as with the mock source.
 	pub demo: bool,
 }
 
+/// The performance limit as the header shows it: the stored cap plus whether it is still being applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limit {
 	pub cap: u8,
-	/// Part of the limit can't reach running jobs yet; the workers it affects carry `over_limit`.
 	pub pending: bool,
+}
+
+impl ArchiveView {
+	pub fn limit(&self) -> Option<Limit> {
+		self.settings.performance_limit.map(|cap| Limit {
+			cap,
+			pending: self.header.limit_pending,
+		})
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,7 +444,8 @@ pub struct Notification {
 	pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ordered by severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NoticeLevel {
 	Info,
 	Warning,
@@ -468,8 +479,8 @@ pub struct Issue {
 	pub reason: String,
 	pub resolution: String,
 	pub verbs: IssueVerbs,
-	/// Oldest first; may be empty.
-	pub attempts: Vec<AttemptLog>,
+	/// Attempts with a failure log, numbered from 1; fetch one with `ArchiveSource::issue_log`.
+	pub attempts: u32,
 }
 
 /// The resolutions an issue kind allows. A `Some` label is the kind's own name for the verb, such as "Copy original".
@@ -495,12 +506,6 @@ pub enum Verb {
 	Retry,
 	Accept,
 	Exclude,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttemptLog {
-	pub attempt: u32,
-	pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -71,7 +71,7 @@ impl SettingsRow {
 			}
 			Self::Rescan => "⏎".to_owned(),
 			Self::RestartPendingJobs => {
-				let pending = view.header.performance_limit.is_some_and(|limit| limit.pending);
+				let pending = view.limit().is_some_and(|limit| limit.pending);
 				if pending {
 					"⏎ · progress will be lost"
 				} else {
@@ -95,6 +95,7 @@ impl Ui {
 			KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => self.adjust(source, row, 1),
 			KeyCode::Esc | KeyCode::Char('s') => self.overlay = None,
 			KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
+			KeyCode::F(2) => self.mouse_capture = !self.mouse_capture,
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done
@@ -132,7 +133,7 @@ impl Ui {
 				return;
 			}
 			SettingsRow::RestartPendingJobs => {
-				if view.header.performance_limit.is_some_and(|limit| limit.pending) {
+				if view.limit().is_some_and(|limit| limit.pending) {
 					self.overlay = Some(Overlay::ConfirmRestart);
 				}
 				return;

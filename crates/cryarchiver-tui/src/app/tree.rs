@@ -94,6 +94,8 @@ pub struct TreeState {
 	matching_files: Option<usize>,
 	selected: Option<Selection>,
 	pending: Option<FileId>,
+	/// Set by reveals: the next rebuild scrolls to the selection instead of keeping the viewport where it was.
+	follow: bool,
 	selected_index: usize,
 	scroll: usize,
 	page: usize,
@@ -110,6 +112,7 @@ impl TreeState {
 			matching_files: None,
 			selected: None,
 			pending: None,
+			follow: false,
 			selected_index: 0,
 			scroll: 0,
 			page: 10,
@@ -128,6 +131,11 @@ impl TreeState {
 
 	pub fn selected(&self) -> Option<Selection> {
 		self.rows.get(self.selected_index).and_then(|row| row.selection())
+	}
+
+	/// The selection as asked for, including a file whose row hasn't loaded yet.
+	pub fn target(&self) -> Option<Selection> {
+		self.selected
 	}
 
 	pub fn selected_index(&self) -> Option<usize> {
@@ -159,9 +167,28 @@ impl TreeState {
 			return;
 		}
 
+		let filter_changed = self.key.as_ref().is_some_and(|old| old.filter != key.filter);
+		let top = self.rows.get(self.scroll).and_then(|row| row.selection());
+
 		self.rebuild(source, filter);
 		self.key = Some(key);
-		self.reselect();
+		let moved = self.reselect();
+		self.place_viewport(top, moved || filter_changed);
+	}
+
+	/// Keeps the row that was at the top of the viewport at the top, so a rebuild never scrolls under the user.
+	/// Only a landed reveal, a lost selection or a new filter scrolls to the selection instead.
+	fn place_viewport(&mut self, top: Option<Selection>, follow_selection: bool) {
+		let follow = std::mem::take(&mut self.follow) || follow_selection;
+		let anchored = top.and_then(|top| self.position(|row| row.shows(top)));
+
+		match anchored {
+			Some(index) if !follow => {
+				self.scroll = index;
+				self.clamp_scroll();
+			}
+			_ => self.ensure_visible(),
+		}
 	}
 
 	/// Records the body height of the frame on screen, so paging and scrolling match what the user sees.
@@ -255,6 +282,8 @@ impl TreeState {
 		self.open_ancestors(library, folder);
 		self.selected = Some(Selection::Folder(folder));
 		self.pending = None;
+		self.follow = true;
+		self.key = None;
 	}
 
 	/// Opens the file's folder and selects the file once its rows have loaded.
@@ -266,6 +295,7 @@ impl TreeState {
 
 		self.selected = Some(Selection::File { file, folder });
 		self.pending = Some(file);
+		self.follow = true;
 		self.key = None;
 	}
 
@@ -348,31 +378,35 @@ impl TreeState {
 		}));
 	}
 
-	fn reselect(&mut self) {
+	/// Returns whether the selection moved on its own: a pending reveal landed, or the selected row disappeared.
+	fn reselect(&mut self) -> bool {
 		if let Some(file) = self.pending
 			&& let Some(index) = self.position(|row| matches!(row.kind, RowKind::File { file: id, .. } if id == file))
 		{
 			self.selected_index = index;
 			self.pending = None;
-			self.ensure_visible();
-			return;
+			return true;
 		}
 
 		let target = self.selected;
 		let found = target.and_then(|selection| self.position(|row| row.shows(selection)));
 		match (found, target) {
-			(Some(index), _) => self.selected_index = index,
+			(Some(index), _) => {
+				self.selected_index = index;
+				false
+			}
 			(None, Some(Selection::File { folder, .. })) if self.pending.is_some() => {
 				if let Some(index) = self.position(|row| row.shows(Selection::Folder(folder))) {
 					self.selected_index = index;
 				}
+				false
 			}
 			_ => {
 				self.selected_index = 0;
 				self.selected = self.rows.first().and_then(|row| row.selection());
+				true
 			}
 		}
-		self.ensure_visible();
 	}
 
 	fn position(&self, wanted: impl Fn(&Row) -> bool) -> Option<usize> {

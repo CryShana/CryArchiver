@@ -195,26 +195,52 @@ fn details_step_through_files_and_skip_folders() {
 	assert_eq!(app.selected(), Some(second));
 }
 
+fn open_fanfares_original(app: &mut cryarchiver_tui::App<cryarchiver_tui::MockSource>) -> Selection {
+	press(app, KeyCode::Char('/'));
+	type_text(app, "fanfares");
+	press(app, KeyCode::Enter);
+	press(app, KeyCode::End);
+	press(app, KeyCode::Enter);
+	app.selected().unwrap()
+}
+
 #[test]
-fn g_goes_back_and_forth_between_a_duplicate_and_its_original() {
+fn g_cycles_through_the_duplicates_of_an_original() {
 	let mut app = app();
-	press(&mut app, KeyCode::Char('/'));
-	type_text(&mut app, "fanfares");
-	press(&mut app, KeyCode::Enter);
-	press(&mut app, KeyCode::End);
-	press(&mut app, KeyCode::Enter);
-	let canonical = app.selected().unwrap();
+	let original = open_fanfares_original(&mut app);
 
 	press(&mut app, KeyCode::Char('g'));
-	let duplicate = app.selected().unwrap();
-	assert_ne!(duplicate, canonical);
+	let first = app.selected().unwrap();
+	assert_ne!(first, original);
 	assert_eq!(app.mode(), ViewMode::Details);
 
 	press(&mut app, KeyCode::Char('g'));
-	assert_eq!(app.selected(), Some(canonical));
+	assert_eq!(app.selected(), Some(original), "a duplicate leads back to its original");
 
 	press(&mut app, KeyCode::Char('g'));
-	assert_eq!(app.selected(), Some(duplicate), "the only duplicate comes round again");
+	let second = app.selected().unwrap();
+	assert_ne!(second, first);
+	assert_ne!(second, original);
+
+	press(&mut app, KeyCode::Char('g'));
+	press(&mut app, KeyCode::Char('g'));
+	assert_eq!(app.selected(), Some(first), "the cycle wraps around");
+}
+
+#[test]
+fn g_starts_over_once_the_selection_moves_elsewhere() {
+	let mut app = app();
+	let original = open_fanfares_original(&mut app);
+	press(&mut app, KeyCode::Char('g'));
+	let first = app.selected().unwrap();
+	press(&mut app, KeyCode::Char('g'));
+
+	press(&mut app, KeyCode::Up);
+	press(&mut app, KeyCode::Down);
+	assert_eq!(app.selected(), Some(original));
+
+	press(&mut app, KeyCode::Char('g'));
+	assert_eq!(app.selected(), Some(first));
 }
 
 #[test]
@@ -271,7 +297,7 @@ fn p_and_e_reach_the_source() {
 
 	let header = &app.source().view().header;
 	assert_eq!(header.run_state, RunState::Paused);
-	assert_eq!(header.performance_limit, Some(Limit { cap: 25, pending: true }));
+	assert_eq!(app.source().view().limit(), Some(Limit { cap: 25, pending: true }));
 }
 
 #[test]

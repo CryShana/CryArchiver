@@ -10,6 +10,8 @@ mod settings;
 mod small;
 mod widgets;
 
+pub use self::issues::AttemptLog;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
@@ -81,13 +83,15 @@ impl Areas {
 	}
 }
 
-pub fn draw(
-	frame: &mut Frame,
-	source: &dyn ArchiveSource,
-	details: Option<&FileDetails>,
-	toast: Option<&Notification>,
-	ui: &mut Ui,
-) {
+/// What the app fetched from the source on demand for this frame, beside the view itself.
+pub struct Fetched<'a> {
+	pub details: Option<&'a FileDetails>,
+	pub issue_log: Option<AttemptLog<'a>>,
+	pub toast: Option<&'a Notification>,
+}
+
+pub fn draw(frame: &mut Frame, source: &dyn ArchiveSource, fetched: &Fetched, ui: &mut Ui) {
+	let details = fetched.details;
 	let view = source.view();
 	let area = frame.area();
 	let buf = frame.buffer_mut();
@@ -125,14 +129,29 @@ pub fn draw(
 				&mut ui.hits,
 			);
 		}
-		ViewMode::Issues => issues::render(buf, areas.main, &view.issues, ui),
+		ViewMode::Issues => issues::render(buf, areas.main, &view.issues, fetched.issue_log.as_ref(), ui),
 	}
 
 	if let Some(log) = areas.log {
-		log::render(buf, log, &view.log, toast, &ui.theme, &mut ui.hits);
+		log::render(
+			buf,
+			log,
+			&view.log,
+			fetched.toast.filter(|_| ui.layout.log_open),
+			&ui.theme,
+			&mut ui.hits,
+		);
 	}
 
-	footer::render(buf, areas.footer, view, details, ui);
+	let log_hidden = ui.layout.maximized || !ui.layout.log_open;
+	footer::render(
+		buf,
+		areas.footer,
+		view,
+		details,
+		fetched.toast.filter(|_| log_hidden),
+		ui,
+	);
 	draw_overlay(buf, area, areas.main, view, ui);
 
 	if ui.lifecycle == Lifecycle::Stopping {

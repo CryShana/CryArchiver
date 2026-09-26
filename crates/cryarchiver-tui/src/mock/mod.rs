@@ -43,6 +43,7 @@ pub struct MockSource {
 	jobs: Vec<Job>,
 	duplicate_of: BTreeMap<FileId, FileId>,
 	next_issue: u64,
+	issue_logs: BTreeMap<IssueId, Vec<issues::AttemptLog>>,
 	scan_target: NodeId,
 	scan_remaining: u64,
 	scan_discovered: u64,
@@ -97,10 +98,14 @@ impl MockSource {
 	pub fn new(seed: u64) -> Self {
 		let mut rng = Rng::new(seed);
 		let built = build::build(Rng::new(rng.next_u64()));
-		let issues: Vec<_> = (0u64..)
+		let (issues, issue_logs): (Vec<_>, BTreeMap<_, _>) = (0u64..)
 			.zip(built.issues)
-			.map(|(id, issue)| issue.into_issue(IssueId(id)))
-			.collect();
+			.map(|(id, issue)| {
+				let id = IssueId(id);
+				let (issue, logs) = issue.into_issue(id);
+				(issue, (id, logs))
+			})
+			.unzip();
 
 		let mut source = Self {
 			view: ArchiveView {
@@ -108,7 +113,7 @@ impl MockSource {
 					source: r"D:\Archive\Family".to_owned(),
 					destination: r"E:\Archive-AV1\Family".to_owned(),
 					codecs: "LATEST".to_owned(),
-					performance_limit: None,
+					limit_pending: false,
 					run_state: RunState::Running,
 					deleting_originals: false,
 					demo: true,
@@ -144,6 +149,7 @@ impl MockSource {
 			rng,
 			tick: 0,
 			next_issue: 0,
+			issue_logs,
 			files: built.files,
 			showcase: built.showcase,
 			queue: built.queue,
@@ -186,6 +192,7 @@ impl MockSource {
 	/// Advances the simulation by one tick of half a second.
 	pub fn step(&mut self) {
 		let saved_before = self.view.overall.saved_bytes;
+		let files_before = self.files.len();
 		self.tick += 1;
 		self.update_system();
 		self.finish_loading();
@@ -209,7 +216,7 @@ impl MockSource {
 		}
 
 		self.summarize();
-		self.refresh_filter();
+		self.refresh_filter(self.files.len() != files_before);
 		self.record_savings(saved_before);
 	}
 }
@@ -260,6 +267,11 @@ impl ArchiveSource for MockSource {
 		details::build(self, file)
 	}
 
+	fn issue_log(&self, issue: IssueId, attempt: u32) -> Option<Vec<String>> {
+		let index = usize::try_from(attempt.checked_sub(1)?).ok()?;
+		self.issue_logs.get(&issue)?.get(index).cloned()
+	}
+
 	fn take_notifications(&mut self) -> Vec<Notification> {
 		std::mem::take(&mut self.notifications)
 	}
@@ -267,6 +279,7 @@ impl ArchiveSource for MockSource {
 	fn perform(&mut self, action: Action) {
 		self.apply(action);
 		self.summarize();
+		self.refresh_filter(false);
 	}
 
 	fn shutdown(&mut self) {

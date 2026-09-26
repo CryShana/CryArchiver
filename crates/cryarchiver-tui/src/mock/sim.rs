@@ -1,11 +1,11 @@
-use super::issues::{NewIssue, attempt};
+use super::issues::{AttemptLog, NewIssue, attempt};
 use super::{
 	IMAGE_SLOTS, Job, LOW_DISK_TICKS, MediaKind, MockSource, Phase, SCAN_BATCH_INDEX, START_CLOCK, VIDEO_SLOTS, build,
 };
 use crate::format::{bytes, saving};
 use crate::view::{
-	AttemptLog, ClockTime, FileId, FileState, FileStatus, IssueId, IssueKind, LogLine, LogMarker, NoticeLevel,
-	Notification, RunState, WorkKind,
+	ClockTime, FileId, FileState, FileStatus, IssueId, IssueKind, LogLine, LogMarker, NoticeLevel, Notification,
+	RunState, WorkKind,
 };
 
 pub(super) const PROBES: [(f64, f64); 4] = [(34.0, 92.4), (29.0, 96.0), (30.25, 95.1), (30.75, 94.9)];
@@ -85,9 +85,9 @@ impl MockSource {
 
 	pub(super) fn update_system(&mut self) {
 		let running = self.view.header.run_state == RunState::Running;
-		let (low, high) = match (running, self.view.header.performance_limit) {
+		let (low, high) = match (running, self.view.settings.performance_limit) {
 			(false, _) => (2, 12),
-			(true, Some(limit)) => (u64::from(limit.cap).saturating_sub(18), u64::from(limit.cap) + 4),
+			(true, Some(cap)) => (u64::from(cap).saturating_sub(18), u64::from(cap) + 4),
 			(true, None) => (70, 97),
 		};
 
@@ -371,7 +371,7 @@ impl MockSource {
 			format!("{name} failed 3 times · waiting for your decision"),
 		);
 		let lines = ["[h264] Invalid NAL unit size (1197 > 1024)", "Conversion failed!"];
-		let attempts = (1..=3).map(|number| attempt(number, &[lines[0], lines[1]])).collect();
+		let attempts = (0..3).map(|_| attempt(&[lines[0], lines[1]])).collect();
 		self.open_issue(
 			file,
 			IssueKind::EncodeFailed,
@@ -397,7 +397,7 @@ impl MockSource {
 			file,
 			IssueKind::SourceDamaged,
 			"Source damaged: the file ends early",
-			vec![attempt(1, &lines)],
+			vec![attempt(&lines)],
 		);
 	}
 
@@ -429,7 +429,9 @@ impl MockSource {
 
 		let id = IssueId(self.next_issue);
 		self.next_issue += 1;
-		self.view.issues.push(issue.into_issue(id));
+		let (issue, logs) = issue.into_issue(id);
+		self.view.issues.push(issue);
+		self.issue_logs.insert(id, logs);
 	}
 
 	pub(super) fn requeue_front(&mut self, file: FileId) {
@@ -438,8 +440,8 @@ impl MockSource {
 	}
 
 	pub(super) fn start_jobs(&mut self) {
-		if let Some(limit) = self.view.header.performance_limit {
-			if !limit.pending && self.jobs.is_empty() {
+		if self.view.settings.performance_limit.is_some() {
+			if !self.view.header.limit_pending && self.jobs.is_empty() {
 				let Some(file) = self.queue.pop_front() else { return };
 				self.start_job(file);
 			}
@@ -503,12 +505,8 @@ impl MockSource {
 
 	/// Once the jobs beyond a new limit have finished on their own, the limit is fully applied.
 	fn settle_limit(&mut self) {
-		let Some(limit) = &mut self.view.header.performance_limit else {
-			return;
-		};
-
-		if limit.pending && self.jobs.len() <= 1 {
-			limit.pending = false;
+		if self.view.header.limit_pending && self.jobs.len() <= 1 {
+			self.view.header.limit_pending = false;
 			for job in &mut self.jobs {
 				job.over_limit = false;
 			}

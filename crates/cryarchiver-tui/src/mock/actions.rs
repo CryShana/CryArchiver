@@ -1,7 +1,7 @@
 use super::{LOW_DISK_TICKS, MockSource};
 use crate::format::{as_f64, round_to_u64};
 use crate::source::{Action, SettingsChange, Target};
-use crate::view::{FileId, FileState, IssueId, IssueKind, Limit, NodeId, NoticeLevel, RunState, Verb};
+use crate::view::{FileId, FileState, IssueId, IssueKind, NodeId, NoticeLevel, RunState, Verb};
 
 const CONFIRMATION: &str = "DELETE";
 
@@ -92,9 +92,7 @@ impl MockSource {
 			self.requeue_front(file);
 		}
 
-		if let Some(limit) = &mut self.view.header.performance_limit {
-			limit.pending = false;
-		}
+		self.view.header.limit_pending = false;
 		self.notify(
 			NoticeLevel::Warning,
 			format!("restarted {} jobs · their progress was lost", over.len()),
@@ -122,7 +120,7 @@ impl MockSource {
 		self.view.system.low_priority = cap.is_some();
 
 		let Some(cap) = cap else {
-			self.view.header.performance_limit = None;
+			self.view.header.limit_pending = false;
 			for job in &mut self.jobs {
 				job.over_limit = false;
 			}
@@ -132,7 +130,7 @@ impl MockSource {
 
 		let pending = self.jobs.len() > 1;
 		self.mark_over_limit();
-		self.view.header.performance_limit = Some(Limit { cap, pending });
+		self.view.header.limit_pending = pending;
 
 		let message = if pending {
 			format!("performance limit {cap} % · applying… extra jobs finish first, or restart them now")
@@ -191,6 +189,7 @@ impl MockSource {
 		};
 
 		let issue = self.view.issues.remove(position);
+		self.issue_logs.remove(&issue.id);
 		if let Some(file) = issue.file {
 			self.apply_resolution(file, issue.kind, verb);
 		}

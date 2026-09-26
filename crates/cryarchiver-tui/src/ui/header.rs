@@ -8,8 +8,59 @@ use crate::theme::Theme;
 use crate::view::{ArchiveView, RunState};
 
 const BADGE: &str = " CryArchiver ";
+const SHORT_BADGE: &str = " CA ";
 const DEMO: &str = " DEMO ";
 const DELETING: &str = " ⚠ DELETING ORIGINALS ";
+const MIN_ROUTE: usize = 10;
+
+/// The left side's texts after squeezing: the route first, then "applying…", then the badge.
+struct Left {
+	badge: &'static str,
+	route_width: usize,
+	limit: Option<String>,
+}
+
+impl Left {
+	fn width(&self, view: &ArchiveView, preset: &str) -> usize {
+		let header = &view.header;
+		let chip = |on: bool, text: &str| if on { width(text) + 1 } else { 0 };
+		let route = if self.route_width > 0 { self.route_width + 1 } else { 0 };
+
+		width(self.badge)
+			+ chip(header.demo, DEMO)
+			+ chip(header.deleting_originals, DELETING)
+			+ route + width(preset)
+			+ 1 + self.limit.as_deref().map_or(0, |limit| width(limit) + 1)
+	}
+}
+
+fn squeeze(view: &ArchiveView, preset: &str, room: usize, wanted_route: usize) -> Left {
+	let limit_text = |short: bool| {
+		view.limit().map(|limit| match (limit.pending, short) {
+			(false, _) => format!("⚡ limit {} %", limit.cap),
+			(true, false) => format!("⚡ limit {} % · applying…", limit.cap),
+			(true, true) => format!("⚡ limit {} % …", limit.cap),
+		})
+	};
+
+	let mut left = Left {
+		badge: BADGE,
+		route_width: 0,
+		limit: limit_text(false),
+	};
+	let spare = |left: &Left| room.saturating_sub(left.width(view, preset));
+
+	if spare(&left) > MIN_ROUTE {
+		left.route_width = wanted_route.min(spare(&left) - 1).max(MIN_ROUTE);
+		return left;
+	}
+
+	left.limit = limit_text(true);
+	if spare(&left) == 0 {
+		left.badge = SHORT_BADGE;
+	}
+	left
+}
 
 pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	let header = &view.header;
@@ -22,26 +73,18 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	let (y, right) = (area.y, area.right());
 
 	let preset = format!(" {} · {} ", view.settings.speed.label(), header.codecs);
-	let limit = header.performance_limit.map(|limit| {
-		let applying = if limit.pending { " · applying…" } else { "" };
-		format!("⚡ limit {} %{applying}", limit.cap)
-	});
 	let (run, run_color) = run_state(header.run_state, theme);
+	let room = usize::from(area.width).saturating_sub(width(run) + 2);
+	let left = squeeze(view, &preset, room, usize::from(area.width) * 3 / 10);
 
-	let fixed = width(BADGE)
-		+ if header.demo { width(DEMO) + 1 } else { 0 }
-		+ if header.deleting_originals {
-			width(DELETING) + 1
-		} else {
-			0
-		} + width(&preset)
-		+ limit.as_deref().map_or(0, |limit| width(limit) + 1)
-		+ width(run)
-		+ 5;
-	let route_room = usize::from(area.width).saturating_sub(fixed);
-	let route_width = (usize::from(area.width) * 3 / 10).min(route_room).max(10);
-
-	let mut x = put(buf, area.x, y, BADGE, bold(theme.background).bg(theme.accent), right);
+	let mut x = put(
+		buf,
+		area.x,
+		y,
+		left.badge,
+		bold(theme.background).bg(theme.accent),
+		right,
+	);
 	if header.demo {
 		x = put(buf, x + 1, y, DEMO, bold(theme.background).bg(theme.warn), right);
 	}
@@ -49,10 +92,19 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 		x = put(buf, x + 1, y, DELETING, bold(theme.bright).bg(theme.error), right);
 	}
 
-	let route = format!("{} → {}", header.source, header.destination);
-	x = put(buf, x + 1, y, &fit_middle(&route, route_width), fg(theme.bright), right);
+	if left.route_width > 0 {
+		let route = format!("{} → {}", header.source, header.destination);
+		x = put(
+			buf,
+			x + 1,
+			y,
+			&fit_middle(&route, left.route_width),
+			fg(theme.bright),
+			right,
+		);
+	}
 	x = put(buf, x + 1, y, &preset, bold(theme.accent), right);
-	if let Some(limit) = &limit {
+	if let Some(limit) = &left.limit {
 		x = put(buf, x + 1, y, limit, fg(theme.warn), right);
 	}
 
@@ -104,7 +156,7 @@ fn render_status(buf: &mut Buffer, area: Rect, view: &ArchiveView, status: &Stat
 	}
 
 	let total = to_u16(width(&extras) + run_width);
-	let start = area.right().saturating_sub(total);
+	let start = area.right().saturating_sub(total).max(area.x);
 	let x = put(buf, start, area.y, &extras, fg(theme.dim), area.right());
 	put(
 		buf,

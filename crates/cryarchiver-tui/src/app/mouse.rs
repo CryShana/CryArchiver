@@ -129,7 +129,7 @@ impl Ui {
 
 	fn on_hit(&mut self, source: &dyn ArchiveSource, hit: Hit, position: Position, double: bool) -> Outcome {
 		match hit {
-			Hit::Footer(code) => return self.on_key(source, KeyEvent::new(code, KeyModifiers::NONE)),
+			Hit::Footer(code) => return self.on_key(source, KeyEvent::new(code, KeyModifiers::NONE), false),
 			Hit::Row { index, arrow_x } => self.on_row_click(index, arrow_x, position, double),
 			Hit::LibraryTitle if double => self.layout.maximized = !self.layout.maximized,
 			Hit::Maximize => self.layout.maximized = !self.layout.maximized,
@@ -161,7 +161,9 @@ impl Ui {
 		let on_arrow = (arrow_x..arrow_x + 2).contains(&position.x);
 
 		match self.tree.selected() {
-			Some(Selection::Folder(folder)) if on_arrow || double => self.tree.toggle(folder),
+			Some(Selection::Folder(folder)) if (on_arrow || double) && self.filter.is_empty() => {
+				self.tree.toggle(folder);
+			}
 			Some(Selection::File { .. }) if double => self.mode = ViewMode::Details,
 			_ => {}
 		}

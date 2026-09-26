@@ -6,10 +6,12 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use tui_input::Input;
 
+use super::log::toast_color;
 use super::widgets::{VERB_KEYS, bold, fg, put, to_u16};
 use crate::app::{Hit, Overlay, Ui, ViewMode};
-use crate::format::width;
-use crate::view::{ArchiveView, Duplicates, FileDetails, IssueVerbs, RunState};
+use crate::format::{fit, width};
+use crate::theme::Theme;
+use crate::view::{ArchiveView, Duplicates, FileDetails, IssueVerbs, Notification, RunState};
 
 struct Chip {
 	key: Cow<'static, str>,
@@ -25,7 +27,15 @@ fn chip(key: &'static str, label: &'static str, code: Option<KeyCode>) -> Chip {
 	}
 }
 
-pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, details: Option<&FileDetails>, ui: &mut Ui) {
+/// The toast is only passed in while the Log is hidden; it takes the right end and the chips give way to it.
+pub fn render(
+	buf: &mut Buffer,
+	area: Rect,
+	view: &ArchiveView,
+	details: Option<&FileDetails>,
+	toast: Option<&Notification>,
+	ui: &mut Ui,
+) {
 	buf.set_style(area, Style::new().bg(ui.theme.panel));
 
 	if let Some(input) = &ui.search {
@@ -33,7 +43,10 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, details: Option<
 		return;
 	}
 
-	let right = area.right();
+	let right = match toast {
+		Some(toast) => render_toast(buf, area, toast, &ui.theme),
+		None => area.right(),
+	};
 	let mut x = area.x + 1;
 	for chip in chips(view, details, ui) {
 		let needed = to_u16(width(&chip.key) + width(&chip.label) + 4);
@@ -51,6 +64,22 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, details: Option<
 				.push(Rect::new(start, area.y, x - start - 1, 1), Hit::Footer(code));
 		}
 	}
+}
+
+/// Draws the toast right-aligned and returns where the chips must stop.
+fn render_toast(buf: &mut Buffer, area: Rect, toast: &Notification, theme: &Theme) -> u16 {
+	let text = fit(&format!("◆ {} ", toast.text), usize::from(area.width / 2));
+	let text = text.trim_end();
+	let x = area.right().saturating_sub(to_u16(width(text)) + 1);
+	put(
+		buf,
+		x,
+		area.y,
+		text,
+		bold(toast_color(toast.level, theme)),
+		area.right(),
+	);
+	x.saturating_sub(1)
 }
 
 fn render_search(buf: &mut Buffer, area: Rect, input: &Input, matching: Option<usize>, ui: &Ui) {
@@ -145,15 +174,20 @@ fn library_chips(view: &ArchiveView, ui: &Ui) -> Vec<Chip> {
 		chips.push(chip("l", "log", Some(KeyCode::Char('l'))));
 	}
 
-	let pause = if view.header.run_state == RunState::Paused {
-		"resume"
-	} else {
-		"pause"
-	};
 	chips.extend([
 		chip("i", "issues", Some(KeyCode::Char('i'))),
 		chip("m", "menu", Some(KeyCode::Char('m'))),
-		chip("p", pause, Some(KeyCode::Char('p'))),
+	]);
+
+	match view.header.run_state {
+		RunState::Paused => chips.push(chip("p", "resume", Some(KeyCode::Char('p')))),
+		RunState::Running | RunState::PausedLowDisk | RunState::Watching => {
+			chips.push(chip("p", "pause", Some(KeyCode::Char('p'))));
+		}
+		RunState::Stopping | RunState::Finished => {}
+	}
+
+	chips.extend([
 		chip("e", "limit", Some(KeyCode::Char('e'))),
 		chip("s", "settings", Some(KeyCode::Char('s'))),
 		chip("?", "help", Some(KeyCode::Char('?'))),

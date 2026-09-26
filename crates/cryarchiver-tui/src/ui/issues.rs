@@ -10,7 +10,13 @@ use crate::view::Issue;
 
 const ROWS_PER_ISSUE: u16 = 3;
 
-pub fn render(buf: &mut Buffer, area: Rect, issues: &[Issue], ui: &mut Ui) {
+/// One attempt's failure log; `lines` is `None` while the source is still loading it.
+pub struct AttemptLog<'a> {
+	pub attempt: u32,
+	pub lines: Option<&'a [String]>,
+}
+
+pub fn render(buf: &mut Buffer, area: Rect, issues: &[Issue], log: Option<&AttemptLog>, ui: &mut Ui) {
 	let theme = ui.theme;
 	ui.issue_selected = ui.issue_selected.min(issues.len().saturating_sub(1));
 
@@ -47,8 +53,7 @@ pub fn render(buf: &mut Buffer, area: Rect, issues: &[Issue], ui: &mut Ui) {
 		render_list(buf, list, issues, ui);
 	}
 
-	let attempt_back = ui.attempt_back;
-	render_log(buf, log_area, issues.get(ui.issue_selected), attempt_back, &theme);
+	render_log(buf, log_area, issues.get(ui.issue_selected), log, &theme);
 }
 
 fn render_list(buf: &mut Buffer, area: Rect, issues: &[Issue], ui: &mut Ui) {
@@ -112,14 +117,11 @@ fn render_issue(buf: &mut Buffer, area: Rect, issue: &Issue, selected: bool, the
 	}
 }
 
-/// Shows one attempt's log, the latest unless the user stepped back with ←.
-fn render_log(buf: &mut Buffer, area: Rect, issue: Option<&Issue>, attempt_back: usize, theme: &Theme) {
-	let attempts = issue.map_or(0, |issue| issue.attempts.len());
-	let shown = attempts.checked_sub(1 + attempt_back.min(attempts.saturating_sub(1)));
-	let title = match (shown, issue) {
-		(Some(index), Some(issue)) if attempts > 1 => {
-			format!("ffmpeg log · attempt {} of {attempts}", issue.attempts[index].attempt)
-		}
+/// Shows the attempt the app fetched: the latest unless the user stepped back with ←.
+fn render_log(buf: &mut Buffer, area: Rect, issue: Option<&Issue>, log: Option<&AttemptLog>, theme: &Theme) {
+	let attempts = issue.map_or(0, |issue| issue.attempts);
+	let title = match log {
+		Some(log) if attempts > 1 => format!("ffmpeg log · attempt {} of {attempts}", log.attempt),
 		_ => "ffmpeg log".to_owned(),
 	};
 	let hint = issue.map(|issue| verb_hint(&issue.verbs));
@@ -133,28 +135,29 @@ fn render_log(buf: &mut Buffer, area: Rect, issue: Option<&Issue>, attempt_back:
 
 	let (x, right) = (inner.x + 1, inner.right().saturating_sub(1));
 	let cells = usize::from(right.saturating_sub(x));
-	put(
-		buf,
-		x,
-		inner.y,
-		&fit(&format!("$ cryarchiver: {}", issue.name), cells),
-		fg(theme.dim),
-		right,
-	);
+	let command = fit(&format!("$ cryarchiver: {}", issue.name), cells);
+	put(buf, x, inner.y, &command, fg(theme.dim), right);
 
-	let Some(index) = shown else {
-		put(
-			buf,
-			x,
-			inner.y + 2,
-			"no log for this kind of issue",
-			fg(theme.dim),
-			right,
-		);
-		return;
+	let lines = match log {
+		None => {
+			put(
+				buf,
+				x,
+				inner.y + 2,
+				"no log for this kind of issue",
+				fg(theme.dim),
+				right,
+			);
+			return;
+		}
+		Some(AttemptLog { lines: None, .. }) => {
+			put(buf, x, inner.y + 2, "loading…", fg(theme.dim), right);
+			return;
+		}
+		Some(AttemptLog { lines: Some(lines), .. }) => lines,
 	};
 
-	for (row, line) in (inner.y + 2..inner.bottom()).zip(&issue.attempts[index].lines) {
+	for (row, line) in (inner.y + 2..inner.bottom()).zip(lines.iter()) {
 		let color = if line.starts_with('[') { theme.warn } else { theme.text };
 		put(buf, x, row, &fit(line, cells), fg(color), right);
 	}

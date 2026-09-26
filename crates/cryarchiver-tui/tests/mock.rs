@@ -143,7 +143,12 @@ fn issue_kinds_carry_their_verbs() {
 	assert_eq!(cycle.file, None);
 
 	let failed = issue(IssueKind::EncodeFailed);
-	assert_eq!(failed.attempts.len(), 3);
+	assert_eq!(failed.attempts, 3);
+	assert_eq!(
+		source.issue_log(failed.id, 3).unwrap().last().unwrap(),
+		"exit code 1 (attempt 3/3)"
+	);
+	assert_eq!(source.issue_log(failed.id, 4), None);
 }
 
 #[test]
@@ -263,16 +268,13 @@ fn a_new_limit_is_pending_until_restart() {
 	let mut source = MockSource::new(5);
 	source.perform(Action::ChangeSettings(SettingsChange::PerformanceLimit(Some(25))));
 
-	assert_eq!(
-		source.view().header.performance_limit,
-		Some(Limit { cap: 25, pending: true })
-	);
+	assert_eq!(source.view().limit(), Some(Limit { cap: 25, pending: true }));
 	let over = source.view().workers.jobs.iter().filter(|job| job.over_limit).count();
 	assert_eq!(over, source.view().workers.jobs.len() - 1);
 
 	source.perform(Action::RestartPendingJobs);
 	assert_eq!(
-		source.view().header.performance_limit,
+		source.view().limit(),
 		Some(Limit {
 			cap: 25,
 			pending: false
@@ -281,7 +283,7 @@ fn a_new_limit_is_pending_until_restart() {
 	assert_eq!(source.view().workers.jobs.len(), 1);
 
 	source.perform(Action::ChangeSettings(SettingsChange::PerformanceLimit(None)));
-	assert_eq!(source.view().header.performance_limit, None);
+	assert_eq!(source.view().limit(), None);
 }
 
 #[test]

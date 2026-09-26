@@ -1,3 +1,4 @@
+mod burst;
 mod keys;
 mod menu;
 mod mouse;
@@ -12,6 +13,7 @@ use ratatui::layout::Rect;
 use throbber_widgets_tui::ThrobberState;
 use tui_input::Input;
 
+pub(crate) use self::burst::BURST_GAP;
 pub(crate) use self::menu::Menu;
 use self::mouse::Click;
 pub(crate) use self::mouse::{Hit, HitMap};
@@ -20,7 +22,7 @@ pub use self::tree::Selection;
 use self::tree::TreeState;
 use crate::source::{Action, ArchiveSource};
 use crate::theme::{ColorDepth, Theme};
-use crate::view::{FileDetails, FileId, NodeId, Notification};
+use crate::view::{FileDetails, FileId, IssueId, Library, NodeId, Notification};
 
 const TOAST_LIFETIME: Duration = Duration::from_secs(6);
 
@@ -66,7 +68,24 @@ pub struct App<S> {
 	ui: Ui,
 	generation: u64,
 	details: Option<(FileId, u64, Option<FileDetails>)>,
+	issue_log: Option<IssueLogCache>,
 	toast: Option<(Notification, Instant)>,
+	last_key: Option<Instant>,
+}
+
+/// Where `g` is in an original's list of duplicates. It lasts only while the selection stays where `g` put it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DuplicateCycle {
+	pub original: FileId,
+	pub next: usize,
+	pub landed: FileId,
+}
+
+struct IssueLogCache {
+	issue: IssueId,
+	attempt: u32,
+	generation: u64,
+	lines: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +111,7 @@ pub(crate) struct Ui {
 	pub issues_area: Option<Rect>,
 	pub spinner: ThrobberState,
 	pub spinner_drawn: bool,
-	pub duplicate_cursor: usize,
+	pub duplicate_cycle: Option<DuplicateCycle>,
 	pub actions: Vec<Action>,
 	last_click: Option<Click>,
 }
@@ -134,7 +153,7 @@ impl<S: ArchiveSource> App<S> {
 			issues_area: None,
 			spinner: ThrobberState::default(),
 			spinner_drawn: false,
-			duplicate_cursor: 0,
+			duplicate_cycle: None,
 			actions: Vec::new(),
 			last_click: None,
 		};
@@ -143,7 +162,9 @@ impl<S: ArchiveSource> App<S> {
 			ui,
 			generation: 0,
 			details: None,
+			issue_log: None,
 			toast: None,
+			last_key: None,
 		}
 	}
 
@@ -168,22 +189,55 @@ impl<S: ArchiveSource> App<S> {
 		self.ui.spinner.calc_next();
 	}
 
+	/// Handles one event on its own, as typed input; the terminal runner feeds batches through [`Self::handle_batch`].
 	pub fn handle_event(&mut self, event: &Event, now: Instant) {
+		self.dispatch(event, now, false);
+	}
+
+	/// Handles events that arrived together, each with the time it was read. Key presses closer together than a
+	/// person types are a paste and only ever reach text fields.
+	pub fn handle_batch(&mut self, events: &[(Event, Instant)]) {
+		let key_times: Vec<Instant> = events
+			.iter()
+			.filter(|(event, _)| is_press(event))
+			.map(|&(_, at)| at)
+			.collect();
+		let mut bursts = burst::burst_flags(&key_times, self.last_key).into_iter();
+		if let Some(&last) = key_times.last() {
+			self.last_key = Some(last);
+		}
+
+		for (event, at) in events {
+			let burst = is_press(event) && bursts.next().unwrap_or(false);
+			self.dispatch(event, *at, burst);
+		}
+	}
+
+	fn dispatch(&mut self, event: &Event, now: Instant, burst: bool) {
 		self.ui.tree.sync(&self.source, &self.ui.filter);
 
 		match event {
 			Event::Key(key) if key.kind == KeyEventKind::Press => {
-				self.ui.on_key(&self.source, *key);
+				self.ui.on_key(&self.source, *key, burst);
 			}
 			Event::Mouse(mouse) => {
 				self.ui.on_mouse(&self.source, *mouse, now);
 			}
-			Event::Paste(text) => self.ui.on_paste(text),
+			Event::Paste(text) => self.ui.on_paste(&self.source, text),
 			_ => {}
 		}
 
 		self.perform_pending();
 		self.ui.tree.sync(&self.source, &self.ui.filter);
+
+		let target = self.ui.tree.target();
+		if self
+			.ui
+			.duplicate_cycle
+			.is_some_and(|cycle| !matches!(target, Some(Selection::File { file, .. }) if file == cycle.landed))
+		{
+			self.ui.duplicate_cycle = None;
+		}
 	}
 
 	fn perform_pending(&mut self) {
@@ -200,12 +254,23 @@ impl<S: ArchiveSource> App<S> {
 		self.take_notifications();
 	}
 
+	/// Shows the most severe of the new notifications; a fresh toast that is more severe stays up.
 	fn take_notifications(&mut self) -> bool {
-		let Some(latest) = self.source.take_notifications().pop() else {
+		let Some(worst) = self
+			.source
+			.take_notifications()
+			.into_iter()
+			.max_by_key(|notice| notice.level)
+		else {
 			return false;
 		};
 
-		self.toast = Some((latest, Instant::now()));
+		let current = self.toast.as_ref().filter(|(_, at)| at.elapsed() < TOAST_LIFETIME);
+		if current.is_some_and(|(shown, _)| shown.level > worst.level) {
+			return false;
+		}
+
+		self.toast = Some((worst, Instant::now()));
 		true
 	}
 
@@ -214,9 +279,45 @@ impl<S: ArchiveSource> App<S> {
 		self.toast = self.toast.take().filter(|(_, at)| at.elapsed() < TOAST_LIFETIME);
 
 		self.refresh_details();
-		let details = self.details.as_ref().and_then(|(_, _, details)| details.as_ref());
-		let toast = self.toast.as_ref().map(|(notification, _)| notification);
-		crate::ui::draw(frame, &self.source, details, toast, &mut self.ui);
+		self.refresh_issue_log();
+		let fetched = crate::ui::Fetched {
+			details: self.details.as_ref().and_then(|(_, _, details)| details.as_ref()),
+			issue_log: self.issue_log.as_ref().map(|cache| crate::ui::AttemptLog {
+				attempt: cache.attempt,
+				lines: cache.lines.as_deref(),
+			}),
+			toast: self.toast.as_ref().map(|(notification, _)| notification),
+		};
+		crate::ui::draw(frame, &self.source, &fetched, &mut self.ui);
+	}
+
+	/// Fetches only the attempt on screen, again only when it or the source changed.
+	fn refresh_issue_log(&mut self) {
+		let issues = &self.source.view().issues;
+		let selected = issues.get(self.ui.issue_selected.min(issues.len().saturating_sub(1)));
+		let wanted = selected
+			.filter(|issue| self.ui.mode == ViewMode::Issues && issue.attempts > 0)
+			.map(|issue| {
+				let back = u32::try_from(self.ui.attempt_back).unwrap_or(u32::MAX);
+				(issue.id, issue.attempts.saturating_sub(back).max(1))
+			});
+
+		let Some((issue, attempt)) = wanted else {
+			self.issue_log = None;
+			return;
+		};
+
+		let fresh = self.issue_log.as_ref().is_some_and(|cache| {
+			cache.issue == issue && cache.attempt == attempt && cache.generation == self.generation
+		});
+		if !fresh {
+			self.issue_log = Some(IssueLogCache {
+				issue,
+				attempt,
+				generation: self.generation,
+				lines: self.source.issue_log(issue, attempt),
+			});
+		}
 	}
 
 	/// Details are rebuilt only when the selected file or the source changed since they were built.
@@ -255,6 +356,7 @@ impl<S: ArchiveSource> App<S> {
 	pub fn begin_shutdown(&mut self) {
 		self.ui.lifecycle = Lifecycle::Stopping;
 		self.ui.overlay = None;
+		self.ui.search = None;
 	}
 
 	pub fn shutdown(&mut self) {
@@ -342,10 +444,20 @@ impl Ui {
 		Outcome::Done
 	}
 
-	fn set_filter(&mut self, filter: String) {
-		if filter != self.filter {
-			self.filter.clone_from(&filter);
-			self.actions.push(Action::SetFilter(filter));
+	/// Clearing the filter keeps what was selected in it, now shown in its own folder.
+	fn set_filter(&mut self, library: &Library, filter: String) {
+		if filter == self.filter {
+			return;
+		}
+
+		let cleared = filter.is_empty();
+		self.filter.clone_from(&filter);
+		self.actions.push(Action::SetFilter(filter));
+
+		match self.tree.selected() {
+			Some(Selection::File { file, folder }) if cleared => self.tree.reveal_file(library, folder, file),
+			Some(Selection::Folder(folder)) if cleared => self.tree.reveal_folder(library, folder),
+			_ => {}
 		}
 	}
 
@@ -355,11 +467,12 @@ impl Ui {
 			.rows()
 			.iter()
 			.any(|row| matches!(row.kind, tree::RowKind::File { file: id, .. } if id == file));
+		let library = &source.view().library;
 		if !self.filter.is_empty() && !visible {
-			self.set_filter(String::new());
+			self.set_filter(library, String::new());
 		}
 
-		self.tree.reveal_file(&source.view().library, folder, file);
+		self.tree.reveal_file(library, folder, file);
 	}
 
 	fn open_details(&mut self, source: &dyn ArchiveSource, folder: NodeId, file: FileId) {
@@ -367,7 +480,7 @@ impl Ui {
 		self.mode = ViewMode::Details;
 	}
 
-	fn escape(&mut self) -> Outcome {
+	fn escape(&mut self, source: &dyn ArchiveSource) -> Outcome {
 		if self.overlay.take().is_some() {
 			return Outcome::Done;
 		}
@@ -375,7 +488,7 @@ impl Ui {
 		if self.mode != ViewMode::Library {
 			self.mode = ViewMode::Library;
 		} else if !self.filter.is_empty() {
-			self.set_filter(String::new());
+			self.set_filter(&source.view().library, String::new());
 		} else if self.layout.maximized {
 			self.layout.maximized = false;
 		} else {
@@ -390,4 +503,8 @@ impl Ui {
 		}
 		self.issue_selected = index;
 	}
+}
+
+fn is_press(event: &Event) -> bool {
+	matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press)
 }

@@ -1,4 +1,6 @@
-use crate::view::{AttemptLog, FileId, Issue, IssueId, IssueKind, IssueVerbs, NodeId};
+use crate::view::{FileId, Issue, IssueId, IssueKind, IssueVerbs, NodeId};
+
+pub type AttemptLog = Vec<String>;
 
 pub struct NewIssue<'a> {
 	pub kind: IssueKind,
@@ -11,8 +13,9 @@ pub struct NewIssue<'a> {
 }
 
 impl NewIssue<'_> {
-	pub fn into_issue(self, id: IssueId) -> Issue {
-		Issue {
+	/// Splits off the attempt logs, which the mock keeps apart and lends out one at a time.
+	pub fn into_issue(self, id: IssueId) -> (Issue, Vec<AttemptLog>) {
+		let issue = Issue {
 			id,
 			kind: self.kind,
 			file: self.file,
@@ -22,8 +25,9 @@ impl NewIssue<'_> {
 			reason: self.reason.to_owned(),
 			resolution: resolution(self.kind).to_owned(),
 			verbs: verbs(self.kind),
-			attempts: self.attempts,
-		}
+			attempts: u32::try_from(self.attempts.len()).unwrap_or(u32::MAX),
+		};
+		(issue, self.attempts)
 	}
 }
 
@@ -64,9 +68,6 @@ fn resolution(kind: IssueKind) -> &'static str {
 	}
 }
 
-pub fn attempt(number: u32, lines: &[&str]) -> AttemptLog {
-	AttemptLog {
-		attempt: number,
-		lines: lines.iter().map(|&line| line.to_owned()).collect(),
-	}
+pub fn attempt(lines: &[&str]) -> AttemptLog {
+	lines.iter().map(|&line| line.to_owned()).collect()
 }
