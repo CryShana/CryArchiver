@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 clap.workspace = true
 cryarchiver-engine = { path = "../cryarchiver-engine", features = ["clap"] }
+cryarchiver-tui = { path = "../cryarchiver-tui" }
 globset.workspace = true
 indicatif.workspace = true
 tokio.workspace = true

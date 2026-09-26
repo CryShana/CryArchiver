@@ -20,14 +20,12 @@ use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::toolchain::{Status, ToolConfig, Toolchain};
 use cryarchiver_engine::workspace::sweep;
+use cryarchiver_tui::MockSource;
 use tokio::sync::Notify;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::report::{Report, Totals, outcome_line};
-
-const TUI_NOTICE: &str =
-	"The archival TUI is not available yet. Run `cryarchiver --help` to compress files from the command line.";
 
 #[derive(Parser)]
 #[command(
@@ -145,23 +143,34 @@ impl Drop for QueueSeat {
 	}
 }
 
+enum Launch {
+	Tui,
+	Doctor(Option<PathBuf>),
+	Compress(CompressArgs),
+}
+
 fn main() -> ExitCode {
-	let code = if std::env::args_os().len() == 1 {
-		tui_notice()
-	} else {
-		dispatch(Cli::parse())
+	let code = match launch() {
+		Launch::Tui => return ExitCode::from(open_tui()),
+		Launch::Doctor(ffmpeg) => block_on(doctor(ffmpeg)),
+		Launch::Compress(args) => block_on(compress(args)),
 	};
 
 	pause_if_launched_from_explorer();
 	ExitCode::from(code)
 }
 
-fn dispatch(cli: Cli) -> u8 {
+fn launch() -> Launch {
+	if std::env::args_os().len() == 1 {
+		return Launch::Tui;
+	}
+
+	let cli = Cli::parse();
 	match cli.command {
-		Some(Command::Doctor { ffmpeg }) => block_on(doctor(ffmpeg)),
-		Some(Command::Tui { .. }) => tui_notice(),
-		None if opens_project(&cli.compress.inputs) => tui_notice(),
-		None => block_on(compress(cli.compress)),
+		Some(Command::Doctor { ffmpeg }) => Launch::Doctor(ffmpeg),
+		Some(Command::Tui { .. }) => Launch::Tui,
+		None if opens_project(&cli.compress.inputs) => Launch::Tui,
+		None => Launch::Compress(cli.compress),
 	}
 }
 
@@ -177,9 +186,15 @@ fn opens_project(inputs: &[PathBuf]) -> bool {
 		.is_some_and(|input| input.extension().is_some_and(|ext| ext == "cryarchive"))
 }
 
-fn tui_notice() -> u8 {
-	println!("{TUI_NOTICE}");
-	0
+fn open_tui() -> u8 {
+	match cryarchiver_tui::run(MockSource::default()) {
+		Ok(()) => 0,
+		Err(err) => {
+			eprintln!("error: {err}");
+			pause_if_launched_from_explorer();
+			2
+		}
+	}
 }
 
 async fn doctor(ffmpeg: Option<PathBuf>) -> u8 {

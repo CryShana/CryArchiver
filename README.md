@@ -56,3 +56,7 @@ cryarchiver album/ --speed slow        # slower, higher quality
 | `-q, --quiet` | Only print failures and the summary | off |
 
 Exit codes: `0` everything succeeded or was kept/skipped · `1` at least one file failed · `2` no inputs, or a problem with ffmpeg.
+
+## Archive dashboard (preview)
+
+`cryarchiver` with no arguments, or `cryarchiver tui`, opens the archive dashboard in the terminal. For now it runs on demo data, so the layout can be tried before whole-folder archiving arrives. It needs a terminal of at least 100×30; press `?` for keys and `q` to quit.

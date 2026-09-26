@@ -36,13 +36,20 @@ fn prints_version() {
 }
 
 #[test]
-fn no_arguments_prints_the_tui_notice() {
+fn tui_without_a_terminal_explains_and_exits_with_2() {
 	let dir = tempfile::tempdir().unwrap();
 
-	let out = cryarchiver(dir.path(), &[]);
+	for args in [&[][..], &["tui"][..], &["family.cryarchive"][..]] {
+		let out = cryarchiver(dir.path(), args);
 
-	assert!(out.status.success());
-	assert!(stdout(&out).contains("TUI"));
+		assert_eq!(out.status.code(), Some(2), "{args:?}");
+		assert!(
+			stderr(&out).contains("needs an interactive terminal"),
+			"{args:?}: {}",
+			stderr(&out)
+		);
+		assert!(stdout(&out).is_empty(), "{args:?}");
+	}
 }
 
 #[test]
