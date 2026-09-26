@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::audio::plan::FilePlan;
+use crate::audio::plan::{FilePlan, LayoutFix, TrackPlan};
 use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
 use crate::toolchain::Toolchain;
@@ -123,6 +123,18 @@ pub fn compare(source: &Levels, output: &Levels, check_levels: bool, lfe: Option
 
 pub fn lfe_index(layout: &str) -> Option<usize> {
 	matches!(layout, "5.1" | "6.1" | "7.1").then_some(3)
+}
+
+pub fn check_tracks(plan: &FilePlan, source: &[Levels], output: &[Levels]) -> Result<(), String> {
+	for (track, (source, measured)) in plan.tracks.iter().zip(source.iter().zip(output)) {
+		let TrackPlan::Encode(encoded) = &track.plan else {
+			continue;
+		};
+
+		let check_levels = !matches!(encoded.layout, LayoutFix::Remix(_));
+		compare(source, measured, check_levels, lfe_index(encoded.layout.target()))?;
+	}
+	Ok(())
 }
 
 #[cfg(test)]

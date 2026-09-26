@@ -23,5 +23,10 @@ pub const MATROSKA_AUDIO: Container = Container {
 	muxer: "matroska",
 	cover: Cover::Stream,
 };
+pub const MATROSKA_VIDEO: Container = Container {
+	extension: "mkv",
+	muxer: "matroska",
+	cover: Cover::Attachment,
+};
 
-pub const OUTPUT_EXTENSIONS: [&str; 2] = [OGG_OPUS.extension, MATROSKA_AUDIO.extension];
+pub const OUTPUT_EXTENSIONS: [&str; 3] = [OGG_OPUS.extension, MATROSKA_AUDIO.extension, MATROSKA_VIDEO.extension];

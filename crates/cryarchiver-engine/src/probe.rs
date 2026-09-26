@@ -3,7 +3,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -88,7 +88,7 @@ pub struct Stream {
 	pub side_data_list: Vec<SideData>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SideData {
 	#[serde(default)]
 	pub side_data_type: String,

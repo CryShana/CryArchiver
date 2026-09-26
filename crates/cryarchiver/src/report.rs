@@ -147,8 +147,12 @@ fn keep_reason(reason: &KeepReason) -> String {
 fn stage_label(stage: Stage) -> &'static str {
 	match stage {
 		Stage::Detect => "detecting",
+		Stage::Probe => "probing",
 		Stage::Plan => "planning",
+		Stage::Queued => "queued",
+		Stage::Analyze => "analysing",
 		Stage::Encode => "encoding",
+		Stage::Mux => "muxing",
 		Stage::Metadata => "cover art",
 		Stage::Verify => "verifying",
 		Stage::Commit => "saving",

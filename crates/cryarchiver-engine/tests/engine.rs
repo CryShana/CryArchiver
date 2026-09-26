@@ -275,3 +275,341 @@ async fn source_changed_during_encode_is_retryable() {
 	assert_eq!(err.kind.class(), ErrorClass::AutoRetry);
 	assert!(!dir.path().join("a.cry.opus").exists());
 }
+
+fn fast(source: &Path) -> Job {
+	Job {
+		speed: Speed::Fast,
+		..job(source)
+	}
+}
+
+fn mpeg4(dir: &Path, name: &str, seconds: u32) -> std::path::PathBuf {
+	support::video(
+		dir,
+		name,
+		seconds,
+		&[
+			"-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-q:v", "2", "-c:a", "aac", "-b:a", "192k",
+		],
+	)
+}
+
+#[tokio::test]
+async fn video_becomes_verified_av1_in_mkv() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = mpeg4(dir.path(), "clip.mp4", 3);
+
+	let outcome = run(&fast(&clip), dir.path()).await;
+
+	let JobOutcome::Encoded {
+		output,
+		out_bytes,
+		src_bytes,
+		..
+	} = outcome
+	else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output, dir.path().join("clip.cry.mkv"));
+	assert!(out_bytes < src_bytes);
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert_eq!(info.streams[0].codec_name, "av1");
+	assert_eq!(info.streams[0].pix_fmt.as_deref(), Some("yuv420p10le"));
+	assert_eq!(info.streams[0].color_primaries.as_deref(), Some("bt709"));
+	assert_eq!(info.streams[1].codec_name, "opus");
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn interlaced_video_is_deinterlaced_to_double_rate() {
+	let dir = tempfile::tempdir().unwrap();
+	let interlaced = dir.path().join("tff.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=720x576:r=50:d=4,interlace=scan=tff,setfield=tff",
+		"-c:v",
+		"mpeg2video",
+		"-b:v",
+		"12M",
+		"-flags",
+		"+ilme+ildct",
+		interlaced.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast(&interlaced), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!(
+		(info.streams[0].fps().unwrap() - 50.0).abs() < 0.5,
+		"{:?}",
+		info.streams[0]
+	);
+	assert_eq!(info.streams[0].color_primaries.as_deref(), Some("bt470bg"));
+}
+
+#[tokio::test]
+async fn transparent_video_stays_vp9_with_alpha() {
+	let dir = tempfile::tempdir().unwrap();
+	let alpha = dir.path().join("alpha.mov");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=2,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,160),255,0)'",
+		"-c:v",
+		"qtrle",
+		alpha.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast(&alpha), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert_eq!(info.streams[0].codec_name, "vp9");
+	assert_eq!(info.streams[0].tag("alpha_mode"), Some("1"));
+}
+
+#[tokio::test]
+async fn truncated_mp4_fails_before_encoding() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::video(
+		dir.path(),
+		"cut.mp4",
+		4,
+		&[
+			"-map",
+			"0:v",
+			"-map",
+			"1:a",
+			"-c:v",
+			"mpeg4",
+			"-c:a",
+			"aac",
+			"-movflags",
+			"+faststart",
+		],
+	);
+	let bytes = fs::read(&clip).unwrap();
+	fs::write(&clip, &bytes[..bytes.len() / 2]).unwrap();
+	let stages = std::sync::Mutex::new(Vec::new());
+
+	let outcome = Engine::new(support::toolchain().await)
+		.run(
+			&fast(&clip),
+			&sink(dir.path()),
+			&|event| stages.lock().unwrap().push(event),
+			&CancellationToken::new(),
+		)
+		.await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if matches!(&err.kind, ErrorKind::SourceDamaged(reason) if reason.contains("truncated"))),
+		"{outcome:?}"
+	);
+	assert!(!stages.lock().unwrap().contains(&JobEvent::Stage(Stage::Encode)));
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn unencodable_audio_is_copied_and_the_video_still_encoded() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("wide.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=3",
+		"-f",
+		"lavfi",
+		"-i",
+		"anoisesrc=d=3:a=0.1",
+		"-filter_complex",
+		"[1:a]pan=10c|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0|c6=c0|c7=c0|c8=c0|c9=c0[wide]",
+		"-map",
+		"0:v",
+		"-map",
+		"[wide]",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		"-c:a",
+		"pcm_s16le",
+		clip.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast(&clip), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings.iter().any(|warning| warning.contains("copied as-is")),
+		"{warnings:?}"
+	);
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert_eq!(info.streams[1].codec_name, "pcm_s16le");
+}
+
+#[tokio::test]
+async fn audio_longer_than_video_is_not_damaged() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("long-audio.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=3",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=6",
+		"-map",
+		"0:v",
+		"-map",
+		"1:a",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		"-c:a",
+		"flac",
+		clip.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast(&clip), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn efficient_av1_is_kept_without_encoding() {
+	let dir = tempfile::tempdir().unwrap();
+	let av1 = dir.path().join("small.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=640x360:r=25:d=3",
+		"-c:v",
+		"libsvtav1",
+		"-preset",
+		"12",
+		"-svtav1-params",
+		"crf=63",
+		av1.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast(&av1), dir.path()).await;
+
+	assert!(
+		matches!(
+			outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::AlreadyEfficient(_)
+			}
+		),
+		"{outcome:?}"
+	);
+}
+
+#[tokio::test]
+async fn keep_metadata_attaches_the_source_probe() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = mpeg4(dir.path(), "meta.mp4", 2);
+
+	let outcome = run(
+		&Job {
+			keep_metadata: true,
+			..fast(&clip)
+		},
+		dir.path(),
+	)
+	.await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!(
+		info.streams
+			.iter()
+			.any(|stream| stream.tag("filename") == Some("source-metadata.json")),
+		"{info:?}"
+	);
+}
+
+#[tokio::test]
+async fn cancel_mid_video_encode_leaves_nothing_behind() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::video(
+		dir.path(),
+		"long.mkv",
+		120,
+		&["-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-c:a", "flac"],
+	);
+	let engine = Engine::new(support::toolchain().await);
+	let cancel = CancellationToken::new();
+	let trigger = cancel.clone();
+	let on_event = move |event: JobEvent| {
+		if event == JobEvent::Stage(Stage::Encode) {
+			let trigger = trigger.clone();
+			tokio::spawn(async move {
+				tokio::time::sleep(Duration::from_millis(300)).await;
+				trigger.cancel();
+			});
+		}
+	};
+
+	let outcome = engine.run(&job(&clip), &sink(dir.path()), &on_event, &cancel).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.kind == ErrorKind::Cancelled),
+		"{outcome:?}"
+	);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+	assert!(!dir.path().join("long.cry.mkv").exists());
+}
+
+#[tokio::test]
+async fn one_video_slot_queues_the_second_video() {
+	let dir = tempfile::tempdir().unwrap();
+	let first = mpeg4(dir.path(), "first.mp4", 3);
+	let second = mpeg4(dir.path(), "second.mp4", 3);
+	let engine = Engine::new(support::toolchain().await);
+	let queued = std::sync::atomic::AtomicUsize::new(0);
+	let on_event = |event: JobEvent| {
+		if event == JobEvent::Stage(Stage::Queued) {
+			queued.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		}
+	};
+	let cancel = CancellationToken::new();
+	let out_sink = sink(dir.path());
+	let (first_job, second_job) = (fast(&first), fast(&second));
+
+	let (a, b) = tokio::join!(
+		engine.run(&first_job, &out_sink, &on_event, &cancel),
+		engine.run(&second_job, &out_sink, &on_event, &cancel),
+	);
+
+	assert!(matches!(a, JobOutcome::Encoded { .. }), "{a:?}");
+	assert!(matches!(b, JobOutcome::Encoded { .. }), "{b:?}");
+	assert_eq!(queued.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
