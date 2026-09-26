@@ -20,6 +20,10 @@ const SVT_CRF: [[f64; 6]; 3] = [
 const VP9_CRF: [u8; 6] = [33, 32, 31, 30, 28, 28];
 const MASTERING_DISPLAY: &str = "Mastering display metadata";
 const HDR10_PLUS: &str = "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)";
+const RATE_AGREEMENT: f64 = 0.001;
+const PACKET_AGREEMENT: f64 = 0.002;
+const MIN_PACKET_SLACK: f64 = 2.0;
+const SOURCE_FRAME_TOLERANCE: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoCaps {
@@ -68,6 +72,7 @@ pub struct VideoPlan {
 	pub filters: String,
 	pub encoder: Encoder,
 	pub expected_frames: Option<u64>,
+	pub frame_tolerance: u64,
 	pub width: u32,
 	pub height: u32,
 	pub colour: ColourTags,
@@ -77,11 +82,14 @@ pub struct VideoPlan {
 }
 
 pub fn main_stream(info: &MediaInfo) -> Option<&Stream> {
-	let mut real = info.streams.iter().filter(|stream| stream.is_real_video());
-	info.streams
-		.iter()
-		.find(|stream| stream.is_real_video() && stream.disposition.get("default") == Some(&1))
-		.or_else(|| real.next())
+	let mut first_real = None;
+	for stream in info.streams.iter().filter(|stream| stream.is_real_video()) {
+		if stream.disposition.get("default") == Some(&1) {
+			return Some(stream);
+		}
+		first_real.get_or_insert(stream);
+	}
+	first_real
 }
 
 pub fn precheck<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream, KeepReason> {
@@ -114,14 +122,7 @@ pub fn precheck<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream,
 	Ok(main)
 }
 
-pub fn plan_video(
-	info: &MediaInfo,
-	frames: &[Frame],
-	analysis: &Analysis,
-	speed: Speed,
-	caps: &VideoCaps,
-) -> Result<VideoPlan, KeepReason> {
-	let main = precheck(info, caps)?;
+pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &Analysis, speed: Speed) -> VideoPlan {
 	let (width, height) = display_size(main);
 	let resolution = Resolution::of(width, height);
 	let alpha = has_alpha(main);
@@ -174,23 +175,46 @@ pub fn plan_video(
 			.map(|stream| stream.index),
 	);
 
-	Ok(VideoPlan {
+	VideoPlan {
 		streams,
 		decoder: forced_decoder(main),
 		filters: filters.join(","),
 		hdr10: matches!(encoder, Encoder::SvtAv1 { .. }) && has_side_data(frames, MASTERING_DISPLAY),
 		encoder,
-		expected_frames: main.nb_read_packets.map(|packets| match analysis.scan {
-			ScanType::Progressive => packets,
-			ScanType::Interlaced { .. } => packets * 2,
-			ScanType::Telecined => packets - packets / 5,
-		}),
+		expected_frames: expected_frames(main, main.declared_duration().or(info.format.duration), analysis.scan),
+		frame_tolerance: frame_tolerance(analysis.scan),
 		width,
 		height,
 		colour,
 		alpha,
 		warnings,
+	}
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn expected_frames(main: &Stream, declared_s: Option<f64>, scan: ScanType) -> Option<u64> {
+	let packets = main.nb_read_packets?;
+	let (average_fps, real_fps) = (main.avg_frame_rate?, main.r_frame_rate?);
+	let frames_by_duration = declared_s? * average_fps;
+
+	let constant_rate = (average_fps - real_fps).abs() <= real_fps * RATE_AGREEMENT;
+	let packet_slack = (frames_by_duration * PACKET_AGREEMENT).max(MIN_PACKET_SLACK);
+	if !constant_rate || (packets as f64 - frames_by_duration).abs() > packet_slack {
+		return None;
+	}
+
+	Some(match scan {
+		ScanType::Progressive => packets,
+		ScanType::Interlaced { .. } => packets * 2,
+		ScanType::Telecined => packets - packets / 5,
 	})
+}
+
+fn frame_tolerance(scan: ScanType) -> u64 {
+	match scan {
+		ScanType::Interlaced { .. } => SOURCE_FRAME_TOLERANCE * 2,
+		ScanType::Progressive | ScanType::Telecined => SOURCE_FRAME_TOLERANCE,
+	}
 }
 
 fn svt_params(crf: f64, grain: bool) -> String {
@@ -279,6 +303,32 @@ fn already_efficient(info: &MediaInfo, main: &Stream) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_plan() -> VideoPlan {
+	VideoPlan {
+		streams: vec![0],
+		decoder: None,
+		filters: String::new(),
+		encoder: Encoder::SvtAv1 {
+			preset: 8,
+			params: String::new(),
+		},
+		expected_frames: None,
+		frame_tolerance: SOURCE_FRAME_TOLERANCE,
+		width: 320,
+		height: 240,
+		colour: ColourTags {
+			primaries: "bt709".into(),
+			transfer: "bt709".into(),
+			matrix: "bt709".into(),
+			range: crate::video::colour::Range::Limited,
+		},
+		alpha: false,
+		hdr10: false,
+		warnings: Vec::new(),
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 
@@ -295,17 +345,23 @@ mod tests {
 		MediaInfo::parse(json.as_bytes()).unwrap()
 	}
 
+	fn plan(info: &MediaInfo, frames: &[Frame], analysis: Analysis, speed: Speed) -> VideoPlan {
+		let main = precheck(info, &CAPS).unwrap();
+		plan_video(info, main, frames, &analysis, speed)
+	}
+
 	fn h264(extra: &str) -> MediaInfo {
 		info(&format!(
 			r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,
 			"pix_fmt":"yuv420p","color_range":"tv","color_space":"bt709","color_transfer":"bt709",
-			"color_primaries":"bt709","avg_frame_rate":"25/1","nb_read_packets":"250"{extra}}}]}}"#
+			"color_primaries":"bt709","avg_frame_rate":"25/1","r_frame_rate":"25/1","duration":"10.000000",
+			"nb_read_packets":"250"{extra}}}]}}"#
 		))
 	}
 
 	#[test]
 	fn progressive_hd_uses_svt_at_the_table_crf() {
-		let plan = plan_video(&h264(""), &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+		let plan = plan(&h264(""), &[], PROGRESSIVE_CLEAN, Speed::Moderate);
 
 		assert_eq!(plan.streams, [0]);
 		assert_eq!(plan.decoder, None);
@@ -327,9 +383,52 @@ mod tests {
 	}
 
 	#[test]
+	fn packet_counts_are_trusted_only_for_plain_constant_rate_streams() {
+		let cfr = Stream {
+			avg_frame_rate: Some(25.0),
+			r_frame_rate: Some(25.0),
+			nb_read_packets: Some(250),
+			..Stream::default()
+		};
+		let variable = Stream {
+			avg_frame_rate: Some(29.5),
+			r_frame_rate: Some(30.0),
+			..cfr.clone()
+		};
+		let pre_roll = Stream {
+			nb_read_packets: Some(280),
+			..cfr.clone()
+		};
+		let field_rate = Stream {
+			r_frame_rate: Some(50.0),
+			..cfr.clone()
+		};
+
+		assert_eq!(expected_frames(&cfr, Some(10.0), ScanType::Progressive), Some(250));
+		assert_eq!(expected_frames(&cfr, Some(10.04), ScanType::Progressive), Some(250));
+		assert_eq!(expected_frames(&cfr, None, ScanType::Progressive), None);
+		assert_eq!(expected_frames(&variable, Some(10.0), ScanType::Progressive), None);
+		assert_eq!(expected_frames(&pre_roll, Some(10.0), ScanType::Progressive), None);
+		assert_eq!(expected_frames(&field_rate, Some(10.0), ScanType::Progressive), None);
+	}
+
+	#[test]
+	fn the_default_stream_is_main_else_the_first_real_video() {
+		let covers_first = info(
+			r#"{"streams":[
+			{"index":0,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1,"default":1}},
+			{"index":1,"codec_type":"video","codec_name":"h264"},
+			{"index":2,"codec_type":"video","codec_name":"h264"}]}"#,
+		);
+
+		assert_eq!(main_stream(&covers_first).unwrap().index, 1);
+		assert!(main_stream(&info(r#"{"streams":[{"index":0,"codec_type":"audio"}]}"#)).is_none());
+	}
+
+	#[test]
 	fn speeds_pick_presets_and_crfs() {
-		let fast = plan_video(&h264(""), &[], &PROGRESSIVE_CLEAN, Speed::Fast, &CAPS).unwrap();
-		let slow = plan_video(&h264(""), &[], &PROGRESSIVE_CLEAN, Speed::Slow, &CAPS).unwrap();
+		let fast = plan(&h264(""), &[], PROGRESSIVE_CLEAN, Speed::Fast);
+		let slow = plan(&h264(""), &[], PROGRESSIVE_CLEAN, Speed::Slow);
 
 		assert!(matches!(fast.encoder, Encoder::SvtAv1 { preset: 8, ref params } if params.ends_with("crf=32")));
 		assert!(matches!(slow.encoder, Encoder::SvtAv1 { preset: 3, ref params } if params.ends_with("crf=25")));
@@ -346,8 +445,8 @@ mod tests {
 			noise: NoiseClass::Clean,
 		};
 
-		let deinterlaced = plan_video(&h264(""), &[], &tff, Speed::Moderate, &CAPS).unwrap();
-		let inverse_telecined = plan_video(&h264(""), &[], &telecined, Speed::Moderate, &CAPS).unwrap();
+		let deinterlaced = plan(&h264(""), &[], tff, Speed::Moderate);
+		let inverse_telecined = plan(&h264(""), &[], telecined, Speed::Moderate);
 
 		assert!(
 			deinterlaced
@@ -355,8 +454,10 @@ mod tests {
 				.starts_with("bwdif=mode=send_field:parity=tff:deint=all,scale=")
 		);
 		assert_eq!(deinterlaced.expected_frames, Some(500));
+		assert_eq!(deinterlaced.frame_tolerance, 4);
 		assert!(inverse_telecined.filters.starts_with("fieldmatch,decimate,scale="));
 		assert_eq!(inverse_telecined.expected_frames, Some(200));
+		assert_eq!(inverse_telecined.frame_tolerance, 2);
 	}
 
 	#[test]
@@ -366,8 +467,8 @@ mod tests {
 			noise: NoiseClass::Light,
 		};
 
-		let moderate = plan_video(&h264(""), &[], &grainy, Speed::Moderate, &CAPS).unwrap();
-		let fast = plan_video(&h264(""), &[], &grainy, Speed::Fast, &CAPS).unwrap();
+		let moderate = plan(&h264(""), &[], grainy, Speed::Moderate);
+		let fast = plan(&h264(""), &[], grainy, Speed::Fast);
 
 		assert!(matches!(moderate.encoder, Encoder::SvtAv1 { ref params, .. }
 			if params == "tune=0:enable-variance-boost=1:keyint=5s:crf=29:film-grain=6:film-grain-denoise=0"));
@@ -378,7 +479,7 @@ mod tests {
 	fn rotation_swaps_the_output_size() {
 		let rotated = h264(r#","side_data_list":[{"side_data_type":"Display Matrix","rotation":-90}]"#);
 
-		let plan = plan_video(&rotated, &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+		let plan = plan(&rotated, &[], PROGRESSIVE_CLEAN, Speed::Moderate);
 
 		assert_eq!((plan.width, plan.height), (1080, 1920));
 	}
@@ -398,15 +499,15 @@ mod tests {
 			libaom: true,
 		};
 
-		let plan = plan_video(&vp9_alpha, &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
-		assert_eq!(plan.decoder, Some("libvpx-vp9"));
-		assert!(plan.alpha);
-		assert_eq!(plan.encoder, Encoder::Vp9Alpha { cpu_used: 2, crf: 33 });
-		assert!(plan.filters.contains("format=yuva420p"), "{}", plan.filters);
+		let vp9 = plan(&vp9_alpha, &[], PROGRESSIVE_CLEAN, Speed::Moderate);
+		assert_eq!(vp9.decoder, Some("libvpx-vp9"));
+		assert!(vp9.alpha);
+		assert_eq!(vp9.encoder, Encoder::Vp9Alpha { cpu_used: 2, crf: 33 });
+		assert!(vp9.filters.contains("format=yuva420p"), "{}", vp9.filters);
 
-		let plan = plan_video(&prores, &[], &PROGRESSIVE_CLEAN, Speed::Fast, &CAPS).unwrap();
-		assert_eq!(plan.decoder, None);
-		assert_eq!(plan.encoder, Encoder::Vp9Alpha { cpu_used: 4, crf: 33 });
+		let from_prores = plan(&prores, &[], PROGRESSIVE_CLEAN, Speed::Fast);
+		assert_eq!(from_prores.decoder, None);
+		assert_eq!(from_prores.encoder, Encoder::Vp9Alpha { cpu_used: 4, crf: 33 });
 
 		assert!(matches!(
 			precheck(&prores, &without_libvpx),
@@ -424,7 +525,7 @@ mod tests {
 		};
 
 		assert!(matches!(precheck(&dovi(5, 0), &CAPS), Err(KeepReason::Unsupported(_))));
-		let plan = plan_video(&dovi(8, 4), &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+		let plan = plan(&dovi(8, 4), &[], PROGRESSIVE_CLEAN, Speed::Moderate);
 		assert!(
 			plan.warnings.iter().any(|warning| warning.contains("Dolby Vision")),
 			"{:?}",
@@ -443,7 +544,7 @@ mod tests {
 			libaom: false,
 		};
 
-		let plan = plan_video(&wide, &[], &PROGRESSIVE_CLEAN, Speed::Fast, &CAPS).unwrap();
+		let plan = plan(&wide, &[], PROGRESSIVE_CLEAN, Speed::Fast);
 
 		assert_eq!(plan.encoder, Encoder::Aom { cpu_used: 6, crf: 38 });
 		assert!(matches!(
@@ -490,7 +591,7 @@ mod tests {
 		)
 		.unwrap();
 
-		let plan = plan_video(&h264(""), &frames, &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+		let plan = plan(&h264(""), &frames, PROGRESSIVE_CLEAN, Speed::Moderate);
 
 		assert!(plan.hdr10);
 		assert!(
@@ -510,7 +611,7 @@ mod tests {
 		);
 
 		assert_eq!(main_stream(&angles).unwrap().index, 1);
-		let plan = plan_video(&angles, &[], &PROGRESSIVE_CLEAN, Speed::Moderate, &CAPS).unwrap();
+		let plan = plan(&angles, &[], PROGRESSIVE_CLEAN, Speed::Moderate);
 		assert_eq!(plan.streams, [1, 0]);
 	}
 

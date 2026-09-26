@@ -118,6 +118,7 @@ pub const VIDEO_FILTERS: &[&str] = &[
 ];
 pub const ALPHA_FILTERS: &[&str] = &["alphaextract", "ssim"];
 const AV1_DECODERS: &[&str] = &["libdav1d", "libaom-av1"];
+const LIBAOM: &str = "libaom-av1";
 const EVERY_KIND: &[MediaKind] = MediaKind::ALL;
 const VIDEO_ONLY: &[MediaKind] = &[MediaKind::Video];
 const OPTIONAL: &[MediaKind] = &[];
@@ -288,6 +289,10 @@ impl Toolchain {
 		AV1_DECODERS.iter().any(|name| self.decoders.contains(*name))
 	}
 
+	pub fn has_libaom(&self) -> bool {
+		self.encoders.contains(LIBAOM)
+	}
+
 	fn missing(&self, selected: impl Fn(&ReportLine) -> bool) -> Vec<String> {
 		self.report()
 			.into_iter()
@@ -381,8 +386,8 @@ impl Toolchain {
 				"transparent video",
 			),
 			check(
-				"libaom-av1",
-				self.encoders.contains("libaom-av1"),
+				LIBAOM,
+				self.has_libaom(),
 				Status::Warn,
 				OPTIONAL,
 				"animated images with alpha, video larger than 16384×8704",
@@ -786,6 +791,7 @@ mod tests {
 		);
 		assert!(tools.problems(MediaKind::Audio).is_empty());
 		assert!(tools.problems(MediaKind::Video).is_empty());
+		assert!(tools.has_libaom());
 	}
 
 	#[test]
@@ -813,6 +819,14 @@ mod tests {
 			!video.iter().any(|problem| problem.starts_with("libvpx-vp9:")),
 			"{video:?}"
 		);
+	}
+
+	#[test]
+	fn libaom_is_looked_up_among_the_encoders() {
+		let mut tools = complete_toolchain();
+		tools.encoders.remove("libaom-av1");
+
+		assert!(!tools.has_libaom());
 	}
 
 	#[test]

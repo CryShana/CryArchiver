@@ -8,10 +8,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::{Args, Parser, Subcommand};
 use cryarchiver_engine::commit::{OutputSink, check_space};
-use cryarchiver_engine::engine::{Engine, Job};
+use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::cli_output_path;
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
 use cryarchiver_engine::preset::Speed;
@@ -19,6 +20,7 @@ use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::toolchain::{Status, ToolConfig, Toolchain};
 use cryarchiver_engine::workspace::sweep;
+use tokio::sync::Notify;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -86,6 +88,57 @@ struct CompressArgs {
 	ffmpeg: Option<PathBuf>,
 	#[arg(short, long, help = "Only print failures and the summary")]
 	quiet: bool,
+}
+
+#[derive(Default)]
+struct VideoQueue {
+	waiting: AtomicUsize,
+	joined: Notify,
+}
+
+impl VideoQueue {
+	fn waiting(&self) -> usize {
+		self.waiting.load(Ordering::SeqCst)
+	}
+}
+
+struct QueueSeat {
+	queue: Arc<VideoQueue>,
+	waiting: AtomicBool,
+}
+
+impl QueueSeat {
+	fn new(queue: Arc<VideoQueue>) -> Self {
+		Self {
+			queue,
+			waiting: AtomicBool::new(false),
+		}
+	}
+
+	fn observe(&self, event: &JobEvent) {
+		match event {
+			JobEvent::Stage(Stage::Queued) => {
+				if !self.waiting.swap(true, Ordering::SeqCst) {
+					self.queue.waiting.fetch_add(1, Ordering::SeqCst);
+					self.queue.joined.notify_one();
+				}
+			}
+			JobEvent::Stage(_) => self.leave(),
+			JobEvent::Progress(_) | JobEvent::Warning(_) => {}
+		}
+	}
+
+	fn leave(&self) {
+		if self.waiting.swap(false, Ordering::SeqCst) {
+			self.queue.waiting.fetch_sub(1, Ordering::SeqCst);
+		}
+	}
+}
+
+impl Drop for QueueSeat {
+	fn drop(&mut self) {
+		self.leave();
+	}
 }
 
 fn main() -> ExitCode {
@@ -243,6 +296,7 @@ async fn run_all(
 	let mut running = JoinSet::new();
 	let mut queue = jobs.into_iter();
 	let mut claimed: HashMap<OsString, PathBuf> = HashMap::new();
+	let videos = Arc::new(VideoQueue::default());
 
 	while let Some(job) = queue.next() {
 		if cancel.is_cancelled() {
@@ -264,9 +318,10 @@ async fn run_all(
 			continue;
 		}
 
-		while running.len() >= parallel {
-			if let Some(joined) = running.join_next().await {
-				record_joined(report, &mut totals, joined);
+		while running.len().saturating_sub(videos.waiting()) >= parallel {
+			tokio::select! {
+				Some(joined) = running.join_next() => record_joined(report, &mut totals, joined),
+				() = videos.joined.notified() => {}
 			}
 		}
 
@@ -276,11 +331,14 @@ async fn run_all(
 		}
 
 		let bar = report.bar(&job.source);
+		let seat = QueueSeat::new(videos.clone());
 		let (engine, sink, cancel) = (engine.clone(), sink.clone(), cancel.clone());
 		running.spawn(async move {
-			let outcome = engine
-				.run(&job, sink.as_ref(), &|event| report::apply(&bar, &event), &cancel)
-				.await;
+			let on_event = |event: JobEvent| {
+				seat.observe(&event);
+				report::apply(&bar, &event);
+			};
+			let outcome = engine.run(&job, sink.as_ref(), &on_event, &cancel).await;
 			bar.finish_and_clear();
 			(job.source, outcome)
 		});
@@ -376,3 +434,44 @@ fn pause_if_launched_from_explorer() {
 
 #[cfg(not(windows))]
 fn pause_if_launched_from_explorer() {}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use super::*;
+
+	#[test]
+	fn queued_videos_count_until_they_move_on_or_end() {
+		let videos = Arc::new(VideoQueue::default());
+		let first = QueueSeat::new(videos.clone());
+		let second = QueueSeat::new(videos.clone());
+
+		first.observe(&JobEvent::Stage(Stage::Probe));
+		assert_eq!(videos.waiting(), 0);
+
+		first.observe(&JobEvent::Stage(Stage::Queued));
+		first.observe(&JobEvent::Stage(Stage::Queued));
+		second.observe(&JobEvent::Stage(Stage::Queued));
+		first.observe(&JobEvent::Progress(0.5));
+		assert_eq!(videos.waiting(), 2);
+
+		first.observe(&JobEvent::Stage(Stage::Analyze));
+		assert_eq!(videos.waiting(), 1);
+
+		drop(second);
+		assert_eq!(videos.waiting(), 0);
+	}
+
+	#[tokio::test]
+	async fn entering_the_queue_wakes_the_scheduler() {
+		let videos = Arc::new(VideoQueue::default());
+		let seat = QueueSeat::new(videos.clone());
+
+		seat.observe(&JobEvent::Stage(Stage::Queued));
+
+		tokio::time::timeout(Duration::from_secs(1), videos.joined.notified())
+			.await
+			.expect("the wake-up is stored until the scheduler waits");
+	}
+}

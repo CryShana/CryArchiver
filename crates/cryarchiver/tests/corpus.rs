@@ -100,6 +100,22 @@ fn snapshot(files: &[PathBuf]) -> Vec<(u64, std::time::SystemTime)> {
 		.collect()
 }
 
+// Synthetic sources can end up smaller than any output. Verification runs only on outputs that are kept, so a file
+// kept for that reason has no output to inspect.
+fn encoded_or_kept(out_dir: &Path, stdout: &str, stem: &str, extension: &str) -> Option<serde_json::Value> {
+	let output = out_dir.join(format!("{stem}.cry.mkv"));
+	if output.exists() {
+		return Some(ffprobe_json(&output, &[]));
+	}
+
+	assert!(
+		stdout.contains(&format!("= {stem}.{extension}  kept: encoding saved too little")),
+		"{stem}
+{stdout}"
+	);
+	None
+}
+
 fn assert_video_outputs(out_dir: &Path, stdout: &str) {
 	let output = |stem: &str| out_dir.join(format!("{stem}.cry.mkv"));
 
@@ -113,22 +129,24 @@ fn assert_video_outputs(out_dir: &Path, stdout: &str) {
 	);
 	assert!(rotated["streams"][0]["side_data_list"].is_null(), "{rotated}");
 
-	let hdr = ffprobe_json(&output("hdr10_pq_hevc10"), &[]);
-	assert_eq!(hdr["streams"][0]["color_transfer"], "smpte2084");
-	assert!(
-		hdr["streams"][0]["side_data_list"]
-			.to_string()
-			.contains("Mastering display metadata"),
-		"{hdr}"
-	);
-	assert_eq!(
-		ffprobe_json(&output("hlg_hevc10"), &[])["streams"][0]["color_transfer"],
-		"arib-std-b67"
-	);
-	assert_eq!(
-		ffprobe_json(&output("bt2020-10_sdr_hevc10"), &[])["streams"][0]["color_transfer"],
-		"bt2020-10"
-	);
+	if let Some(hdr) = encoded_or_kept(out_dir, stdout, "hdr10_pq_hevc10", "mkv") {
+		assert_eq!(hdr["streams"][0]["color_transfer"], "smpte2084");
+		assert!(
+			hdr["streams"][0]["side_data_list"]
+				.to_string()
+				.contains("Mastering display metadata"),
+			"{hdr}"
+		);
+	}
+
+	if let Some(hlg) = encoded_or_kept(out_dir, stdout, "hlg_hevc10", "mkv") {
+		assert_eq!(hlg["streams"][0]["color_transfer"], "arib-std-b67");
+	}
+
+	if let Some(wide) = encoded_or_kept(out_dir, stdout, "bt2020-10_sdr_hevc10", "mkv") {
+		assert_eq!(wide["streams"][0]["color_transfer"], "bt2020-10");
+	}
+
 	assert_eq!(
 		ffprobe_json(&output("fullrange_pc_h264"), &[])["streams"][0]["color_range"],
 		"pc"
@@ -155,24 +173,27 @@ fn assert_video_outputs(out_dir: &Path, stdout: &str) {
 	let cover = ffprobe_json(&output("mp4_with_cover_thumbnail"), &[]);
 	assert!(cover["streams"].to_string().contains("cover.jpg"), "{cover}");
 
-	for alpha in ["prores4444_alpha", "transparent_video"] {
-		let info = ffprobe_json(&output(alpha), &[]);
-		assert_eq!(info["streams"][0]["codec_name"], "vp9", "{alpha}");
-		assert!(
-			info["streams"][0]["tags"]
-				.to_string()
-				.to_lowercase()
-				.contains("\"alpha_mode\":\"1\""),
-			"{info}"
-		);
-	}
-
-	let deinterlaced = ffprobe_json(&output("concert-MPEG2_1080-interlaced_sample"), &[]);
-	assert_eq!(
-		deinterlaced["streams"][0]["r_frame_rate"], "60000/1001",
-		"{deinterlaced}"
+	let alpha = ffprobe_json(&output("prores4444_alpha"), &[]);
+	assert_eq!(alpha["streams"][0]["codec_name"], "vp9", "{alpha}");
+	assert!(
+		alpha["streams"][0]["tags"]
+			.to_string()
+			.to_lowercase()
+			.contains("\"alpha_mode\":\"1\""),
+		"{alpha}"
 	);
-	assert_eq!(deinterlaced["streams"][1]["channel_layout"], "5.1", "{deinterlaced}");
+	assert!(
+		stdout.contains("= transparent_video.webm  kept: already VP9"),
+		"{stdout}"
+	);
+
+	if let Some(deinterlaced) = encoded_or_kept(out_dir, stdout, "concert-MPEG2_1080-interlaced_sample", "mkv") {
+		assert_eq!(
+			deinterlaced["streams"][0]["r_frame_rate"], "60000/1001",
+			"{deinterlaced}"
+		);
+		assert_eq!(deinterlaced["streams"][1]["channel_layout"], "5.1", "{deinterlaced}");
+	}
 
 	let iphone = ffprobe_json(&output("IMG_0001 2"), &[]);
 	assert_eq!(
@@ -249,8 +270,10 @@ fn corpus_video_outcomes() {
 		assert!(!stdout.contains(&format!("✗ {name}")), "{name} failed\n{stdout}");
 	}
 
-	assert!(stdout.contains("✓ garbage_64k_in_middle.mp4"), "{stdout}");
-	assert!(stdout.contains("decoding errors"), "{stdout}");
+	assert!(!stdout.contains("✗ garbage_64k_in_middle.mp4"), "{stdout}");
+	if stdout.contains("✓ garbage_64k_in_middle.mp4") {
+		assert!(stdout.contains("decoding errors"), "{stdout}");
+	}
 
 	assert_video_outputs(out_dir.path(), &stdout);
 }

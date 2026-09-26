@@ -6,11 +6,13 @@ use crate::outcome::{ErrorKind, JobError};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::process::{self, STALL_TIMEOUT, ToolCommand};
 use crate::toolchain::Toolchain;
+use crate::video::mux::{MuxInput, OutputStream};
 use crate::video::plan::{Encoder, VideoPlan};
 use crate::video::run_ffmpeg;
 use crate::video::streams::StreamPlan;
 
 const MIN_ALPHA_SSIM: f64 = 0.98;
+const MIN_START_TOLERANCE_S: f64 = 0.05;
 const MASTERING_DISPLAY: &str = "Mastering display metadata";
 const DOVI_RECORD: &str = "DOVI configuration record";
 
@@ -19,6 +21,14 @@ pub struct Expected<'a> {
 	pub streams: &'a StreamPlan,
 	pub source_chapters: usize,
 	pub attached_files: usize,
+	pub start_offsets: Vec<Option<f64>>,
+	pub source_fps: Option<f64>,
+}
+
+pub struct Timelines<'a> {
+	pub source: &'a MediaInfo,
+	pub video_temp: &'a MediaInfo,
+	pub audio_temp: Option<&'a MediaInfo>,
 }
 
 pub fn check_output(output: &MediaInfo, first_frame: Option<&Frame>, expected: &Expected<'_>) -> Result<(), String> {
@@ -92,7 +102,8 @@ pub fn check_output(output: &MediaInfo, first_frame: Option<&Frame>, expected: &
 	if plan.hdr10 && (main.side_data(MASTERING_DISPLAY).is_none() || !frame_has_mastering) {
 		return Err("HDR10 mastering-display metadata is missing".into());
 	}
-	Ok(())
+
+	check_start_offsets(output, expected)
 }
 
 pub async fn verify_output(
@@ -101,13 +112,37 @@ pub async fn verify_output(
 	expected: &Expected<'_>,
 	cancel: &CancellationToken,
 ) -> Result<(), JobError> {
-	let info = probe::probe(tools, output, cancel).await.map_err(unreadable)?;
-	let frames = probe::first_frames(tools, output, 0, 1, cancel)
-		.await
-		.map_err(unreadable)?;
+	let (info, frames) = tokio::try_join!(
+		Box::pin(probe::probe(tools, output, cancel)),
+		Box::pin(probe::first_frames(tools, output, 0, 1, cancel))
+	)
+	.map_err(unreadable)?;
 
 	check_output(&info, frames.first(), expected)
 		.map_err(|reason| ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into())
+}
+
+pub async fn probe_temp(tools: &Toolchain, temp: &Path, cancel: &CancellationToken) -> Result<MediaInfo, JobError> {
+	probe::probe(tools, temp, cancel).await.map_err(unreadable)
+}
+
+pub fn earliest_video_start(info: &MediaInfo) -> Option<f64> {
+	info.streams
+		.iter()
+		.filter(|stream| stream.is_real_video())
+		.filter_map(|stream| stream.start_time)
+		.reduce(f64::min)
+}
+
+// Encoded streams are measured in their temps rather than in the source: a stream's start_time there counts
+// packets the decoder drops (edit-list pre-roll, leading frames before the first keyframe).
+pub fn start_offsets(outputs: &[OutputStream], timelines: &Timelines<'_>) -> Vec<Option<f64>> {
+	let video_start = earliest_video_start(timelines.video_temp);
+
+	outputs
+		.iter()
+		.map(|output| Some(landing(output, timelines)? - video_start?))
+		.collect()
 }
 
 pub fn parse_ssim(stderr: &[String]) -> Option<f64> {
@@ -155,6 +190,56 @@ pub fn check_alpha(ssim: f64) -> Result<(), JobError> {
 			"alpha verification failed: SSIM {ssim:.4} is below {MIN_ALPHA_SSIM}"
 		))
 		.into());
+	}
+	Ok(())
+}
+
+fn landing(output: &OutputStream, timelines: &Timelines<'_>) -> Option<f64> {
+	match output.input {
+		MuxInput::VideoTemp(ordinal) => {
+			let mut videos = timelines
+				.video_temp
+				.streams
+				.iter()
+				.filter(|stream| stream.is_real_video());
+			videos.nth(ordinal)?.start_time
+		}
+		MuxInput::AudioTemp(ordinal) => timelines.audio_temp?.audio_streams().nth(ordinal)?.start_time,
+		MuxInput::Source => {
+			let stream = timelines
+				.source
+				.streams
+				.iter()
+				.find(|stream| stream.index == output.origin)?;
+			Some(stream.start_time? - timelines.source.format.start_time.unwrap_or(0.0))
+		}
+	}
+}
+
+fn check_start_offsets(output: &MediaInfo, expected: &Expected<'_>) -> Result<(), String> {
+	let Some(video_start) = earliest_video_start(output) else {
+		return Ok(());
+	};
+	let tolerance = expected
+		.source_fps
+		.map_or(MIN_START_TOLERANCE_S, |fps| (1.0 / fps).max(MIN_START_TOLERANCE_S));
+
+	// ffprobe reports a Matroska subtitle stream as starting at 0 whenever other streams do, whatever its first cue.
+	for (stream, wanted) in output.streams.iter().zip(&expected.start_offsets) {
+		let (Some(start), Some(wanted)) = (stream.start_time, wanted) else {
+			continue;
+		};
+		if stream.codec_type == "subtitle" {
+			continue;
+		}
+
+		let actual = start - video_start;
+		if (actual - wanted).abs() > tolerance {
+			return Err(format!(
+				"stream {} starts {actual:.3} s after the video, {wanted:.3} s expected",
+				stream.index
+			));
+		}
 	}
 	Ok(())
 }
@@ -212,33 +297,18 @@ fn unreadable(err: ProbeError) -> JobError {
 mod tests {
 	use super::*;
 	use crate::audio::plan::{TrackJob, TrackPlan};
-	use crate::video::colour::{ColourTags, Range};
+	use crate::video::plan::test_plan;
 
 	fn plan(alpha: bool, hdr10: bool) -> VideoPlan {
 		VideoPlan {
-			streams: vec![0],
-			decoder: None,
-			filters: String::new(),
 			encoder: if alpha {
 				Encoder::Vp9Alpha { cpu_used: 4, crf: 33 }
 			} else {
-				Encoder::SvtAv1 {
-					preset: 8,
-					params: String::new(),
-				}
-			},
-			expected_frames: None,
-			width: 320,
-			height: 240,
-			colour: ColourTags {
-				primaries: "bt709".into(),
-				transfer: "bt709".into(),
-				matrix: "bt709".into(),
-				range: Range::Limited,
+				test_plan().encoder
 			},
 			alpha,
 			hdr10,
-			warnings: Vec::new(),
+			..test_plan()
 		}
 	}
 
@@ -285,6 +355,8 @@ mod tests {
 			streams,
 			source_chapters: 1,
 			attached_files: 1,
+			start_offsets: Vec::new(),
+			source_fps: None,
 		}
 	}
 
@@ -397,6 +469,128 @@ mod tests {
 			Ok(())
 		);
 		assert!(check_output(&output(&vp9(""), ""), Some(&vp9_frame), &expected(&video, &streams)).is_err());
+	}
+
+	#[test]
+	fn streams_must_start_where_they_started_against_the_video() {
+		let (video, streams) = (plan(false, false), streams(1));
+		let delayed = MediaInfo {
+			streams: output(AV1, "")
+				.streams
+				.into_iter()
+				.zip([Some(1.32), Some(1.8), None])
+				.map(|(stream, start_time)| Stream { start_time, ..stream })
+				.collect(),
+			..output(AV1, "")
+		};
+		let with_offsets = |start_offsets: Vec<Option<f64>>, source_fps: Option<f64>| Expected {
+			start_offsets,
+			source_fps,
+			..expected(&video, &streams)
+		};
+
+		assert_eq!(
+			check_output(
+				&delayed,
+				Some(&tagged_frame()),
+				&with_offsets(vec![Some(0.0), Some(0.5)], None)
+			),
+			Ok(())
+		);
+		assert_eq!(
+			check_output(
+				&delayed,
+				Some(&tagged_frame()),
+				&with_offsets(vec![Some(0.0), None], None)
+			),
+			Ok(())
+		);
+		assert_eq!(
+			check_output(
+				&delayed,
+				Some(&tagged_frame()),
+				&with_offsets(vec![Some(0.0), Some(0.0)], None)
+			),
+			Err("stream 1 starts 0.480 s after the video, 0.000 s expected".into())
+		);
+		assert!(
+			check_output(
+				&delayed,
+				Some(&tagged_frame()),
+				&with_offsets(vec![Some(0.0), Some(0.4)], None)
+			)
+			.is_err()
+		);
+		assert_eq!(
+			check_output(
+				&delayed,
+				Some(&tagged_frame()),
+				&with_offsets(vec![Some(0.0), Some(0.4)], Some(10.0))
+			),
+			Ok(())
+		);
+	}
+
+	#[test]
+	fn subtitle_starts_are_not_compared() {
+		let (video, streams) = (plan(false, false), streams(1));
+		let muxed = MediaInfo::parse(
+			br#"{"streams":[{"index":0,"codec_type":"video","start_time":"0.000000"},
+			{"index":1,"codec_type":"subtitle","start_time":"0.000000"}]}"#,
+		)
+		.unwrap();
+		let expected = Expected {
+			start_offsets: vec![Some(0.0), Some(0.2)],
+			source_fps: None,
+			..expected(&video, &streams)
+		};
+
+		assert_eq!(check_start_offsets(&muxed, &expected), Ok(()));
+	}
+
+	#[test]
+	fn encoded_streams_are_placed_by_their_temps_and_copies_by_the_source() {
+		let source = MediaInfo::parse(
+			br#"{"streams":[{"index":0,"codec_type":"video","start_time":"-1.300000"},
+			{"index":1,"codec_type":"audio","start_time":"-1.250000"},
+			{"index":2,"codec_type":"audio","start_time":"0.500000"},
+			{"index":3,"codec_type":"subtitle"}],
+			"format":{"start_time":"-1.250000"}}"#,
+		)
+		.unwrap();
+		let video_temp =
+			MediaInfo::parse(br#"{"streams":[{"index":0,"codec_type":"video","start_time":"1.250000"}]}"#).unwrap();
+		let audio_temp =
+			MediaInfo::parse(br#"{"streams":[{"index":0,"codec_type":"audio","start_time":"1.750000"}]}"#).unwrap();
+		let outputs = [
+			OutputStream {
+				origin: 0,
+				input: MuxInput::VideoTemp(0),
+			},
+			OutputStream {
+				origin: 1,
+				input: MuxInput::AudioTemp(0),
+			},
+			OutputStream {
+				origin: 2,
+				input: MuxInput::Source,
+			},
+			OutputStream {
+				origin: 3,
+				input: MuxInput::Source,
+			},
+		];
+
+		let offsets = start_offsets(
+			&outputs,
+			&Timelines {
+				source: &source,
+				video_temp: &video_temp,
+				audio_temp: Some(&audio_temp),
+			},
+		);
+
+		assert_eq!(offsets, [Some(0.0), Some(0.5), Some(0.5), None]);
 	}
 
 	#[test]

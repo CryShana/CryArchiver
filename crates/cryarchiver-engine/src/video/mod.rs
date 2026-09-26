@@ -24,3 +24,12 @@ pub(crate) async fn run_ffmpeg(
 	let reason = process::failure_reason(&out.stderr_tail);
 	Err(JobError::with_log(ErrorKind::EncodeFailed(reason), out.stderr_tail))
 }
+
+#[cfg(test)]
+pub(crate) fn joined(cmd: &ToolCommand) -> String {
+	cmd.args
+		.iter()
+		.map(|arg| arg.to_string_lossy().into_owned())
+		.collect::<Vec<_>>()
+		.join(" ")
+}

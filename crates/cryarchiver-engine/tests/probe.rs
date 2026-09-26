@@ -63,7 +63,10 @@ async fn video_probe_counts_packets_and_reads_rotation_and_chapters() {
 	]);
 	let tools = support::toolchain().await;
 
-	let (info, json) = probe_video(&tools, &rotated, &CancellationToken::new()).await.unwrap();
+	let bytes = std::fs::metadata(&rotated).unwrap().len();
+	let (info, json) = probe_video(&tools, &rotated, bytes, &CancellationToken::new())
+		.await
+		.unwrap();
 
 	let video = info.streams.iter().find(|stream| stream.is_real_video()).unwrap();
 	assert_eq!(video.nb_read_packets, Some(50));

@@ -22,6 +22,7 @@ fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan 
 			}
 		},
 		expected_frames: None,
+		frame_tolerance: 2,
 		width: 320,
 		height: 240,
 		colour: ColourTags {
@@ -82,12 +83,16 @@ async fn a_tagged_av1_output_passes_and_a_mislabelled_one_fails() {
 		streams: &streams,
 		source_chapters: 0,
 		attached_files: 0,
+		start_offsets: Vec::new(),
+		source_fps: None,
 	};
 	let fails = Expected {
 		video: &wrong,
 		streams: &streams,
 		source_chapters: 0,
 		attached_files: 0,
+		start_offsets: Vec::new(),
+		source_fps: None,
 	};
 
 	verify_output(&tools, &output, &passes, &CancellationToken::new())

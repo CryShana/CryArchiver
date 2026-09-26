@@ -21,6 +21,7 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 			params: "tune=0:enable-variance-boost=1:keyint=5s:crf=40".into(),
 		},
 		expected_frames,
+		frame_tolerance: 2,
 		width: 320,
 		height: 240,
 		colour: ColourTags {
@@ -57,7 +58,7 @@ async fn encodes_the_video_temp_and_reports_frames_and_duration() {
 	assert_eq!(encoded.frames, 50);
 	assert!((encoded.decoded_s - 2.0).abs() < 0.1, "{encoded:?}");
 	assert_eq!(encoded.decode_errors, 0);
-	assert_eq!(check_video_temp(&video, &encoded, Some(2.0)).unwrap(), None);
+	assert_eq!(check_video_temp(&video, &encoded, Some(2.0), 0.0).unwrap(), None);
 	assert!(fractions.last().is_some_and(|last| *last > 0.9), "{fractions:?}");
 	let info = probe(&tools, &output, &CancellationToken::new()).await.unwrap();
 	assert_eq!(info.streams.len(), 1);
@@ -85,7 +86,7 @@ async fn a_truncated_matroska_decodes_short() {
 	.unwrap();
 
 	assert!(encoded.decoded_s < 4.0, "{encoded:?}");
-	assert!(check_video_temp(&video, &encoded, Some(6.0)).is_err());
+	assert!(check_video_temp(&video, &encoded, Some(6.0), 0.0).is_err());
 }
 
 #[tokio::test]

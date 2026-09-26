@@ -22,6 +22,7 @@ use progress::{HighWater, ProgressParser};
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 const STDERR_LINES: usize = 500;
+const SILENT_BYTES_PER_SECOND: u64 = 20_000_000;
 
 #[derive(Debug, Clone)]
 pub struct ToolCommand {
@@ -159,6 +160,10 @@ pub async fn run(
 	})
 }
 
+pub fn scaled_timeout(bytes: u64) -> Duration {
+	STALL_TIMEOUT + Duration::from_secs(bytes / SILENT_BYTES_PER_SECOND)
+}
+
 pub fn tool_path(path: &Path) -> PathBuf {
 	std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -280,6 +285,16 @@ mod tests {
 		assert!(resolved.is_absolute(), "{}", resolved.display());
 		assert!(resolved.ends_with(&relative), "{}", resolved.display());
 		assert_eq!(tool_path(&absolute), absolute);
+	}
+
+	#[test]
+	fn silent_steps_get_a_second_per_20_mb() {
+		assert_eq!(scaled_timeout(0), STALL_TIMEOUT);
+		assert_eq!(scaled_timeout(19_999_999), STALL_TIMEOUT);
+		assert_eq!(
+			scaled_timeout(50_000_000_000),
+			STALL_TIMEOUT + Duration::from_secs(2500)
+		);
 	}
 
 	#[test]

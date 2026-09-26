@@ -4,8 +4,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audio::plan::TrackPlan;
 use crate::outcome::JobError;
-use crate::probe::MediaInfo;
-use crate::process::{self, STALL_TIMEOUT, ToolCommand};
+use crate::probe::{MediaInfo, Stream};
+use crate::process::{self, ToolCommand};
 use crate::video::plan::VideoPlan;
 use crate::video::run_ffmpeg;
 use crate::video::streams::StreamPlan;
@@ -13,6 +13,15 @@ use crate::video::streams::StreamPlan;
 const BRAND_TAGS: &[&str] = &["major_brand", "minor_version", "compatible_brands"];
 const CLEAN_STREAM_TAGS: &[&str] = &["language", "title"];
 const ATTACHMENT_TAGS: &[&str] = &["filename", "mimetype"];
+const STATISTICS_TAGS: &[&str] = &[
+	"BPS",
+	"DURATION",
+	"NUMBER_OF_FRAMES",
+	"NUMBER_OF_BYTES",
+	"_STATISTICS_TAGS",
+	"_STATISTICS_WRITING_APP",
+	"_STATISTICS_WRITING_DATE_UTC",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
@@ -25,6 +34,7 @@ pub struct MuxInputs<'a> {
 	pub video: &'a Path,
 	pub audio: Option<&'a Path>,
 	pub source: &'a Path,
+	pub source_bytes: u64,
 	pub attachments: &'a [Attachment],
 }
 
@@ -35,9 +45,60 @@ pub struct MuxPlan<'a> {
 	pub keep_metadata: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxInput {
+	VideoTemp(usize),
+	AudioTemp(usize),
+	Source,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputStream {
+	pub origin: u32,
+	pub input: MuxInput,
+}
+
+impl OutputStream {
+	pub fn is_encoded(self) -> bool {
+		self.input != MuxInput::Source
+	}
+}
+
+pub fn output_streams(video: &VideoPlan, streams: &StreamPlan) -> Vec<OutputStream> {
+	let mut outputs: Vec<OutputStream> = video
+		.streams
+		.iter()
+		.enumerate()
+		.map(|(ordinal, &origin)| OutputStream {
+			origin,
+			input: MuxInput::VideoTemp(ordinal),
+		})
+		.collect();
+
+	let mut encoded = 0;
+	for track in &streams.audio {
+		let input = if matches!(track.plan, TrackPlan::Encode(_)) {
+			encoded += 1;
+			MuxInput::AudioTemp(encoded - 1)
+		} else {
+			MuxInput::Source
+		};
+		outputs.push(OutputStream {
+			origin: track.stream_index,
+			input,
+		});
+	}
+
+	outputs.extend(streams.subtitles.iter().map(|subtitle| OutputStream {
+		origin: subtitle.stream_index,
+		input: MuxInput::Source,
+	}));
+	outputs
+}
+
 pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output: &Path) -> ToolCommand {
-	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
-	cmd.args(["-hide_banner", "-nostdin", "-y", "-i"])
+	let mut cmd = ToolCommand::new(ffmpeg, process::scaled_timeout(inputs.source_bytes));
+	cmd.args(["-hide_banner", "-nostdin", "-y", "-copyts", "-i"])
 		.arg(process::tool_path(inputs.video));
 	if let Some(audio) = inputs.audio {
 		cmd.arg("-i").arg(process::tool_path(audio));
@@ -47,9 +108,13 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 	if plan.keep_metadata && plan.info.format.format_name.contains("mov") {
 		cmd.args(["-export_xmp", "1"]);
 	}
+	if let Some(offset) = source_offset(plan.info) {
+		cmd.arg("-itsoffset").arg(offset);
+	}
 	cmd.arg("-i").arg(process::tool_path(inputs.source));
 
-	let origins = push_maps(&mut cmd, plan, source);
+	let outputs = output_streams(plan.video, plan.streams);
+	push_maps(&mut cmd, &outputs, &plan.streams.attachments, source);
 	cmd.args(["-c", "copy"]);
 	for (ordinal, _) in plan
 		.streams
@@ -76,8 +141,9 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 		for tag in BRAND_TAGS {
 			cmd.arg("-metadata").arg(format!("{tag}="));
 		}
+		push_statistics_reset(&mut cmd, plan.info, &outputs);
 	} else {
-		push_clean_metadata(&mut cmd, plan, &origins);
+		push_clean_metadata(&mut cmd, plan, &outputs);
 	}
 
 	cmd.arg("-map_chapters").arg(source.to_string());
@@ -90,50 +156,70 @@ pub async fn mux(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<(), Jo
 	run_ffmpeg(cmd, |_| {}, cancel).await.map(drop)
 }
 
-fn push_maps(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, source: usize) -> Vec<u32> {
-	let mut origins = Vec::new();
-	for (ordinal, &index) in plan.video.streams.iter().enumerate() {
-		cmd.arg("-map").arg(format!("0:v:{ordinal}"));
-		origins.push(index);
-	}
-
-	let mut encoded = 0;
-	for track in &plan.streams.audio {
-		if matches!(track.plan, TrackPlan::Encode(_)) {
-			cmd.arg("-map").arg(format!("1:a:{encoded}"));
-			encoded += 1;
-		} else {
-			cmd.arg("-map").arg(format!("{source}:{}", track.stream_index));
-		}
-		origins.push(track.stream_index);
-	}
-
-	for subtitle in &plan.streams.subtitles {
-		cmd.arg("-map").arg(format!("{source}:{}", subtitle.stream_index));
-		origins.push(subtitle.stream_index);
-	}
-	for attachment in &plan.streams.attachments {
-		cmd.arg("-map").arg(format!("{source}:{attachment}"));
-	}
-	origins
+// The temps were cut from the source shifted by its start time; `-copyts` keeps them there, so the source itself
+// must be shifted the same way to stay in sync with them.
+fn source_offset(info: &MediaInfo) -> Option<String> {
+	info.format
+		.start_time
+		.filter(|start| *start != 0.0)
+		.map(|start| format!("{:.6}", -start))
 }
 
-fn push_clean_metadata(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, origins: &[u32]) {
+fn push_maps(cmd: &mut ToolCommand, outputs: &[OutputStream], attachments: &[u32], source: usize) {
+	for output in outputs {
+		let spec = match output.input {
+			MuxInput::VideoTemp(ordinal) => format!("0:v:{ordinal}"),
+			MuxInput::AudioTemp(ordinal) => format!("1:a:{ordinal}"),
+			MuxInput::Source => format!("{source}:{}", output.origin),
+		};
+		cmd.arg("-map").arg(spec);
+	}
+
+	for attachment in attachments {
+		cmd.arg("-map").arg(format!("{source}:{attachment}"));
+	}
+}
+
+fn push_statistics_reset(cmd: &mut ToolCommand, info: &MediaInfo, outputs: &[OutputStream]) {
+	for (position, output) in outputs.iter().enumerate().filter(|(_, output)| output.is_encoded()) {
+		let Some(stream) = source_stream(info, output.origin) else {
+			continue;
+		};
+
+		for key in stream.tags.keys().filter(|key| is_statistics_tag(key)) {
+			cmd.arg(format!("-metadata:s:{position}")).arg(format!("{key}="));
+		}
+	}
+}
+
+fn is_statistics_tag(key: &str) -> bool {
+	let name = match key.rsplit_once('-') {
+		Some((name, language))
+			if (2..=3).contains(&language.len()) && language.chars().all(|c| c.is_ascii_alphabetic()) =>
+		{
+			name
+		}
+		_ => key,
+	};
+	STATISTICS_TAGS.iter().any(|tag| tag.eq_ignore_ascii_case(name))
+}
+
+fn push_clean_metadata(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, outputs: &[OutputStream]) {
 	cmd.args(["-map_metadata:g", "-1", "-map_metadata:s", "-1"]);
 
-	for (output, origin) in origins.iter().enumerate() {
-		let Some(stream) = plan.info.streams.iter().find(|stream| stream.index == *origin) else {
+	for (position, output) in outputs.iter().enumerate() {
+		let Some(stream) = source_stream(plan.info, output.origin) else {
 			continue;
 		};
 		for key in CLEAN_STREAM_TAGS {
 			if let Some(value) = stream.tag(key) {
-				cmd.arg(format!("-metadata:s:{output}")).arg(format!("{key}={value}"));
+				cmd.arg(format!("-metadata:s:{position}")).arg(format!("{key}={value}"));
 			}
 		}
 	}
 
 	for (ordinal, origin) in plan.streams.attachments.iter().enumerate() {
-		let Some(stream) = plan.info.streams.iter().find(|stream| stream.index == *origin) else {
+		let Some(stream) = source_stream(plan.info, *origin) else {
 			continue;
 		};
 		for key in ATTACHMENT_TAGS {
@@ -152,6 +238,10 @@ fn push_clean_metadata(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, origins: &[u32
 	}
 }
 
+fn source_stream(info: &MediaInfo, index: u32) -> Option<&Stream> {
+	info.streams.iter().find(|stream| stream.index == index)
+}
+
 fn timecode(info: &MediaInfo) -> Option<&str> {
 	info.streams
 		.iter()
@@ -163,33 +253,9 @@ fn timecode(info: &MediaInfo) -> Option<&str> {
 mod tests {
 	use super::*;
 	use crate::audio::plan::{EncodePlan, LayoutFix, TrackJob};
-	use crate::video::colour::{ColourTags, Range};
-	use crate::video::plan::Encoder;
+	use crate::video::joined;
+	use crate::video::plan::test_plan;
 	use crate::video::streams::SubtitleTrack;
-
-	fn video_plan(alpha: bool) -> VideoPlan {
-		VideoPlan {
-			streams: vec![0],
-			decoder: None,
-			filters: String::new(),
-			encoder: Encoder::SvtAv1 {
-				preset: 8,
-				params: String::new(),
-			},
-			expected_frames: None,
-			width: 320,
-			height: 240,
-			colour: ColourTags {
-				primaries: "bt709".into(),
-				transfer: "bt709".into(),
-				matrix: "bt709".into(),
-				range: Range::Limited,
-			},
-			alpha,
-			hdr10: false,
-			warnings: Vec::new(),
-		}
-	}
 
 	fn stream_plan() -> StreamPlan {
 		StreamPlan {
@@ -225,42 +291,40 @@ mod tests {
 		}
 	}
 
+	const INFO: &str = r#"{"streams":[
+		{"index":0,"codec_type":"video","tags":{"title":"Angle 1","BPS-eng":"9000000","NUMBER_OF_FRAMES":"75"}},
+		{"index":1,"codec_type":"audio","tags":{"language":"eng","title":"Main","_STATISTICS_TAGS":"BPS"}},
+		{"index":2,"codec_type":"audio","tags":{"language":"jpn","BPS":"128000"}},
+		{"index":3,"codec_type":"subtitle","tags":{"language":"slv","timecode":"01:02:03:04"}},
+		{"index":4,"codec_type":"subtitle"},
+		{"index":5,"codec_type":"attachment","tags":{"filename":"a.ttf","mimetype":"font/ttf"}}],
+		"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}"#;
+
 	fn info() -> MediaInfo {
-		MediaInfo::parse(
-			br#"{"streams":[{"index":0,"codec_type":"video","tags":{"title":"Angle 1"}},
-			{"index":1,"codec_type":"audio","tags":{"language":"eng","title":"Main"}},
-			{"index":2,"codec_type":"audio","tags":{"language":"jpn"}},
-			{"index":3,"codec_type":"subtitle","tags":{"language":"slv","timecode":"01:02:03:04"}},
-			{"index":4,"codec_type":"subtitle"},
-			{"index":5,"codec_type":"attachment","tags":{"filename":"a.ttf","mimetype":"font/ttf"}}],
-			"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}"#,
-		)
-		.unwrap()
+		MediaInfo::parse(INFO.as_bytes()).unwrap()
 	}
 
-	fn joined(cmd: &ToolCommand) -> String {
-		cmd.args
-			.iter()
-			.map(|arg| arg.to_string_lossy().into_owned())
-			.collect::<Vec<_>>()
-			.join(" ")
-	}
-
-	fn build(keep_metadata: bool, alpha: bool, attachments: &[Attachment]) -> String {
-		let (info, video, streams) = (info(), video_plan(alpha), stream_plan());
+	fn build_with(info: &MediaInfo, keep_metadata: bool, alpha: bool, attachments: &[Attachment]) -> String {
+		let video = VideoPlan { alpha, ..test_plan() };
+		let streams = stream_plan();
 		let inputs = MuxInputs {
 			video: Path::new("video.a1.mkv"),
 			audio: Some(Path::new("audio.mka")),
 			source: Path::new("source.mp4"),
+			source_bytes: 0,
 			attachments,
 		};
 		let plan = MuxPlan {
-			info: &info,
+			info,
 			video: &video,
 			streams: &streams,
 			keep_metadata,
 		};
 		joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")))
+	}
+
+	fn build(keep_metadata: bool, alpha: bool, attachments: &[Attachment]) -> String {
+		build_with(&info(), keep_metadata, alpha, attachments)
 	}
 
 	#[test]
@@ -275,6 +339,53 @@ mod tests {
 	}
 
 	#[test]
+	fn output_streams_name_their_origin_and_input() {
+		let video = VideoPlan {
+			streams: vec![0, 6],
+			..test_plan()
+		};
+
+		let outputs = output_streams(&video, &stream_plan());
+
+		assert_eq!(
+			outputs
+				.iter()
+				.map(|output| (output.origin, output.input))
+				.collect::<Vec<_>>(),
+			[
+				(0, MuxInput::VideoTemp(0)),
+				(6, MuxInput::VideoTemp(1)),
+				(1, MuxInput::AudioTemp(0)),
+				(2, MuxInput::Source),
+				(3, MuxInput::Source),
+				(4, MuxInput::Source),
+			]
+		);
+		assert_eq!(
+			outputs.iter().map(|output| output.is_encoded()).collect::<Vec<_>>(),
+			[true, true, true, false, false, false]
+		);
+	}
+
+	#[test]
+	fn temps_keep_their_timestamps_and_the_source_is_shifted_by_its_start() {
+		let mut delayed = info();
+		delayed.format.start_time = Some(1.4);
+		let mut zero = info();
+		zero.format.start_time = Some(0.0);
+
+		let shifted = build_with(&delayed, true, false, &[]);
+		let unshifted = build_with(&zero, false, false, &[]);
+		let unknown = build(false, false, &[]);
+
+		assert!(shifted.starts_with("-hide_banner -nostdin -y -copyts -i "), "{shifted}");
+		assert!(shifted.contains("-export_xmp 1 -itsoffset -1.400000 -i "), "{shifted}");
+		assert!(unshifted.contains(" -copyts "), "{unshifted}");
+		assert!(!unshifted.contains("-itsoffset"), "{unshifted}");
+		assert!(!unknown.contains("-itsoffset"), "{unknown}");
+	}
+
+	#[test]
 	fn keep_mode_maps_global_metadata_and_exports_xmp() {
 		let args = build(true, false, &[]);
 
@@ -285,6 +396,29 @@ mod tests {
 			)
 		);
 		assert!(!args.contains("-map_metadata:s"), "{args}");
+	}
+
+	#[test]
+	fn keep_mode_clears_source_statistics_on_encoded_streams_only() {
+		let args = build(true, false, &[]);
+
+		assert!(
+			args.contains("-metadata:s:0 BPS-eng= -metadata:s:0 NUMBER_OF_FRAMES= -metadata:s:1 _STATISTICS_TAGS="),
+			"{args}"
+		);
+		assert!(!args.contains("-metadata:s:2 BPS="), "{args}");
+		assert!(!build(false, false, &[]).contains("BPS"));
+	}
+
+	#[test]
+	fn statistics_tags_match_with_any_case_and_language_suffix() {
+		assert!(is_statistics_tag("BPS"));
+		assert!(is_statistics_tag("bps-eng"));
+		assert!(is_statistics_tag("_STATISTICS_WRITING_DATE_UTC-de"));
+		assert!(is_statistics_tag("Duration"));
+		assert!(!is_statistics_tag("BPS-english"));
+		assert!(!is_statistics_tag("title"));
+		assert!(!is_statistics_tag("HANDLER_NAME"));
 	}
 
 	#[test]
@@ -326,7 +460,7 @@ mod tests {
 
 	#[test]
 	fn without_an_audio_temp_the_source_is_input_one() {
-		let (info, video) = (info(), video_plan(false));
+		let (info, video) = (info(), test_plan());
 		let streams = StreamPlan {
 			audio: vec![TrackJob {
 				stream_index: 2,
@@ -339,6 +473,7 @@ mod tests {
 			video: Path::new("video.a1.mkv"),
 			audio: None,
 			source: Path::new("source.mkv"),
+			source_bytes: 0,
 			attachments: &[],
 		};
 		let plan = MuxPlan {

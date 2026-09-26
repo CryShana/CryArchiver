@@ -25,17 +25,6 @@ fn flac(dir: &Path, name: &str, seconds: u32) -> PathBuf {
 	support::tone(dir, name, "stereo", 2, seconds, &["-c:a", "flac"])
 }
 
-fn clip(dir: &Path, name: &str) -> PathBuf {
-	support::video(
-		dir,
-		name,
-		3,
-		&[
-			"-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-q:v", "2", "-c:a", "aac", "-b:a", "192k",
-		],
-	)
-}
-
 #[test]
 fn prints_version() {
 	let dir = tempfile::tempdir().unwrap();
@@ -202,7 +191,7 @@ fn same_stem_inputs_do_not_share_an_output() {
 #[test]
 fn compresses_a_video_next_to_the_source() {
 	let dir = tempfile::tempdir().unwrap();
-	let source = clip(dir.path(), "clip.mp4");
+	let source = support::mpeg4(dir.path(), "clip.mp4", 3);
 	let before = fs::read(&source).unwrap();
 
 	let out = cryarchiver(dir.path(), &["-s", "fast", "clip.mp4"]);
@@ -216,7 +205,7 @@ fn compresses_a_video_next_to_the_source() {
 #[test]
 fn rerun_skips_existing_video_outputs() {
 	let dir = tempfile::tempdir().unwrap();
-	clip(dir.path(), "clip.mp4");
+	support::mpeg4(dir.path(), "clip.mp4", 3);
 	assert!(cryarchiver(dir.path(), &["-s", "fast", "clip.mp4"]).status.success());
 
 	let out = cryarchiver(dir.path(), &["-s", "fast", "clip.mp4"]);
@@ -228,8 +217,8 @@ fn rerun_skips_existing_video_outputs() {
 #[test]
 fn mixed_audio_and_video_batches_run_together() {
 	let dir = tempfile::tempdir().unwrap();
-	clip(dir.path(), "a.mp4");
-	clip(dir.path(), "b.mp4");
+	support::mpeg4(dir.path(), "a.mp4", 3);
+	support::mpeg4(dir.path(), "b.mp4", 3);
 	flac(dir.path(), "c.flac", 5);
 
 	let out = cryarchiver(dir.path(), &["-s", "fast", "."]);

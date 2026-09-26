@@ -12,13 +12,15 @@ use crate::detect::{self, Detection, MediaClass};
 use crate::integrity;
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use crate::preset::Speed;
-use crate::probe::{self, MediaInfo, ProbeError, Stream};
+use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::text::display_path;
 use crate::toolchain::{MediaKind, Toolchain};
 use crate::video::mux::{self, Attachment, MuxInputs, MuxPlan};
 use crate::video::plan::{VideoCaps, VideoPlan, plan_video, precheck};
 use crate::video::streams::{Extracted, StreamPlan, plan_streams};
-use crate::video::verify::{Expected, alpha_ssim, check_alpha, verify_output};
+use crate::video::verify::{
+	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
+};
 use crate::video::{analyze, encode as video_encode};
 use crate::workspace::Workspace;
 
@@ -77,8 +79,28 @@ enum Produced {
 }
 
 enum Planned {
-	Audio { info: MediaInfo, plan: FilePlan },
+	Audio { info: Box<MediaInfo>, plan: FilePlan },
 	Video,
+}
+
+struct VideoJob<'a> {
+	info: &'a MediaInfo,
+	probe_json: &'a [u8],
+	first_frame: Option<&'a Frame>,
+	main: &'a Stream,
+	video: &'a VideoPlan,
+	streams: &'a StreamPlan,
+}
+
+struct Temp {
+	path: PathBuf,
+	info: MediaInfo,
+}
+
+struct EncodedTemps {
+	video: Temp,
+	audio: Option<Temp>,
+	warnings: Vec<String>,
 }
 
 impl Engine {
@@ -127,7 +149,10 @@ impl Engine {
 				self.require(MediaKind::Audio)?;
 				on_event(JobEvent::Stage(Stage::Plan));
 				match plan_file(&info, job.speed) {
-					AudioPlan::Encode(plan) => Planned::Audio { info, plan },
+					AudioPlan::Encode(plan) => Planned::Audio {
+						info: Box::new(info),
+						plan,
+					},
 					AudioPlan::Keep(reason) => return Ok(JobOutcome::KeptOriginal { reason }),
 				}
 			}
@@ -140,7 +165,9 @@ impl Engine {
 				}
 
 				on_event(JobEvent::Stage(Stage::Plan));
-				if let Err(reason) = precheck(&info, &self.video_caps()) {
+				let planned =
+					precheck(&info, &self.video_caps()).and_then(|_| plan_streams(&info, job.speed, job.keep_metadata));
+				if let Err(reason) = planned {
 					return Ok(JobOutcome::KeptOriginal { reason });
 				}
 				Planned::Video
@@ -189,7 +216,7 @@ impl Engine {
 	fn video_caps(&self) -> VideoCaps {
 		VideoCaps {
 			vp9_alpha: self.tools.vp9_alpha,
-			libaom: self.tools.encoders.contains("libaom-av1"),
+			libaom: self.tools.has_libaom(),
 		}
 	}
 
@@ -245,14 +272,15 @@ impl Engine {
 
 	async fn produce_video(&self, cx: &Context<'_>, workspace: &Workspace) -> Result<Produced, JobError> {
 		let source = cx.job.source.as_path();
-		let caps = self.video_caps();
 
 		(cx.on_event)(JobEvent::Stage(Stage::Probe));
-		let (info, probe_json) = probe::probe_video(&self.tools, source, cx.cancel)
+		let (info, probe_json) = probe::probe_video(&self.tools, source, cx.source_bytes, cx.cancel)
 			.await
 			.map_err(video_probe_error)?;
-		let main = match precheck(&info, &caps) {
-			Ok(main) => main,
+		let planned = precheck(&info, &self.video_caps())
+			.and_then(|main| plan_streams(&info, cx.job.speed, cx.job.keep_metadata).map(|streams| (main, streams)));
+		let (main, streams) = match planned {
+			Ok(planned) => planned,
 			Err(reason) => return Ok(Produced::Kept(reason)),
 		};
 		let frames = probe::first_frames(&self.tools, source, main.index, 5, cx.cancel)
@@ -268,35 +296,57 @@ impl Engine {
 		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
 		let declared_s = main.declared_duration().or(info.format.duration);
 		let analysis = Box::pin(analyze::analyze(&self.tools, source, main, declared_s, cx.cancel)).await?;
-		let video = match plan_video(&info, &frames, &analysis, cx.job.speed, &caps) {
-			Ok(video) => video,
-			Err(reason) => return Ok(Produced::Kept(reason)),
-		};
-		let streams = plan_streams(&info, cx.job.speed, cx.job.keep_metadata);
+		let video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
 
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
-		let (video_temp, audio_temp, audio_plan, encode_warnings) =
-			Box::pin(self.encode_stage(cx, workspace, source, &video, &streams, declared_s)).await?;
-		let mut warnings: Vec<String> = video.warnings.iter().chain(&streams.warnings).cloned().collect();
-		warnings.extend(encode_warnings);
+		let temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &streams, declared_s)).await?;
+
+		let job = VideoJob {
+			info: &info,
+			probe_json: &probe_json,
+			first_frame: frames.first(),
+			main,
+			video: &video,
+			streams: &streams,
+		};
+		Box::pin(self.mux_and_verify(cx, workspace, &job, temps)).await
+	}
+
+	async fn mux_and_verify(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		job: &VideoJob<'_>,
+		temps: EncodedTemps,
+	) -> Result<Produced, JobError> {
+		let source = cx.job.source.as_path();
+		let mut warnings: Vec<String> = job
+			.video
+			.warnings
+			.iter()
+			.chain(&job.streams.warnings)
+			.cloned()
+			.collect();
+		warnings.extend(temps.warnings);
 
 		(cx.on_event)(JobEvent::Stage(Stage::Mux));
-		let metadata = cx.job.keep_metadata.then_some((probe_json.as_slice(), frames.first()));
-		let attachments = collect_attachments(workspace, &streams.extracted, metadata, &mut warnings)?;
+		let metadata = cx.job.keep_metadata.then_some((job.probe_json, job.first_frame));
+		let attachments = collect_attachments(workspace, &job.streams.extracted, metadata, &mut warnings)?;
 
 		let output = workspace.file("mux.mkv");
 		let cmd = mux::command(
 			&self.tools.ffmpeg,
 			&MuxInputs {
-				video: &video_temp,
-				audio: audio_plan.as_ref().map(|_| audio_temp.as_path()),
+				video: &temps.video.path,
+				audio: temps.audio.as_ref().map(|temp| temp.path.as_path()),
 				source,
+				source_bytes: cx.source_bytes,
 				attachments: &attachments,
 			},
 			&MuxPlan {
-				info: &info,
-				video: &video,
-				streams: &streams,
+				info: job.info,
+				video: job.video,
+				streams: job.streams,
 				keep_metadata: cx.job.keep_metadata,
 			},
 			&output,
@@ -314,15 +364,22 @@ impl Engine {
 		}
 
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
+		let timelines = Timelines {
+			source: job.info,
+			video_temp: &temps.video.info,
+			audio_temp: temps.audio.as_ref().map(|temp| &temp.info),
+		};
 		let expected = Expected {
-			video: &video,
-			streams: &streams,
-			source_chapters: info.chapters.len(),
+			video: job.video,
+			streams: job.streams,
+			source_chapters: job.info.chapters.len(),
 			attached_files: attachments.len(),
+			start_offsets: start_offsets(&mux::output_streams(job.video, job.streams), &timelines),
+			source_fps: job.main.fps(),
 		};
 		verify_output(&self.tools, &output, &expected, cx.cancel).await?;
-		if video.alpha {
-			check_alpha(alpha_ssim(&self.tools, &output, source, &video, cx.cancel).await?)?;
+		if job.video.alpha {
+			check_alpha(alpha_ssim(&self.tools, &output, source, job.video, cx.cancel).await?)?;
 		}
 
 		for warning in &warnings {
@@ -345,7 +402,7 @@ impl Engine {
 		video: &VideoPlan,
 		streams: &StreamPlan,
 		declared_s: Option<f64>,
-	) -> Result<(PathBuf, PathBuf, Option<FilePlan>, Vec<String>), JobError> {
+	) -> Result<EncodedTemps, JobError> {
 		let video_temp = workspace.file("video.a1.mkv");
 		let audio_temp = workspace.file("audio.mka");
 		let audio_plan = video_encode::audio_plan(streams);
@@ -372,16 +429,32 @@ impl Engine {
 			video_encode::extract(&self.tools.ffmpeg, source, workspace, &streams.extracted, cx.cancel),
 		)?;
 
-		let warnings: Vec<String> = video_encode::check_video_temp(video, &encoded, declared_s)?
+		let video_info = probe_temp(&self.tools, &video_temp, cx.cancel).await?;
+		let start_s = earliest_video_start(&video_info).unwrap_or(0.0);
+		let warnings: Vec<String> = video_encode::check_video_temp(video, &encoded, declared_s, start_s)?
 			.into_iter()
 			.collect();
 
-		if let (Some(plan), Some(source_levels)) = (&audio_plan, &source_levels) {
-			self.verify_audio_temp(plan, source_levels, &audio_temp, cx.cancel)
-				.await?;
-		}
+		let audio = match (&audio_plan, &source_levels) {
+			(Some(plan), Some(source_levels)) => {
+				self.verify_audio_temp(plan, source_levels, &audio_temp, cx.cancel)
+					.await?;
+				Some(Temp {
+					info: probe_temp(&self.tools, &audio_temp, cx.cancel).await?,
+					path: audio_temp,
+				})
+			}
+			_ => None,
+		};
 
-		Ok((video_temp, audio_temp, audio_plan, warnings))
+		Ok(EncodedTemps {
+			video: Temp {
+				path: video_temp,
+				info: video_info,
+			},
+			audio,
+			warnings,
+		})
 	}
 
 	async fn verify_audio_temp(

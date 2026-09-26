@@ -1,4 +1,5 @@
 use crate::audio::plan::{TrackJob, TrackPlan, plan_track};
+use crate::outcome::KeepReason;
 use crate::preset::Speed;
 use crate::probe::{MediaInfo, Stream};
 
@@ -13,6 +14,21 @@ const MKV_SUBTITLES: &[&str] = &[
 	"dvb_subtitle",
 	"hdmv_text_subtitle",
 	"arib_caption",
+];
+const TEXT_SUBTITLES: &[&str] = &[
+	"mov_text",
+	"text",
+	"microdvd",
+	"sami",
+	"realtext",
+	"subviewer",
+	"subviewer1",
+	"jacosub",
+	"mpl2",
+	"pjs",
+	"vplayer",
+	"stl",
+	"eia_608",
 ];
 const DATA_MIME: &str = "application/octet-stream";
 
@@ -54,20 +70,24 @@ impl StreamPlan {
 	}
 }
 
-pub fn plan_streams(info: &MediaInfo, speed: Speed, keep_metadata: bool) -> StreamPlan {
+pub fn plan_streams(info: &MediaInfo, speed: Speed, keep_metadata: bool) -> Result<StreamPlan, KeepReason> {
 	let mut plan = StreamPlan::default();
+	let mut audio_tracks = 0;
 	let mut dropped_data = 0;
 
 	for stream in &info.streams {
 		match stream.codec_type.as_str() {
 			"audio" => {
-				let track = plan.audio.len() + 1;
-				plan.audio.push(audio_track(stream, track, speed, &mut plan.warnings));
+				audio_tracks += 1;
+				if stream.channels.unwrap_or(0) == 0 {
+					plan.warnings
+						.push(format!("audio track {audio_tracks} has no audio data and was dropped"));
+				} else {
+					plan.audio
+						.push(audio_track(stream, audio_tracks, speed, &mut plan.warnings));
+				}
 			}
-			"subtitle" => plan.subtitles.push(SubtitleTrack {
-				stream_index: stream.index,
-				to_srt: !MKV_SUBTITLES.contains(&stream.codec_name.as_str()),
-			}),
+			"subtitle" => plan.subtitles.push(subtitle_track(stream)?),
 			"attachment" => plan.attachments.push(stream.index),
 			"video" if stream.is_attached_pic() => match cover(stream) {
 				Some(cover) => plan.extracted.push(cover),
@@ -93,7 +113,25 @@ pub fn plan_streams(info: &MediaInfo, speed: Speed, keep_metadata: bool) -> Stre
 			if dropped_data == 1 { "" } else { "s" }
 		));
 	}
-	plan
+	Ok(plan)
+}
+
+fn subtitle_track(stream: &Stream) -> Result<SubtitleTrack, KeepReason> {
+	let codec = stream.codec_name.as_str();
+	let to_srt = if MKV_SUBTITLES.contains(&codec) {
+		false
+	} else if TEXT_SUBTITLES.contains(&codec) {
+		true
+	} else {
+		return Err(KeepReason::Unsupported(format!(
+			"subtitle codec {codec} can't be stored in MKV"
+		)));
+	};
+
+	Ok(SubtitleTrack {
+		stream_index: stream.index,
+		to_srt,
+	})
 }
 
 fn audio_track(stream: &Stream, track: usize, speed: Speed, warnings: &mut Vec<String>) -> TrackJob {
@@ -170,7 +208,7 @@ mod tests {
 
 	#[test]
 	fn audio_is_planned_per_track() {
-		let plan = plan_streams(&info(IPHONE), Speed::Moderate, false);
+		let plan = plan_streams(&info(IPHONE), Speed::Moderate, false).unwrap();
 
 		assert_eq!(
 			plan.audio,
@@ -189,8 +227,8 @@ mod tests {
 
 	#[test]
 	fn data_streams_are_attached_only_when_keeping_metadata() {
-		let kept = plan_streams(&info(IPHONE), Speed::Moderate, true);
-		let clean = plan_streams(&info(IPHONE), Speed::Moderate, false);
+		let kept = plan_streams(&info(IPHONE), Speed::Moderate, true).unwrap();
+		let clean = plan_streams(&info(IPHONE), Speed::Moderate, false).unwrap();
 
 		assert_eq!(
 			kept.extracted,
@@ -226,7 +264,8 @@ mod tests {
 			),
 			Speed::Moderate,
 			true,
-		);
+		)
+		.unwrap();
 
 		assert!(plan.audio.iter().all(|track| track.plan == TrackPlan::Copy));
 		assert_eq!(
@@ -252,14 +291,14 @@ mod tests {
 		);
 
 		assert_eq!(
-			plan_streams(&mp4, Speed::Moderate, false).extracted,
+			plan_streams(&mp4, Speed::Moderate, false).unwrap().extracted,
 			vec![Extracted {
 				stream_index: 2,
 				file_name: "cover.jpg".into(),
 				mime_type: "image/jpeg".into(),
 			}]
 		);
-		let kept = plan_streams(&mkv, Speed::Moderate, true);
+		let kept = plan_streams(&mkv, Speed::Moderate, true).unwrap();
 		assert_eq!(kept.extracted[0].file_name, "small_cover.png");
 		assert_eq!(kept.extracted[0].work_file(), "stream-4.bin");
 	}
@@ -276,7 +315,8 @@ mod tests {
 			),
 			Speed::Moderate,
 			false,
-		);
+		)
+		.unwrap();
 
 		assert_eq!(
 			plan.subtitles,
@@ -308,9 +348,66 @@ mod tests {
 			),
 			Speed::Moderate,
 			true,
-		);
+		)
+		.unwrap();
 
 		assert!(plan.extracted.is_empty());
 		assert!(plan.warnings.is_empty());
+	}
+
+	#[test]
+	fn empty_audio_tracks_are_dropped_with_a_warning() {
+		let plan = plan_streams(
+			&info(
+				r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+				{"index":1,"codec_type":"audio","codec_name":"mp2","sample_rate":"48000","channels":0},
+				{"index":2,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo"}]}"#,
+			),
+			Speed::Moderate,
+			false,
+		)
+		.unwrap();
+
+		assert_eq!(
+			plan.audio.iter().map(|track| track.stream_index).collect::<Vec<_>>(),
+			[2]
+		);
+		assert_eq!(plan.warnings, ["audio track 1 has no audio data and was dropped"]);
+	}
+
+	#[test]
+	fn text_subtitles_become_srt_and_the_rest_of_the_mkv_row_is_copied() {
+		let plan = plan_streams(
+			&info(
+				r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+				{"index":1,"codec_type":"subtitle","codec_name":"webvtt"},
+				{"index":2,"codec_type":"subtitle","codec_name":"eia_608"},
+				{"index":3,"codec_type":"subtitle","codec_name":"dvb_subtitle"},
+				{"index":4,"codec_type":"subtitle","codec_name":"microdvd"}]}"#,
+			),
+			Speed::Moderate,
+			false,
+		)
+		.unwrap();
+
+		assert_eq!(
+			plan.subtitles.iter().map(|track| track.to_srt).collect::<Vec<_>>(),
+			[false, true, false, true]
+		);
+	}
+
+	#[test]
+	fn subtitles_matroska_cannot_hold_keep_the_original() {
+		let teletext = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"mpeg2video"},
+			{"index":1,"codec_type":"subtitle","codec_name":"dvb_teletext"}]}"#,
+		);
+
+		assert_eq!(
+			plan_streams(&teletext, Speed::Moderate, false),
+			Err(KeepReason::Unsupported(
+				"subtitle codec dvb_teletext can't be stored in MKV".into()
+			))
+		);
 	}
 }

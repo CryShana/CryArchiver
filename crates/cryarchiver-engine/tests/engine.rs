@@ -283,21 +283,17 @@ fn fast(source: &Path) -> Job {
 	}
 }
 
-fn mpeg4(dir: &Path, name: &str, seconds: u32) -> std::path::PathBuf {
-	support::video(
-		dir,
-		name,
-		seconds,
-		&[
-			"-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-q:v", "2", "-c:a", "aac", "-b:a", "192k",
-		],
-	)
+fn fast_keeping_any_saving(source: &Path) -> Job {
+	Job {
+		min_savings: 0.0,
+		..fast(source)
+	}
 }
 
 #[tokio::test]
 async fn video_becomes_verified_av1_in_mkv() {
 	let dir = tempfile::tempdir().unwrap();
-	let clip = mpeg4(dir.path(), "clip.mp4", 3);
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
 
 	let outcome = run(&fast(&clip), dir.path()).await;
 
@@ -317,9 +313,46 @@ async fn video_becomes_verified_av1_in_mkv() {
 		.unwrap();
 	assert_eq!(info.streams[0].codec_name, "av1");
 	assert_eq!(info.streams[0].pix_fmt.as_deref(), Some("yuv420p10le"));
-	assert_eq!(info.streams[0].color_primaries.as_deref(), Some("bt709"));
+	assert_eq!(info.streams[0].color_primaries.as_deref(), Some("bt470bg"));
 	assert_eq!(info.streams[1].codec_name, "opus");
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn hdr10_keeps_its_transfer_and_mastering_metadata() {
+	let dir = tempfile::tempdir().unwrap();
+	let hdr = dir.path().join("hdr.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=2,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+		"-c:v",
+		"libx265",
+		"-pix_fmt",
+		"yuv420p10le",
+		"-crf",
+		"4",
+		"-x265-params",
+		"master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400:log-level=error",
+		hdr.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast_keeping_any_saving(&hdr), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert_eq!(info.streams[0].color_transfer.as_deref(), Some("smpte2084"));
+	assert_eq!(info.streams[0].color_primaries.as_deref(), Some("bt2020"));
+	assert!(
+		info.streams[0].side_data("Mastering display metadata").is_some(),
+		"{:?}",
+		info.streams[0]
+	);
 }
 
 #[tokio::test]
@@ -451,7 +484,7 @@ async fn unencodable_audio_is_copied_and_the_video_still_encoded() {
 		clip.to_str().unwrap(),
 	]);
 
-	let outcome = run(&fast(&clip), dir.path()).await;
+	let outcome = run(&fast_keeping_any_saving(&clip), dir.path()).await;
 
 	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
 		panic!("{outcome:?}")
@@ -531,7 +564,7 @@ async fn efficient_av1_is_kept_without_encoding() {
 #[tokio::test]
 async fn keep_metadata_attaches_the_source_probe() {
 	let dir = tempfile::tempdir().unwrap();
-	let clip = mpeg4(dir.path(), "meta.mp4", 2);
+	let clip = support::mpeg4(dir.path(), "meta.mp4", 2);
 
 	let outcome = run(
 		&Job {
@@ -591,8 +624,8 @@ async fn cancel_mid_video_encode_leaves_nothing_behind() {
 #[tokio::test]
 async fn one_video_slot_queues_the_second_video() {
 	let dir = tempfile::tempdir().unwrap();
-	let first = mpeg4(dir.path(), "first.mp4", 3);
-	let second = mpeg4(dir.path(), "second.mp4", 3);
+	let first = support::mpeg4(dir.path(), "first.mp4", 3);
+	let second = support::mpeg4(dir.path(), "second.mp4", 3);
 	let engine = Engine::new(support::toolchain().await);
 	let queued = std::sync::atomic::AtomicUsize::new(0);
 	let on_event = |event: JobEvent| {
@@ -612,4 +645,79 @@ async fn one_video_slot_queues_the_second_video() {
 	assert!(matches!(a, JobOutcome::Encoded { .. }), "{a:?}");
 	assert!(matches!(b, JobOutcome::Encoded { .. }), "{b:?}");
 	assert_eq!(queued.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn delayed_audio_stays_in_sync() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("delayed.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=3",
+		"-itsoffset",
+		"0.5",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=440:duration=3",
+		"-map",
+		"0:v",
+		"-map",
+		"1:a",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		"-c:a",
+		"aac",
+		clip.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast_keeping_any_saving(&clip), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let start = |kind: &str| {
+		info.streams
+			.iter()
+			.find(|stream| stream.codec_type == kind)
+			.and_then(|stream| stream.start_time)
+			.unwrap()
+	};
+	let delay = start("audio") - start("video");
+	assert!((delay - 0.5).abs() <= 0.05, "{delay} {info:?}");
+}
+
+#[tokio::test]
+async fn trimmed_mp4_is_encoded() {
+	let dir = tempfile::tempdir().unwrap();
+	let full = support::video(
+		dir.path(),
+		"full.mp4",
+		6,
+		&[
+			"-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-crf", "8", "-pix_fmt", "yuv420p", "-g", "50", "-c:a",
+			"aac",
+		],
+	);
+	let trimmed = dir.path().join("trimmed.mp4");
+	support::ffmpeg(&[
+		"-ss",
+		"1.3",
+		"-i",
+		full.to_str().unwrap(),
+		"-c",
+		"copy",
+		trimmed.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast_keeping_any_saving(&trimmed), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
 }

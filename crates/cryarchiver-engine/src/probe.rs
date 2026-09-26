@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::process::{self, RunError, STALL_TIMEOUT, StdoutMode, ToolCommand};
+use crate::process::{self, RunError, StdoutMode, ToolCommand};
 use crate::toolchain::Toolchain;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -27,6 +27,8 @@ pub struct MediaInfo {
 pub struct Format {
 	#[serde(default)]
 	pub format_name: String,
+	#[serde(default, deserialize_with = "number")]
+	pub start_time: Option<f64>,
 	#[serde(default, deserialize_with = "number")]
 	pub duration: Option<f64>,
 	#[serde(default, deserialize_with = "number")]
@@ -78,6 +80,8 @@ pub struct Stream {
 	pub avg_frame_rate: Option<f64>,
 	#[serde(default, deserialize_with = "number")]
 	pub nb_read_packets: Option<u64>,
+	#[serde(default, deserialize_with = "number")]
+	pub start_time: Option<f64>,
 	#[serde(default, deserialize_with = "number")]
 	pub duration: Option<f64>,
 	#[serde(default)]
@@ -250,9 +254,10 @@ pub async fn probe(tools: &Toolchain, path: &Path, cancel: &CancellationToken) -
 pub async fn probe_video(
 	tools: &Toolchain,
 	path: &Path,
+	source_bytes: u64,
 	cancel: &CancellationToken,
 ) -> Result<(MediaInfo, Vec<u8>), ProbeError> {
-	let mut cmd = ToolCommand::new(&tools.ffprobe, STALL_TIMEOUT);
+	let mut cmd = ToolCommand::new(&tools.ffprobe, process::scaled_timeout(source_bytes));
 	cmd.args([
 		"-v",
 		"warning",
@@ -390,7 +395,7 @@ mod tests {
 			{ "index": 0, "codec_name": "hevc", "codec_type": "video", "codec_tag_string": "hvc1", "width": 1920,
 			  "height": 1080, "pix_fmt": "yuv420p10le", "color_range": "tv", "color_space": "bt2020nc",
 			  "color_transfer": "arib-std-b67", "color_primaries": "bt2020", "r_frame_rate": "30000/1001",
-			  "avg_frame_rate": "233850/7801", "duration": "52.005000", "nb_read_packets": "1559",
+			  "avg_frame_rate": "233850/7801", "start_time": "0.021000", "duration": "52.005000", "nb_read_packets": "1559",
 			  "disposition": { "default": 1, "attached_pic": 0, "timed_thumbnails": 0 },
 			  "tags": { "handler_name": "Core Media Video" },
 			  "side_data_list": [
@@ -401,7 +406,7 @@ mod tests {
 			{ "index": 2, "codec_type": "data", "codec_tag_string": "mebx", "tags": { "handler_name": "Core Media Metadata" } }
 		],
 		"chapters": [ { "id": 1, "start_time": "0.000000" } ],
-		"format": { "format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "52.005000",
+		"format": { "format_name": "mov,mp4,m4a,3gp,3g2,mj2", "start_time": "-1.400000", "duration": "52.005000",
 		            "tags": { "com.apple.quicktime.make": "Apple" } }
 	}"#;
 
@@ -415,6 +420,8 @@ mod tests {
 		assert_eq!(video.color_transfer.as_deref(), Some("arib-std-b67"));
 		assert!((video.fps().unwrap() - 29.977).abs() < 0.001);
 		assert_eq!(video.nb_read_packets, Some(1559));
+		assert_eq!(video.start_time, Some(0.021));
+		assert_eq!(info.format.start_time, Some(-1.4));
 		assert_eq!(video.rotation(), -90);
 		let dovi = video.side_data("DOVI configuration record").unwrap();
 		assert_eq!(dovi.number("dv_profile"), Some(8.0));

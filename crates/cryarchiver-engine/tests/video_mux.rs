@@ -7,7 +7,7 @@ use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::video::analyze::{Analysis, NoiseClass, ScanType};
 use cryarchiver_engine::video::mux::{Attachment, MuxInputs, MuxPlan, command, mux};
-use cryarchiver_engine::video::plan::{VideoCaps, plan_video};
+use cryarchiver_engine::video::plan::{VideoCaps, plan_video, precheck};
 use cryarchiver_engine::video::streams::plan_streams;
 use tokio_util::sync::CancellationToken;
 
@@ -91,7 +91,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 	let cancel = CancellationToken::new();
 
 	let info = probe(&tools, &source, &cancel).await.unwrap();
-	let streams = plan_streams(&info, Speed::Fast, false);
+	let streams = plan_streams(&info, Speed::Fast, false).unwrap();
 	let analysis = Analysis {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,
@@ -100,7 +100,8 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 		vp9_alpha: false,
 		libaom: false,
 	};
-	let video = plan_video(&info, &[], &analysis, Speed::Fast, &caps).unwrap();
+	let main = precheck(&info, &caps).unwrap();
+	let video = plan_video(&info, main, &[], &analysis, Speed::Fast);
 
 	let video_temp = dir.path().join("video.a1.mkv");
 	let audio_temp = dir.path().join("audio.mka");
@@ -132,6 +133,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 			video: &video_temp,
 			audio: Some(&audio_temp),
 			source: &source,
+			source_bytes: fs::metadata(&source).unwrap().len(),
 			attachments: &attachments,
 		},
 		&MuxPlan {

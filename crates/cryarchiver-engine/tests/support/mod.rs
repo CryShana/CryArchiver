@@ -53,6 +53,17 @@ pub fn video(dir: &Path, name: &str, seconds: u32, args: &[&str]) -> PathBuf {
 	path
 }
 
+pub fn mpeg4(dir: &Path, name: &str, seconds: u32) -> PathBuf {
+	video(
+		dir,
+		name,
+		seconds,
+		&[
+			"-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-q:v", "2", "-c:a", "aac", "-b:a", "192k",
+		],
+	)
+}
+
 pub fn mp3_with_cover(dir: &Path, name: &str, title: &str) -> PathBuf {
 	let path = dir.join(name);
 	let title_tag = format!("title={title}");

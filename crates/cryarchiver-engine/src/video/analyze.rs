@@ -16,6 +16,7 @@ const TELECINE_REPEATS: f64 = 0.25;
 const INTERLACED_SHARE: f64 = 0.6;
 const FIELD_ORDER_SHARE: f64 = 0.8;
 const REJECT_SHARE: f64 = 0.5;
+const INTERLACED_FIELD_ORDERS: &[&str] = &["tt", "bb", "tb", "bt"];
 const CLEAN_PSNR_DB: f64 = 50.0;
 const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:d=1,\
 	scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,\
@@ -157,9 +158,10 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 		sum(|segment| segment.bff),
 	);
 
+	let flagged_interlaced = field_order.is_some_and(|order| INTERLACED_FIELD_ORDERS.contains(&order));
 	let scan = match fps {
 		_ if frames < 1.0 => ScanType::Progressive,
-		Some(fps) if fps > MAX_INTERLACED_FPS => ScanType::Progressive,
+		Some(fps) if fps > MAX_INTERLACED_FPS && !flagged_interlaced => ScanType::Progressive,
 		Some(fps) if (fps - NTSC_FPS).abs() < 0.01 && repeated / frames >= TELECINE_REPEATS => ScanType::Telecined,
 		_ if (tff + bff) / frames >= INTERLACED_SHARE => {
 			let top_share = tff / (tff + bff);
@@ -216,11 +218,7 @@ pub async fn analyze(
 	);
 	let stats: Vec<SegmentStats> = [first?, second?, third?, fourth?].into_iter().flatten().collect();
 
-	Ok(classify(
-		&stats,
-		main.r_frame_rate.or(main.fps()),
-		main.field_order.as_deref(),
-	))
+	Ok(classify(&stats, main.fps(), main.field_order.as_deref()))
 }
 
 pub fn forced_decoder(stream: &Stream) -> Option<&'static str> {
@@ -367,6 +365,20 @@ mod tests {
 		);
 		assert_eq!(classify(&testsrc, Some(30.0), None).scan, ScanType::Progressive);
 		assert_eq!(classify(&hfr, Some(120.0), None).scan, ScanType::Progressive);
+	}
+
+	#[test]
+	fn a_flagged_interlaced_container_overrides_the_field_rate_gate() {
+		let tff = [stats([90, 0, 0], [90, 0])];
+
+		assert_eq!(
+			classify(&tff, Some(50.0), Some("tt")).scan,
+			ScanType::Interlaced { top_first: true }
+		);
+		assert_eq!(
+			classify(&tff, Some(50.0), Some("progressive")).scan,
+			ScanType::Progressive
+		);
 	}
 
 	#[test]
