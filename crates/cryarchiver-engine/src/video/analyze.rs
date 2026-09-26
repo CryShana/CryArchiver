@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::outcome::JobError;
 use crate::probe::Stream;
-use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
+use crate::process::{self, STALL_TIMEOUT, ToolCommand};
 use crate::toolchain::Toolchain;
 
 const SEGMENT_S: f64 = 3.0;
@@ -203,7 +203,7 @@ pub async fn analyze(
 		};
 
 		let cmd = segment_command(&tools.ffmpeg, source, main.index, forced_decoder(main), &segment);
-		let out = process::run(&cmd, StdoutMode::Progress, |_| {}, cancel).await?;
+		let out = super::run_ffmpeg(&cmd, |_| {}, cancel).await?;
 
 		Ok::<_, JobError>(parse_segment(&out.stderr_tail, segment_length(&segment, duration_s)))
 	};
