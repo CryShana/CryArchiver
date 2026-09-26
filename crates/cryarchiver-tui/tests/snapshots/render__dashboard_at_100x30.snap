@@ -1,0 +1,34 @@
+---
+source: crates/cryarchiver-tui/tests/render.rs
+expression: "draw(&mut app(), 100, 30).backend()"
+---
+" CryArchiver  D:\Archive\Family → E:\Ar…mily  MODERATE · LATEST  ⚡ limit 50 %                      " Hidden by multi-width symbols: [(66, " ")]
+"╭─ Overall ──────────────────╮╭─ Workers ───────────────────────────────╮╭─ System ────────────────╮"
+"│ 38.7% of 44,517+ files     ││ #1 AV1  IMG_0001 2.MOV encode   71.7%   ││ CPU █████▌┃       46%   │"
+"│ ██████████                 ││ #2 AV1  2018 -…Pro.mkv encode   97.5%   ││     █▇▆▆▇▇▇▇▆▇▇▇        │"
+"│ ✓ 17,239 done              ││ #3 AV1  McCart…ple.mkv encode   22.5%   ││ RAM ████▏        11/32G │"
+"│ = 522 kept  ↪ 150 dup      ││ #4 AVIF DSC_4703.JPG   verify   48.0%   ││ Disk E: · 1.20 TB free  │"
+"│ Saved 223 GB (65 %)  ▃▅███ ││ #5 AVIF DSC_4704.JPG   encode   73.3%   ││ ⚡ limit 50 %           │" Hidden by multi-width symbols: [(76, " ")]
+"│ ETA 9h 7m                  ││ #6 AVIF DSC_4705.JPG   encode   34.6%   ││ ffmpeg 9.0.1            │"
+"│                            ││                                         ││                         │"
+"╰────────────────────────────╯╰─────────────────────────────────────────╯╰─────────────────────────╯"
+"╭─ Library ───────────────────────────────────────────────────────────────────── 44,517+ files [⤢]─╮"
+"│Name                                                        Status     Progress       Codec Saved │"
+"│▾ Family !                                                  17k/44k    ━━━───── 38.7%        −65% ┃"
+"│  ▾ Photos !                                                8.8k/12k   ━━━━━━── 70.6%        −76% │"
+"│    ▸ 2019                                                  3.1k/3.1k  ━━━━━━━━  100%        −76% │"
+"│    ▾ 2020 !                                                3.2k/4.4k  ━━━━━━── 71.9%        −75% │"
+"│      ▾ Bled !                                              18/31      ━━━━━─── 65.4%        −68% │"
+"│        ✓ DSC_0001.JPG                                      done       ━━━━━━━━  100% AVIF   −77% │"
+"│        ✓ DSC_0002.JPG                                      done       ━━━━━━━━  100% AVIF   −84% │"
+"│        ● IMG_0001 2.MOV                                    encode     ━━━━━━── 71.7% AV1         │"
+"│        ✓ comic-veryTallImage.jpg                       done       ━━━━━━━━  100% JXL    −62% │"
+"│        ✓ large-map.jpg                                        done       ━━━━━━━━  100% AVIF   −68% │"
+"╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
+"╭─ Log ──────────────────────────────────────────────────────────────────────────── l to collapse ─╮"
+"│ 14:02:11 ✓ DSC_4702.JPG → AVIF 3.79 MB (−72 %)                                                   │"
+"│ 14:02:08 ◌ concert-MPEG2_1080-interlaced_sample.mkv: CRF 30.75 → VMAF 94.9 (4 probes) · enco…  │"
+"│ 14:02:07 ✓ 02. 試験曲.mp3 → Opus 1.71 MB (−53 %) · cover + tags kept                             │" Hidden by multi-width symbols: [(18, " "), (20, " "), (22, " ")]
+"│ 14:02:00 ◷ GOPR0107.MP4 waiting for space · needs 4.3 GB, 3.9 GB free                            │"
+"╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
+"  ↑↓  move   ←→  fold   ⏎  details   /  search   z  maximize   l  log   i  issues   m  menu         "
