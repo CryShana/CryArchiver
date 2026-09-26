@@ -1,6 +1,6 @@
 use crate::view::{ArchiveView, FileDetails, NodeId};
 
-/// The TUI's only connection to an archive run. The mock implements it today; the project layer will later.
+/// Everything the TUI reads from an archive run and every command it sends back.
 pub trait ArchiveSource {
 	/// Folds in everything that happened since the last call and reports whether the view changed.
 	/// The UI thread calls it before every frame, so it must never block on a worker.
@@ -12,6 +12,10 @@ pub trait ArchiveSource {
 	fn details(&self, file: NodeId) -> Option<FileDetails>;
 
 	fn perform(&mut self, action: Action);
+
+	/// Called once when the TUI quits, while a "stopping" frame is on screen. It may block until running jobs are
+	/// cancelled and requeued, which can take seconds.
+	fn shutdown(&mut self);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

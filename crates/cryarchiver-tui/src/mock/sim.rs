@@ -688,9 +688,19 @@ impl MockSource {
 				header.run_state = RunState::Running;
 				"resumed"
 			}
-			RunState::Finished => return,
+			RunState::Stopping | RunState::Finished => return,
 		};
 		self.log_action(message.to_owned());
+	}
+
+	pub(super) fn stop_now(&mut self) {
+		let running: Vec<NodeId> = self.jobs.drain(..).map(|job| job.file).collect();
+		for file in running.into_iter().rev() {
+			self.requeue_front(file);
+		}
+
+		self.view.header.run_state = RunState::Stopping;
+		self.log_action("stop now · running jobs requeued".to_owned());
 	}
 
 	fn toggle_limit(&mut self) {

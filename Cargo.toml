@@ -29,7 +29,7 @@ insta = "1.48.0"
 libc = "0.2"
 lofty = "0.25.4"
 process-wrap = { version = "10.0.1", default-features = false, features = ["tokio1", "creation-flags", "job-object", "kill-on-drop", "process-group"] }
-ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"

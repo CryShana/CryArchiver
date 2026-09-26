@@ -183,6 +183,28 @@ fn details_step_through_files_and_skip_folders() {
 }
 
 #[test]
+fn g_goes_back_and_forth_between_a_duplicate_and_its_original() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('/'));
+	type_text(&mut app, "fanfares");
+	press(&mut app, KeyCode::Enter);
+	press(&mut app, KeyCode::End);
+	press(&mut app, KeyCode::Enter);
+	let canonical = app.selected().unwrap();
+
+	press(&mut app, KeyCode::Char('g'));
+	let duplicate = app.selected().unwrap();
+	assert_ne!(duplicate, canonical);
+	assert_eq!(app.mode(), ViewMode::Details);
+
+	press(&mut app, KeyCode::Char('g'));
+	assert_eq!(app.selected(), Some(canonical));
+
+	press(&mut app, KeyCode::Char('g'));
+	assert_eq!(app.selected(), Some(duplicate), "the only duplicate comes round again");
+}
+
+#[test]
 fn enter_on_a_folder_folds_it() {
 	let mut app = app();
 	press(&mut app, KeyCode::Home);

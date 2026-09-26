@@ -60,8 +60,8 @@ impl Ui {
 				self.on_click(source, position, double)
 			}
 			MouseEventKind::Down(MouseButton::Right) => self.on_right_click(source, position),
-			MouseEventKind::ScrollDown => self.on_wheel(position, WHEEL_ROWS),
-			MouseEventKind::ScrollUp => self.on_wheel(position, -WHEEL_ROWS),
+			MouseEventKind::ScrollDown => self.on_wheel(source, position, WHEEL_ROWS),
+			MouseEventKind::ScrollUp => self.on_wheel(source, position, -WHEEL_ROWS),
 			_ => Outcome::Ignored,
 		}
 	}
@@ -163,14 +163,15 @@ impl Ui {
 		self.open_menu(source, Some((position.x, position.y)))
 	}
 
-	fn on_wheel(&mut self, position: Position, rows: isize) -> Outcome {
+	fn on_wheel(&mut self, source: &dyn ArchiveSource, position: Position, rows: isize) -> Outcome {
 		if self.overlay.is_some() {
 			return Outcome::Ignored;
 		}
 
 		if self.issues_area.is_some_and(|area| area.contains(position)) {
 			let step = rows.signum();
-			self.issue_selected = self.issue_selected.saturating_add_signed(step);
+			let last = source.view().issues.len().saturating_sub(1);
+			self.issue_selected = self.issue_selected.saturating_add_signed(step).min(last);
 			return Outcome::Done;
 		}
 

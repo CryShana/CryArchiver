@@ -105,3 +105,26 @@ pub fn menu(buf: &mut Buffer, screen: Rect, menu: &Menu, default_anchor: (u16, u
 		hits.push(row_area, Hit::MenuItem(index));
 	}
 }
+
+pub fn stopping(buf: &mut Buffer, screen: Rect, theme: &Theme) {
+	let area = screen.centered(Constraint::Length(50), Constraint::Length(5));
+	let inner = modal(buf, area, screen, theme, "Stopping");
+	let right = inner.right();
+
+	put(
+		buf,
+		inner.x + 2,
+		inner.y + 1,
+		"■ Stopping… running jobs are requeued",
+		bold(theme.warn),
+		right,
+	);
+	put(
+		buf,
+		inner.x + 2,
+		inner.y + 2,
+		"Nothing is lost; reopening resumes the work",
+		fg(theme.dim),
+		right,
+	);
+}

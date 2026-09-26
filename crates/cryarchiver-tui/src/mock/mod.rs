@@ -95,6 +95,7 @@ impl MockSource {
 					codecs: "LATEST".to_owned(),
 					performance_limit: Some(50),
 					run_state: RunState::Running,
+					demo: true,
 				},
 				overall: Overall {
 					files_done: 0,
@@ -212,6 +213,11 @@ impl ArchiveSource for MockSource {
 
 	fn perform(&mut self, action: Action) {
 		self.apply(action);
+		self.summarize();
+	}
+
+	fn shutdown(&mut self) {
+		self.stop_now();
 		self.summarize();
 	}
 }

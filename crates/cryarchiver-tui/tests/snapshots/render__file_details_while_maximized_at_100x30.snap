@@ -2,7 +2,7 @@
 source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app, 100, 30).backend()"
 ---
-" CryArchiver  D:\Archive\Family → E:\Ar…mily  MODERATE · LATEST  ⚡ limit 50 %                      " Hidden by multi-width symbols: [(66, " ")]
+" CryArchiver   DEMO  D:\Archive\Family → E:\Ar…mily  MODERATE · LATEST  ⚡ limit 50 %     ▶ running " Hidden by multi-width symbols: [(73, " ")]
 "╭─ IMG_0001 2.MOV ───────────────────────────────────────────────────────── ⏎ back · ↑↓ prev/next ─╮"
 "│ Source   D:\Archive\Family\Photos\2020\Bled\IMG…73 2.MOV  ffmpeg (live tail)                     │"
 "│ Output   E:\Archive-AV1\Family\Photos\2020\Bled…73 2.mkv  frame=  1119 fps=88 q=31.2 size=12.2 … │"

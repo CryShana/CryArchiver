@@ -32,6 +32,13 @@ pub enum OverlayKind {
 	Menu,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lifecycle {
+	Running,
+	Quitting,
+	Stopping,
+}
+
 pub(crate) enum Overlay {
 	Help,
 	Menu(Menu),
@@ -65,10 +72,12 @@ pub(crate) struct Ui {
 	pub tree: TreeState,
 	pub issue_selected: usize,
 	pub mouse_capture: bool,
-	pub quit: bool,
+	pub lifecycle: Lifecycle,
 	pub hits: HitMap,
 	pub issues_area: Option<Rect>,
 	pub spinner: ThrobberState,
+	pub spinner_drawn: bool,
+	pub duplicate_cursor: usize,
 	last_click: Option<Click>,
 }
 
@@ -103,10 +112,12 @@ impl<S: ArchiveSource> App<S> {
 			tree,
 			issue_selected: 0,
 			mouse_capture: true,
-			quit: false,
+			lifecycle: Lifecycle::Running,
 			hits: HitMap::default(),
 			issues_area: None,
 			spinner: ThrobberState::default(),
+			spinner_drawn: false,
+			duplicate_cursor: 0,
 			last_click: None,
 		};
 		Self { source, ui }
@@ -157,11 +168,29 @@ impl<S: ArchiveSource> App<S> {
 	}
 
 	pub fn should_quit(&self) -> bool {
-		self.ui.quit
+		self.ui.lifecycle != Lifecycle::Running
 	}
 
 	pub fn mouse_capture(&self) -> bool {
 		self.ui.mouse_capture
+	}
+
+	pub fn set_mouse_capture(&mut self, captured: bool) {
+		self.ui.mouse_capture = captured;
+	}
+
+	/// Whether the last frame showed the scanning spinner, so the runner only animates what is visible.
+	pub fn spinner_visible(&self) -> bool {
+		self.ui.spinner_drawn
+	}
+
+	pub fn begin_shutdown(&mut self) {
+		self.ui.lifecycle = Lifecycle::Stopping;
+		self.ui.overlay = None;
+	}
+
+	pub fn shutdown(&mut self) {
+		self.source.shutdown();
 	}
 
 	pub fn maximized(&self) -> bool {

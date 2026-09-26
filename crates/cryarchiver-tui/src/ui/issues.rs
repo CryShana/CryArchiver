@@ -14,7 +14,7 @@ pub fn render(buf: &mut Buffer, area: Rect, issues: &[Issue], ui: &mut Ui) {
 	let theme = ui.theme;
 	ui.issue_selected = ui.issue_selected.min(issues.len().saturating_sub(1));
 
-	let list_width = (area.width * 46 / 100).max(34).min(area.width);
+	let list_width = to_u16(usize::from(area.width) * 46 / 100).max(34).min(area.width);
 	let list_area = Rect {
 		width: list_width,
 		..area

@@ -12,7 +12,7 @@ mod widgets;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
-use crate::app::{Overlay, Ui, ViewMode};
+use crate::app::{Lifecycle, Overlay, Ui, ViewMode};
 use crate::view::{ArchiveView, FileDetails};
 
 pub const MIN_WIDTH: u16 = 100;
@@ -84,6 +84,7 @@ pub fn draw(frame: &mut Frame, view: &ArchiveView, details: Option<&FileDetails>
 	buf.set_style(area, ui.theme.base());
 	ui.hits.clear();
 	ui.issues_area = None;
+	ui.spinner_drawn = false;
 
 	if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
 		small::render(buf, area, view, &ui.theme);
@@ -94,7 +95,7 @@ pub fn draw(frame: &mut Frame, view: &ArchiveView, details: Option<&FileDetails>
 	header::render(buf, areas.header, view, &ui.theme);
 
 	if let Some(top) = areas.top {
-		panels::render(buf, top, view, &ui.theme, &ui.spinner);
+		ui.spinner_drawn = panels::render(buf, top, view, &ui.theme, &ui.spinner);
 	}
 
 	match ui.mode {
@@ -116,6 +117,10 @@ pub fn draw(frame: &mut Frame, view: &ArchiveView, details: Option<&FileDetails>
 
 	footer::render(buf, areas.footer, view, details, ui);
 	draw_overlay(buf, area, areas.main, ui);
+
+	if ui.lifecycle == Lifecycle::Stopping {
+		overlay::stopping(buf, area, &ui.theme);
+	}
 }
 
 fn draw_overlay(buf: &mut ratatui::buffer::Buffer, screen: Rect, main: Rect, ui: &mut Ui) {

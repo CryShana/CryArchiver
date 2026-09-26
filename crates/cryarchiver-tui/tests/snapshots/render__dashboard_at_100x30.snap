@@ -2,12 +2,12 @@
 source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app(), 100, 30).backend()"
 ---
-" CryArchiver  D:\Archive\Family → E:\Ar…mily  MODERATE · LATEST  ⚡ limit 50 %                      " Hidden by multi-width symbols: [(66, " ")]
+" CryArchiver   DEMO  D:\Archive\Family → E:\Ar…mily  MODERATE · LATEST  ⚡ limit 50 %     ▶ running " Hidden by multi-width symbols: [(73, " ")]
 "╭─ Overall ──────────────────╮╭─ Workers ───────────────────────────────╮╭─ System ────────────────╮"
 "│ 38.7% of 44,517+ files     ││ #1 AV1  IMG_0001 2.MOV encode   71.7%   ││ CPU █████▌┃       46%   │"
 "│ ██████████                 ││ #2 AV1  2018 -…Pro.mkv encode   97.5%   ││     █▇▆▆▇▇▇▇▆▇▇▇        │"
 "│ ✓ 17,239 done              ││ #3 AV1  McCart…ple.mkv encode   22.5%   ││ RAM ████▏        11/32G │"
-"│ = 522 kept  ↪ 150 dup      ││ #4 AVIF DSC_4703.JPG   verify   48.0%   ││ Disk E: · 1.20 TB free  │"
+"│ ! 4 issues  = 522 kept     ││ #4 AVIF DSC_4703.JPG   verify   48.0%   ││ Disk E: · 1.20 TB free  │"
 "│ Saved 223 GB (65 %)  ▃▅███ ││ #5 AVIF DSC_4704.JPG   encode   73.3%   ││ ⚡ limit 50 %           │" Hidden by multi-width symbols: [(76, " ")]
 "│ ETA 9h 7m                  ││ #6 AVIF DSC_4705.JPG   encode   34.6%   ││ ffmpeg 9.0.1            │"
 "│                            ││                                         ││                         │"

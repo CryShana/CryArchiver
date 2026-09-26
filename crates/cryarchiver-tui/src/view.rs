@@ -25,12 +25,15 @@ pub struct Header {
 	pub codecs: String,
 	pub performance_limit: Option<u8>,
 	pub run_state: RunState,
+	/// The data is made up, as with the mock source.
+	pub demo: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
 	Running,
 	Paused,
+	Stopping,
 	Finished,
 }
 
@@ -221,6 +224,8 @@ impl Library {
 		&mut self.nodes[id.index()]
 	}
 
+	/// Ascending ids. A node is always added after its parent, so its id is greater and a reverse walk visits
+	/// children before their parents.
 	pub fn ids(&self) -> impl DoubleEndedIterator<Item = NodeId> + use<> {
 		(0..u32::try_from(self.nodes.len()).expect("fewer than 2^32 nodes")).map(NodeId)
 	}

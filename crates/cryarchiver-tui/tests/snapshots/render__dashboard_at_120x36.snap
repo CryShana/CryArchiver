@@ -2,12 +2,12 @@
 source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app(), 120, 36).backend()"
 ---
-" CryArchiver  D:\Archive\Family → E:\Archive-…mily  MODERATE · LATEST  ⚡ limit 50 %                                    " Hidden by multi-width symbols: [(72, " ")]
+" CryArchiver   DEMO  D:\Archive\Family → E:\Archive-…mily  MODERATE · LATEST  ⚡ limit 50 %       ETA 9h 7m · ▶ running " Hidden by multi-width symbols: [(79, " ")]
 "╭─ Overall ────────────────────────╮╭─ Workers ─── 6 active · 3 video + 3 image slots ─╮╭─ System ─────────────────────╮"
 "│ 38.7% of 44,517+ files           ││ #1 AV1  IMG_0001 2.MOV     encode  ━━━━━── 71.7% ││ CPU ███████▊┃          46%   │"
 "│ ████████████▍                    ││ #2 AV1  2018 - UT…oPro.mkv encode  ━━━━━━━ 97.5% ││     ▇▇▇▇▇█▇▆▆▇▇▇▇▆▇▇▇        │"
 "│ ✓ 17,239 done  ● 6 active        ││ #3 AV1  Concertos…mple.mkv encode  ━━───── 22.5% ││ RAM █████▉            11/32G │"
-"│ = 522 kept  ↪ 150 dup            ││ #4 AVIF DSC_4703.JPG       verify  ━━━──── 48.0% ││ Disk E: · 1.20 TB free       │"
+"│ ! 4 issues  = 522 kept           ││ #4 AVIF DSC_4703.JPG       verify  ━━━──── 48.0% ││ Disk E: · 1.20 TB free       │"
 "│ Saved 223 GB (65 %)     ▃▃▃▃▅███ ││ #5 AVIF DSC_4704.JPG       encode  ━━━━━── 73.3% ││ ⚡ limit 50 % · priority low │" Hidden by multi-width symbols: [(91, " ")]
 "│ ETA 9h 7m · grows while scanning ││ #6 AVIF DSC_4705.JPG       encode  ━━───── 34.6% ││ ffmpeg 9.0.1 · SVT-AV1 4.2   │"
 "│                                  ││                                                  ││                              │"

@@ -2,12 +2,12 @@
 source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app(), 160, 45).backend()"
 ---
-" CryArchiver  D:\Archive\Family → E:\Archive-AV1\Family         MODERATE · LATEST  ⚡ limit 50 %                    saved 223 GB (65 %) · ETA 9h 7m · ▶ running " Hidden by multi-width symbols: [(84, " ")]
+" CryArchiver   DEMO  D:\Archive\Family → E:\Archive-AV1\Family         MODERATE · LATEST  ⚡ limit 50 %             saved 223 GB (65 %) · ETA 9h 7m · ▶ running " Hidden by multi-width symbols: [(91, " ")]
 "╭─ Overall ────────────────────────────────────╮╭─ Workers ──────────────────── 6 active · 3 video + 3 image slots ─╮╭─ System ────────────────────────────────╮"
 "│ 38.7% of 44,517+ files ⠋ scanning            ││ #1 AV1  IMG_0001 2.MOV      encode  ━━━━━━─── 71.7% 88 fps 2.9×   ││ CPU ████████████▉ ┃               46%   │"
 "│ █████████████████                            ││ #2 AV1  2018 - UTR…oPro.mkv encode  ━━━━━━━━━ 97.5% 126 fps 4.2×  ││     ▆▆▆█▆█▇▆▅▆▆▆▆▆▆▆▇▆▆▅▆▆▆▆▆▆▇▆        │"
 "│ ✓ 17,239 done  ● 6 active  · 27,269 queued   ││ #3 AV1  Concertos-…mple.mkv encode  ━━─────── 22.5% 131 fps 4.4×  ││ RAM █████████▊                   11/32G │"
-"│ = 522 kept  ↪ 150 dup  ! 4 issues            ││ #4 AVIF DSC_4703.JPG        verify  ━━━━───── 48.0%               ││ Disk E: · 1.20 TB free                  │"
+"│ ! 4 issues  = 522 kept  ↪ 150 dup            ││ #4 AVIF DSC_4703.JPG        verify  ━━━━───── 48.0%               ││ Disk E: · 1.20 TB free                  │"
 "│ Saved 223 GB (65 %)  ▆▅▃▆▇▁▇█▁▄▃             ││ #5 AVIF DSC_4704.JPG        encode  ━━━━━━━── 73.3%               ││ ⚡ limit 50 % · priority low            │" Hidden by multi-width symbols: [(120, " ")]
 "│ ETA 9h 7m · grows while scanning             ││ #6 AVIF DSC_4705.JPG        encode  ━━━────── 34.6%               ││ ffmpeg 9.0.1 · SVT-AV1 4.2              │"
 "│                                              ││                                                                   ││                                         │"

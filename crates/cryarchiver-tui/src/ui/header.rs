@@ -1,66 +1,93 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 
 use super::widgets::{bold, fg, put, to_u16};
 use crate::format::{bytes, duration, fit_middle, round_to_u32, width};
 use crate::theme::Theme;
 use crate::view::{ArchiveView, RunState};
 
+const BADGE: &str = " CryArchiver ";
+const DEMO: &str = " DEMO ";
+
 pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	buf.set_style(area, Style::new().bg(theme.panel));
 	let (y, right) = (area.y, area.right());
 	let header = &view.header;
 
-	let mut x = put(
-		buf,
-		area.x,
-		y,
-		" CryArchiver ",
-		bold(theme.background).bg(theme.accent),
-		right,
-	);
-
-	let route = format!("{} → {}", header.source, header.destination);
-	let route_width = (usize::from(area.width) * 3 / 10).max(10);
-	x = put(buf, x + 1, y, &fit_middle(&route, route_width), fg(theme.bright), right);
-
 	let preset = format!(" {} · {} ", header.speed, header.codecs);
-	x = put(buf, x + 1, y, &preset, bold(theme.accent), right);
+	let limit = header.performance_limit.map(|limit| format!("⚡ limit {limit} %"));
+	let (run, run_color) = run_state(header.run_state, theme);
 
-	if let Some(limit) = header.performance_limit {
-		x = put(buf, x + 1, y, &format!("⚡ limit {limit} %"), fg(theme.warn), right);
+	let fixed = width(BADGE)
+		+ if header.demo { width(DEMO) + 1 } else { 0 }
+		+ width(&preset)
+		+ limit.as_deref().map_or(0, |limit| width(limit) + 1)
+		+ width(run)
+		+ 5;
+	let route_room = usize::from(area.width).saturating_sub(fixed);
+	let route_width = (usize::from(area.width) * 3 / 10).min(route_room).max(10);
+
+	let mut x = put(buf, area.x, y, BADGE, bold(theme.background).bg(theme.accent), right);
+	if header.demo {
+		x = put(buf, x + 1, y, DEMO, bold(theme.background).bg(theme.warn), right);
 	}
 
-	let status = status_block(view);
-	let status_width = to_u16(width(&status));
-	if x + status_width + 2 < right {
-		let color = if header.run_state == RunState::Paused {
-			theme.warn
-		} else {
-			theme.dim
-		};
-		put(buf, right - status_width, y, &status, fg(color), right);
+	let route = format!("{} → {}", header.source, header.destination);
+	x = put(buf, x + 1, y, &fit_middle(&route, route_width), fg(theme.bright), right);
+	x = put(buf, x + 1, y, &preset, bold(theme.accent), right);
+	if let Some(limit) = &limit {
+		x = put(buf, x + 1, y, limit, fg(theme.warn), right);
+	}
+
+	render_status(
+		buf,
+		Rect::new(x, y, right.saturating_sub(x), 1),
+		view,
+		run,
+		run_color,
+		theme,
+	);
+}
+
+fn run_state(state: RunState, theme: &Theme) -> (&'static str, Color) {
+	match state {
+		RunState::Running => ("▶ running", theme.done),
+		RunState::Paused => ("‖ paused", theme.warn),
+		RunState::Stopping => ("■ stopping…", theme.warn),
+		RunState::Finished => ("✓ complete", theme.done),
 	}
 }
 
-fn status_block(view: &ArchiveView) -> String {
+/// The run state always shows; the ETA and then the saving join it only when they fit.
+fn render_status(buf: &mut Buffer, area: Rect, view: &ArchiveView, run: &str, run_color: Color, theme: &Theme) {
 	let overall = &view.overall;
-	let saved_percent = round_to_u32(overall.saved_fraction * 100.0);
-	let mut parts = vec![format!("saved {} ({saved_percent} %)", bytes(overall.saved_bytes))];
+	let saved = format!(
+		"saved {} ({} %) · ",
+		bytes(overall.saved_bytes),
+		round_to_u32(overall.saved_fraction * 100.0)
+	);
+	let eta = overall
+		.eta
+		.filter(|_| view.header.run_state != RunState::Finished)
+		.map(|eta| format!("ETA {} · ", duration(eta)))
+		.unwrap_or_default();
 
-	if let Some(eta) = overall.eta.filter(|_| view.header.run_state != RunState::Finished) {
-		parts.push(format!("ETA {}", duration(eta)));
+	let room = usize::from(area.width).saturating_sub(2);
+	let run_width = width(run) + 1;
+	let with_eta = run_width + width(&eta) <= room;
+	let with_saved = with_eta && run_width + width(&eta) + width(&saved) <= room;
+
+	let mut extras = String::new();
+	if with_saved {
+		extras.push_str(&saved);
+	}
+	if with_eta {
+		extras.push_str(&eta);
 	}
 
-	parts.push(
-		match view.header.run_state {
-			RunState::Running => "▶ running",
-			RunState::Paused => "‖ paused",
-			RunState::Finished => "✓ finished",
-		}
-		.to_owned(),
-	);
-
-	format!("{} ", parts.join(" · "))
+	let total = to_u16(width(&extras) + run_width);
+	let start = area.right().saturating_sub(total);
+	let x = put(buf, start, area.y, &extras, fg(theme.dim), area.right());
+	put(buf, x, area.y, &format!("{run} "), bold(run_color), area.right());
 }

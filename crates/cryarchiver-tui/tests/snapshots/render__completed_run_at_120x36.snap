@@ -2,11 +2,11 @@
 source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app, 120, 36).backend()"
 ---
-" CryArchiver  D:\Archive\Family → E:\Archive-…mily  MODERATE · LATEST  ⚡ limit 50 %   saved 482 GB (66 %) · ✓ finished " Hidden by multi-width symbols: [(72, " ")]
+" CryArchiver   DEMO  D:\Archive\Family → E:\Archive-…mily  MODERATE · LATEST  ⚡ limit 50 %                  ✓ complete " Hidden by multi-width symbols: [(79, " ")]
 "╭─ Overall ────────────────────────╮╭─ Workers ─── 0 active · 3 video + 3 image slots ─╮╭─ System ─────────────────────╮"
 "│ 100% of 44,422 files             ││ all work finished                                ││ CPU ███████▊┃          46%   │"
 "│ ████████████████████████████████ ││                                                  ││     ▆▆▆▆█▆█▇▆▅▆▆▆▆▆▆▆        │"
-"│ = 522 kept  ↪ 150 dup            ││                                                  ││ RAM █████▉            11/32G │"
+"│ ! 0 issues  = 522 kept           ││                                                  ││ RAM █████▉            11/32G │"
 "│ Saved 482 GB (66 %)  ▆▅▃▆▇▁▇█▁▄▃ ││                                                  ││ Disk E: · 1.07 TB free       │"
 "│ 44,422 source files → 44,421 in  ││                                                  ││ ⚡ limit 50 % · priority low │" Hidden by multi-width symbols: [(91, " ")]
 "│ the archive ✓ + 1 excluded       ││                                                  ││ ffmpeg 9.0.1 · SVT-AV1 4.2   │"

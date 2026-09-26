@@ -2,14 +2,14 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use super::{Outcome, Overlay, Ui, ViewMode};
+use super::{Lifecycle, Outcome, Overlay, Ui, ViewMode};
 use crate::source::{Action, ArchiveSource};
 use crate::view::Duplicates;
 
 impl Ui {
 	pub(super) fn on_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
 		if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-			self.quit = true;
+			self.lifecycle = Lifecycle::Quitting;
 			return Outcome::Done;
 		}
 
@@ -72,8 +72,10 @@ impl Ui {
 
 	fn on_overlay_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
 		let Some(Overlay::Menu(menu)) = &mut self.overlay else {
-			if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q')) {
-				self.overlay = None;
+			match key.code {
+				KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
+				KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => self.overlay = None,
+				_ => {}
 			}
 			return Outcome::Done;
 		};
@@ -87,6 +89,7 @@ impl Ui {
 				return self.activate(source, item, target);
 			}
 			KeyCode::Esc | KeyCode::Char('m') => self.overlay = None,
+			KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
 			_ => {}
 		}
 		Outcome::Done
@@ -94,7 +97,7 @@ impl Ui {
 
 	fn on_global_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
 		match key.code {
-			KeyCode::Char('q') => self.quit = true,
+			KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
 			KeyCode::F(2) => self.mouse_capture = !self.mouse_capture,
 			KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
 			KeyCode::Char('p') => return Outcome::Perform(Action::TogglePause),
@@ -193,12 +196,15 @@ impl Ui {
 	fn jump_to_duplicate(&mut self, source: &dyn ArchiveSource, file: crate::view::NodeId) -> Outcome {
 		let target = match source.details(file).map(|details| details.duplicates) {
 			Some(Duplicates::PlaceholderOf(link)) => link.file,
-			Some(Duplicates::CanonicalOf(links)) if !links.is_empty() => links[0].file,
+			Some(Duplicates::CanonicalOf(links)) if !links.is_empty() => {
+				let link = &links[self.duplicate_cursor % links.len()];
+				self.duplicate_cursor += 1;
+				link.file
+			}
 			_ => return Outcome::Ignored,
 		};
 
 		self.reveal(source, target);
-		self.mode = ViewMode::Library;
 		Outcome::Done
 	}
 

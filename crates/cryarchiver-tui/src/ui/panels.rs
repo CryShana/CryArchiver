@@ -21,7 +21,8 @@ const PERCENT_CELLS: usize = 6;
 const RATE_CELLS: usize = 14;
 const MAX_GAUGE: usize = 24;
 
-pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) {
+/// Returns whether the scanning spinner made it onto the screen.
+pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) -> bool {
 	let overall_width = to_u16(usize::from(area.width) * 30 / 100);
 	let workers_width = to_u16((usize::from(area.width) * 43 + 50) / 100);
 	let [overall, workers, system] = Layout::horizontal([
@@ -31,9 +32,9 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, s
 	])
 	.areas(area);
 
-	render_overall(buf, overall, view, theme, spinner);
 	render_workers(buf, workers, view, theme);
 	render_system(buf, system, view, theme);
+	render_overall(buf, overall, view, theme, spinner)
 }
 
 fn content(inner: Rect) -> Rect {
@@ -48,7 +49,7 @@ fn cow<'a>(text: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
 	text.into()
 }
 
-fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) {
+fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) -> bool {
 	let chrome = Chrome {
 		title: "Overall",
 		right: None,
@@ -63,8 +64,13 @@ fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 		theme.accent
 	};
 
+	let headline = headline(overall, cells, theme, spinner);
+	let spinning = headline
+		.spans
+		.last()
+		.is_some_and(|span| span.content.ends_with("scanning"));
 	let mut lines = vec![
-		headline(overall, cells, theme, spinner),
+		headline,
 		Line::from(block_gauge(cells, overall.progress, gauge_color, theme)),
 	];
 	if overall.parity.is_none() {
@@ -91,6 +97,7 @@ fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 			theme.done,
 		);
 	}
+	spinning
 }
 
 fn headline<'a>(overall: &Overall, cells: usize, theme: &Theme, spinner: &ThrobberState) -> Line<'a> {
@@ -139,16 +146,16 @@ fn outcomes_line<'a>(overall: &Overall, cells: usize, theme: &Theme) -> Line<'a>
 	let mut parts = Parts::new(cells);
 	parts
 		.group([
+			(cow("! "), bold(theme.error)),
+			(cow(format!("{} issues  ", overall.open_issues)), fg(theme.text)),
+		])
+		.group([
 			(cow("= "), fg(theme.warn)),
 			(cow(format!("{} kept  ", thousands(overall.kept))), fg(theme.text)),
 		])
 		.group([
 			(cow("↪ "), fg(theme.search)),
-			(cow(format!("{} dup  ", thousands(overall.duplicates))), fg(theme.text)),
-		])
-		.group([
-			(cow("! "), bold(theme.error)),
-			(cow(format!("{} issues", overall.open_issues)), fg(theme.text)),
+			(cow(format!("{} dup", thousands(overall.duplicates))), fg(theme.text)),
 		]);
 	parts.line()
 }
@@ -210,6 +217,7 @@ fn render_workers(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 		let idle = match view.header.run_state {
 			RunState::Running => "idle",
 			RunState::Paused => "paused · no job running",
+			RunState::Stopping => "stopping…",
 			RunState::Finished => "all work finished",
 		};
 		put(buf, body.x, body.y, idle, fg(theme.dim), body.right());
@@ -383,7 +391,8 @@ fn cpu_line(buf: &mut Buffer, area: Rect, system: &SystemStats, limit: Option<u8
 	buf.set_span(x + 4, y, &block_gauge(usize::from(cells), load, color, theme), cells);
 
 	if let Some(limit) = limit {
-		let marker = x + 4 + to_u16(usize::from(cells) * usize::from(limit) / 100);
+		let marker_cell = (usize::from(cells) * usize::from(limit) / 100).min(usize::from(cells) - 1);
+		let marker = x + 4 + to_u16(marker_cell);
 		buf.set_string(marker, y, "┃", Style::new().fg(theme.error).bg(theme.panel));
 	}
 
