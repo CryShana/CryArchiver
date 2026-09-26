@@ -56,6 +56,20 @@ impl Row {
 	}
 }
 
+/// The row itself, then every folder above it, nearest first: the fallbacks for keeping it at the top.
+fn anchor_chain(library: &Library, row: Row) -> Vec<Selection> {
+	let (own, folder) = match row.kind {
+		RowKind::Folder(folder, _) => (Some(Selection::Folder(folder)), library.node(folder).parent),
+		RowKind::File { folder, file, .. } => (Some(Selection::File { file, folder }), Some(folder)),
+		RowKind::Loading(folder) => (None, Some(folder)),
+	};
+
+	let folders = folder
+		.into_iter()
+		.flat_map(|folder| std::iter::once(folder).chain(library.ancestors(folder)));
+	own.into_iter().chain(folders.map(Selection::Folder)).collect()
+}
+
 /// The file row a tree row stands for, looked up in the source's current lists.
 pub fn file_row(source: &dyn ArchiveSource, kind: RowKind) -> Option<&FileRow> {
 	match kind {
@@ -168,27 +182,34 @@ impl TreeState {
 		}
 
 		let filter_changed = self.key.as_ref().is_some_and(|old| old.filter != key.filter);
-		let top = self.rows.get(self.scroll).and_then(|row| row.selection());
+		let anchors = self
+			.rows
+			.get(self.scroll)
+			.map(|&row| anchor_chain(library, row))
+			.unwrap_or_default();
 
 		self.rebuild(source, filter);
 		self.key = Some(key);
 		let moved = self.reselect();
-		self.place_viewport(top, moved || filter_changed);
+		self.place_viewport(&anchors, moved || filter_changed);
 	}
 
-	/// Keeps the row that was at the top of the viewport at the top, so a rebuild never scrolls under the user.
-	/// Only a landed reveal, a lost selection or a new filter scrolls to the selection instead.
-	fn place_viewport(&mut self, top: Option<Selection>, follow_selection: bool) {
-		let follow = std::mem::take(&mut self.follow) || follow_selection;
-		let anchored = top.and_then(|top| self.position(|row| row.shows(top)));
-
-		match anchored {
-			Some(index) if !follow => {
-				self.scroll = index;
-				self.clamp_scroll();
-			}
-			_ => self.ensure_visible(),
+	/// Keeps the row that was at the top of the viewport at the top, so a rebuild never scrolls under the user. When
+	/// that row is gone, its nearest surviving ancestor takes its place. Only a landed reveal, a lost selection or a
+	/// new filter scrolls to the selection instead.
+	fn place_viewport(&mut self, anchors: &[Selection], follow_selection: bool) {
+		if std::mem::take(&mut self.follow) || follow_selection {
+			self.ensure_visible();
+			return;
 		}
+
+		if let Some(index) = anchors
+			.iter()
+			.find_map(|&anchor| self.position(|row| row.shows(anchor)))
+		{
+			self.scroll = index;
+		}
+		self.clamp_scroll();
 	}
 
 	/// Records the body height of the frame on screen, so paging and scrolling match what the user sees.

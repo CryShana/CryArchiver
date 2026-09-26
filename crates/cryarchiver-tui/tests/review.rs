@@ -39,6 +39,95 @@ fn a_rebuild_keeps_the_viewport_where_the_wheel_left_it() {
 	assert_eq!(row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW), before);
 }
 
+fn folder_named(app: &App<MockSource>, name: &str) -> cryarchiver_tui::view::NodeId {
+	let library = &app.source().view().library;
+	library.ids().find(|&id| library.node(id).name == name).unwrap()
+}
+
+#[test]
+fn collapsing_the_selected_parent_of_the_top_row_keeps_the_viewport_at_it() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let bled = find_row(&terminal, "▾ Bled").unwrap();
+	support::click(&mut app, 30, bled, Instant::now());
+	mouse(&mut app, MouseEventKind::ScrollDown, 40, 20, Instant::now());
+	mouse(&mut app, MouseEventKind::ScrollDown, 40, 20, Instant::now());
+	let before = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
+	assert!(
+		before.contains(".JPG") || before.contains(".MOV"),
+		"a Bled file is at the top: {before}"
+	);
+
+	press(&mut app, KeyCode::Left);
+
+	let top = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
+	assert!(
+		top.contains("▸ Bled"),
+		"the collapsed parent took the file's place: {top}"
+	);
+	assert_eq!(app.selected_name().as_deref(), Some("Bled"));
+}
+
+#[test]
+fn released_rows_anchor_on_their_folder_not_on_a_distant_selection() {
+	let mut app = app();
+	draw(&mut app, 120, 36);
+	press(&mut app, KeyCode::End);
+	draw(&mut app, 120, 36);
+	press(&mut app, KeyCode::Home);
+	press(&mut app, KeyCode::End);
+	for _ in 0..40 {
+		mouse(&mut app, MouseEventKind::ScrollUp, 40, 20, Instant::now());
+	}
+	mouse(&mut app, MouseEventKind::ScrollDown, 40, 20, Instant::now());
+	mouse(&mut app, MouseEventKind::ScrollDown, 40, 20, Instant::now());
+	let before = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
+	assert!(
+		before.contains(".JPG") || before.contains(".MOV"),
+		"a Bled file is at the top: {before}"
+	);
+
+	let bled = folder_named(&app, "Bled");
+	app.source_mut().perform(Action::Expanded(bled, false));
+
+	let top = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
+	assert!(
+		top.contains("▾ Bled"),
+		"the viewport stays at the folder that lost its rows: {top}"
+	);
+}
+
+#[test]
+fn header_shortens_applying_before_it_drops_the_route() {
+	let mut source = support::source();
+	source.perform(Action::ChangeSettings(SettingsChange::DeleteOriginals {
+		enabled: true,
+		confirmation: "DELETE".to_owned(),
+	}));
+	source.perform(Action::ChangeSettings(SettingsChange::PerformanceLimit(Some(25))));
+	let mut app = App::new(source, ColorDepth::TrueColor);
+
+	let wide = row_text(&draw(&mut app, 112, 30), 0);
+	assert!(wide.contains("applying…") && wide.contains("D:\\"), "{wide}");
+
+	let terminal = draw(&mut app, 105, 30);
+	let band = row_text(&terminal, 0);
+	assert!(
+		band.contains("limit 25 % …") && band.contains("D:\\"),
+		"the route stays while applying shortens: {band}"
+	);
+	assert!(band.contains(" CryArchiver "), "{band}");
+
+	let narrow = row_text(&draw(&mut app, 100, 30), 0);
+	assert!(narrow.contains("limit 25 % …") && !narrow.contains("D:\\"), "{narrow}");
+	assert!(
+		narrow.contains(" CryArchiver "),
+		"the badge is the last to shorten: {narrow}"
+	);
+
+	assert_snapshot!(terminal.backend());
+}
+
 #[test]
 fn a_new_filter_result_keeps_the_viewport_too() {
 	let mut app = app();

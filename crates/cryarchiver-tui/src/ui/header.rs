@@ -13,7 +13,8 @@ const DEMO: &str = " DEMO ";
 const DELETING: &str = " ⚠ DELETING ORIGINALS ";
 const MIN_ROUTE: usize = 10;
 
-/// The left side's texts after squeezing: the route first, then "applying…", then the badge.
+/// The left side's texts after squeezing: the route shrinks to its minimum, then "applying…" becomes "…", then the
+/// route goes, then the badge shortens.
 struct Left {
 	badge: &'static str,
 	route_width: usize,
@@ -56,6 +57,11 @@ fn squeeze(view: &ArchiveView, preset: &str, room: usize, wanted_route: usize) -
 	}
 
 	left.limit = limit_text(true);
+	if spare(&left) > MIN_ROUTE {
+		left.route_width = wanted_route.min(spare(&left) - 1).max(MIN_ROUTE);
+		return left;
+	}
+
 	if spare(&left) == 0 {
 		left.badge = SHORT_BADGE;
 	}
