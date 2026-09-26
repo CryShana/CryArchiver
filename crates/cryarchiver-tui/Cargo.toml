@@ -1,0 +1,20 @@
+[package]
+name = "cryarchiver-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cryarchiver-engine = { path = "../cryarchiver-engine" }
+ratatui.workspace = true
+thiserror.workspace = true
+throbber-widgets-tui.workspace = true
+tui-input.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
