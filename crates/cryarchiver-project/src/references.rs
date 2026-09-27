@@ -165,7 +165,7 @@ fn resolve(folder: &RelPath, text: &[u8]) -> Option<RelPath> {
 			b".." => {
 				components.pop()?;
 			}
-			name => components.push(OsString::from(std::str::from_utf8(name).ok()?)),
+			name => components.push(crate::keys::os_from_bytes(name)),
 		}
 	}
 
@@ -302,5 +302,15 @@ mod tests {
 			),
 			"movie.mp4.en.srt"
 		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn names_that_are_not_utf8_still_resolve() {
+		use std::os::unix::ffi::OsStrExt;
+
+		let target = resolve(&folder("Music"), b"caf\xe9.flac");
+
+		assert_eq!(target, Some(folder("Music").join(OsStr::from_bytes(b"caf\xe9.flac"))));
 	}
 }
