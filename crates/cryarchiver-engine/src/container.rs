@@ -1,3 +1,4 @@
+pub mod av1;
 pub mod isobmff;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

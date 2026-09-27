@@ -34,4 +34,5 @@ libc.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
+moxcms.workspace = true
 tempfile.workspace = true
