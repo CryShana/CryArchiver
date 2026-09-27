@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 blake3.workspace = true
 cryarchiver-engine = { path = "../cryarchiver-engine" }
+notify.workspace = true
 redb.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true

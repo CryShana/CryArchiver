@@ -12,3 +12,4 @@ pub mod schedule;
 pub mod settings;
 pub mod store;
 pub mod tree;
+pub mod watch;
