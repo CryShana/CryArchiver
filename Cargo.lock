@@ -703,6 +703,7 @@ name = "cryarchiver-project"
 version = "0.1.0"
 dependencies = [
  "cryarchiver-engine",
+ "redb",
  "rmp-serde",
  "serde",
  "tempfile",
@@ -2538,6 +2539,15 @@ name = "reborrow"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
+
+[[package]]
+name = "redb"
+version = "4.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb338a6c67830a61bed824b78c2bb034ab1ff401a20616bd7957524f4fdc2f22"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "redox_syscall"
