@@ -11,9 +11,11 @@ use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::workspace::sweep;
 use tokio::sync::mpsc::unbounded_channel;
 
+use super::dangerous::DangerState;
 use super::dependencies::ReferenceState;
 use super::duplicates::DedupState;
 use super::finish::FinishState;
+use super::live::{self, LiveState};
 use super::owner::Owner;
 use super::pipeline::Pipeline;
 use super::publish::ViewState;
@@ -50,16 +52,19 @@ impl Owner {
 			.collect();
 		let watching = WatchState::new(Debouncer::new(options.tuning.debounce), unknown);
 		let memory = Arc::new(MemoryBudget::default());
-		let image_threads = std::thread::available_parallelism().map_or(1, usize::from);
-		let pipeline = Pipeline::new(
+		let applied = live::apply_limit(settings.performance_limit);
+		let image_threads = live::image_threads(settings.performance_limit, applied);
+		let mut pipeline = Pipeline::new(
 			&settings.destination,
 			GovernorConfig {
 				ramp: options.tuning.ramp,
 				max_encodes: options.tuning.max_encodes,
 			},
 			options.backend.encoder(image_threads, memory.clone()),
+			image_threads,
 			memory,
 		);
+		pipeline.governor.set_limit(settings.performance_limit.is_some());
 
 		let mut owner = Self {
 			project_file: project_file.to_path_buf(),
@@ -90,6 +95,8 @@ impl Owner {
 			references: ReferenceState::default(),
 			finish: FinishState::default(),
 			watching,
+			danger: DangerState::default(),
+			live: LiveState::new(applied),
 			view: ViewState::default(),
 			issue_ids: IssueIds::default(),
 			issue_files: BTreeSet::new(),
@@ -138,7 +145,8 @@ impl Owner {
 		self.last_attempts = loaded.last_attempts;
 	}
 
-	/// Work that was running is requeued; a commit whose rename happened becomes Done.
+	/// Work that was running is requeued; a commit whose rename happened becomes Done, and so does a delete that didn't
+	/// happen.
 	fn recover(&mut self) {
 		let files: Vec<FileId> = self.tree.file_ids().collect();
 		for file in files {
@@ -149,6 +157,7 @@ impl Owner {
 					let (output, replaces) = (output.clone(), record.replaces.clone());
 					self.recover_commit(file, output, replaces.as_ref());
 				}
+				FileState::DeletePending(_) => self.recover_delete(file),
 				_ => {}
 			}
 		}

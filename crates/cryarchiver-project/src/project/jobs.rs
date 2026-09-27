@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cryarchiver_engine::commit::{SourceTimes, check_space, file_id, free_space};
@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::owner::Message;
 use crate::keys::RelPath;
-use crate::record::{CopyReason, Hash, How};
-use crate::run::{self, Staged};
+use crate::record::{CopyReason, Hash, How, Identity, mtime_ns};
+use crate::run::{self, Deletion, Expected, Staged};
 use crate::tree::FileId;
 
 /// How an output was made, before the project names it.
@@ -54,6 +54,8 @@ pub(crate) enum JobMessage {
 	Commit {
 		staged: Staged,
 		made: Made,
+		/// The source's identity, read once its content was: what a later delete checks the original against.
+		identity: Option<Identity>,
 		reply: oneshot::Sender<Option<Target>>,
 	},
 	Placed,
@@ -63,7 +65,24 @@ pub(crate) enum JobMessage {
 	Kept(String),
 	/// A placeholder's source and its canonical copy's source are no longer the same file.
 	NotSameFile,
+	/// The delete checks passed: the project writes `DeletePending` durably, then answers whether to go on.
+	DeleteIntent {
+		reply: oneshot::Sender<bool>,
+	},
+	/// What deleting the original did: it is gone, or another program has it open.
+	Deleted(Deletion),
+	/// Nothing was deleted, and why.
+	DeleteRefused(Refusal),
 	Finished(Result<(), JobError>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refusal {
+	/// The archived file no longer matches its recorded BLAKE3.
+	OutputDamaged,
+	/// The original isn't the file that was archived any more: its size and time now, when they can be read.
+	SourceChanged(Option<(u64, i64)>),
+	Kept(String),
 }
 
 pub(crate) enum Task {
@@ -81,6 +100,31 @@ pub(crate) enum Task {
 		from: PathBuf,
 		made: Made,
 	},
+	Delete(DeleteCheck),
+}
+
+/// What must hold, read back from disk, before an original is deleted (project layer spec §9).
+#[derive(Debug, Clone)]
+pub(crate) struct DeleteCheck {
+	pub(crate) output: PathBuf,
+	pub(crate) size: u64,
+	pub(crate) hash: Hash,
+	/// The original's identity when it was archived.
+	pub(crate) identity: Identity,
+	pub(crate) placeholder: Option<PlaceholderCheck>,
+	pub(crate) source_root: PathBuf,
+}
+
+/// For a placeholder: the canonical copy's archived file, which holds the content.
+#[derive(Debug, Clone)]
+pub(crate) struct PlaceholderCheck {
+	/// The link the placeholder's text must name.
+	pub(crate) link: String,
+	pub(crate) output: PathBuf,
+	pub(crate) size: u64,
+	pub(crate) hash: Hash,
+	/// A placeholder matched by file identity alone: the canonical copy's source, which must still be the same file.
+	pub(crate) same_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -110,6 +154,7 @@ impl JobContext {
 				same_file,
 			} => self.write(content, made, same_file).await,
 			Task::Move { from, made } => self.take_over(from, made).await,
+			Task::Delete(check) => self.delete(check).await,
 		};
 
 		self.send(JobMessage::Finished(result));
@@ -205,6 +250,54 @@ impl JobContext {
 		self.commit(Staged { path: from, size, hash }, made).await
 	}
 
+	/// Checks the archive and the original, asks the project for its durable intent, and only then deletes. Nothing is
+	/// retried here: the project decides what comes next.
+	async fn delete(&self, check: DeleteCheck) -> Result<(), JobError> {
+		let (source, size, mtime_ns) = (self.source.clone(), self.size, self.mtime_ns);
+		let verify = check.clone();
+		let verdict = blocking(move || verify_before_delete(&verify, &source, size, mtime_ns)).await?;
+		if let Err(refusal) = verdict {
+			self.send(JobMessage::DeleteRefused(refusal));
+			return Ok(());
+		}
+
+		let (reply, answer) = oneshot::channel();
+		self.send(JobMessage::DeleteIntent { reply });
+		if !answer.await.unwrap_or(false) {
+			return Err(ErrorKind::Cancelled.into());
+		}
+
+		let (source, root) = (self.source.clone(), check.source_root);
+		let expected = Expected {
+			size: self.size,
+			mtime_ns: self.mtime_ns,
+			identity: Some(check.identity),
+		};
+		let deletion = blocking(move || run::delete_original(&source, &root, &expected))
+			.await?
+			.map_err(|err| JobError::io(IoSide::Source(&self.source), &err))?;
+
+		let message = match deletion {
+			Deletion::Changed => {
+				let source = self.source.clone();
+				let now = blocking(move || size_and_time(&source)).await?;
+				JobMessage::DeleteRefused(Refusal::SourceChanged(now))
+			}
+			Deletion::Refused(reason) => JobMessage::DeleteRefused(Refusal::Kept(reason.into())),
+			deletion => JobMessage::Deleted(deletion),
+		};
+		self.send(message);
+		Ok(())
+	}
+
+	async fn source_identity(&self) -> Option<Identity> {
+		let source = self.source.clone();
+		blocking(move || file_id(&source).ok().map(Identity::from))
+			.await
+			.ok()
+			.flatten()
+	}
+
 	fn copy_error(&self, err: &io::Error) -> JobError {
 		if err.kind() == io::ErrorKind::StorageFull {
 			let need = self.size.saturating_add(self.size / 10);
@@ -223,6 +316,7 @@ impl JobContext {
 			}
 		};
 
+		let identity = self.source_identity().await;
 		loop {
 			if self.cancel.is_cancelled() {
 				discard_unplaced(&staged);
@@ -233,6 +327,7 @@ impl JobContext {
 			self.send(JobMessage::Commit {
 				staged: staged.clone(),
 				made: made.clone(),
+				identity,
 				reply,
 			});
 			let Ok(Some(target)) = answer.await else {
@@ -254,6 +349,53 @@ impl JobContext {
 			}
 		}
 	}
+}
+
+/// The read-back and source checks of spec §9, cheapest first.
+fn verify_before_delete(check: &DeleteCheck, source: &Path, size: u64, mtime_ns: i64) -> Result<(), Refusal> {
+	let matches = |path: &Path, size, hash| run::read_back(path, size, hash).unwrap_or(false);
+
+	if !run::source_unchanged(source, size, mtime_ns) {
+		return Err(Refusal::SourceChanged(size_and_time(source)));
+	}
+
+	if !matches(&check.output, check.size, check.hash) {
+		return Err(Refusal::OutputDamaged);
+	}
+
+	let Some(placeholder) = &check.placeholder else {
+		return Ok(());
+	};
+
+	let names_link =
+		fs::read_to_string(&check.output).is_ok_and(|text| run::placeholder_links_to(&text, &placeholder.link));
+	if !names_link {
+		return Err(Refusal::Kept(
+			"the placeholder no longer names the archived copy".into(),
+		));
+	}
+
+	if !matches(&placeholder.output, placeholder.size, placeholder.hash) {
+		return Err(Refusal::Kept(
+			"the archived copy it points to doesn't match its BLAKE3".into(),
+		));
+	}
+
+	if let Some(canonical) = &placeholder.same_file {
+		let same = matches!((file_id(source), file_id(canonical)), (Ok(a), Ok(b)) if a == b);
+		if !same {
+			return Err(Refusal::Kept(
+				"it is no longer the same file as the archived copy's source".into(),
+			));
+		}
+	}
+
+	Ok(())
+}
+
+fn size_and_time(path: &Path) -> Option<(u64, i64)> {
+	let meta = fs::metadata(path).ok()?;
+	Some((meta.len(), mtime_ns(meta.modified().ok()?)))
 }
 
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, JobError> {
@@ -286,7 +428,6 @@ mod tests {
 	use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 	use super::*;
-	use crate::record::mtime_ns;
 
 	struct NoEncoder;
 
@@ -324,12 +465,18 @@ mod tests {
 			let mut sent = Vec::new();
 			while let Some(Message::Job(_, message)) = inbox.recv().await {
 				let message = match message {
-					JobMessage::Commit { staged, made, reply } => {
+					JobMessage::Commit {
+						staged,
+						made,
+						identity,
+						reply,
+					} => {
 						let _ = reply.send(None);
 						let (unanswered, _) = oneshot::channel();
 						JobMessage::Commit {
 							staged,
 							made,
+							identity,
 							reply: unanswered,
 						}
 					}

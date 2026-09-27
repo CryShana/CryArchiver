@@ -1,10 +1,12 @@
 //! The project task and its handle (project layer spec §11). One task owns the in-memory state and the project file;
 //! every change goes through it. Front ends send [`Command`]s and fold the [`Update`]s it sends back.
 
+mod dangerous;
 mod dependencies;
 mod duplicates;
 mod finish;
 mod jobs;
+mod live;
 mod open;
 mod owner;
 mod pipeline;
@@ -103,6 +105,8 @@ pub enum Fault {
 	AfterPlaced,
 	/// A placeholder adopted its canonical copy's earlier output, still in the unwritten batch.
 	AfterAdoption,
+	/// `DeletePending` is durable; the original is never deleted.
+	AfterDeleteIntent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

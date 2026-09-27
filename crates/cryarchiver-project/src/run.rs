@@ -91,6 +91,11 @@ pub fn placeholder_text(link: &str, source: &str, size: u64, hash: Option<Hash>)
 	)
 }
 
+/// Whether a placeholder's text, as [`placeholder_text`] wrote it, links to `link`.
+pub fn placeholder_links_to(text: &str, link: &str) -> bool {
+	text.lines().nth(1) == Some(link.replace('/', MAIN_SEPARATOR_STR).as_str())
+}
+
 /// Reads the file back from the medium, past the page cache, with large sequential reads, and checks its size and
 /// BLAKE3.
 pub fn read_back(path: &Path, size: u64, hash: Hash) -> io::Result<bool> {
@@ -782,6 +787,8 @@ mod tests {
 				"ab".repeat(32)
 			)
 		);
+		assert!(placeholder_links_to(&text, "../Photos/a.avif"));
+		assert!(!placeholder_links_to(&text, "../Photos/b.avif"));
 	}
 
 	#[test]

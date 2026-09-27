@@ -704,6 +704,7 @@ fn archived_files_whose_source_comes_back_are_picked_up() {
 fn a_pending_delete_finishes_only_when_the_source_is_gone() {
 	let setup = setup(|_| {});
 	write(&setup.source, "present.txt", b"present");
+	write(&setup.destination, "present.txt", b"present");
 	write(&setup.source, "gone.txt", b"gone");
 	seed(
 		&setup,
@@ -721,7 +722,7 @@ fn a_pending_delete_finishes_only_when_the_source_is_gone() {
 
 	assert_eq!(
 		state_of(&setup, "present.txt"),
-		FileState::DeletePending(copied("present.txt", 7))
+		FileState::Done(copied("present.txt", 7))
 	);
 	assert_eq!(
 		state_of(&setup, "gone.txt"),

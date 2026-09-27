@@ -100,6 +100,7 @@ impl Owner {
 		{
 			self.set_state(file, FileState::Done(output.clone()));
 			self.file_settled(file);
+			self.queue_delete(file);
 			return;
 		}
 

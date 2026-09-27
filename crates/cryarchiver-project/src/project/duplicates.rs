@@ -579,6 +579,11 @@ impl Owner {
 		}
 	}
 
+	/// Whether a canonical copy's move takes the file's archived output over, planned or running.
+	pub(super) fn gives_output_to_a_take_over(&self, file: FileId) -> bool {
+		self.dedup.moves.values().any(|holder| *holder == file)
+	}
+
 	pub(super) fn is_duplicate(&self, file: FileId) -> bool {
 		self.dedup.canonical_of.contains_key(&file) || self.dedup.moves.contains_key(&file)
 	}
@@ -735,8 +740,13 @@ impl Owner {
 
 	/// A dependent whose canonical copy holds no content it can adopt. A gone original keeps its record, its
 	/// placeholder marked lost: no archived file holds its content any more, and it depends on nothing. Anything else
-	/// is archived again from its own source, replacing its placeholder.
-	fn release(&mut self, dependent: FileId) {
+	/// is archived again from its own source, replacing its placeholder. A pending delete ends first: only its result
+	/// tells whether the original is gone.
+	pub(super) fn release(&mut self, dependent: FileId) {
+		if self.release_after_delete(dependent) {
+			return;
+		}
+
 		let entry = self.tree.file(dependent);
 		let name = entry.key.display();
 		if is_gone(&entry.record.state) {
@@ -1249,9 +1259,15 @@ mod tests {
 			extension: "bin".into(),
 		};
 
-		fixture
-			.owner
-			.on_job(canonical, JobMessage::Commit { staged, made, reply });
+		fixture.owner.on_job(
+			canonical,
+			JobMessage::Commit {
+				staged,
+				made,
+				identity: None,
+				reply,
+			},
+		);
 		answer.blocking_recv().unwrap()
 	}
 
@@ -1423,7 +1439,15 @@ mod tests {
 			hash: Hash(*blake3::hash(content).as_bytes()),
 		};
 
-		fixture.owner.on_job(file, JobMessage::Commit { staged, made, reply });
+		fixture.owner.on_job(
+			file,
+			JobMessage::Commit {
+				staged,
+				made,
+				identity: None,
+				reply,
+			},
+		);
 		answer.blocking_recv().unwrap()
 	}
 
@@ -1981,6 +2005,26 @@ mod tests {
 
 		assert!(!fixture.owner.is_duplicate(twin));
 		assert_eq!(fixture.owner.tree.file(twin).record.state, FileState::Queued);
+	}
+
+	#[test]
+	fn a_member_whose_output_a_take_over_moves_gets_no_delete_job() {
+		let mut fixture = Fixture::new();
+		let taker = fixture.gated("a.bin", ready(None, 1));
+		let holder = fixture.add(
+			"b.bin",
+			FileRecord {
+				identity: Some(Identity { volume: 1, index: 2 }),
+				state: FileState::Done(copied("b.bin")),
+				..ready(None, 1)
+			},
+		);
+
+		fixture.owner.dedup.moves.insert(taker, holder);
+		assert!(!fixture.owner.deletable(holder));
+
+		fixture.owner.dedup.moves.remove(&taker);
+		assert!(fixture.owner.deletable(holder));
 	}
 
 	#[test]

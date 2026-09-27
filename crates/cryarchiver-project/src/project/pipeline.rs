@@ -19,7 +19,7 @@ use super::jobs::{JobContext, JobMessage, Made, Target, Task};
 use super::owner::{Message, Owner};
 use crate::keys::RelPath;
 use crate::memory::MemoryBudget;
-use crate::record::{CopyReason, FailureLog, FileRecord, FileState, How, IssueKind, MediaClass, Output};
+use crate::record::{CopyReason, FailureLog, FileRecord, FileState, How, Identity, IssueKind, MediaClass, Output};
 use crate::references::{self, RefKind};
 use crate::run::Staged;
 use crate::schedule::{DiskGuard, Governor, GovernorConfig, Queue, Waits, Work, retry_delay};
@@ -29,6 +29,7 @@ use crate::watch::{ReadyCheck, check_ready, is_stable};
 
 const READY_CHECKS: usize = 8;
 const START_ORDER: [Work; 5] = [Work::Placeholder, Work::Hash, Work::Delete, Work::Copy, Work::Encode];
+const DELETES_FIRST: [Work; 5] = [Work::Placeholder, Work::Delete, Work::Hash, Work::Copy, Work::Encode];
 
 pub(crate) struct RunningJob {
 	pub(super) work: Work,
@@ -54,7 +55,11 @@ pub(crate) struct Pipeline {
 	/// Files ready to start again while their earlier job still winds down; they start once it has finished.
 	pub(super) deferred: HashSet<FileId>,
 	pub(super) governor: Governor,
+	/// A hash started while deletes waited: the next free disk slot goes to a delete, so an endless stream of
+	/// hashes in watch mode can't hold deletes back for good.
+	deletes_first: bool,
 	pub(super) encoder: Arc<dyn Encode>,
+	pub(super) image_threads: usize,
 	pub(super) memory: Arc<MemoryBudget>,
 	pub(super) sink: ArchivalSink,
 	pub(super) disk: DiskGuard,
@@ -83,6 +88,7 @@ impl Pipeline {
 		destination: &Path,
 		config: GovernorConfig,
 		encoder: Arc<dyn Encode>,
+		image_threads: usize,
 		memory: Arc<MemoryBudget>,
 	) -> Self {
 		Self {
@@ -95,7 +101,9 @@ impl Pipeline {
 			jobs: HashMap::new(),
 			deferred: HashSet::new(),
 			governor: Governor::new(config),
+			deletes_first: false,
 			encoder,
+			image_threads,
 			memory,
 			sink: ArchivalSink::new(destination),
 			disk: DiskGuard::default(),
@@ -235,17 +243,32 @@ impl Owner {
 			return;
 		}
 
-		for work in START_ORDER {
+		let order = if self.pipeline.deletes_first {
+			DELETES_FIRST
+		} else {
+			START_ORDER
+		};
+		for work in order {
 			while self.pipeline.governor.may_start(work, now) {
 				let next = self.pipeline.queues.get_mut(&work).and_then(Queue::pop_front);
 				let Some(file) = next else {
 					break;
 				};
 
-				if work == Work::Hash {
-					self.start_hash(file, now);
-				} else {
-					self.start_job(file, work, now);
+				match work {
+					Work::Hash => {
+						self.start_hash(file, now);
+						self.pipeline.deletes_first = self
+							.pipeline
+							.queues
+							.get(&Work::Delete)
+							.is_some_and(|queue| !queue.is_empty());
+					}
+					Work::Delete => {
+						self.pipeline.deletes_first = false;
+						self.start_job(file, work, now);
+					}
+					_ => self.start_job(file, work, now),
 				}
 			}
 		}
@@ -253,7 +276,12 @@ impl Owner {
 
 	fn start_job(&mut self, file: FileId, work: Work, now: Instant) {
 		let entry = self.tree.file(file);
-		if entry.removed || entry.record.state != FileState::Queued {
+		let startable = if work == Work::Delete {
+			self.deletable(file) && !self.pipeline.jobs.contains_key(&file)
+		} else {
+			!entry.removed && entry.record.state == FileState::Queued
+		};
+		if !startable {
 			return;
 		}
 
@@ -296,7 +324,9 @@ impl Owner {
 			},
 		);
 		self.pipeline.workers_dirty = true;
-		self.set_state(file, FileState::InProgress { attempt });
+		if work != Work::Delete {
+			self.set_state(file, FileState::InProgress { attempt });
+		}
 		tokio::spawn(context.run(task));
 	}
 
@@ -313,15 +343,21 @@ impl Owner {
 			Work::Copy if self.pipeline.chosen_copies.contains(&file) => Some(Task::Copy(CopyReason::Chosen)),
 			Work::Copy => Some(self.reference_task(file).unwrap_or(Task::Copy(CopyReason::NotMedia))),
 			Work::Placeholder => self.duplicate_task(file),
-			Work::Hash | Work::Delete => None,
+			Work::Delete => self.delete_task(file),
+			Work::Hash => None,
 		}
 	}
 
 	pub(super) fn on_job(&mut self, file: FileId, message: JobMessage) {
 		match message {
 			JobMessage::Event(event) => self.on_job_event(file, event),
-			JobMessage::Commit { staged, made, reply } => {
-				let target = self.commit_intent(file, &staged, &made);
+			JobMessage::Commit {
+				staged,
+				made,
+				identity,
+				reply,
+			} => {
+				let target = self.commit_intent(file, &staged, &made, identity);
 				let _ = reply.send(target);
 			}
 			JobMessage::Placed => self.placed(file),
@@ -332,6 +368,12 @@ impl Owner {
 					job.not_same_file = true;
 				}
 			}
+			JobMessage::DeleteIntent { reply } => {
+				let go_on = self.delete_intent(file);
+				let _ = reply.send(go_on);
+			}
+			JobMessage::Deleted(deletion) => self.deleted(file, &deletion),
+			JobMessage::DeleteRefused(refusal) => self.delete_refused(file, refusal),
 			JobMessage::Finished(result) => self.job_finished(file, result),
 		}
 	}
@@ -369,7 +411,13 @@ impl Owner {
 	}
 
 	/// Names the output and writes `Committing` durably; only then may the job rename it into place.
-	fn commit_intent(&mut self, file: FileId, staged: &Staged, made: &Made) -> Option<Target> {
+	fn commit_intent(
+		&mut self,
+		file: FileId,
+		staged: &Staged,
+		made: &Made,
+		identity: Option<Identity>,
+	) -> Option<Target> {
 		let attempt = self
 			.pipeline
 			.jobs
@@ -418,6 +466,7 @@ impl Owner {
 
 		let entry = self.tree.file(file);
 		let mut record = entry.record.clone();
+		record.identity = identity.or(record.identity);
 		record.state = FileState::Committing {
 			attempt,
 			output: output.clone(),
@@ -564,6 +613,7 @@ impl Owner {
 			self.pipeline.governor.set_video_waiting(false);
 		}
 		self.pipeline.workers_dirty = true;
+		self.live.stale.remove(&file);
 
 		if let Some(abandoned) = &job.pending {
 			self.release_intent_claim(file, &abandoned.path);
@@ -571,6 +621,11 @@ impl Owner {
 
 		if self.pipeline.deferred.remove(&file) {
 			self.released(file);
+		}
+
+		if job.work == Work::Delete {
+			self.delete_finished(file, job.requeue, &result);
+			return;
 		}
 
 		let still_ours = matches!(
@@ -587,6 +642,7 @@ impl Owner {
 				self.requeue(file);
 			} else {
 				self.member_done(file);
+				self.queue_delete(file);
 			}
 			return;
 		};
@@ -906,6 +962,7 @@ pub(super) mod tests {
 				JobMessage::Commit {
 					staged,
 					made: Made::Copied(CopyReason::NotMedia),
+					identity: None,
 					reply,
 				},
 			);

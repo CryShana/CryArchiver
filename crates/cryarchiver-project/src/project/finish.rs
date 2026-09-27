@@ -111,6 +111,7 @@ impl Owner {
 			&& self.pipeline.queues.values().all(crate::schedule::Queue::is_empty)
 			&& self.pipeline.observed.is_empty()
 			&& self.pipeline.retry_at.is_empty()
+			&& !self.delete_retries_pending()
 			&& !self.hashes_pending()
 			&& self.groups_planned()
 			&& self.watching.debouncer.is_empty()

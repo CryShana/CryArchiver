@@ -203,7 +203,7 @@ impl Owner {
 
 		Status {
 			run_state,
-			limit_pending: false,
+			limit_pending: self.limit_pending(),
 			scan_complete: self.scan.complete,
 			deleting_originals: self.settings.delete_originals,
 		}

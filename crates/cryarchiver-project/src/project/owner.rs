@@ -11,10 +11,12 @@ use cryarchiver_engine::text::display_name;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 
+use super::dangerous::DangerState;
 use super::dependencies::ReferenceState;
 use super::duplicates::{DedupState, HashOutcome, HashRequest};
 use super::finish::FinishState;
 use super::jobs::JobMessage;
+use super::live::LiveState;
 use super::pipeline::Pipeline;
 use super::publish::ViewState;
 use super::scanning::ScanState;
@@ -25,10 +27,10 @@ use crate::keys::RelPath;
 use crate::record::{FileState, Identity};
 use crate::references;
 use crate::scan::{DestinationFile, Listing};
-use crate::settings::{Settings, SettingsChange};
+use crate::settings::Settings;
 use crate::store::{Store, StoreError};
 use crate::tree::{FileId, FolderId, Tree};
-use crate::view::{NoticeLevel, SystemView, Update};
+use crate::view::{LogKind, NoticeLevel, SystemView, Update};
 use crate::watch::{Hint, ReadyCheck};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
@@ -78,6 +80,8 @@ pub(crate) struct Owner {
 	pub(super) references: ReferenceState,
 	pub(super) finish: FinishState,
 	pub(super) watching: WatchState,
+	pub(super) danger: DangerState,
+	pub(super) live: LiveState,
 	pub(super) view: ViewState,
 	pub(super) issue_ids: IssueIds,
 	pub(super) issue_files: BTreeSet<FileId>,
@@ -186,14 +190,14 @@ impl Owner {
 				self.start_scan();
 				self.reconcile_destination();
 			}
-			Command::ChangeSettings(change) => self.change_settings(change),
+			Command::ChangeSettings(change) => self.change_settings(&change),
 			Command::Watch(folder, watched) => self.watch_folder(folder, watched),
 			Command::Filter(query) => self.set_filter(query),
 			Command::Details(file) => self.send_details(file),
 			Command::IssueLog(issue, attempt) => self.send_issue_log(issue, attempt),
 			Command::Resolve(issue, verb) => self.resolve(issue, verb),
 			Command::RetryFailedIn(folder) => self.retry_failed_in(folder),
-			Command::RestartPendingJobs => {}
+			Command::RestartPendingJobs => self.restart_pending_jobs(),
 		}
 
 		self.view.status_dirty = true;
@@ -220,7 +224,9 @@ impl Owner {
 		self.sample_system(now);
 		self.check_discovered(now);
 		self.retry_due(now);
+		self.retry_deletes(now);
 		self.check_disk(now);
+		self.check_space_estimate(now);
 		self.plan_dirty_groups();
 		self.start_jobs(now);
 		self.finish_folders();
@@ -294,7 +300,7 @@ impl Owner {
 		self.send(Update::Stopped);
 	}
 
-	fn start(&mut self, delete_confirmed: bool) {
+	pub(super) fn start(&mut self, delete_confirmed: bool) {
 		if self.settings.delete_originals && !delete_confirmed {
 			self.notice(
 				NoticeLevel::Error,
@@ -305,18 +311,10 @@ impl Owner {
 
 		self.started = true;
 		self.paused = false;
-		self.delete_confirmed = delete_confirmed;
-	}
-
-	fn change_settings(&mut self, change: SettingsChange) {
-		match self.settings.apply(change) {
-			Ok(()) => {
-				if let Err(err) = self.store.set_settings(&self.settings) {
-					self.fail(err);
-				}
-				self.send(Update::Settings(self.settings.clone()));
-			}
-			Err(err) => self.notice(NoticeLevel::Warning, err.to_string()),
+		self.delete_confirmed = delete_confirmed && self.settings.delete_originals;
+		if self.deleting() {
+			self.log(LogKind::Action, "deleting originals is on".into());
+			self.queue_all_deletes();
 		}
 	}
 
