@@ -2,10 +2,10 @@
 
 mod support;
 
-use std::time::Duration;
-
 use cryarchiver_project::Command;
 use cryarchiver_project::settings::SettingsChange;
+use cryarchiver_project::tree::FolderId;
+use cryarchiver_project::view::RowState;
 use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
 
 #[test]
@@ -29,13 +29,39 @@ fn the_performance_limit_runs_one_job_at_a_time_and_restart_applies_it_to_runnin
 			&& s.workers.iter().filter(|worker| worker.over_limit).count() == 2
 	});
 
-	project.send(Command::RestartPendingJobs);
-	wait_for(&project, &mut snapshot, "one job under the limit", |s| {
-		s.workers.len() == 1 && s.status.as_ref().is_some_and(|status| !status.limit_pending)
+	project.send(Command::Watch(FolderId::ROOT, true));
+	wait_for(&project, &mut snapshot, "the rows", |s| {
+		s.rows.contains_key(&FolderId::ROOT)
 	});
-	std::thread::sleep(Duration::from_millis(200));
+	project.send(Command::RestartPendingJobs);
+	wait_for(
+		&project,
+		&mut snapshot,
+		"two jobs requeued and one still running",
+		|s| {
+			let states: Vec<RowState> = s.rows[&FolderId::ROOT].iter().map(|row| row.status.state).collect();
+			let count = |state| states.iter().filter(|&&found| found == state).count();
+			count(RowState::Queued) == 2
+				&& count(RowState::Encoding) == 1
+				&& s.workers.len() == 1
+				&& s.status.as_ref().is_some_and(|status| !status.limit_pending)
+		},
+	);
+	let queued = snapshot.rows[&FolderId::ROOT]
+		.iter()
+		.find(|row| row.status.state == RowState::Queued)
+		.unwrap()
+		.id;
+	project.send(Command::Details(queued));
+	wait_for(
+		&project,
+		&mut snapshot,
+		"the project to answer after the requeue",
+		|s| s.details.contains_key(&queued),
+	);
 	support::drain(&project, &mut snapshot);
 	assert_eq!(snapshot.workers.len(), 1);
+	assert_eq!(encoder.calls().len(), 3, "no requeued job started again");
 	wait_for(&project, &mut snapshot, "low priority", |s| {
 		s.system.as_ref().is_some_and(|system| system.low_priority)
 	});

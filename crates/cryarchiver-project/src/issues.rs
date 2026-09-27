@@ -81,14 +81,22 @@ impl Problem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IssueId(pub u64);
 
-/// What an issue is about: a source file, a file in the destination the project didn't write, or a folder link
-/// that leads back into its own tree.
+/// What an issue is about: a source file, a file in the destination the project didn't write, a folder link that
+/// leads back into its own tree, or a source folder that can't be read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IssueKey {
 	File(FileId),
 	Unknown(RelPath),
 	Cycle(FolderId),
+	Unreadable(FolderId),
 }
+
+/// A folder that can't be read is only ever listed again: nothing in it is known well enough to accept or exclude.
+pub const UNREADABLE_FOLDER_VERBS: Verbs = Verbs {
+	retry: Some("Retry"),
+	accept: None,
+	exclude: false,
+};
 
 /// Hands out issue ids for the session, so the same issue keeps its id while it stays open.
 #[derive(Debug, Default)]

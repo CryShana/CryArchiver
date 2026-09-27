@@ -25,6 +25,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use cryarchiver_engine::engine::{Encode, MemoryGate};
+use cryarchiver_engine::text::display_path;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -112,7 +113,9 @@ pub enum Fault {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-	/// `delete_confirmed` is the front end's confirmation for a project that deletes originals (spec §9).
+	/// `delete_confirmed` is the front end's confirmation for a project that deletes originals (spec §9). Without it
+	/// such a project archives but deletes nothing, until a later start or `ChangeSettings` with the typed `DELETE`
+	/// confirms it for the session.
 	Start {
 		delete_confirmed: bool,
 	},
@@ -134,7 +137,7 @@ pub enum Command {
 		target: Target,
 		destination: bool,
 	},
-	/// Answers with a notice that carries the full source path.
+	/// Answers with [`Update::Path`](crate::view::Update::Path), the full source path.
 	ShowPath(Target),
 }
 
@@ -152,6 +155,10 @@ pub enum ProjectError {
 	Settings(#[from] SettingsError),
 	#[error(transparent)]
 	Io(#[from] io::Error),
+	#[error(
+		"this project file was moved or copied away from its archive, which is {destination}; open the project file there"
+	)]
+	Moved { destination: String },
 }
 
 /// Creates `<destination>/<name>.cryarchive` for a new project. The destination is created if needed.
@@ -162,7 +169,7 @@ pub fn create(
 	configure: impl FnOnce(&mut Settings),
 ) -> Result<PathBuf, ProjectError> {
 	refuse_a_destination_inside(source, destination)?;
-	fs::create_dir_all(destination)?;
+	fs::create_dir_all(destination).map_err(|err| naming(destination, &err))?;
 	let (source, destination) = check_roots(source, destination)?;
 
 	let mut file_name = name.to_os_string();
@@ -179,7 +186,7 @@ pub fn create(
 /// The destination may not exist yet; creating it inside the source would already write to the source, so its
 /// nearest existing ancestor is checked first.
 fn refuse_a_destination_inside(source: &Path, destination: &Path) -> Result<(), ProjectError> {
-	let source = fs::canonicalize(source)?;
+	let source = fs::canonicalize(source).map_err(|err| naming(source, &err))?;
 	let mut existing = destination;
 	let mut missing = Vec::new();
 	while !existing.exists() {
@@ -194,12 +201,16 @@ fn refuse_a_destination_inside(source: &Path, destination: &Path) -> Result<(), 
 		};
 	}
 
-	let mut planned = fs::canonicalize(existing)?;
+	let mut planned = fs::canonicalize(existing).map_err(|err| naming(existing, &err))?;
 	planned.extend(missing.iter().rev());
 	if planned.starts_with(&source) {
 		return Err(SettingsError::Roots("the destination is inside the source".into()).into());
 	}
 	Ok(())
+}
+
+fn naming(path: &Path, err: &io::Error) -> io::Error {
+	io::Error::new(err.kind(), format!("{}: {err}", display_path(path)))
 }
 
 /// An open project. Dropping it stops the run safely, like [`Project::shutdown`].

@@ -35,7 +35,10 @@ impl Owner {
 			Some(IssueKey::File(file)) => self.resolve_file(file, verb),
 			Some(IssueKey::Cycle(folder)) if verb == Verb::Accept => self.acknowledge_cycle(folder),
 			Some(IssueKey::Unknown(path)) if verb == Verb::Accept => self.acknowledge_unknown(&path),
-			Some(IssueKey::Unknown(_) | IssueKey::Cycle(_)) | None => {
+			Some(IssueKey::Unreadable(folder)) if verb == Verb::Retry => {
+				self.queue_listing(self.tree.folder(folder).key.clone(), true);
+			}
+			Some(IssueKey::Unknown(_) | IssueKey::Cycle(_) | IssueKey::Unreadable(_)) | None => {
 				self.notice(
 					NoticeLevel::Warning,
 					"that resolution doesn't apply to this issue".into(),

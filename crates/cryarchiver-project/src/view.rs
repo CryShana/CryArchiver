@@ -22,6 +22,7 @@ pub enum RunState {
 	Finished,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
 	pub run_state: RunState,
@@ -29,6 +30,8 @@ pub struct Status {
 	pub limit_pending: bool,
 	pub scan_complete: bool,
 	pub deleting_originals: bool,
+	/// The project deletes originals, but this session hasn't confirmed it yet: nothing is deleted until it does.
+	pub deleting_paused: bool,
 }
 
 /// The state a file row shows.
@@ -107,6 +110,8 @@ pub struct Worker {
 	pub codec: String,
 	pub name: String,
 	pub state: RowState,
+	/// The engine's current stage, in words.
+	pub stage: Option<String>,
 	pub fraction: f64,
 	/// The pending performance limit wouldn't let this job run; restarting cancels it.
 	pub over_limit: bool,
@@ -177,7 +182,8 @@ pub struct Details {
 	pub bytes_in: u64,
 	pub bytes_out: Option<u64>,
 	pub plan: Vec<(String, String)>,
-	pub log_tail: Vec<String>,
+	/// What the project noted about the file this session, oldest first.
+	pub notes: Vec<String>,
 	pub duplicates: Duplicates,
 	pub issue: Option<IssueView>,
 }
@@ -250,7 +256,43 @@ pub enum Update {
 	},
 	Log(LogEntry),
 	Notice(Notice),
+	/// The answer to `Command::ShowPath`: the full source path.
+	Path(String),
 	System(SystemView),
 	/// The project task has stopped; nothing follows.
 	Stopped,
+}
+
+/// A size in decimal units, as people read them: `950 B`, `12.3 MB`, `1.24 GB`.
+pub fn size_text(bytes: u64) -> String {
+	const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+
+	#[allow(clippy::cast_precision_loss)]
+	let mut value = bytes as f64;
+	let mut unit = 0;
+	while value >= 1000.0 && unit < UNITS.len() - 1 {
+		value /= 1000.0;
+		unit += 1;
+	}
+
+	if unit == 0 || value >= 100.0 {
+		format!("{value:.0} {}", UNITS[unit])
+	} else if value >= 10.0 {
+		format!("{value:.1} {}", UNITS[unit])
+	} else {
+		format!("{value:.2} {}", UNITS[unit])
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn sizes_read_in_decimal_units() {
+		assert_eq!(size_text(950), "950 B");
+		assert_eq!(size_text(12_345_678), "12.3 MB");
+		assert_eq!(size_text(1_240_000_000), "1.24 GB");
+		assert_eq!(size_text(123_456_789), "123 MB");
+	}
 }

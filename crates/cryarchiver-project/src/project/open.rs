@@ -8,6 +8,7 @@ use std::sync::mpsc::Sender;
 
 use cryarchiver_engine::commit::file_id;
 use cryarchiver_engine::sink::ArchivalSink;
+use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::workspace::sweep;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -35,6 +36,23 @@ use crate::tree::{FileId, FolderId, Tree};
 use crate::view::Update;
 use crate::watch::Debouncer;
 
+/// Every destination path is the stored one, so a project file copied or moved elsewhere would drive the archive it
+/// came from; it is opened only from its own archive's folder.
+fn refuse_a_moved_project(project_file: &Path, destination: &Path) -> Result<(), ProjectError> {
+	let folder = match project_file.parent() {
+		Some(parent) if !parent.as_os_str().is_empty() => parent,
+		_ => Path::new("."),
+	};
+
+	let here = fs::canonicalize(folder)?;
+	if fs::canonicalize(destination).is_ok_and(|stored| stored == here) {
+		return Ok(());
+	}
+	Err(ProjectError::Moved {
+		destination: display_path(destination),
+	})
+}
+
 impl Owner {
 	pub(super) fn open(
 		project_file: &Path,
@@ -44,6 +62,7 @@ impl Owner {
 		options: ProjectOptions,
 		updates: Sender<Update>,
 	) -> Result<Self, ProjectError> {
+		refuse_a_moved_project(project_file, &settings.destination)?;
 		fs::create_dir_all(&settings.destination)?;
 		let (messages, inbox) = unbounded_channel();
 		let unknown = loaded

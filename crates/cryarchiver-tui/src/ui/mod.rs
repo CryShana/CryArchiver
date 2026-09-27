@@ -169,7 +169,9 @@ fn draw_overlay(buf: &mut ratatui::buffer::Buffer, screen: Rect, main: Rect, vie
 			overlay::menu(buf, screen, menu, default_anchor, &ui.theme, &mut ui.hits);
 		}
 		Some(Overlay::Settings(selected)) => settings::render(buf, screen, view, *selected, &ui.theme, &mut ui.hits),
-		Some(Overlay::ConfirmDelete(input)) => settings::confirm_delete(buf, screen, input, &ui.theme, &mut ui.hits),
+		Some(Overlay::ConfirmDelete(input)) => {
+			settings::confirm_delete(buf, screen, view, input, &ui.theme, &mut ui.hits);
+		}
 		Some(Overlay::ConfirmRestart) => settings::confirm_restart(buf, screen, view, &ui.theme, &mut ui.hits),
 		None => {}
 	}

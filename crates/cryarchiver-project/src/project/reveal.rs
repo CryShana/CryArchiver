@@ -8,20 +8,30 @@ use cryarchiver_engine::process::limits;
 use cryarchiver_engine::text::display_path;
 
 use super::Target;
-use super::owner::Owner;
-use crate::view::{LogKind, NoticeLevel};
+use super::owner::{Message, Owner};
+use crate::view::{LogKind, NoticeLevel, Update};
 
 impl Owner {
+	/// Looking at the folder and starting the file manager run off the project task: a slow network path must not
+	/// stall it.
 	pub(super) fn reveal(&mut self, target: Target, destination: bool) {
 		let Some(folder) = self.target_folder(target, destination) else {
 			return;
 		};
 
-		match open_in_file_manager(&folder) {
-			Ok(()) => self.log(LogKind::Action, format!("opened {}", display_path(&folder))),
+		let messages = self.messages.clone();
+		tokio::task::spawn_blocking(move || {
+			let result = open_in_file_manager(&folder).map_err(|err| err.to_string());
+			let _ = messages.send(Message::Revealed(folder, result));
+		});
+	}
+
+	pub(super) fn on_revealed(&mut self, folder: &Path, result: Result<(), String>) {
+		match result {
+			Ok(()) => self.log(LogKind::Action, format!("opened {}", display_path(folder))),
 			Err(err) => self.notice(
 				NoticeLevel::Warning,
-				format!("{} can't be opened: {err}", display_path(&folder)),
+				format!("{} can't be opened: {err}", display_path(folder)),
 			),
 		}
 	}
@@ -33,7 +43,7 @@ impl Owner {
 			Target::File(_) | Target::Folder(_) => return,
 		};
 
-		self.notice(NoticeLevel::Info, display_path(&path));
+		self.send(Update::Path(display_path(&path)));
 	}
 
 	fn target_folder(&self, target: Target, destination: bool) -> Option<PathBuf> {
@@ -121,7 +131,51 @@ fn file_manager(folder: &Path) -> (&'static str, Command) {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::mpsc::Receiver;
+	use std::time::Duration;
+
 	use super::*;
+	use crate::project::scanning::tests::owner;
+	use crate::record::FolderRecord;
+	use crate::tree::FolderId;
+
+	fn notices(updates: &Receiver<Update>) -> Vec<String> {
+		updates
+			.try_iter()
+			.filter_map(|update| match update {
+				Update::Notice(notice) => Some(notice.text),
+				_ => None,
+			})
+			.collect()
+	}
+
+	#[test]
+	fn revealing_a_folder_answers_later_from_off_the_project_task() {
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		let _entered = runtime.enter();
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		std::fs::create_dir_all(&source).unwrap();
+		let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
+		let mut inbox = owner.inbox.take().unwrap();
+		let photos = owner
+			.tree
+			.add_folder(FolderId::ROOT, std::ffi::OsStr::new("Photos"), FolderRecord::default());
+
+		owner.reveal(Target::Folder(photos), true);
+		assert!(notices(&updates).is_empty(), "nothing is looked at on the project task");
+
+		let message = runtime
+			.block_on(async { tokio::time::timeout(Duration::from_secs(20), inbox.recv()).await })
+			.unwrap()
+			.unwrap();
+		let Message::Revealed(folder, result) = message else {
+			panic!("not the reveal's answer");
+		};
+		assert!(result.is_err(), "the folder isn't in the archive yet");
+		owner.on_revealed(&folder, result);
+		assert_eq!(notices(&updates).len(), 1);
+	}
 
 	#[test]
 	fn a_missing_folder_is_never_handed_to_the_file_manager() {

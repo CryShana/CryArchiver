@@ -160,9 +160,29 @@ fn run_reports_unknown_destination_files_and_exits_with_1() {
 	let out = cryarchiver(dir.path(), &["run", project.to_str().unwrap()]);
 
 	assert_eq!(out.status.code(), Some(1), "{}{}", stdout(&out), stderr(&out));
-	assert!(stdout(&out).contains("1 open issues"), "{}", stdout(&out));
+	assert!(stdout(&out).contains("1 open issue:"), "{}", stdout(&out));
 	assert!(stdout(&out).contains("old backup.txt"), "{}", stdout(&out));
 	assert!(dir.path().join("archive").join("old backup.txt").is_file());
+}
+
+#[test]
+fn run_with_the_source_drive_gone_exits_with_1() {
+	let dir = tempfile::tempdir().unwrap();
+	let project = project_with(dir.path(), false);
+	fs::write(dir.path().join("source").join("a.txt"), b"a").unwrap();
+	let first = cryarchiver(dir.path(), &["run", project.to_str().unwrap()]);
+	assert_eq!(first.status.code(), Some(0), "{}{}", stdout(&first), stderr(&first));
+	fs::rename(dir.path().join("source"), dir.path().join("unplugged")).unwrap();
+
+	let out = cryarchiver(dir.path(), &["run", project.to_str().unwrap()]);
+
+	assert_eq!(out.status.code(), Some(1), "{}{}", stdout(&out), stderr(&out));
+	assert!(
+		stdout(&out).contains("the source folder: the folder can't be read"),
+		"{}",
+		stdout(&out)
+	);
+	assert!(dir.path().join("archive").join("a.txt").is_file());
 }
 
 #[test]

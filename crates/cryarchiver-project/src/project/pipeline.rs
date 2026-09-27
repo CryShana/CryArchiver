@@ -26,7 +26,7 @@ use crate::references::{self, RefKind};
 use crate::run::Staged;
 use crate::schedule::{DiskGuard, Governor, GovernorConfig, Queue, Waits, Work, retry_delay};
 use crate::tree::{FileId, FolderId};
-use crate::view::{LogKind, NoticeLevel};
+use crate::view::{LogKind, NoticeLevel, size_text};
 use crate::watch::{ReadyCheck, check_ready, is_stable};
 
 const READY_CHECKS: usize = 8;
@@ -725,7 +725,11 @@ impl Owner {
 			self.pipeline.disk.pause(need);
 			self.notice(
 				NoticeLevel::Warning,
-				format!("paused: low disk space ({free} bytes free, {need} needed)"),
+				format!(
+					"paused: low disk space ({} free, {} needed)",
+					size_text(free),
+					size_text(need)
+				),
 			);
 			self.requeue(file);
 			return;

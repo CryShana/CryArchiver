@@ -57,7 +57,14 @@ pub fn render(buf: &mut Buffer, screen: Rect, view: &ArchiveView, selected: usiz
 	);
 }
 
-pub fn confirm_delete(buf: &mut Buffer, screen: Rect, input: &Input, theme: &Theme, hits: &mut HitMap) {
+pub fn confirm_delete(
+	buf: &mut Buffer,
+	screen: Rect,
+	view: &ArchiveView,
+	input: &Input,
+	theme: &Theme,
+	hits: &mut HitMap,
+) {
 	let area = screen.centered(
 		Constraint::Length(screen.width.saturating_sub(10).min(72)),
 		Constraint::Length(10),
@@ -83,14 +90,12 @@ pub fn confirm_delete(buf: &mut Buffer, screen: Rect, input: &Input, theme: &The
 		put(buf, inner.x + 2, y, &fit(line, cells), fg(theme.text), right);
 	}
 
-	put(
-		buf,
-		inner.x + 2,
-		inner.y + 5,
-		"Type DELETE to turn it on:",
-		fg(theme.dim),
-		right,
-	);
+	let ask = if view.settings.delete_originals {
+		"Type DELETE to allow it for this session:"
+	} else {
+		"Type DELETE to turn it on:"
+	};
+	put(buf, inner.x + 2, inner.y + 5, ask, fg(theme.dim), right);
 	let field = Rect::new(inner.x + 2, inner.y + 6, inner.width.saturating_sub(4).min(24), 1);
 	buf.set_style(field, Style::new().bg(theme.selection));
 	let typed = format!("{}█", input.value());

@@ -1,10 +1,12 @@
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
 	self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -120,6 +122,9 @@ fn pump<S: ArchiveSource>(
 		}
 
 		dirty |= app.refresh();
+		if let Some(text) = app.take_clipboard() {
+			copy_to_clipboard(&text);
+		}
 		if app.spinner_visible() && now >= next_spin {
 			app.advance_spinner();
 			next_spin = now + SPINNER_STEP;
@@ -132,6 +137,18 @@ fn pump<S: ArchiveSource>(
 		}
 		next_frame = now + FRAME;
 	}
+}
+
+/// OSC 52 asks the terminal to set the clipboard. Most terminals do; one that doesn't ignores the sequence, and the
+/// notice with the path is still on screen.
+fn osc52(text: &str) -> String {
+	format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
+}
+
+fn copy_to_clipboard(text: &str) {
+	let mut stdout = io::stdout();
+	let _ = stdout.write_all(osc52(text).as_bytes());
+	let _ = stdout.flush();
 }
 
 /// Collects the events that follow the first one closely. A paste arrives as a quick run of key presses, and the app
@@ -182,4 +199,14 @@ fn spawn_input(stop: Arc<AtomicBool>) -> (Receiver<io::Result<(Event, Instant)>>
 		}
 	});
 	(receiver, reader)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn the_clipboard_sequence_carries_the_text_in_base64() {
+		assert_eq!(osc52(r"C:\Photos"), "\x1b]52;c;QzpcUGhvdG9z\x07");
+	}
 }

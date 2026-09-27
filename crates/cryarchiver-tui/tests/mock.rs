@@ -261,6 +261,7 @@ fn deleting_originals_runs_delete_jobs() {
 			.newest_first()
 			.any(|line| line.message.starts_with("original deleted"))
 	);
+	assert!(source.view().overall.originals_deleted > 0);
 }
 
 #[test]

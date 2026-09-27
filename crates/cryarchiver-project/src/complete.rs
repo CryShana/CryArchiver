@@ -13,11 +13,15 @@ pub struct ParityReport {
 	pub excluded: u64,
 	/// Source files with no destination file.
 	pub missing: Vec<RelPath>,
+	/// Source folders that couldn't be listed: whatever they hold is neither archived nor checked.
+	pub unreadable_folders: u64,
 }
 
 impl ParityReport {
 	pub fn is_clean(&self) -> bool {
-		self.missing.is_empty() && self.source_files == self.archive_files + self.excluded
+		self.missing.is_empty()
+			&& self.unreadable_folders == 0
+			&& self.source_files == self.archive_files + self.excluded
 	}
 
 	/// "N archived", or "N archived + K excluded".
@@ -109,6 +113,17 @@ mod tests {
 
 		assert_eq!(report.summary(), "1 archived + 1 excluded");
 		assert_eq!(report.missing, [path("c.jpg"), path("d.jpg")]);
+		assert!(!report.is_clean());
+	}
+
+	#[test]
+	fn an_unreadable_folder_keeps_the_archive_from_being_clean() {
+		let destination = HashSet::from([path("a.avif")]);
+		let mut report = check([(&path("a.jpg"), &done("a.avif"))], &destination);
+		assert!(report.is_clean());
+
+		report.unreadable_folders = 1;
+
 		assert!(!report.is_clean());
 	}
 

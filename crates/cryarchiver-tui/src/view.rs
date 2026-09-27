@@ -18,15 +18,19 @@ pub struct ArchiveView {
 	pub issues: Vec<Issue>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
 	pub source: String,
 	pub destination: String,
-	pub codecs: String,
+	/// `None` when the source doesn't have a codec choice to show.
+	pub codecs: Option<String>,
 	/// Part of the performance limit can't reach running jobs yet; the workers it affects carry `over_limit`.
 	pub limit_pending: bool,
 	pub run_state: RunState,
 	pub deleting_originals: bool,
+	/// Deleting originals is on, but this session hasn't confirmed it with `DELETE` yet, so nothing is deleted.
+	pub deleting_paused: bool,
 	/// The data is made up, as with the mock source.
 	pub demo: bool,
 }
@@ -109,6 +113,7 @@ pub struct Overall {
 	pub eta: Option<Duration>,
 	/// Set once the run has finished and the completion check ran.
 	pub parity: Option<Parity>,
+	pub originals_deleted: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +126,7 @@ pub struct Parity {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workers {
 	pub jobs: Vec<WorkerJob>,
-	/// For example `1 video + 3 image slots`.
+	/// For example `1 video + 3 image slots`; empty when the source has nothing to say about slots.
 	pub slots: String,
 }
 
@@ -133,6 +138,8 @@ pub struct WorkerJob {
 	pub codec: String,
 	pub name: String,
 	pub state: FileState,
+	/// The job's current step in words, where the source knows it.
+	pub stage: Option<String>,
 	pub activity: JobActivity,
 	/// The pending performance limit would not let this job run; restarting cancels it.
 	pub over_limit: bool,
@@ -521,7 +528,10 @@ pub struct FileDetails {
 	pub estimated_out: Option<u64>,
 	pub plan: Vec<PlanLine>,
 	pub quality: Option<String>,
+	/// The tool's live output; empty when the source doesn't have it.
 	pub log_tail: Vec<String>,
+	/// What the source noted about the file, oldest first.
+	pub notes: Vec<String>,
 	pub duplicates: Duplicates,
 	pub issue: Option<IssueSummary>,
 }

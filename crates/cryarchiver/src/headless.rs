@@ -18,8 +18,11 @@ const LISTED_ISSUES: usize = 20;
 
 #[derive(Debug, Default)]
 struct Summary {
+	/// The last state before the run began to stop.
 	run_state: Option<RunState>,
 	overall: Overall,
+	/// Originals the project had deleted when it opened, so the summary counts this run's only.
+	deleted_before: Option<u64>,
 	/// Every open issue, unacknowledged unknown destination files and folder cycles included.
 	issues: Vec<IssueView>,
 	stopped: bool,
@@ -28,8 +31,11 @@ struct Summary {
 impl Summary {
 	fn apply(&mut self, update: Update, out: &mut impl Write) {
 		match update {
-			Update::Status(status) => self.run_state = Some(status.run_state),
-			Update::Overall(overall) => self.overall = overall,
+			Update::Status(status) if status.run_state != RunState::Stopping => self.run_state = Some(status.run_state),
+			Update::Overall(overall) => {
+				self.deleted_before.get_or_insert(overall.originals_deleted);
+				self.overall = overall;
+			}
 			Update::Issues(issues) => self.issues = issues,
 			Update::Log(entry) => {
 				let _ = writeln!(out, "{}  {}", clock(entry.time), entry.message);
@@ -44,6 +50,22 @@ impl Summary {
 
 	fn finished(&self) -> bool {
 		self.run_state == Some(RunState::Finished)
+	}
+
+	fn watching(&self) -> bool {
+		self.run_state == Some(RunState::Watching)
+	}
+
+	/// A watched run the user stopped while it waited for new files ended as cleanly as a finished one.
+	fn exit_code(&self, stopped_by_user: bool) -> u8 {
+		let ended = self.finished() || (stopped_by_user && self.watching());
+		u8::from(!(self.clean() && ended))
+	}
+
+	fn deleted_this_run(&self) -> u64 {
+		self.overall
+			.originals_deleted
+			.saturating_sub(self.deleted_before.unwrap_or(0))
 	}
 
 	/// Source files the completion check found no archived file for, files with issues included.
@@ -92,15 +114,18 @@ impl Summary {
 			None => lines.push("stopped before the archive was complete; run again to resume".into()),
 		}
 
-		if self.gaps() > 0 {
-			lines.push(format!("{} source files have no archived file", self.gaps()));
+		match self.gaps() {
+			0 => {}
+			1 => lines.push("1 source file has no archived file".into()),
+			gaps => lines.push(format!("{gaps} source files have no archived file")),
 		}
 
 		if !self.issues.is_empty() {
-			lines.push(format!(
-				"{} open issues: open the project in the TUI to resolve them",
-				self.issues.len()
-			));
+			let count = match self.issues.len() {
+				1 => "1 open issue".to_owned(),
+				count => format!("{count} open issues"),
+			};
+			lines.push(format!("{count}: open the project in the TUI to resolve them"));
 			for issue in self.issues.iter().take(LISTED_ISSUES) {
 				lines.push(format!("  {}: {}", issue.location, issue.reason));
 			}
@@ -110,7 +135,10 @@ impl Summary {
 		}
 
 		if deleting {
-			lines.push(format!("{} originals deleted", self.overall.originals_deleted));
+			lines.push(match self.deleted_this_run() {
+				1 => "1 original deleted".to_owned(),
+				count => format!("{count} originals deleted"),
+			});
 		}
 		lines
 	}
@@ -164,8 +192,6 @@ pub fn run(project: &mut Project, delete_originals: bool, interrupted: &Arc<Atom
 		}
 	};
 
-	let finished = summary.finished();
-	let watching = summary.run_state == Some(RunState::Watching);
 	project.shutdown();
 	while let Some(update) = project.try_update() {
 		summary.apply(update, &mut out);
@@ -174,8 +200,7 @@ pub fn run(project: &mut Project, delete_originals: bool, interrupted: &Arc<Atom
 		let _ = writeln!(out, "{line}");
 	}
 
-	let clean = summary.clean() && (finished || (stopped_by_user && watching));
-	u8::from(!clean)
+	summary.exit_code(stopped_by_user)
 }
 
 fn clock(seconds: u32) -> String {
@@ -229,6 +254,7 @@ mod tests {
 				originals_deleted: 8,
 				..Overall::default()
 			},
+			deleted_before: Some(5),
 			issues: vec![unknown_file("old/notes.txt")],
 			..Summary::default()
 		};
@@ -238,9 +264,9 @@ mod tests {
 			summary.final_lines(true),
 			[
 				"10 source files → 8 archived + 2 excluded",
-				"1 open issues: open the project in the TUI to resolve them",
+				"1 open issue: open the project in the TUI to resolve them",
 				"  old/notes.txt: a file in the destination that the project didn't write",
-				"8 originals deleted",
+				"3 originals deleted",
 			]
 		);
 	}
@@ -262,8 +288,50 @@ mod tests {
 		assert!(!summary.clean());
 		assert_eq!(
 			summary.final_lines(false),
-			["3 source files → 2 archived", "1 source files have no archived file"]
+			["3 source files → 2 archived", "1 source file has no archived file"]
 		);
+	}
+
+	fn status(run_state: RunState) -> Update {
+		Update::Status(cryarchiver_project::view::Status {
+			run_state,
+			limit_pending: false,
+			scan_complete: true,
+			deleting_originals: false,
+			deleting_paused: false,
+		})
+	}
+
+	#[test]
+	fn a_watched_run_stopped_with_ctrl_c_exits_clean_from_its_last_state_before_stopping() {
+		let mut summary = Summary::default();
+		let mut out = Vec::new();
+
+		for state in [RunState::Running, RunState::Watching, RunState::Stopping] {
+			summary.apply(status(state), &mut out);
+		}
+
+		assert!(summary.watching());
+		assert_eq!(summary.exit_code(true), 0);
+		assert_eq!(summary.exit_code(false), 1);
+	}
+
+	#[test]
+	fn only_this_runs_deletions_are_counted() {
+		let mut summary = Summary::default();
+		let mut out = Vec::new();
+
+		for deleted in [4, 6] {
+			summary.apply(
+				Update::Overall(Overall {
+					originals_deleted: deleted,
+					..Overall::default()
+				}),
+				&mut out,
+			);
+		}
+
+		assert_eq!(summary.final_lines(true).last().unwrap(), "2 originals deleted");
 	}
 
 	#[test]

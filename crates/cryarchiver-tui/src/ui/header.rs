@@ -11,6 +11,7 @@ const BADGE: &str = " CryArchiver ";
 const SHORT_BADGE: &str = " CA ";
 const DEMO: &str = " DEMO ";
 const DELETING: &str = " ⚠ DELETING ORIGINALS ";
+const DELETING_PAUSED: &str = " deleting paused: type DELETE to allow ";
 const MIN_ROUTE: usize = 10;
 
 /// The left side's texts after squeezing: the route shrinks to its minimum, then "applying…" becomes "…", then the
@@ -30,6 +31,7 @@ impl Left {
 		width(self.badge)
 			+ chip(header.demo, DEMO)
 			+ chip(header.deleting_originals, DELETING)
+			+ chip(header.deleting_originals && header.deleting_paused, DELETING_PAUSED)
 			+ route + width(preset)
 			+ 1 + self.limit.as_deref().map_or(0, |limit| width(limit) + 1)
 	}
@@ -78,7 +80,10 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	buf.set_style(area, Style::new().bg(background));
 	let (y, right) = (area.y, area.right());
 
-	let preset = format!(" {} · {} ", view.settings.speed.label(), header.codecs);
+	let preset = match &header.codecs {
+		Some(codecs) => format!(" {} · {codecs} ", view.settings.speed.label()),
+		None => format!(" {} ", view.settings.speed.label()),
+	};
 	let (run, run_color) = run_state(header.run_state, theme);
 	let room = usize::from(area.width).saturating_sub(width(run) + 2);
 	let left = squeeze(view, &preset, room, usize::from(area.width) * 3 / 10);
@@ -96,6 +101,16 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	}
 	if header.deleting_originals {
 		x = put(buf, x + 1, y, DELETING, bold(theme.bright).bg(theme.error), right);
+	}
+	if header.deleting_originals && header.deleting_paused {
+		x = put(
+			buf,
+			x + 1,
+			y,
+			DELETING_PAUSED,
+			bold(theme.background).bg(theme.warn),
+			right,
+		);
 	}
 
 	if left.route_width > 0 {

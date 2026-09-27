@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::BuildHasher;
+use std::io;
 use std::path::Path;
 
 use cryarchiver_engine::commit::file_id;
@@ -40,6 +41,8 @@ pub struct Listing {
 	pub entries: Vec<Entry>,
 	/// The folder itself couldn't be read.
 	pub error: Option<String>,
+	/// The folder no longer exists while its parent does: it was deleted or moved away, not made unreadable.
+	pub gone: bool,
 }
 
 /// Blocking: run it on a blocking thread.
@@ -55,6 +58,7 @@ pub fn list_folder(root: &Path, folder: &RelPath) -> Listing {
 	let entries = match fs::read_dir(&dir) {
 		Ok(entries) => entries,
 		Err(err) => {
+			listing.gone = !folder.is_root() && err.kind() == io::ErrorKind::NotFound && vanished(&dir);
 			listing.error = Some(err.to_string());
 			return listing;
 		}
@@ -93,6 +97,16 @@ pub fn list_folder(root: &Path, folder: &RelPath) -> Listing {
 		.entries
 		.sort_by(|a, b| a.name.as_encoded_bytes().cmp(b.name.as_encoded_bytes()));
 	listing
+}
+
+/// A link whose target is offline still exists itself, so only a folder with no entry at all under a parent that is
+/// there has vanished.
+fn vanished(dir: &Path) -> bool {
+	let missing = fs::symlink_metadata(dir).is_err_and(|err| err.kind() == io::ErrorKind::NotFound);
+	missing
+		&& dir
+			.parent()
+			.is_some_and(|parent| fs::metadata(parent).is_ok_and(|meta| meta.is_dir()))
 }
 
 /// What a folder's listing changes, compared with what the project stored for it.
@@ -212,13 +226,24 @@ mod tests {
 	}
 
 	#[test]
-	fn an_unreadable_folder_reports_an_error() {
+	fn a_folder_that_is_gone_reports_an_error_and_that_it_is_gone() {
 		let dir = tempfile::tempdir().unwrap();
 
 		let listing = list_folder(dir.path(), &RelPath::root().join(OsStr::new("missing")));
 
 		assert!(listing.error.is_some());
+		assert!(listing.gone);
 		assert!(listing.entries.is_empty());
+	}
+
+	#[test]
+	fn a_missing_source_root_is_never_gone() {
+		let dir = tempfile::tempdir().unwrap();
+
+		let listing = list_folder(&dir.path().join("unplugged"), &RelPath::root());
+
+		assert!(listing.error.is_some());
+		assert!(!listing.gone);
 	}
 
 	fn symlink_dir(target: &Path, link: &Path) -> bool {
@@ -256,6 +281,25 @@ mod tests {
 			linked.identity,
 			list_folder(dir.path(), &RelPath::root().join(OsStr::new("real"))).identity
 		);
+	}
+
+	#[test]
+	fn a_folder_link_whose_target_is_offline_is_unreadable_not_gone() {
+		let dir = tempfile::tempdir().unwrap();
+		let target = dir.path().join("disk");
+		fs::create_dir(&target).unwrap();
+		if !symlink_dir(&target, &dir.path().join("linked")) {
+			eprintln!("skipped: can't create a folder link here");
+			return;
+		}
+		fs::remove_dir(&target).unwrap();
+
+		let top = list_folder(dir.path(), &RelPath::root());
+		let linked = list_folder(dir.path(), &RelPath::root().join(OsStr::new("linked")));
+
+		assert!(matches!(top.entries[0].kind, EntryKind::Broken(_)));
+		assert!(linked.error.is_some());
+		assert!(!linked.gone);
 	}
 
 	#[cfg(unix)]

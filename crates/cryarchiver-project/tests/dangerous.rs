@@ -154,9 +154,12 @@ fn files_with_issues_or_excluded_are_never_deleted() {
 	assert!(broken.exists());
 
 	project.send(Command::Resolve(snapshot.issues[0].id, Verb::Exclude));
-	wait_for(&project, &mut snapshot, "the exclusion", |s| s.issues.is_empty());
-	std::thread::sleep(std::time::Duration::from_millis(200));
+	wait_for(&project, &mut snapshot, "the exclusion and the finish", |s| {
+		s.issues.is_empty() && s.finished()
+	});
+	support::drain(&project, &mut snapshot);
 	assert!(broken.exists());
+	assert_eq!(deleted(&snapshot), 1);
 }
 
 #[test]
@@ -197,10 +200,12 @@ fn a_duplicate_whose_canonical_copy_no_longer_checks_out_keeps_its_original() {
 		delete_confirmed: false,
 	});
 	enable_deleting(&project);
-	wait_for(&project, &mut snapshot, "the canonical copy's issue", |s| {
-		s.issues.iter().any(|issue| issue.problem == Problem::OutputMissing)
-	});
-	std::thread::sleep(std::time::Duration::from_millis(200));
+	wait_for(
+		&project,
+		&mut snapshot,
+		"the canonical copy's issue and the finish",
+		|s| s.issues.iter().any(|issue| issue.problem == Problem::OutputMissing) && s.finished(),
+	);
 	support::drain(&project, &mut snapshot);
 
 	assert!(canonical.exists() && duplicate.exists());

@@ -421,6 +421,10 @@ impl<S: ArchiveSource> App<S> {
 		self.ui.issue_selected
 	}
 
+	pub fn take_clipboard(&mut self) -> Option<String> {
+		self.source.take_clipboard()
+	}
+
 	pub fn toast(&self) -> Option<&Notification> {
 		self.toast.as_ref().map(|(notification, _)| notification)
 	}

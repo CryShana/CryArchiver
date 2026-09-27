@@ -78,11 +78,15 @@ cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashbo
 - A file that is still being written waits until it has been still for 30 seconds, and on Windows until no other program holds it open for writing.
 - Duplicates are confirmed with a full BLAKE3 before anything is replaced, then become `placeholder_<name>.txt` files that point to the archived copy in the shallowest folder. Files under 64 KiB are always archived normally.
 - Cue sheets and playlists wait for the files they name, and are copied with the new names written in. Subtitles and other sidecars keep matching their video's name.
+- A source folder that can't be read, or a source drive that isn't there, is an open issue: nothing below it is forgotten or archived again, and the run isn't complete until it can be read.
+- A project file opens only from its own archive folder; a copy of it elsewhere is refused.
 - A file that fails stays an open issue until you retry it, copy the original or exclude it in the dashboard (`i`). Files in the destination that the project didn't write are reported as issues until you acknowledge them; they are never deleted.
 - With watch mode on, the run keeps going once everything is archived and picks up new files as they appear.
 - The performance limit runs in the background: low priority, one job at a time, and at most the chosen share of the CPU.
 
-**Deleting originals** is off by default. It can only be turned on in the dashboard's settings (`s`), by typing `DELETE`. An original is then deleted permanently, with no Recycle Bin, once its archived copy has been read back from disk and matches its BLAKE3. A headless run of such a project also needs `--delete-originals`, or it refuses to start.
+**Deleting originals** is off by default. It can only be turned on in the dashboard's settings (`s`), by typing `DELETE`. An original is then deleted permanently, with no Recycle Bin, once its archived copy has been read back from disk and matches its BLAKE3. A headless run of such a project also needs `--delete-originals`, or it refuses to start. When the dashboard opens such a project, it archives as usual but deletes nothing until you type `DELETE` again in its settings, once per session.
+
+On Linux, the check that an original is still open in another program is best effort: it isn't available on network or FUSE file systems (NFS, CIFS/SMB, FUSE), or for files you don't own. Close programs that write to the source before deleting originals.
 
 | Command | Meaning |
 |---|---|

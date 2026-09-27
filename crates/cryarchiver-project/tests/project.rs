@@ -474,25 +474,111 @@ fn a_cycle_whose_link_is_removed_is_no_longer_an_issue() {
 }
 
 #[test]
-fn a_project_that_deletes_originals_needs_the_confirmation_to_start() {
+fn a_project_that_deletes_originals_archives_but_deletes_nothing_until_the_session_confirms_it() {
 	let setup = setup(|settings| settings.delete_originals = true);
+	let original = write(&setup.source, "notes.txt", b"notes");
 	let project = support::open(&setup, &FakeEncoder::new());
 	let mut snapshot = Snapshot::default();
 
 	project.send(Command::Start {
 		delete_confirmed: false,
 	});
-	wait_for(&project, &mut snapshot, "the refusal", |s| {
-		s.notices.iter().any(|notice| notice.level == NoticeLevel::Error)
-	});
-	assert_eq!(snapshot.status.as_ref().unwrap().run_state, RunState::Paused);
+	wait_for(&project, &mut snapshot, "the archive", Snapshot::finished);
+	assert!(original.exists());
+	assert!(setup.destination.join("notes.txt").exists());
+	assert!(snapshot.status.as_ref().unwrap().deleting_paused);
 
 	project.send(Command::Start { delete_confirmed: true });
-	wait_for(&project, &mut snapshot, "the start", |s| {
-		s.status
-			.as_ref()
-			.is_some_and(|status| status.run_state == RunState::Running && status.deleting_originals)
+	wait_for(&project, &mut snapshot, "the delete", |s| {
+		s.overall.as_ref().is_some_and(|overall| overall.originals_deleted == 1)
 	});
+	assert!(!original.exists());
+	assert!(!snapshot.status.as_ref().unwrap().deleting_paused);
+}
+
+#[test]
+fn a_project_file_copied_away_from_its_archive_is_refused() {
+	let setup = setup(|_| {});
+	let elsewhere = setup.dir.path().join("elsewhere");
+	fs::create_dir_all(&elsewhere).unwrap();
+	let copy = elsewhere.join("archive.cryarchive");
+	fs::copy(&setup.project, &copy).unwrap();
+
+	let refused = Project::open(
+		&copy,
+		ProjectOptions {
+			backend: Arc::new(FakeBackend {
+				encoder: FakeEncoder::new(),
+			}),
+			tuning: support::tuning(),
+			fault: None,
+		},
+	);
+
+	let Err(err @ ProjectError::Moved { .. }) = refused else {
+		panic!("the copy opened");
+	};
+	let (_, meta, _) = Store::open(&setup.project).unwrap();
+	assert!(
+		err.to_string()
+			.contains(&cryarchiver_engine::text::display_path(&meta.settings.destination)),
+		"{err}"
+	);
+
+	assert_eq!(
+		fs::read_dir(&elsewhere).unwrap().count(),
+		1,
+		"nothing written beside the copy"
+	);
+	drop(support::open(&setup, &FakeEncoder::new()));
+}
+
+#[test]
+fn a_missing_source_root_leaves_the_run_unclean() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.txt", b"a");
+	{
+		let project = support::open(&setup, &FakeEncoder::new());
+		let mut snapshot = Snapshot::default();
+		project.send(Command::Start {
+			delete_confirmed: false,
+		});
+		wait_for(&project, &mut snapshot, "the archive", Snapshot::finished);
+	}
+	fs::rename(&setup.source, setup.dir.path().join("unplugged")).unwrap();
+
+	let project = support::open(&setup, &FakeEncoder::new());
+	let mut snapshot = Snapshot::default();
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+	wait_for(&project, &mut snapshot, "the completion check", Snapshot::finished);
+	drop(project);
+
+	assert_eq!(snapshot.issues.len(), 1, "{:?}", snapshot.issues);
+	assert_eq!(snapshot.issues[0].location, "the source folder");
+	assert!(snapshot.overall.as_ref().unwrap().progress < 1.0);
+	assert!(
+		snapshot
+			.notices
+			.iter()
+			.any(|notice| notice.text == "1 source folder can't be read, so the archive isn't complete")
+	);
+	assert!(matches!(records(&setup)[0].1.state, FileState::Done(_)));
+}
+
+#[test]
+fn creating_a_project_over_a_missing_source_names_it() {
+	let dir = tempfile::tempdir().unwrap();
+	let missing = dir.path().join("missing");
+
+	let err = cryarchiver_project::create(&missing, &dir.path().join("archive"), OsStr::new("a"), |_| {}).unwrap_err();
+
+	assert!(
+		err.to_string()
+			.contains(&cryarchiver_engine::text::display_path(&missing)),
+		"{err}"
+	);
 }
 
 #[test]

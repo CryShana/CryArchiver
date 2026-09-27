@@ -63,7 +63,9 @@ impl SettingsRow {
 			Self::StabilityWindow => format!("{} s", settings.stability_window.as_secs()),
 			Self::KeepAuxiliaryImages => on_off(settings.keep_auxiliary_images),
 			Self::DeleteOriginals => {
-				if settings.delete_originals {
+				if settings.delete_originals && view.header.deleting_paused {
+					"ON · paused this session: ⏎ type DELETE to allow · ← off".to_owned()
+				} else if settings.delete_originals {
 					"ON · originals are deleted after a verified archive".to_owned()
 				} else {
 					"off".to_owned()
@@ -120,7 +122,7 @@ impl Ui {
 				SettingsChange::StabilityWindow(Duration::from_secs(seconds.clamp(5, 300)))
 			}
 			SettingsRow::KeepAuxiliaryImages => SettingsChange::KeepAuxiliaryImages(!settings.keep_auxiliary_images),
-			SettingsRow::DeleteOriginals if !settings.delete_originals => {
+			SettingsRow::DeleteOriginals if !settings.delete_originals || (view.header.deleting_paused && step > 0) => {
 				self.overlay = Some(Overlay::ConfirmDelete(Input::default()));
 				return;
 			}

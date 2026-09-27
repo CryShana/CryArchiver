@@ -43,30 +43,34 @@ pub struct ProjectSource {
 	requested_details: RefCell<HashMap<FileId, Instant>>,
 	issue_logs: RefCell<HashMap<(IssueId, u32), Option<AttemptLog>>>,
 	notifications: Vec<Notification>,
+	clipboard: Option<String>,
 	savings: VecDeque<u64>,
 	cpu: VecDeque<u64>,
 	last_history: Option<Instant>,
 }
 
 impl ProjectSource {
-	/// Wraps an open project and starts it: the TUI's confirmation for deleting originals is the typed `DELETE`
-	/// that turned the setting on.
+	/// Wraps an open project and starts it. A project that deletes originals archives, but deletes nothing until the
+	/// user types `DELETE` once in this session.
 	pub fn new(project: Project) -> Self {
 		let settings = project.settings().clone();
 		let library = Library::new(display_path(&settings.source));
 		let root = library.root();
 
-		project.send(Command::Start { delete_confirmed: true });
+		project.send(Command::Start {
+			delete_confirmed: false,
+		});
 
 		Self {
 			view: ArchiveView {
 				header: Header {
 					source: display_path(&settings.source),
 					destination: display_path(&settings.destination),
-					codecs: "LATEST".into(),
+					codecs: None,
 					limit_pending: false,
 					run_state: RunState::Paused,
 					deleting_originals: settings.delete_originals,
+					deleting_paused: settings.delete_originals,
 					demo: false,
 				},
 				settings: settings_view(&settings),
@@ -85,6 +89,7 @@ impl ProjectSource {
 					savings_history: Vec::new(),
 					eta: None,
 					parity: None,
+					originals_deleted: 0,
 				},
 				workers: Workers {
 					jobs: Vec::new(),
@@ -115,6 +120,7 @@ impl ProjectSource {
 			requested_details: RefCell::new(HashMap::new()),
 			issue_logs: RefCell::new(HashMap::new()),
 			notifications: Vec::new(),
+			clipboard: None,
 			savings: VecDeque::new(),
 			cpu: VecDeque::new(),
 			last_history: None,
@@ -146,6 +152,7 @@ impl ProjectSource {
 				self.view.header.run_state = run_state(status.run_state);
 				self.view.header.limit_pending = status.limit_pending;
 				self.view.header.deleting_originals = status.deleting_originals;
+				self.view.header.deleting_paused = status.deleting_paused;
 				self.view.overall.scan_complete = status.scan_complete;
 			}
 			Update::Settings(settings) => {
@@ -200,6 +207,13 @@ impl ProjectSource {
 				},
 				text: notice.text,
 			}),
+			Update::Path(path) => {
+				self.notifications.push(Notification {
+					level: NoticeLevel::Info,
+					text: path.clone(),
+				});
+				self.clipboard = Some(path);
+			}
 			Update::System(system) => {
 				self.view.system.cpu_percent = system.cpu_percent;
 				self.view.system.ram_used = system.ram_used;
@@ -297,11 +311,11 @@ impl ProjectSource {
 				archive_files: parity.archive_files,
 				excluded: parity.excluded,
 			}),
+			originals_deleted: overall.originals_deleted,
 		};
 	}
 
 	fn apply_workers(&mut self, workers: Vec<project_view::Worker>) {
-		let running = workers.len();
 		self.view.workers.jobs = workers
 			.into_iter()
 			.map(|worker| WorkerJob {
@@ -311,6 +325,7 @@ impl ProjectSource {
 				codec: worker.codec,
 				name: worker.name,
 				state: file_state(worker.state),
+				stage: worker.stage,
 				activity: JobActivity::Progress {
 					fraction: worker.fraction,
 					fps: None,
@@ -322,7 +337,7 @@ impl ProjectSource {
 		self.view.workers.slots = if self.view.settings.performance_limit.is_some() {
 			"limit: one job at a time".into()
 		} else {
-			format!("{running} running")
+			String::new()
 		};
 	}
 
@@ -413,7 +428,7 @@ impl ProjectSource {
 				.stage
 				.iter()
 				.map(|stage| StageMark {
-					name: stage.to_lowercase(),
+					name: stage.clone(),
 					progress: crate::view::StageProgress::Current,
 				})
 				.collect(),
@@ -435,7 +450,8 @@ impl ProjectSource {
 				})
 				.collect(),
 			quality: None,
-			log_tail: details.log_tail.clone(),
+			log_tail: Vec::new(),
+			notes: details.notes.clone(),
 			duplicates: match &details.duplicates {
 				project_view::Duplicates::None => Duplicates::None,
 				project_view::Duplicates::PlaceholderOf(link) => Duplicates::PlaceholderOf(self.link(link)),
@@ -534,9 +550,15 @@ impl ArchiveSource for ProjectSource {
 		std::mem::take(&mut self.notifications)
 	}
 
+	fn take_clipboard(&mut self) -> Option<String> {
+		self.clipboard.take()
+	}
+
 	fn perform(&mut self, action: Action) {
 		let command = match action {
-			Action::Start => Command::Start { delete_confirmed: true },
+			Action::Start => Command::Start {
+				delete_confirmed: false,
+			},
 			Action::Pause => Command::Pause,
 			Action::StopNow => Command::StopNow,
 			Action::Rescan => Command::Rescan,

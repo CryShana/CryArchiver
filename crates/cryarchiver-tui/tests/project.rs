@@ -12,9 +12,10 @@ use cryarchiver_engine::text::display_path;
 use cryarchiver_project::{Backend, Project, ProjectOptions, SystemSample, Tuning};
 use cryarchiver_tui::source::Target;
 use cryarchiver_tui::view::{FileState, NoticeLevel, RunState};
-use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, ProjectSource};
+use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, OverlayKind, ProjectSource};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use tokio_util::sync::CancellationToken;
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -72,6 +73,10 @@ struct Setup {
 }
 
 fn setup(files: &[(&str, &[u8])]) -> Setup {
+	setup_with(files, false)
+}
+
+fn setup_with(files: &[(&str, &[u8])], delete_originals: bool) -> Setup {
 	let dir = tempfile::tempdir().unwrap();
 	let source = dir.path().join("source");
 
@@ -88,6 +93,7 @@ fn setup(files: &[(&str, &[u8])]) -> Setup {
 		OsStr::new("archive"),
 		|settings| {
 			settings.stability_window = Duration::ZERO;
+			settings.delete_originals = delete_originals;
 		},
 	)
 	.unwrap();
@@ -130,6 +136,22 @@ fn refresh_until(source: &mut ProjectSource, what: &str, done: impl Fn(&ProjectS
 
 fn finished(source: &ProjectSource) -> bool {
 	source.view().overall.parity.is_some()
+}
+
+fn screen(app: &mut App<ProjectSource>) -> String {
+	let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+	terminal.draw(|frame| app.draw(frame)).unwrap();
+	terminal
+		.backend()
+		.buffer()
+		.content()
+		.iter()
+		.map(ratatui::buffer::Cell::symbol)
+		.collect()
+}
+
+fn press(app: &mut App<ProjectSource>, code: KeyCode) {
+	app.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), Instant::now());
 }
 
 #[test]
@@ -249,8 +271,75 @@ fn copy_path_shows_the_full_source_path() {
 		std::thread::sleep(Duration::from_millis(10));
 	}
 
-	assert_eq!(notifications[0].level, NoticeLevel::Info);
-	assert_eq!(notifications[0].text, expected);
+	let path = notifications
+		.iter()
+		.find(|notice| notice.text == expected)
+		.unwrap_or_else(|| panic!("no notice with the path: {notifications:?}"));
+	assert_eq!(path.level, NoticeLevel::Info);
+	assert_eq!(source.take_clipboard(), Some(expected));
+	assert_eq!(source.take_clipboard(), None);
+}
+
+#[test]
+fn a_deleting_project_archives_but_deletes_nothing_until_delete_is_typed_this_session() {
+	let setup = setup_with(&[("notes.txt", b"notes")], true);
+	let original = setup.source.join("notes.txt");
+	let mut source = open(&setup.project);
+	refresh_until(&mut source, "the archive", finished);
+
+	assert!(original.exists());
+	assert!(source.view().header.deleting_originals);
+	assert!(source.view().header.deleting_paused);
+	assert_eq!(source.view().overall.originals_deleted, 0);
+
+	let mut app = App::new(source, ColorDepth::TrueColor);
+	assert!(screen(&mut app).contains("deleting paused: type DELETE to allow"));
+	press(&mut app, KeyCode::Char('s'));
+	for _ in 0..6 {
+		press(&mut app, KeyCode::Down);
+	}
+	press(&mut app, KeyCode::Enter);
+	assert_eq!(app.overlay(), Some(OverlayKind::ConfirmDelete));
+	app.handle_event(&Event::Paste("DELETE".to_owned()), Instant::now());
+	press(&mut app, KeyCode::Enter);
+
+	let deadline = Instant::now() + WAIT;
+	while app.source().view().overall.originals_deleted < 1 {
+		assert!(Instant::now() < deadline, "timed out waiting for the delete");
+		if !app.refresh() {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+	assert!(!original.exists());
+	assert!(!app.source().view().header.deleting_paused);
+	let shown = screen(&mut app);
+	assert!(!shown.contains("deleting paused"));
+	assert!(shown.contains("⊗ 1 original deleted"), "{shown}");
+}
+
+#[test]
+fn a_real_project_shows_only_what_it_knows() {
+	let setup = setup(&[("a.txt", b"a")]);
+	let mut source = open(&setup.project);
+	refresh_until(&mut source, "the finish", finished);
+	let root = source.view().library.root();
+	source.perform(Action::Expanded(root, true));
+	refresh_until(&mut source, "the rows", |s| s.files(root).is_some());
+	let file = source.files(root).unwrap()[0].id;
+
+	assert_eq!(source.view().header.codecs, None);
+	assert_eq!(source.view().workers.slots, "");
+	refresh_until(&mut source, "the details", |s| s.details(file).is_some());
+	let details = source.details(file).unwrap();
+	assert!(details.stages.is_empty(), "no job runs, so no stage");
+	assert!(details.log_tail.is_empty(), "the engine sends no live tool output");
+	assert_eq!((details.quality, details.estimated_out), (None, None));
+	assert_eq!(details.source_info, "1 B");
+
+	let mut app = App::new(source, ColorDepth::TrueColor);
+	let screen = screen(&mut app);
+	assert!(!screen.contains("LATEST"), "{screen}");
+	assert!(!screen.contains("running ·"), "{screen}");
 }
 
 #[test]

@@ -34,6 +34,12 @@ pub trait ArchiveSource {
 	/// Notifications raised since the last call, oldest first. Log lines stay in [`ArchiveView::log`].
 	fn take_notifications(&mut self) -> Vec<Notification>;
 
+	/// Text a "Copy path" asked to put on the clipboard since the last call. The terminal runner hands it to the
+	/// terminal.
+	fn take_clipboard(&mut self) -> Option<String> {
+		None
+	}
+
 	fn perform(&mut self, action: Action);
 
 	/// Called once on every exit of a started TUI, while a "stopping" frame is on screen when there is a terminal.

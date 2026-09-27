@@ -112,10 +112,11 @@ impl MockSource {
 				header: Header {
 					source: r"D:\Archive\Family".to_owned(),
 					destination: r"E:\Archive-AV1\Family".to_owned(),
-					codecs: "LATEST".to_owned(),
+					codecs: Some("LATEST".to_owned()),
 					limit_pending: false,
 					run_state: RunState::Running,
 					deleting_originals: false,
+					deleting_paused: false,
 					demo: true,
 				},
 				settings: Settings {
@@ -304,6 +305,7 @@ fn initial_overall(rng: &mut Rng) -> Overall {
 		savings_history: initial_history(rng, 60, 400),
 		eta: None,
 		parity: None,
+		originals_deleted: 0,
 	}
 }
 

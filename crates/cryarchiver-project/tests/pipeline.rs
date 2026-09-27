@@ -267,10 +267,29 @@ fn nothing_starts_before_the_start_command() {
 	let mut snapshot = Snapshot::default();
 
 	wait_for(&project, &mut snapshot, "the scan", Snapshot::scan_complete);
-	std::thread::sleep(std::time::Duration::from_millis(200));
 	project.send(Command::Watch(FolderId::ROOT, true));
 	wait_for(&project, &mut snapshot, "the rows", |s| !s.rows.is_empty());
+	let file = snapshot.row(FolderId::ROOT, "a.jpg").id;
+	let read = |s: &Snapshot| {
+		s.details
+			.get(&file)
+			.is_some_and(|details| details.plan.contains(&("Kind".to_owned(), "media".to_owned())))
+	};
+	while !read(&snapshot) {
+		project.send(Command::Details(file));
+		wait_for(&project, &mut snapshot, "the details", |s| {
+			s.details.contains_key(&file)
+		});
+		if !read(&snapshot) {
+			snapshot.details.clear();
+		}
+	}
 
+	assert_eq!(
+		snapshot.details[&file].state,
+		RowState::Queued,
+		"ready, and still not started"
+	);
 	assert!(encoder.calls().is_empty());
 	assert_eq!(snapshot.row(FolderId::ROOT, "a.jpg").status.state, RowState::Queued);
 
@@ -467,4 +486,27 @@ fn work_starts_as_soon_as_there_is_room_not_on_the_next_tick() {
 		"{:?}",
 		started.elapsed()
 	);
+}
+
+#[test]
+fn the_low_disk_pause_names_its_sizes_in_readable_units() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.jpg", &jpeg(1, 100));
+	let encoder = FakeEncoder::new();
+	encoder.rule(
+		"a.jpg",
+		Rule::Fail(ErrorKind::InsufficientSpace {
+			need: 5_000_000_000,
+			free: 1_200_000,
+		}),
+	);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	start(&project);
+
+	wait_for(&project, &mut snapshot, "the low-disk notice", |s| {
+		s.notices
+			.iter()
+			.any(|notice| notice.text == "paused: low disk space (1.20 MB free, 5.00 GB needed)")
+	});
 }

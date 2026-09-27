@@ -12,7 +12,6 @@ use cryarchiver_project::keys::RelPath;
 use cryarchiver_project::record::{FileRecord, FileState, How, Output};
 use cryarchiver_project::settings::{DELETE_CONFIRMATION, SettingsChange};
 use cryarchiver_project::store::Store;
-use cryarchiver_project::view::NoticeLevel;
 use cryarchiver_project::{Command, Fault};
 use support::{FakeEncoder, Snapshot, jpeg, setup, wait_for, write};
 
@@ -321,9 +320,13 @@ fn a_crash_after_delete_pending_checks_again_before_deleting() {
 	project.send(Command::Start {
 		delete_confirmed: false,
 	});
-	wait_for(&project, &mut snapshot, "the refusal to start", |s| {
-		s.notices.iter().any(|notice| notice.level == NoticeLevel::Error)
-	});
+	wait_for(
+		&project,
+		&mut snapshot,
+		"the run to finish without deleting",
+		Snapshot::finished,
+	);
+	assert!(snapshot.status.as_ref().unwrap().deleting_paused);
 	drop(project);
 
 	assert!(notes.exists(), "a start without the confirmation never deletes");

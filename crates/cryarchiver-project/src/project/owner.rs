@@ -54,6 +54,7 @@ pub(crate) enum Message {
 	FoldersChanged(Vec<RelPath>),
 	DestinationListed(Vec<DestinationFile>),
 	OutputVerified(FileId, Output, bool),
+	Revealed(PathBuf, Result<(), String>),
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -224,6 +225,7 @@ impl Owner {
 			Message::FoldersChanged(folders) => self.on_folders_changed(folders),
 			Message::DestinationListed(files) => self.on_destination_listed(&files),
 			Message::OutputVerified(file, output, intact) => self.on_output_verified(file, output, intact),
+			Message::Revealed(folder, result) => self.on_revealed(&folder, result),
 		}
 
 		if self.stopping || !frees {
@@ -320,21 +322,22 @@ impl Owner {
 		self.send(Update::Stopped);
 	}
 
+	/// A project that deletes originals archives without the confirmation too, but deletes nothing until this session
+	/// confirms it; a later start without it never takes a confirmation back.
 	pub(super) fn start(&mut self, delete_confirmed: bool) {
-		if self.settings.delete_originals && !delete_confirmed {
-			self.notice(
-				NoticeLevel::Error,
-				"this project deletes originals: confirm it to start (run with --delete-originals)".into(),
-			);
-			return;
-		}
-
 		self.started = true;
 		self.paused = false;
-		self.delete_confirmed = delete_confirmed && self.settings.delete_originals;
+		self.delete_confirmed |= delete_confirmed && self.settings.delete_originals;
+
 		if self.deleting() {
 			self.log(LogKind::Action, "deleting originals is on".into());
 			self.queue_all_deletes();
+		} else if self.settings.delete_originals {
+			self.log(
+				LogKind::Action,
+				"deleting originals is paused until it is confirmed for this session".into(),
+			);
+			self.view.status_dirty = true;
 		}
 	}
 

@@ -166,18 +166,25 @@ fn render_side(buf: &mut Buffer, area: Rect, details: &FileDetails, theme: &Them
 	let bottom = area.bottom();
 	let right = area.right();
 
-	put(buf, area.x, y, "ffmpeg (live tail)", bold(theme.dim), right);
-	y += 1;
-	for line in &details.log_tail {
-		if y >= bottom {
-			return;
+	for (heading, lines) in [("ffmpeg (live tail)", &details.log_tail), ("Notes", &details.notes)] {
+		if lines.is_empty() {
+			continue;
 		}
-		let color = if line.starts_with('[') { theme.warn } else { theme.text };
-		put(buf, area.x, y, &fit(line, usize::from(area.width)), fg(color), right);
+
+		put(buf, area.x, y, heading, bold(theme.dim), right);
+		y += 1;
+		for line in lines {
+			if y >= bottom {
+				return;
+			}
+			let color = if line.starts_with('[') { theme.warn } else { theme.text };
+			put(buf, area.x, y, &fit(line, usize::from(area.width)), fg(color), right);
+			y += 1;
+		}
 		y += 1;
 	}
 
-	y = render_duplicates(buf, Rect { y: y + 1, ..area }, &details.duplicates, theme, hits);
+	y = render_duplicates(buf, Rect { y, ..area }, &details.duplicates, theme, hits);
 	if let Some(issue) = &details.issue {
 		render_issue(buf, Rect { y: y + 1, ..area }, issue, theme);
 	}

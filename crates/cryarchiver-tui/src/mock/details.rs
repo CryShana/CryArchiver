@@ -38,6 +38,7 @@ pub fn build(source: &MockSource, file: FileId) -> Option<FileDetails> {
 		plan: plan(source, file, kind),
 		quality: quality(source, file, status, kind),
 		log_tail: source.log_tail(file, status),
+		notes: Vec::new(),
 		duplicates: source.duplicates(file),
 		issue: source
 			.view

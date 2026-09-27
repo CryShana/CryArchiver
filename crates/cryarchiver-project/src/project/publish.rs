@@ -7,16 +7,16 @@ use std::ffi::OsStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cryarchiver_engine::engine::Stage;
-use cryarchiver_engine::text::display_name;
+use cryarchiver_engine::text::{display_name, display_path};
 
 use super::owner::Owner;
-use crate::issues::{IssueId, IssueKey, Problem, Verbs};
+use crate::issues::{IssueId, IssueKey, Problem, UNREADABLE_FOLDER_VERBS, Verbs};
 use crate::record::{CopyReason, FileState, How, IssueKind, MediaClass};
 use crate::schedule::Work;
 use crate::tree::{FileId, FolderId};
 use crate::view::{
 	Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, LogEntry, LogKind, Notice,
-	NoticeLevel, Overall, Parity, PathLink, RowState, RunState, Status, Update, Worker,
+	NoticeLevel, Overall, Parity, PathLink, RowState, RunState, Status, Update, Worker, size_text,
 };
 
 const THROUGHPUT_WINDOW: Duration = Duration::from_mins(5);
@@ -130,13 +130,6 @@ impl Owner {
 			}
 		}
 
-		let status = self.status();
-		if self.view.status_dirty || self.view.last_status.as_ref() != Some(&status) {
-			self.view.status_dirty = false;
-			self.view.last_status = Some(status.clone());
-			self.send(Update::Status(status));
-		}
-
 		self.record_throughput(now);
 		let overall = self.overall();
 		if self.view.last_overall.as_ref() != Some(&overall) {
@@ -153,6 +146,14 @@ impl Owner {
 		if self.pipeline.workers_dirty {
 			self.pipeline.workers_dirty = false;
 			self.send(Update::Workers(self.workers()));
+		}
+
+		// Last, so a front end that sees the run finished already has the counts and issues it finished with.
+		let status = self.status();
+		if self.view.status_dirty || self.view.last_status.as_ref() != Some(&status) {
+			self.view.status_dirty = false;
+			self.view.last_status = Some(status.clone());
+			self.send(Update::Status(status));
 		}
 	}
 
@@ -179,8 +180,9 @@ impl Owner {
 					.to_owned(),
 					name: display_name(&entry.name),
 					state: self.row_state(**file),
+					stage: job.stage.map(|stage| stage_label(stage).to_owned()),
 					fraction: job.fraction,
-					over_limit: index >= jobs.len() - over_limit,
+					over_limit: index >= jobs.len().saturating_sub(over_limit),
 				}
 			})
 			.collect()
@@ -206,6 +208,7 @@ impl Owner {
 			limit_pending: self.limit_pending(),
 			scan_complete: self.scan.complete,
 			deleting_originals: self.settings.delete_originals,
+			deleting_paused: self.settings.delete_originals && !self.delete_confirmed,
 		}
 	}
 
@@ -232,7 +235,7 @@ impl Owner {
 			progress: stats.progress,
 			kept: root.kept,
 			duplicates: root.duplicates,
-			open_issues: u64::try_from(self.issue_files.len()).unwrap_or(u64::MAX),
+			open_issues: u64::try_from(self.issue_files.len() + self.scan.unreadable.len()).unwrap_or(u64::MAX),
 			saved_bytes: saved,
 			saved_fraction,
 			eta: self.eta(root.size.saturating_sub(root.bytes_in)),
@@ -450,7 +453,7 @@ impl Owner {
 			.jobs
 			.get(&file)
 			.and_then(|job| job.stage)
-			.map(|stage| format!("{stage:?}"));
+			.map(|stage| stage_label(stage).to_owned());
 		let mut plan = vec![(
 			"Kind".to_owned(),
 			match record.class {
@@ -465,18 +468,17 @@ impl Owner {
 		}
 
 		Details {
-			source_path: self.source_path(&entry.key).display().to_string(),
-			destination_path: output.map_or_else(String::new, |output| {
-				self.destination_path(&output.path).display().to_string()
-			}),
-			source_info: format!("{} bytes", record.size),
+			source_path: display_path(&self.source_path(&entry.key)),
+			destination_path: output
+				.map_or_else(String::new, |output| display_path(&self.destination_path(&output.path))),
+			source_info: size_text(record.size),
 			state: status.state,
 			stage,
 			fraction: status.progress,
 			bytes_in: record.size,
 			bytes_out: status.bytes_out,
 			plan,
-			log_tail: notes,
+			notes,
 			duplicates,
 			issue,
 		}
@@ -560,6 +562,33 @@ impl Owner {
 			}
 		}
 
+		let unreadable: Vec<(FolderId, String)> = self
+			.scan
+			.unreadable
+			.iter()
+			.map(|(folder, reason)| (*folder, reason.clone()))
+			.collect();
+		for (folder, reason) in unreadable {
+			let entry = self.tree.folder(folder);
+			let label = self.folder_label(folder);
+			issues.push(IssueView {
+				id: self.issue_ids.id(&IssueKey::Unreadable(folder)),
+				problem: Problem::SourceUnreadable,
+				file: None,
+				folder: Some(folder),
+				name: if entry.key.is_root() {
+					label.clone()
+				} else {
+					display_name(&entry.name)
+				},
+				location: label,
+				reason: format!("the folder can't be read, so nothing in it is archived or checked: {reason}"),
+				resolution: resolution(UNREADABLE_FOLDER_VERBS),
+				verbs: UNREADABLE_FOLDER_VERBS,
+				attempts: 0,
+			});
+		}
+
 		issues.extend(self.unknown_issues());
 		issues
 	}
@@ -599,6 +628,24 @@ fn resolution(verbs: Verbs) -> String {
 	format!("waiting for you: {}", choices.join(", "))
 }
 
+/// The engine's stage in the words the CLI uses too.
+pub(super) fn stage_label(stage: Stage) -> &'static str {
+	match stage {
+		Stage::Detect => "detecting",
+		Stage::Probe => "probing",
+		Stage::Plan => "planning",
+		Stage::Queued => "queued",
+		Stage::WaitingForMemory => "waiting for memory",
+		Stage::Analyze => "analysing",
+		Stage::Sample => "sampling",
+		Stage::Encode => "encoding",
+		Stage::Mux => "muxing",
+		Stage::Metadata => "cover art",
+		Stage::Verify => "verifying",
+		Stage::Commit => "saving",
+	}
+}
+
 pub(super) fn codec_label(how: &How, output_name: &OsStr) -> String {
 	match how {
 		How::Copied(_) => "copy".into(),
@@ -616,5 +663,82 @@ pub(super) fn codec_label(how: &How, output_name: &OsStr) -> String {
 				other => other.to_uppercase(),
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::fs;
+
+	use cryarchiver_engine::engine::Stage;
+
+	use super::*;
+	use crate::keys::RelPath;
+	use crate::project::pipeline::tests::running_job;
+	use crate::project::scanning::tests::{key, list, owner};
+	use crate::record::FileRecord;
+
+	#[test]
+	fn more_jobs_over_the_limit_than_workers_shown_never_panics() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		fs::write(source.join("a.jpg"), b"a").unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		let file = owner.tree.file_id(&key("a.jpg")).unwrap();
+		let mut job = running_job(Work::Encode);
+		job.stage = Some(Stage::WaitingForMemory);
+		owner.pipeline.jobs.insert(file, job);
+		let now = Instant::now();
+		owner.pipeline.governor.started(Work::Encode, now);
+		owner.pipeline.governor.started(Work::Hash, now);
+		owner.pipeline.governor.started(Work::Hash, now);
+		owner.pipeline.governor.set_limit(true);
+
+		let workers = owner.workers();
+
+		assert_eq!(workers.len(), 1);
+		assert!(workers[0].over_limit);
+		assert_eq!(workers[0].stage.as_deref(), Some("waiting for memory"));
+	}
+
+	#[test]
+	fn a_later_start_without_the_confirmation_never_takes_it_back() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		owner.settings.delete_originals = true;
+
+		owner.start(false);
+		assert!(owner.status().deleting_paused);
+
+		owner.start(true);
+		owner.start(false);
+		assert!(!owner.status().deleting_paused);
+		assert!(owner.deleting());
+	}
+
+	#[test]
+	fn details_show_escaped_paths_readable_sizes_and_stage_words() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		let file = owner.tree.add_file(
+			FolderId::ROOT,
+			OsStr::new("a\u{1b}[2Jb.jpg"),
+			FileRecord::discovered(12_345_678, 1),
+		);
+		let mut job = running_job(Work::Encode);
+		job.stage = Some(Stage::WaitingForMemory);
+		owner.pipeline.jobs.insert(file, job);
+
+		let details = owner.details(file);
+
+		assert!(!details.source_path.contains('\u{1b}'), "{}", details.source_path);
+		assert_eq!(details.source_info, "12.3 MB");
+		assert_eq!(details.stage.as_deref(), Some("waiting for memory"));
 	}
 }

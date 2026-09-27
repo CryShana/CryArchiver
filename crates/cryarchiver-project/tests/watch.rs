@@ -109,12 +109,12 @@ fn a_file_another_program_holds_open_for_writing_waits() {
 		.open(&path)
 		.unwrap();
 	writer.write_all(b"still recording").unwrap();
+	write(&setup.source, "free.txt", b"free");
 	let project = support::open(&setup, &FakeEncoder::new());
 	let mut snapshot = Snapshot::default();
 	start(&project);
 
-	std::thread::sleep(Duration::from_millis(500));
-	support::drain(&project, &mut snapshot);
+	wait_for_file(&project, &mut snapshot, &setup.destination.join("free.txt"));
 	assert!(!setup.destination.join("capture.txt").exists());
 
 	drop(writer);
@@ -177,8 +177,13 @@ fn unknown_destination_files_are_reported_never_deleted_and_can_be_acknowledged(
 	);
 	let project = support::open(&setup, &FakeEncoder::new());
 	let mut snapshot = Snapshot::default();
-	wait_for(&project, &mut snapshot, "the scan", Snapshot::scan_complete);
-	std::thread::sleep(Duration::from_millis(200));
+	start(&project);
+	wait_for(
+		&project,
+		&mut snapshot,
+		"the destination walk and the finish",
+		Snapshot::finished,
+	);
 	support::drain(&project, &mut snapshot);
 	assert!(snapshot.issues.is_empty(), "{:?}", snapshot.issues);
 }

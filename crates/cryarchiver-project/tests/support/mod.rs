@@ -18,7 +18,7 @@ use cryarchiver_project::issues::IssueId;
 use cryarchiver_project::settings::Settings;
 use cryarchiver_project::tree::{FileId, FolderId, FolderStats};
 use cryarchiver_project::view::{
-	Details, FileRow, FilterView, IssueView, LogEntry, Notice, Overall, Status, SystemView, Update, Worker,
+	Details, FileRow, FilterView, IssueView, LogEntry, Notice, Overall, RunState, Status, SystemView, Update, Worker,
 };
 use cryarchiver_project::{Backend, Fault, Project, ProjectOptions, SystemSample, Tuning};
 use tokio_util::sync::CancellationToken;
@@ -330,6 +330,7 @@ pub struct Snapshot {
 	pub issue_logs: HashMap<(IssueId, u32), Vec<String>>,
 	pub logs: Vec<LogEntry>,
 	pub notices: Vec<Notice>,
+	pub paths: Vec<String>,
 	pub system: Option<SystemView>,
 	pub stopped: bool,
 }
@@ -371,6 +372,7 @@ impl Snapshot {
 			}
 			Update::Log(entry) => self.logs.push(entry),
 			Update::Notice(notice) => self.notices.push(notice),
+			Update::Path(path) => self.paths.push(path),
 			Update::System(system) => self.system = Some(system),
 			Update::Stopped => self.stopped = true,
 		}
@@ -392,6 +394,14 @@ impl Snapshot {
 
 	pub fn scan_complete(&self) -> bool {
 		self.status.as_ref().is_some_and(|status| status.scan_complete)
+	}
+
+	pub fn run_state(&self) -> Option<RunState> {
+		self.status.as_ref().map(|status| status.run_state)
+	}
+
+	pub fn finished(&self) -> bool {
+		self.run_state() == Some(RunState::Finished)
 	}
 
 	pub fn root(&self) -> FolderStats {

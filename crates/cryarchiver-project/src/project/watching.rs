@@ -82,13 +82,7 @@ impl Owner {
 	pub(super) fn on_hint(&mut self, hint: Hint) {
 		match hint {
 			Hint::Folder(folder) => self.watching.debouncer.hint(folder, Instant::now()),
-			Hint::Rescan => {
-				self.log(
-					LogKind::Action,
-					"the watcher lost events: scanning the source again".into(),
-				);
-				self.request_rescan();
-			}
+			Hint::Rescan => self.request_rescan(),
 		}
 	}
 
@@ -146,12 +140,24 @@ impl Owner {
 		});
 	}
 
+	/// Folders that couldn't be read are tried again on every pass, whatever their time: a link's target that comes
+	/// back online changes nothing the pass compares.
 	pub(super) fn on_folders_changed(&mut self, folders: Vec<RelPath>) {
 		self.watching.safety_pass_running = false;
 		for folder in folders {
 			if self.tree.folder_id(&folder).is_some() {
 				self.relist(folder);
 			}
+		}
+
+		let unreadable: Vec<RelPath> = self
+			.scan
+			.unreadable
+			.keys()
+			.map(|&folder| self.tree.folder(folder).key.clone())
+			.collect();
+		for folder in unreadable {
+			self.queue_listing(folder, true);
 		}
 	}
 
@@ -558,5 +564,20 @@ mod tests {
 		}
 		let file = owner.tree.file_id(&key("A/B/b.txt")).unwrap();
 		assert!(!owner.tree.file(file).removed);
+	}
+
+	#[test]
+	fn every_safety_pass_tries_folders_that_could_not_be_read_again() {
+		let (_dir, mut owner, _updates, _) = fixture();
+		list(&mut owner, &RelPath::root(), true);
+		owner
+			.scan
+			.unreadable
+			.insert(FolderId::ROOT, "the drive is offline".into());
+
+		owner.on_folders_changed(Vec::new());
+		list_queued(&mut owner);
+
+		assert!(owner.scan.unreadable.is_empty());
 	}
 }

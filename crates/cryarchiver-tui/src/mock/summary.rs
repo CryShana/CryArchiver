@@ -47,6 +47,7 @@ struct Counts {
 	kept: u64,
 	duplicates: u64,
 	excluded: u64,
+	deleted: u64,
 }
 
 impl MockSource {
@@ -145,6 +146,7 @@ impl MockSource {
 		overall.progress = root.progress();
 		overall.kept = counts.kept;
 		overall.duplicates = counts.duplicates;
+		overall.originals_deleted = counts.deleted;
 		overall.open_issues = open_issues;
 		overall.saved_bytes = saved;
 		overall.saved_fraction = fraction(saved, root.bytes_in);
@@ -170,6 +172,7 @@ impl MockSource {
 					codec: kind.codec().unwrap_or("copy").to_owned(),
 					name: row.name.clone(),
 					state: row.status.state,
+					stage: None,
 					activity: activity(job, kind),
 					over_limit: job.over_limit,
 				}
@@ -185,6 +188,7 @@ fn file_tally(status: &FileStatus, open_issue: bool, counts: &mut Counts) -> Tal
 		FileState::KeptOriginal => counts.kept += 1,
 		FileState::Duplicate => counts.duplicates += 1,
 		FileState::Excluded => counts.excluded += 1,
+		FileState::OriginalDeleted => counts.deleted += 1,
 		_ => {}
 	}
 

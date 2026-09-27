@@ -1,7 +1,8 @@
 //! Applying source listings (project layer spec §6.1 and §6.2): new, changed, vanished and unreadable files, new
 //! folders, and folder links that lead back into their own tree.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 
 use cryarchiver_engine::text::display_name;
@@ -17,11 +18,36 @@ use crate::view::{LogKind, NoticeLevel, Update};
 
 #[derive(Debug, Default)]
 pub(crate) struct ScanState {
-	queue: VecDeque<(RelPath, bool)>,
+	/// Each folder at most once, in the order first asked for.
+	queue: VecDeque<RelPath>,
+	/// The queued folders, and whether each listing goes on into the folder's subfolders.
+	queued: HashMap<RelPath, bool>,
 	active: usize,
 	pub(super) complete: bool,
 	/// A rescan asked for while one already runs: exactly one more starts once it lands.
 	rescan_pending: bool,
+	/// Folders whose last listing failed, and why. Each is an open issue and counts as not scanned until a listing
+	/// succeeds.
+	pub(super) unreadable: BTreeMap<FolderId, String>,
+}
+
+impl ScanState {
+	/// A folder already queued keeps its place; asking for it again recursively makes that listing recursive.
+	fn push(&mut self, folder: RelPath, recursive: bool) {
+		match self.queued.entry(folder) {
+			Entry::Occupied(mut queued) => *queued.get_mut() |= recursive,
+			Entry::Vacant(slot) => {
+				self.queue.push_back(slot.key().clone());
+				slot.insert(recursive);
+			}
+		}
+	}
+
+	fn pop(&mut self) -> Option<(RelPath, bool)> {
+		let folder = self.queue.pop_front()?;
+		let recursive = self.queued.remove(&folder).unwrap_or(false);
+		Some((folder, recursive))
+	}
 }
 
 impl Owner {
@@ -33,13 +59,21 @@ impl Owner {
 	}
 
 	pub(super) fn queue_listing(&mut self, folder: RelPath, recursive: bool) {
-		self.scan.queue.push_back((folder, recursive));
+		self.scan.push(folder, recursive);
 		self.pump_listings();
 	}
 
 	/// A rescan the watcher lost events asked for: coalesced into the running scan when one is already going, so a
-	/// burst of hints never queues more than one follow-up.
+	/// burst of hints never queues more than one follow-up, and is logged only when it asks for one.
 	pub(super) fn request_rescan(&mut self) {
+		if self.scanning() && self.scan.rescan_pending {
+			return;
+		}
+
+		self.log(
+			LogKind::Action,
+			"the watcher lost events: scanning the source again".into(),
+		);
 		if self.scanning() {
 			self.scan.rescan_pending = true;
 		} else {
@@ -49,7 +83,7 @@ impl Owner {
 
 	pub(super) fn pump_listings(&mut self) {
 		while self.scan.active < self.tuning.listings {
-			let Some((folder, recursive)) = self.scan.queue.pop_front() else {
+			let Some((folder, recursive)) = self.scan.pop() else {
 				break;
 			};
 
@@ -67,6 +101,8 @@ impl Owner {
 		self.scan.active > 0 || !self.scan.queue.is_empty()
 	}
 
+	/// A folder that is gone is left to its parent's listing, which sees it vanish; one that can't be read is an issue
+	/// and changes nothing below it.
 	pub(super) fn on_listed(&mut self, listing: &Listing, recursive: bool) {
 		self.scan.active -= 1;
 
@@ -75,21 +111,46 @@ impl Owner {
 			return;
 		};
 
-		if let Some(error) = &listing.error {
-			self.notice(
-				NoticeLevel::Warning,
-				format!("{} can't be read: {error}", self.folder_label(folder)),
-			);
-		} else if self.leads_back(folder, listing.identity) {
-			self.found_cycle(folder);
+		if listing.gone {
+			self.folder_readable(folder);
+			if let Some(parent) = self.tree.folder(folder).parent {
+				self.scan.push(self.tree.folder(parent).key.clone(), false);
+			}
+		} else if let Some(error) = &listing.error {
+			self.folder_unreadable(folder, error);
 		} else {
-			self.apply_listing(folder, listing, recursive);
+			self.folder_readable(folder);
+			if self.leads_back(folder, listing.identity) {
+				self.found_cycle(folder);
+			} else {
+				self.apply_listing(folder, listing, recursive);
+			}
+			self.tree.set_scanned(folder, true);
 		}
 
-		self.tree.set_scanned(folder, true);
 		self.save_folder(folder);
 		self.touch_folder(folder);
 		self.after_listing();
+	}
+
+	/// The folder is an open issue and counts as not scanned, which holds the run below 100 % and its completion
+	/// check short of clean; nothing below it changes.
+	fn folder_unreadable(&mut self, folder: FolderId, reason: &str) {
+		self.tree.set_scanned(folder, false);
+		if self.scan.unreadable.get(&folder).is_some_and(|known| known == reason) {
+			return;
+		}
+
+		let label = self.folder_label(folder);
+		self.log(LogKind::Action, format!("{label} can't be read: {reason}"));
+		self.scan.unreadable.insert(folder, reason.to_owned());
+		self.view.issues_dirty = true;
+	}
+
+	fn folder_readable(&mut self, folder: FolderId) {
+		if self.scan.unreadable.remove(&folder).is_some() {
+			self.view.issues_dirty = true;
+		}
 	}
 
 	fn apply_listing(&mut self, folder: FolderId, listing: &Listing, recursive: bool) {
@@ -135,9 +196,21 @@ impl Owner {
 			}
 		}
 
+		let mut present = HashSet::new();
 		for &index in &diff.broken {
-			if let EntryKind::Broken(reason) = &listing.entries[index].kind {
-				self.source_broken(folder, &listing.entries[index].name, reason);
+			let entry = &listing.entries[index];
+			let EntryKind::Broken(reason) = &entry.kind else {
+				continue;
+			};
+
+			match self.tree.folder_id(&self.tree.folder(folder).key.join(&entry.name)) {
+				Some(child) => {
+					present.insert(entry.name.clone());
+					self.folder_unreadable(child, reason);
+					self.save_folder(child);
+					self.touch_folder(child);
+				}
+				None => self.source_broken(folder, &entry.name, reason),
 			}
 		}
 
@@ -147,14 +220,13 @@ impl Owner {
 			}
 		}
 
-		let mut present = HashSet::new();
 		for &index in &diff.folders {
 			let name = &listing.entries[index].name;
 			present.insert(name.clone());
 			let (child, new) = self.add_folder(folder, name);
 			let returned = std::mem::take(&mut self.tree.folder_mut(child).vanished);
 			if recursive || new || returned || !self.tree.folder(child).record.scanned {
-				self.scan.queue.push_back((self.tree.folder(child).key.clone(), true));
+				self.scan.push(self.tree.folder(child).key.clone(), true);
 			}
 		}
 
@@ -375,6 +447,7 @@ impl Owner {
 	/// The folder is gone, with everything below it, including any cycle it was.
 	fn subtree_missing(&mut self, folder: FolderId) {
 		self.tree.folder_mut(folder).vanished = true;
+		self.folder_readable(folder);
 		if self.tree.folder_mut(folder).record.cycle.take().is_some() {
 			self.view.issues_dirty = true;
 		}
@@ -456,7 +529,9 @@ pub(super) mod tests {
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
+	use crate::issues::Problem;
 	use crate::project::{Backend, ProjectOptions, SystemSample, Tuning, create};
+	use crate::record::{CopyReason, How, Output};
 	use crate::store::Store;
 	use crate::watch::Hint;
 
@@ -522,9 +597,18 @@ pub(super) mod tests {
 	}
 
 	pub(crate) fn list_queued(owner: &mut Owner) {
-		while let Some((folder, recursive)) = owner.scan.queue.pop_front() {
+		while let Some((folder, recursive)) = owner.scan.pop() {
 			list(owner, &folder, recursive);
 		}
+	}
+
+	pub(crate) fn queued(owner: &Owner) -> Vec<(RelPath, bool)> {
+		owner
+			.scan
+			.queue
+			.iter()
+			.map(|folder| (folder.clone(), owner.scan.queued[folder]))
+			.collect()
 	}
 
 	pub(crate) fn key(path: &str) -> RelPath {
@@ -550,7 +634,7 @@ pub(super) mod tests {
 		fs::rename(dir.path().join("moved"), source.join("A")).unwrap();
 		list(&mut owner, &RelPath::root(), false);
 		assert!(!owner.tree.folder(a).vanished);
-		assert_eq!(Vec::from(owner.scan.queue.clone()), [(key("A"), true)]);
+		assert_eq!(queued(&owner), [(key("A"), true)]);
 
 		list_queued(&mut owner);
 		let b = owner.tree.folder_id(&key("A/B")).unwrap();
@@ -562,17 +646,253 @@ pub(super) mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let source = dir.path().join("source");
 		fs::create_dir_all(&source).unwrap();
-		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
 		owner.scan.active = 1;
 
 		for _ in 0..5 {
 			owner.on_hint(Hint::Rescan);
 		}
-		assert!(owner.scan.queue.is_empty(), "no scan queued while one runs");
+		assert!(queued(&owner).is_empty(), "no scan queued while one runs");
 
 		owner.scan.active = 0;
 		owner.after_listing();
 
-		assert_eq!(Vec::from(owner.scan.queue.clone()), [(RelPath::root(), true)]);
+		assert_eq!(queued(&owner), [(RelPath::root(), true)]);
+		let lost = updates
+			.try_iter()
+			.filter(|update| matches!(update, Update::Log(entry) if entry.message.contains("lost events")))
+			.count();
+		assert_eq!(lost, 1, "one log line for the burst");
+	}
+
+	fn link_folder(target: &Path, link: &Path) -> bool {
+		#[cfg(unix)]
+		return std::os::unix::fs::symlink(target, link).is_ok();
+
+		#[cfg(windows)]
+		return std::process::Command::new("cmd")
+			.arg("/C")
+			.arg("mklink")
+			.arg("/J")
+			.arg(link)
+			.arg(target)
+			.output()
+			.is_ok_and(|out| out.status.success());
+	}
+
+	fn copied(path: &str) -> Output {
+		Output {
+			how: How::Copied(CopyReason::NotMedia),
+			path: key(path),
+			size: 1,
+			hash: None,
+		}
+	}
+
+	fn states(owner: &Owner, files: &[FileId]) -> Vec<(FileState, bool)> {
+		files
+			.iter()
+			.map(|&file| {
+				(
+					owner.tree.file(file).record.state.clone(),
+					owner.tree.file(file).removed,
+				)
+			})
+			.collect()
+	}
+
+	fn nothing_to_archive(owner: &Owner) -> bool {
+		owner.pipeline.observed.is_empty() && owner.pipeline.queues.values().all(crate::schedule::Queue::is_empty)
+	}
+
+	#[test]
+	fn a_linked_folder_whose_target_is_offline_leaves_everything_below_it_as_it_was() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		let disk = dir.path().join("disk");
+		fs::create_dir_all(&source).unwrap();
+		fs::create_dir_all(&disk).unwrap();
+		for name in ["a.txt", "b.txt", "c.txt"] {
+			fs::write(disk.join(name), b"x").unwrap();
+		}
+		if !link_folder(&disk, &source.join("Linked")) {
+			eprintln!("skipped: can't create a folder link here");
+			return;
+		}
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		list_queued(&mut owner);
+		let files: Vec<FileId> = ["Linked/a.txt", "Linked/b.txt", "Linked/c.txt"]
+			.iter()
+			.map(|path| owner.tree.file_id(&key(path)).unwrap())
+			.collect();
+		owner.set_state(files[0], FileState::Done(copied("Linked/a.txt")));
+		owner.set_state(files[1], FileState::DeletePending(copied("Linked/b.txt")));
+		owner.set_state(files[2], FileState::Excluded);
+		owner.pipeline.observed.clear();
+		let before = states(&owner, &files);
+
+		fs::rename(&disk, dir.path().join("offline")).unwrap();
+		list(&mut owner, &RelPath::root(), false);
+		list(&mut owner, &key("Linked"), true);
+
+		let linked = owner.tree.folder_id(&key("Linked")).unwrap();
+		assert_eq!(states(&owner, &files), before);
+		assert!(
+			owner.tree.file_id(&key("Linked")).is_none(),
+			"no file issue for the folder"
+		);
+		assert!(owner.issue_files.is_empty());
+		assert!(owner.scan.unreadable.contains_key(&linked));
+		assert!(!owner.tree.folder(linked).vanished);
+		assert!(!owner.tree.is_complete(FolderId::ROOT));
+		let issues = owner.issues_view();
+		assert_eq!(issues.len(), 1);
+		assert_eq!(
+			(issues[0].problem, issues[0].file, issues[0].folder),
+			(Problem::SourceUnreadable, None, Some(linked))
+		);
+
+		fs::rename(dir.path().join("offline"), &disk).unwrap();
+		list(&mut owner, &RelPath::root(), false);
+		list_queued(&mut owner);
+
+		assert_eq!(states(&owner, &files), before);
+		assert!(owner.scan.unreadable.is_empty());
+		assert!(owner.tree.folder(linked).record.scanned);
+		assert!(nothing_to_archive(&owner), "nothing is archived again");
+	}
+
+	#[test]
+	fn a_folder_that_cant_be_read_is_an_issue_until_a_listing_succeeds() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(source.join("Private")).unwrap();
+		fs::write(source.join("Private").join("a.txt"), b"a").unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		list_queued(&mut owner);
+		let private = owner.tree.folder_id(&key("Private")).unwrap();
+		let file = owner.tree.file_id(&key("Private/a.txt")).unwrap();
+
+		owner.scan.active += 1;
+		owner.on_listed(
+			&Listing {
+				folder: key("Private"),
+				error: Some("Access is denied. (os error 5)".into()),
+				..Listing::default()
+			},
+			false,
+		);
+
+		assert!(!owner.tree.folder(private).record.scanned);
+		assert!(owner.tree.stats(FolderId::ROOT).progress < 1.0);
+		assert!(!owner.tree.file(file).removed, "nothing below it changes");
+		assert_eq!(owner.overall().open_issues, 1);
+		let issues = owner.issues_view();
+		assert_eq!(issues.len(), 1);
+		assert_eq!(issues[0].location, "Private");
+		assert!(issues[0].reason.ends_with("Access is denied. (os error 5)"));
+		assert_eq!(issues[0].verbs.retry, Some("Retry"));
+
+		list(&mut owner, &key("Private"), false);
+
+		assert!(owner.scan.unreadable.is_empty());
+		assert!(owner.tree.folder(private).record.scanned);
+		assert!(owner.issues_view().is_empty());
+	}
+
+	#[test]
+	fn a_missing_source_root_is_an_issue_and_forgets_nothing() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		fs::write(source.join("a.txt"), b"a").unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		let file = owner.tree.file_id(&key("a.txt")).unwrap();
+		owner.set_state(file, FileState::Done(copied("a.txt")));
+
+		fs::rename(&source, dir.path().join("unplugged")).unwrap();
+		list(&mut owner, &RelPath::root(), true);
+
+		assert_eq!(owner.tree.file(file).record.state, FileState::Done(copied("a.txt")));
+		assert!(owner.scan.unreadable.contains_key(&FolderId::ROOT));
+		assert_eq!(owner.issues_view()[0].location, "the source folder");
+		assert!(!owner.tree.is_complete(FolderId::ROOT));
+	}
+
+	#[test]
+	fn a_deleted_folder_vanishes_through_its_parent_without_an_issue() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(source.join("Old")).unwrap();
+		fs::write(source.join("Old").join("a.txt"), b"a").unwrap();
+		let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		list_queued(&mut owner);
+		let file = owner.tree.file_id(&key("Old/a.txt")).unwrap();
+
+		fs::remove_dir_all(source.join("Old")).unwrap();
+		list(&mut owner, &key("Old"), false);
+
+		assert!(owner.scan.unreadable.is_empty());
+		assert_eq!(queued(&owner), [(RelPath::root(), false)]);
+		list_queued(&mut owner);
+		let old = owner.tree.folder_id(&key("Old")).unwrap();
+		assert!(owner.tree.folder(old).vanished);
+		assert!(owner.tree.file(file).removed);
+		let unreadable = updates.try_iter().any(|update| match update {
+			Update::Log(entry) => entry.message.contains("can't be read"),
+			Update::Notice(notice) => notice.text.contains("can't be read"),
+			_ => false,
+		});
+		assert!(!unreadable, "a deleted folder isn't reported as unreadable");
+	}
+
+	#[test]
+	fn a_burst_of_a_thousand_hints_lists_each_folder_once() {
+		const RUNAWAY: usize = 5_000;
+
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		for index in 0..1000 {
+			fs::create_dir_all(source.join("Big").join(format!("sub{index}"))).unwrap();
+		}
+
+		for index in 0..1000 {
+			owner.relist(key(&format!("Big/sub{index}")));
+		}
+		owner.relist(key("Big"));
+		assert_eq!(queued(&owner), [(RelPath::root(), false)]);
+
+		let mut listings = 0;
+		while let Some((folder, recursive)) = owner.scan.pop() {
+			list(&mut owner, &folder, recursive);
+			listings += 1;
+			if listings > RUNAWAY {
+				break;
+			}
+		}
+
+		assert_eq!(listings, 1 + 1 + 1000);
+	}
+
+	#[test]
+	fn a_folder_asked_for_again_keeps_its_place_and_becomes_recursive() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+
+		owner.scan.push(key("A"), false);
+		owner.scan.push(key("B"), false);
+		owner.scan.push(key("A"), true);
+		owner.scan.push(key("B"), false);
+
+		assert_eq!(queued(&owner), [(key("A"), true), (key("B"), false)]);
 	}
 }

@@ -160,7 +160,7 @@ impl Owner {
 		}
 
 		let present: HashSet<RelPath> = files.iter().map(|file| file.path.clone()).collect();
-		let report = complete::check(
+		let mut report = complete::check(
 			self.tree
 				.file_ids()
 				.map(|id| self.tree.file(id))
@@ -168,15 +168,22 @@ impl Owner {
 				.map(|file| (&file.key, &file.record.state)),
 			&present,
 		);
+		report.unreadable_folders = self.scan.unreadable.len() as u64;
 
 		self.log(LogKind::Action, format!("complete: {}", report.summary()));
 		for missing in report.missing.iter().take(LISTED_GAPS) {
 			self.log(LogKind::Action, format!("no archived file for {}", missing.display()));
 		}
-		if !report.is_clean() {
+		if !report.missing.is_empty() {
+			self.notice(NoticeLevel::Warning, files_without_an_archive(report.missing.len()));
+		}
+		if report.unreadable_folders > 0 {
 			self.notice(
 				NoticeLevel::Warning,
-				format!("{} source files have no archived file", report.missing.len()),
+				match report.unreadable_folders {
+					1 => "1 source folder can't be read, so the archive isn't complete".to_owned(),
+					count => format!("{count} source folders can't be read, so the archive isn't complete"),
+				},
 			);
 		}
 
@@ -194,11 +201,24 @@ impl Owner {
 	}
 }
 
+fn files_without_an_archive(count: usize) -> String {
+	match count {
+		1 => "1 source file has no archived file".to_owned(),
+		count => format!("{count} source files have no archived file"),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use crate::project::scanning::tests::{key, list, owner};
 
 	use super::*;
+
+	#[test]
+	fn gaps_are_counted_in_words() {
+		assert_eq!(files_without_an_archive(1), "1 source file has no archived file");
+		assert_eq!(files_without_an_archive(3), "3 source files have no archived file");
+	}
 
 	#[test]
 	fn a_folder_that_got_a_new_file_while_its_timestamps_were_set_stays_pending() {

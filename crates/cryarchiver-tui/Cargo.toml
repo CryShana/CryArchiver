@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+base64.workspace = true
 cryarchiver-engine = { path = "../cryarchiver-engine" }
 cryarchiver-project = { path = "../cryarchiver-project" }
 ratatui.workspace = true

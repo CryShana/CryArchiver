@@ -77,6 +77,9 @@ fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 		lines.push(counts_line(overall, cells, theme));
 	}
 	lines.push(outcomes_line(overall, cells, theme));
+	if overall.originals_deleted > 0 {
+		lines.push(deleted_line(overall, cells, theme));
+	}
 
 	let saved = saved_line(overall, cells, theme);
 	let spark_x = body.x + to_u16(saved.width()) + 2;
@@ -160,6 +163,21 @@ fn outcomes_line<'a>(overall: &Overall, cells: usize, theme: &Theme) -> Line<'a>
 	parts.line()
 }
 
+fn deleted_line<'a>(overall: &Overall, cells: usize, theme: &Theme) -> Line<'a> {
+	let mut parts = Parts::new(cells);
+	parts.group([
+		(cow("⊗ "), fg(theme.dim)),
+		(
+			cow(match overall.originals_deleted {
+				1 => "1 original deleted".to_owned(),
+				count => format!("{} originals deleted", thousands(count)),
+			}),
+			fg(theme.text),
+		),
+	]);
+	parts.line()
+}
+
 fn saved_line<'a>(overall: &Overall, cells: usize, theme: &Theme) -> Line<'a> {
 	let saved_percent = round_to_u32(overall.saved_fraction * 100.0);
 	let mut parts = Parts::new(cells);
@@ -205,7 +223,11 @@ fn closing_lines<'a>(overall: &Overall, cells: usize, theme: &Theme) -> Vec<Line
 
 fn render_workers(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	let workers = &view.workers;
-	let right = format!(" {} active · {} ", workers.jobs.len(), workers.slots);
+	let right = if workers.slots.is_empty() {
+		format!(" {} active ", workers.jobs.len())
+	} else {
+		format!(" {} active · {} ", workers.jobs.len(), workers.slots)
+	};
 	let chrome = Chrome {
 		title: "Workers",
 		right: Some(&right),
@@ -244,10 +266,11 @@ fn worker_line(buf: &mut Buffer, area: Rect, number: usize, job: &WorkerJob, the
 	let mut x = put(buf, area.x, y, &format!("#{number} "), fg(theme.dim), right);
 	x = put(buf, x, y, &fit(&job.codec, 5), bold(theme.accent), right);
 	x = put(buf, x, y, &fit_middle(&job.name, name_width), fg(theme.text), right);
-	let status = match (job.over_limit, job.work) {
-		(true, _) => "limit",
-		(false, WorkKind::Encode) => label(job.state),
-		(false, work) => work.label(),
+	let status = match (job.over_limit, job.work, &job.stage) {
+		(true, _, _) => "limit",
+		(false, WorkKind::Encode, Some(stage)) => stage.as_str(),
+		(false, WorkKind::Encode, None) => label(job.state),
+		(false, work, _) => work.label(),
 	};
 	x = put(buf, x + 1, y, &fit(status, 7), fg(state_color), right);
 
