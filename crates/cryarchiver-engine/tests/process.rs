@@ -13,6 +13,32 @@ fn tool(program: &str, args: &[&str], stall_timeout: Duration) -> ToolCommand {
 }
 
 #[tokio::test]
+async fn captured_output_past_the_limit_stops_the_tool() {
+	let mut cmd = tool(
+		"ffmpeg",
+		&[
+			"-hide_banner",
+			"-nostdin",
+			"-v",
+			"error",
+			"-f",
+			"lavfi",
+			"-i",
+			"color=size=64x64:duration=1",
+			"-f",
+			"rawvideo",
+			"-",
+		],
+		PATIENT,
+	);
+	cmd.capture_limit = Some(1000);
+
+	let result = run(&cmd, StdoutMode::Capture, |_| {}, &CancellationToken::new()).await;
+
+	assert!(matches!(result, Err(RunError::CaptureLimit(1000))), "{result:?}");
+}
+
+#[tokio::test]
 async fn reports_progress_until_end() {
 	let cmd = tool(
 		"ffmpeg",

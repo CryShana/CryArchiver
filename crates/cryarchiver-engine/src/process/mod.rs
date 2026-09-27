@@ -30,6 +30,7 @@ pub struct ToolCommand {
 	pub args: Vec<OsString>,
 	pub stall_timeout: Duration,
 	pub counted: &'static [&'static str],
+	pub capture_limit: Option<usize>,
 }
 
 impl ToolCommand {
@@ -39,6 +40,7 @@ impl ToolCommand {
 			args: Vec::new(),
 			stall_timeout,
 			counted: &[],
+			capture_limit: None,
 		}
 	}
 
@@ -89,6 +91,8 @@ pub enum RunError {
 	Stalled(Duration),
 	#[error("cancelled")]
 	Cancelled,
+	#[error("the tool wrote more than {0} bytes")]
+	CaptureLimit(usize),
 }
 
 pub async fn run(
@@ -127,6 +131,12 @@ pub async fn run(
 			Ok(Err(err)) => return Err(stop(child.as_mut(), RunError::Io(err)).await),
 			Ok(Ok(0)) => break child.wait().await.map_err(RunError::Io)?,
 			Ok(Ok(n)) if mode == StdoutMode::Capture => {
+				if let Some(limit) = cmd.capture_limit
+					&& captured.len() + n > limit
+				{
+					return Err(stop(child.as_mut(), RunError::CaptureLimit(limit)).await);
+				}
+
 				captured.extend_from_slice(&buf[..n]);
 				last_advance = Instant::now();
 			}

@@ -149,6 +149,10 @@ impl From<crate::process::RunError> for JobError {
 			RunError::Stalled(after) => ErrorKind::Stalled(after).into(),
 			RunError::Spawn(err) => ErrorKind::Toolchain(err.to_string()).into(),
 			RunError::Io(err) => ErrorKind::ToolCrashed(err.to_string()).into(),
+			RunError::CaptureLimit(limit) => ErrorKind::SourceDamaged(format!(
+				"the decoded image is larger than its header declares ({limit} bytes)"
+			))
+			.into(),
 		}
 	}
 }

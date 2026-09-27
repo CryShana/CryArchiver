@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::container::isobmff;
 use crate::images::blocking;
+use crate::images::plan::BOMB_PIXELS;
 use crate::metadata::icc::Cicp;
 use crate::metadata::{ImageFormat, SourceMetadata, exif, sniff};
 use crate::outcome::{ErrorKind, JobError, KeepReason};
@@ -115,7 +116,9 @@ pub async fn decode(
 				deep: source_pix_fmt.is_some_and(deep_pix_fmt),
 				keep_stored_orientation: true,
 			};
-			run_pam(&pam_command(&tools.ffmpeg, source, request), cancel).await?
+			let mut cmd = pam_command(&tools.ffmpeg, source, request);
+			cmd.capture_limit = Some(pam_capture_limit(header_dimensions(&bytes, None), request.deep));
+			run_pam(&cmd, cancel).await?
 		}
 	};
 
@@ -171,6 +174,17 @@ pub fn pam_command(ffmpeg: &Path, source: &Path, request: PamRequest) -> ToolCom
 	}
 	cmd.args(["-frames:v", "1", "-c:v", "pam", "-f", "image2pipe", "-"]);
 	cmd
+}
+
+// A PAM header is a few dozen bytes; the slack also covers a trailing newline some encoders add.
+const PAM_HEADER_SLACK: usize = 4096;
+
+pub fn pam_capture_limit(dimensions: Option<(u32, u32)>, deep: bool) -> usize {
+	let bytes_per_pixel: u64 = if deep { 8 } else { 4 };
+	let pixels = dimensions.map_or(BOMB_PIXELS, |(width, height)| u64::from(width) * u64::from(height));
+	usize::try_from(pixels.saturating_mul(bytes_per_pixel))
+		.unwrap_or(usize::MAX)
+		.saturating_add(PAM_HEADER_SLACK)
 }
 
 pub async fn run_pam(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<(DynamicImage, usize), JobError> {
