@@ -178,9 +178,11 @@ fn launch() -> Launch {
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
-	tokio::runtime::Runtime::new()
-		.expect("tokio runtime starts")
-		.block_on(future)
+	let runtime = tokio::runtime::Runtime::new().expect("tokio runtime starts");
+	let output = runtime.block_on(future);
+	// A cancelled image encode keeps running in its blocking thread; waiting for it would delay the exit.
+	runtime.shutdown_background();
+	output
 }
 
 fn opens_project(inputs: &[PathBuf]) -> bool {
@@ -306,7 +308,9 @@ async fn compress(args: CompressArgs) -> u8 {
 		})
 		.collect();
 	let parallel = args.jobs.unwrap_or_else(default_jobs).max(1);
-	let engine = Engine::new(tools).with_video_jobs(args.jobs.unwrap_or(1));
+	let engine = Engine::new(tools)
+		.with_video_jobs(args.jobs.unwrap_or(1))
+		.with_image_threads(image_threads(parallel));
 	let report = Report::new(args.quiet);
 
 	let totals = run_all(&Arc::new(engine), &sink, jobs, parallel, &report, &cancel).await;
@@ -441,6 +445,10 @@ fn cancel_on_ctrl_c(cancel: &CancellationToken) {
 			std::process::exit(130);
 		}
 	});
+}
+
+fn image_threads(parallel: usize) -> usize {
+	std::thread::available_parallelism().map_or(1, |cores| cores.get().div_ceil(parallel))
 }
 
 fn default_jobs() -> usize {
