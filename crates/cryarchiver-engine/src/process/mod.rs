@@ -1,3 +1,4 @@
+pub mod limits;
 mod lines;
 mod progress;
 
@@ -106,6 +107,7 @@ pub async fn run(
 	}
 
 	let mut child = spawn(cmd, mode).map_err(RunError::Spawn)?;
+	let _tracked = limits::track(child.id());
 	let mut stdout = child.stdout().take().expect("stdout is piped");
 	let stderr = tokio::spawn(collect_stderr(
 		child.stderr().take().expect("stderr is piped"),
@@ -190,7 +192,7 @@ fn spawn(cmd: &ToolCommand, mode: StdoutMode) -> io::Result<Box<dyn ChildWrapper
 			.stderr(Stdio::piped());
 
 		#[cfg(target_os = "linux")]
-		die_with_parent(command);
+		die_with_parent(command, limits::current().low_priority);
 	});
 	command.wrap(KillOnDrop);
 
@@ -209,7 +211,7 @@ fn spawn(cmd: &ToolCommand, mode: StdoutMode) -> io::Result<Box<dyn ChildWrapper
 // PR_SET_PDEATHSIG fires when the spawning *thread* exits, not the process: spawn children from the runtime's
 // long-lived worker threads, never from `spawn_blocking`.
 #[cfg(target_os = "linux")]
-fn die_with_parent(command: &mut tokio::process::Command) {
+fn die_with_parent(command: &mut tokio::process::Command, low_priority: bool) {
 	// SAFETY: getpid has no preconditions.
 	let parent = unsafe { libc::getpid() };
 
@@ -221,6 +223,10 @@ fn die_with_parent(command: &mut tokio::process::Command) {
 			// If the parent died before prctl ran, the death signal will never come.
 			if libc::getppid() != parent {
 				libc::_exit(1);
+			}
+
+			if low_priority {
+				limits::lower_this_process();
 			}
 			Ok(())
 		});
