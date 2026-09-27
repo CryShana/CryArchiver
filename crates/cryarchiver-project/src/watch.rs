@@ -146,6 +146,17 @@ pub fn check_ready(path: &Path, size: u64, modified_ns: i64, want_content: bool)
 		return ReadyCheck::Unreadable(err.to_string());
 	}
 
+	if u64::try_from(bytes.len()).ok() != Some(size.min(limit)) {
+		let meta = std::fs::metadata(path).ok();
+		return ReadyCheck::Changed {
+			size: meta.as_ref().map_or(0, std::fs::Metadata::len),
+			mtime_ns: meta
+				.and_then(|meta| meta.modified().ok())
+				.map(mtime_ns)
+				.unwrap_or_default(),
+		};
+	}
+
 	let class = media_class(size, &bytes);
 	let content = (want_content && size <= MAX_REFERENCE_BYTES).then_some(bytes);
 	ReadyCheck::Ready { class, content }
