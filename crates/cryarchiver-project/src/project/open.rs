@@ -145,19 +145,20 @@ impl Owner {
 	}
 
 	/// A re-archive into its own earlier output's place can find the old output there, with the same size, so only
-	/// the new content's hash proves the rename happened.
+	/// the new content's hash proves the rename happened. A file someone else put at the named path isn't ours either:
+	/// a recorded hash must match.
 	fn recover_commit(&mut self, file: FileId, output: Output, replaces: Option<&RelPath>) {
 		let target = self.destination_path(&output.path);
 		let hash_matches = |hash| full_hash(&target).is_ok_and(|found| found == hash);
 		let placed = match replaces {
 			Some(previous) if *previous == output.path => output.hash.is_some_and(hash_matches),
-			Some(_) => {
+			_ => {
 				fs::metadata(&target).is_ok_and(|meta| meta.len() == output.size)
 					&& output.hash.is_none_or(hash_matches)
 			}
-			None => fs::metadata(&target).is_ok_and(|meta| meta.len() == output.size),
 		};
 		if !placed {
+			self.release_intent_claim(file, &output.path);
 			self.set_state(file, FileState::Queued);
 			return;
 		}

@@ -202,6 +202,11 @@ impl JobContext {
 		};
 
 		loop {
+			if self.cancel.is_cancelled() {
+				discard_unplaced(&staged);
+				return Err(ErrorKind::Cancelled.into());
+			}
+
 			let (reply, answer) = oneshot::channel();
 			self.send(JobMessage::Commit {
 				staged: staged.clone(),

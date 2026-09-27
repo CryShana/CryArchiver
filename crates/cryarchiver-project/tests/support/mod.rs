@@ -33,6 +33,8 @@ pub enum Rule {
 	Fail(ErrorKind),
 	/// Runs until it is cancelled.
 	Hold,
+	/// Takes this long without looking at a cancel, then comes back as not media, so the job copies the source.
+	Slow(Duration),
 }
 
 #[derive(Default)]
@@ -112,6 +114,13 @@ impl Encode for FakeEncoder {
 					on_event(JobEvent::Stage(Stage::Encode));
 					cancel.cancelled().await;
 					JobOutcome::Failed(ErrorKind::Cancelled.into())
+				}
+				Rule::Slow(duration) => {
+					on_event(JobEvent::Stage(Stage::Encode));
+					tokio::time::sleep(duration).await;
+					JobOutcome::Skipped {
+						reason: "not media".into(),
+					}
 				}
 			};
 

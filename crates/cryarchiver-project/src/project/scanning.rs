@@ -202,11 +202,13 @@ impl Owner {
 	pub(super) fn source_changed(&mut self, file: FileId, size: u64, mtime_ns: i64) {
 		self.withdraw(file);
 		let old = &self.tree.file(file).record;
-		let replaces = old
-			.state
-			.output()
-			.map(|output| output.path.clone())
-			.or(old.replaces.clone());
+		let replaces = match &old.state {
+			FileState::Committing { .. } => old.replaces.clone(),
+			state => state
+				.output()
+				.map(|output| output.path.clone())
+				.or(old.replaces.clone()),
+		};
 		let record = FileRecord {
 			size,
 			mtime_ns,
@@ -243,6 +245,7 @@ impl Owner {
 
 	pub(super) fn forget_file(&mut self, file: FileId) {
 		self.withdraw(file);
+		self.release_all_claims(file);
 		let folder = self.tree.file(file).folder;
 		self.tree.remove_file(file);
 		self.track_issue(file);
@@ -293,6 +296,9 @@ impl Owner {
 			queue.remove(file);
 		}
 		self.pipeline.waits.forget(file);
+		self.pipeline.deferred.remove(&file);
+		self.pipeline.retries.remove(&file);
+		self.pipeline.retry_at.retain(|(_, waiting)| *waiting != file);
 		self.pipeline.chosen_copies.remove(&file);
 		self.leave_dedup(file);
 		self.forget_reference(file);
@@ -372,7 +378,7 @@ impl Owner {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
 	use std::fs;
 	use std::path::Path;
 	use std::pin::Pin;
@@ -419,7 +425,7 @@ mod tests {
 	}
 
 	/// An owner whose listings run only when the test lists a folder: nothing is spawned.
-	fn owner(source: &Path, destination: &Path) -> (Owner, Receiver<Update>) {
+	pub(crate) fn owner(source: &Path, destination: &Path) -> (Owner, Receiver<Update>) {
 		let project = create(source, destination, OsStr::new("archive"), |_| {}).unwrap();
 		let (store, meta, loaded) = Store::open(&project).unwrap();
 		let (updates, received) = channel();
@@ -438,7 +444,7 @@ mod tests {
 		)
 	}
 
-	fn list(owner: &mut Owner, folder: &RelPath, recursive: bool) {
+	pub(crate) fn list(owner: &mut Owner, folder: &RelPath, recursive: bool) {
 		let listing = scan::list_folder(&owner.settings.source, folder);
 		owner.scan.active += 1;
 		owner.on_listed(&listing, recursive);
@@ -450,7 +456,7 @@ mod tests {
 		}
 	}
 
-	fn key(path: &str) -> RelPath {
+	pub(crate) fn key(path: &str) -> RelPath {
 		RelPath::from_bytes(path.as_bytes().to_vec())
 	}
 

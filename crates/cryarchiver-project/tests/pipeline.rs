@@ -1,14 +1,16 @@
 mod support;
 
 use std::fs;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use cryarchiver_engine::outcome::ErrorKind;
-use cryarchiver_project::Command;
 use cryarchiver_project::issues::{Problem, Verb};
-use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How};
+use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How, Output};
 use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
 use cryarchiver_project::view::RowState;
+use cryarchiver_project::{Command, Fault};
 use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
 
 fn records(setup: &support::Setup) -> Vec<(String, FileRecord)> {
@@ -303,4 +305,138 @@ fn a_source_that_changes_while_its_job_runs_is_archived_again() {
 	let record = record(&setup, "long.jpg");
 	assert_eq!(record.size, 311);
 	assert!(matches!(record.state, FileState::Done(_)));
+}
+
+fn crash_after_the_intent(setup: &support::Setup, encoder: &std::sync::Arc<FakeEncoder>) -> Output {
+	let project = support::open_with(setup, encoder, Some(Fault::AfterCommitIntent));
+	let mut snapshot = Snapshot::default();
+	start(&project);
+	wait_for(&project, &mut snapshot, "the crash", |s| s.stopped);
+	drop(project);
+
+	match record(setup, "notes.txt").state {
+		FileState::Committing { output, .. } => output,
+		state => panic!("no intent: {state:?}"),
+	}
+}
+
+#[test]
+fn a_same_sized_file_found_at_the_named_path_after_a_crash_is_not_taken_for_the_output() {
+	let setup = setup(|_| {});
+	write(&setup.source, "notes.txt", b"our notes");
+	let encoder = FakeEncoder::new();
+	let intent = crash_after_the_intent(&setup, &encoder);
+	assert_eq!(intent.path.display(), "notes.txt");
+	write(&setup.destination, "notes.txt", b"not ours!");
+
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	wait_for(&project, &mut snapshot, "the scan", Snapshot::scan_complete);
+	drop(project);
+	assert_eq!(record(&setup, "notes.txt").state, FileState::Queued);
+
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+	drop(project);
+
+	assert_eq!(fs::read(setup.destination.join("notes.txt")).unwrap(), b"not ours!");
+	assert_eq!(fs::read(setup.destination.join("notes (2).txt")).unwrap(), b"our notes");
+	assert_eq!(
+		record(&setup, "notes.txt").state.output().unwrap().path.display(),
+		"notes (2).txt"
+	);
+}
+
+#[test]
+fn the_first_intent_already_avoids_a_name_something_occupies() {
+	let setup = setup(|_| {});
+	write(&setup.source, "notes.txt", b"our notes");
+	write(&setup.destination, "notes.txt", b"not ours!");
+	let encoder = FakeEncoder::new();
+
+	let intent = crash_after_the_intent(&setup, &encoder);
+
+	assert_eq!(intent.path.display(), "notes (2).txt");
+	assert_eq!(fs::read(setup.destination.join("notes.txt")).unwrap(), b"not ours!");
+}
+
+#[test]
+fn a_source_that_changes_under_a_slow_job_never_has_two_jobs_at_once() {
+	let setup = setup(|_| {});
+	let long = write(&setup.source, "long.jpg", &jpeg(1, 100));
+	let encoder = FakeEncoder::new();
+	encoder.rule("long.jpg", Rule::Slow(Duration::from_millis(500)));
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "the job", |s| !s.workers.is_empty());
+	fs::write(&long, jpeg(2, 300)).unwrap();
+	project.send(Command::Rescan);
+	wait_for(&project, &mut snapshot, "the re-archive", |s| {
+		complete(s) && s.root().bytes_in == 311 && s.workers.is_empty()
+	});
+	drop(project);
+
+	assert_eq!(encoder.peak.load(Ordering::SeqCst), 1);
+	assert_eq!(encoder.calls().len(), 2);
+	assert_eq!(fs::read(setup.destination.join("long.jpg")).unwrap(), jpeg(2, 300));
+	let record = record(&setup, "long.jpg");
+	assert_eq!(record.size, 311);
+	assert!(matches!(record.state, FileState::Done(_)));
+}
+
+#[test]
+fn stop_now_leaves_nothing_staged() {
+	let setup = setup(|_| {});
+	write(&setup.source, "slow.jpg", &jpeg(1, 100));
+	let encoder = FakeEncoder::new();
+	encoder.rule("slow.jpg", Rule::Slow(Duration::from_millis(300)));
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "the job", |s| !s.workers.is_empty());
+	project.send(Command::StopNow);
+	wait_for(&project, &mut snapshot, "the requeue", |s| s.workers.is_empty());
+	let staged = setup.destination.join(".cryarchiver").join("work").join("staged");
+	let leftovers = fs::read_dir(&staged).map_or(0, Iterator::count);
+	drop(project);
+
+	assert_eq!(leftovers, 0);
+	assert_eq!(record(&setup, "slow.jpg").state, FileState::Queued);
+	assert!(!setup.destination.join("slow.jpg").exists());
+}
+
+#[test]
+fn outputs_competing_for_one_name_are_numbered_in_turn() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.txt", b"copied as it is");
+	write(&setup.source, "a.dat", b"encoded one");
+	write(&setup.source, "a.bin", b"encoded two");
+	let encoder = FakeEncoder::new();
+	encoder.rule("a.dat", Rule::Encode("txt"));
+	encoder.rule("a.bin", Rule::Encode("txt"));
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+	drop(project);
+
+	let expected: [(&str, &[u8]); 3] = [
+		("a.txt", b"copied as it is"),
+		("a.dat", b"encoded a.dat"),
+		("a.bin", b"encoded a.bin"),
+	];
+	let mut names = Vec::new();
+	for (source, content) in expected {
+		let output = record(&setup, source).state.output().unwrap().path.display();
+		assert_eq!(fs::read(setup.destination.join(&output)).unwrap(), content, "{source}");
+		names.push(output);
+	}
+	names.sort();
+	assert_eq!(names, ["a (2).txt", "a (3).txt", "a.txt"]);
 }

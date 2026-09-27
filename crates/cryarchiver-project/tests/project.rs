@@ -26,6 +26,14 @@ fn copied(path: &str, size: u64) -> Output {
 	}
 }
 
+/// A copy that carries the hash of `content`, as a real commit's does.
+fn copy_of(path: &str, content: &[u8]) -> Output {
+	Output {
+		hash: Some(hash_of(content)),
+		..copied(path, content.len() as u64)
+	}
+}
+
 fn records(setup: &support::Setup) -> Vec<(String, FileRecord)> {
 	let (_, _, loaded) = Store::open(&setup.project).unwrap();
 	loaded
@@ -267,11 +275,12 @@ fn recovery_requeues_running_work_and_finishes_placed_commits() {
 				&record("running.txt", 1, FileState::InProgress { attempt: 1 }),
 			)
 			.unwrap();
-		for (name, size) in [("placed.txt", 2), ("lost.txt", 3)] {
+		for (name, content) in [("placed.txt", b"22".as_slice()), ("lost.txt", b"333")] {
 			let state = FileState::Committing {
 				attempt: 1,
-				output: copied(name, size),
+				output: copy_of(name, content),
 			};
+			let size = content.len() as u64;
 			store.write_intent(&key(name), &record(name, size, state)).unwrap();
 		}
 	}
@@ -279,7 +288,10 @@ fn recovery_requeues_running_work_and_finishes_placed_commits() {
 	drop(support::open(&setup, &FakeEncoder::new()));
 
 	assert_eq!(state_of(&setup, "running.txt"), FileState::Queued);
-	assert_eq!(state_of(&setup, "placed.txt"), FileState::Done(copied("placed.txt", 2)));
+	assert_eq!(
+		state_of(&setup, "placed.txt"),
+		FileState::Done(copy_of("placed.txt", b"22"))
+	);
 	assert_eq!(state_of(&setup, "lost.txt"), FileState::Queued);
 }
 

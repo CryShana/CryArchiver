@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,7 +19,7 @@ use super::jobs::{JobContext, JobMessage, Made, Target, Task};
 use super::owner::{Message, Owner};
 use crate::keys::RelPath;
 use crate::memory::MemoryBudget;
-use crate::record::{CopyReason, FailureLog, FileState, How, IssueKind, MediaClass, Output};
+use crate::record::{CopyReason, FailureLog, FileRecord, FileState, How, IssueKind, MediaClass, Output};
 use crate::references;
 use crate::run::Staged;
 use crate::schedule::{DiskGuard, Governor, GovernorConfig, Queue, Waits, Work, retry_delay};
@@ -46,8 +47,10 @@ pub(crate) struct Pipeline {
 	pub(super) queues: HashMap<Work, Queue>,
 	pub(super) waits: Waits,
 	pub(super) retry_at: BTreeSet<(Instant, FileId)>,
-	retries: HashMap<FileId, u32>,
+	pub(super) retries: HashMap<FileId, u32>,
 	pub(super) jobs: HashMap<FileId, RunningJob>,
+	/// Files ready to start again while their earlier job still winds down; they start once it has finished.
+	pub(super) deferred: HashSet<FileId>,
 	pub(super) governor: Governor,
 	pub(super) encoder: Arc<dyn Encode>,
 	pub(super) memory: Arc<MemoryBudget>,
@@ -76,6 +79,7 @@ impl Pipeline {
 			retry_at: BTreeSet::new(),
 			retries: HashMap::new(),
 			jobs: HashMap::new(),
+			deferred: HashSet::new(),
 			governor: Governor::new(config),
 			encoder,
 			memory,
@@ -233,6 +237,11 @@ impl Owner {
 	fn start_job(&mut self, file: FileId, work: Work, now: Instant) {
 		let entry = self.tree.file(file);
 		if entry.removed || entry.record.state != FileState::Queued {
+			return;
+		}
+
+		if self.pipeline.jobs.contains_key(&file) {
+			self.pipeline.deferred.insert(file);
 			return;
 		}
 
@@ -404,8 +413,8 @@ impl Owner {
 		})
 	}
 
-	/// The output is in place. A file whose source changed or vanished meanwhile keeps the state that change gave it:
-	/// a change already names this output as the one its re-archive replaces.
+	/// The output is in place, and only now proven ours. A file whose source changed meanwhile keeps the state that
+	/// change gave it, and its re-archive replaces this output; a file whose source vanished keeps it as `SourceGone`.
 	fn placed(&mut self, file: FileId) {
 		let Some(output) = self.pipeline.jobs.get_mut(&file).and_then(|job| job.pending.take()) else {
 			return;
@@ -415,10 +424,10 @@ impl Owner {
 		}
 
 		let entry = self.tree.file(file);
-		if entry.removed || !matches!(entry.record.state, FileState::Committing { .. }) {
-			return;
-		}
-
+		let (removed, committing) = (
+			entry.removed,
+			matches!(entry.record.state, FileState::Committing { .. }),
+		);
 		let previous = entry.record.replaces.clone();
 		if let Some(previous) =
 			previous.filter(|previous| *previous != output.path && !self.claimed_by_other(file, previous))
@@ -427,12 +436,42 @@ impl Owner {
 			self.remove_replaced_output(&previous, &output.path);
 		}
 
+		if removed {
+			self.placed_after_removal(file, output);
+			return;
+		}
+
 		let mut record = self.tree.file(file).record.clone();
+		if !committing {
+			record.replaces = Some(output.path);
+			self.tree.set_record(file, record);
+			self.save_file(file);
+			return;
+		}
+
 		record.replaces = None;
 		self.tree.set_record(file, record);
 		self.pipeline.retries.remove(&file);
 		self.set_state(file, FileState::Done(output));
 		self.file_settled(file);
+	}
+
+	/// The file left the project because its source vanished during the rename: the output stays, tracked.
+	fn placed_after_removal(&mut self, file: FileId, output: Output) {
+		self.claim(file, &output.path);
+
+		let entry = self.tree.file(file);
+		let (folder, name) = (entry.folder, entry.name.clone());
+		let record = FileRecord {
+			replaces: None,
+			state: FileState::SourceGone(output),
+			..entry.record.clone()
+		};
+		self.tree.add_file(folder, &name, record);
+		self.track_issue(file);
+		self.save_file(file);
+		self.touch_file(file);
+		self.file_added(file);
 	}
 
 	/// A file became Done or was resolved: whatever waited for it may go on.
@@ -459,6 +498,13 @@ impl Owner {
 		let folder = self.tree.file(file).folder;
 		self.release_claim(file, &output.path);
 		self.pipeline.taken.insert((folder, collision_key(&output.path.name())));
+
+		let mut record = self.tree.file(file).record.clone();
+		if record.replaces.as_ref() == Some(&output.path) {
+			record.replaces = None;
+			self.tree.set_record(file, record);
+			self.save_file(file);
+		}
 	}
 
 	fn job_finished(&mut self, file: FileId, result: Result<(), JobError>) {
@@ -471,6 +517,14 @@ impl Owner {
 			self.pipeline.governor.set_video_waiting(false);
 		}
 		self.pipeline.workers_dirty = true;
+
+		if let Some(abandoned) = &job.pending {
+			self.release_intent_claim(file, &abandoned.path);
+		}
+
+		if self.pipeline.deferred.remove(&file) {
+			self.released(file);
+		}
 
 		let still_ours = matches!(
 			self.tree.file(file).record.state,
@@ -592,9 +646,11 @@ impl Owner {
 		}
 	}
 
-	/// The destination path for a file's output, avoiding names other files already hold.
-	fn output_path(&self, file: FileId, made: &Made) -> RelPath {
+	/// The destination path for a file's output, avoiding names other files hold and names something already occupies
+	/// in the destination, unless that is the file's own earlier output.
+	fn output_path(&mut self, file: FileId, made: &Made) -> RelPath {
 		let entry = self.tree.file(file);
+		let (folder, replaces) = (entry.folder, entry.record.replaces.clone());
 		let base = match made {
 			Made::Encoded { extension }
 			| Made::Moved {
@@ -610,18 +666,25 @@ impl Owner {
 			Made::Placeholder { .. } => placeholder_name(&entry.name),
 		};
 
+		let destination = self.destination_folder(folder);
 		let mut candidate = base.clone();
 		for number in 2.. {
-			let key = (entry.folder, collision_key(&candidate));
+			let key = (folder, collision_key(&candidate));
 			let held = self.pipeline.claims.get(&key).is_some_and(|holder| *holder != file);
 			if !held && !self.pipeline.taken.contains(&key) {
-				break;
+				let path = destination.join(&candidate);
+				let occupied = fs::symlink_metadata(self.destination_path(&path)).is_ok();
+				if !occupied || replaces.as_ref() == Some(&path) {
+					break;
+				}
+
+				self.pipeline.taken.insert(key);
 			}
 
 			candidate = numbered(&base, number);
 		}
 
-		self.destination_folder(entry.folder).join(&candidate)
+		destination.join(&candidate)
 	}
 
 	/// The mirrored folder: every name mapped to one the destination can hold.
@@ -650,6 +713,17 @@ impl Owner {
 			self.pipeline.claims.remove(&key);
 		}
 	}
+
+	/// An intent that never placed its output gives its name back, unless the file's own earlier output is there.
+	pub(super) fn release_intent_claim(&mut self, file: FileId, path: &RelPath) {
+		if self.tree.file(file).record.replaces.as_ref() != Some(path) {
+			self.release_claim(file, path);
+		}
+	}
+
+	pub(super) fn release_all_claims(&mut self, file: FileId) {
+		self.pipeline.claims.retain(|_, holder| *holder != file);
+	}
 }
 
 fn issue_kind(kind: &ErrorKind) -> IssueKind {
@@ -670,4 +744,296 @@ fn numbered(name: &OsString, number: u32) -> OsString {
 		None => format!("{stem} ({number})"),
 	};
 	destination_name(std::ffi::OsStr::new(&numbered))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::PathBuf;
+	use std::sync::mpsc::Receiver;
+	use std::time::Duration;
+
+	use tokio::sync::oneshot;
+
+	use super::*;
+	use crate::project::scanning::tests::{key, list, owner};
+	use crate::record::Hash;
+	use crate::view::Update;
+
+	struct Fixture {
+		_dir: tempfile::TempDir,
+		owner: Owner,
+		_updates: Receiver<Update>,
+		file: FileId,
+	}
+
+	impl Fixture {
+		fn new(content: &[u8]) -> Self {
+			let dir = tempfile::tempdir().unwrap();
+			let source = dir.path().join("source");
+			fs::create_dir_all(&source).unwrap();
+			fs::write(source.join("notes.txt"), content).unwrap();
+
+			let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
+			list(&mut owner, &RelPath::root(), true);
+			let file = owner.tree.file_id(&key("notes.txt")).unwrap();
+			let mut fixture = Self {
+				_dir: dir,
+				owner,
+				_updates: updates,
+				file,
+			};
+			fixture.queue();
+			fixture
+		}
+
+		fn source(&self) -> PathBuf {
+			self.owner.settings.source.join("notes.txt")
+		}
+
+		fn destination(&self, name: &str) -> PathBuf {
+			self.owner.settings.destination.join(name)
+		}
+
+		fn change_source(&mut self, content: &[u8]) {
+			fs::write(self.source(), content).unwrap();
+			list(&mut self.owner, &RelPath::root(), false);
+		}
+
+		fn remove_source(&mut self) {
+			fs::remove_file(self.source()).unwrap();
+			list(&mut self.owner, &RelPath::root(), false);
+		}
+
+		fn queue(&mut self) {
+			self.owner.on_ready_checked(
+				self.file,
+				ReadyCheck::Ready {
+					class: MediaClass::Other,
+					content: None,
+				},
+			);
+		}
+
+		/// What `start_job` does, without spawning the job.
+		fn running(&mut self) -> CancellationToken {
+			let cancel = CancellationToken::new();
+			for queue in self.owner.pipeline.queues.values_mut() {
+				queue.remove(self.file);
+			}
+
+			self.owner.pipeline.governor.started(Work::Copy, Instant::now());
+			self.owner.pipeline.jobs.insert(
+				self.file,
+				RunningJob {
+					work: Work::Copy,
+					attempt: 1,
+					cancel: cancel.clone(),
+					fraction: 0.0,
+					stage: None,
+					video_waiting: false,
+					requeue: false,
+					pending: None,
+				},
+			);
+			self.owner.set_state(self.file, FileState::InProgress { attempt: 1 });
+			cancel
+		}
+
+		fn commit(&mut self, content: &[u8]) -> Option<Target> {
+			let (reply, answer) = oneshot::channel();
+			let staged = Staged {
+				path: PathBuf::from("staged"),
+				size: content.len() as u64,
+				hash: Hash(*blake3::hash(content).as_bytes()),
+			};
+
+			self.owner.on_job(
+				self.file,
+				JobMessage::Commit {
+					staged,
+					made: Made::Copied(CopyReason::NotMedia),
+					reply,
+				},
+			);
+			answer.blocking_recv().unwrap()
+		}
+
+		fn job(&mut self, message: JobMessage) {
+			self.owner.on_job(self.file, message);
+		}
+
+		fn claims(&self) -> usize {
+			self.owner
+				.pipeline
+				.claims
+				.values()
+				.filter(|holder| **holder == self.file)
+				.count()
+		}
+
+		fn record(&self) -> &FileRecord {
+			&self.owner.tree.file(self.file).record
+		}
+	}
+
+	fn place(target: &Target, content: &[u8]) {
+		fs::create_dir_all(target.path.parent().unwrap()).unwrap();
+		fs::write(&target.path, content).unwrap();
+	}
+
+	fn cancelled() -> JobMessage {
+		JobMessage::Finished(Err(ErrorKind::Cancelled.into()))
+	}
+
+	fn failed(kind: ErrorKind) -> JobMessage {
+		JobMessage::Finished(Err(kind.into()))
+	}
+
+	#[test]
+	fn a_source_change_before_taken_never_costs_the_unknown_file_its_place() {
+		let mut fixture = Fixture::new(b"first");
+		fixture.running();
+		let first = fixture.commit(b"first").unwrap();
+		assert_eq!(first.path, fixture.destination("notes.txt"));
+
+		fs::write(&first.path, b"someone else's").unwrap();
+		fixture.change_source(b"second version");
+		fixture.job(JobMessage::Taken);
+		fixture.job(cancelled());
+		assert_eq!(fixture.record().replaces, None);
+
+		fixture.queue();
+		fixture.running();
+		let second = fixture.commit(b"second version").unwrap();
+		assert_eq!(second.path, fixture.destination("notes (2).txt"));
+		assert_eq!(second.replaces, None);
+		place(&second, b"second version");
+		fixture.job(JobMessage::Placed);
+
+		assert_eq!(fs::read(&first.path).unwrap(), b"someone else's");
+		assert!(matches!(fixture.record().state, FileState::Done(_)));
+	}
+
+	#[test]
+	fn an_output_placed_while_its_source_changed_is_replaced_by_the_re_archive() {
+		let mut fixture = Fixture::new(b"first");
+		fixture.running();
+		let first = fixture.commit(b"first").unwrap();
+
+		fixture.change_source(b"second version");
+		place(&first, b"first");
+		fixture.job(JobMessage::Placed);
+		fixture.job(JobMessage::Finished(Ok(())));
+		assert_eq!(fixture.record().replaces, Some(key("notes.txt")));
+		assert_eq!(fixture.record().state, FileState::Discovered);
+
+		fixture.queue();
+		fixture.running();
+		let again = fixture.commit(b"second version").unwrap();
+		assert_eq!(again.path, fixture.destination("notes.txt"));
+		assert_eq!(again.replaces, Some(fixture.destination("notes.txt")));
+	}
+
+	#[test]
+	fn a_file_ready_again_starts_only_once_its_earlier_job_finished() {
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		let _entered = runtime.enter();
+		let mut fixture = Fixture::new(b"first");
+		let mut inbox = fixture.owner.inbox.take().unwrap();
+		fixture.owner.started = true;
+		fixture.owner.paused = false;
+
+		let earlier = fixture.running();
+		fixture.change_source(b"second version");
+		assert!(earlier.is_cancelled());
+		fixture.queue();
+		fixture.owner.start_jobs(Instant::now());
+		assert_eq!(fixture.owner.pipeline.governor.total(), 1);
+		assert_eq!(fixture.record().state, FileState::Queued);
+
+		fixture.job(cancelled());
+		assert_eq!(fixture.owner.pipeline.governor.total(), 0);
+		fixture.owner.start_jobs(Instant::now());
+		assert_eq!(fixture.owner.pipeline.governor.total(), 1);
+		while !fixture.owner.pipeline.jobs.is_empty() {
+			let message = runtime
+				.block_on(tokio::time::timeout(Duration::from_secs(20), inbox.recv()))
+				.unwrap()
+				.unwrap();
+			if let Message::Job(file, message) = message {
+				fixture.owner.on_job(file, message);
+			}
+		}
+
+		assert_eq!(fixture.owner.pipeline.governor.total(), 0);
+		assert!(matches!(fixture.record().state, FileState::Done(_)));
+		assert_eq!(fs::read(fixture.destination("notes.txt")).unwrap(), b"second version");
+	}
+
+	#[test]
+	fn a_changed_source_starts_its_retries_afresh() {
+		let mut fixture = Fixture::new(b"first");
+		fixture.owner.pipeline.retries.insert(fixture.file, 2);
+		fixture
+			.owner
+			.pipeline
+			.retry_at
+			.insert((Instant::now() + Duration::from_mins(1), fixture.file));
+
+		fixture.change_source(b"second version");
+
+		assert!(!fixture.owner.pipeline.retries.contains_key(&fixture.file));
+		assert!(fixture.owner.pipeline.retry_at.is_empty());
+	}
+
+	#[test]
+	fn abandoned_intents_give_their_names_back() {
+		let mut fixture = Fixture::new(b"first");
+
+		fixture.running();
+		fixture.commit(b"first").unwrap();
+		assert_eq!(fixture.claims(), 1);
+		fixture.job(failed(ErrorKind::DestinationIo("gone".into())));
+		assert_eq!(fixture.record().state, FileState::Queued);
+		assert_eq!(fixture.claims(), 0, "a failed rename");
+
+		fixture.running();
+		fixture.commit(b"first").unwrap();
+		fixture.job(failed(ErrorKind::EncodeFailed("broken".into())));
+		assert!(matches!(fixture.record().state, FileState::Issue { .. }));
+		assert_eq!(fixture.claims(), 0, "an issue");
+
+		let cancel = fixture.running();
+		fixture.commit(b"first").unwrap();
+		cancel.cancel();
+		fixture.job(JobMessage::Taken);
+		assert!(fixture.commit(b"first").is_none());
+		fixture.job(cancelled());
+		assert_eq!(fixture.claims(), 0, "a cancel between intents");
+
+		fixture.running();
+		fixture.commit(b"first").unwrap();
+		fixture.remove_source();
+		assert!(fixture.owner.tree.file(fixture.file).removed);
+		assert_eq!(fixture.claims(), 0, "a forgotten file");
+	}
+
+	#[test]
+	fn an_output_placed_after_its_source_vanished_stays_tracked() {
+		let mut fixture = Fixture::new(b"first");
+		fixture.running();
+		let target = fixture.commit(b"first").unwrap();
+
+		fixture.remove_source();
+		place(&target, b"first");
+		fixture.job(JobMessage::Placed);
+		fixture.job(JobMessage::Finished(Ok(())));
+
+		assert!(!fixture.owner.tree.file(fixture.file).removed);
+		let FileState::SourceGone(output) = &fixture.record().state else {
+			panic!("not kept: {:?}", fixture.record().state)
+		};
+		assert_eq!(output.path, key("notes.txt"));
+		assert_eq!(fixture.claims(), 1);
+	}
 }
