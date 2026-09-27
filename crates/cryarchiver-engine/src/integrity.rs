@@ -8,6 +8,9 @@ const DOC_TYPE_ID: [u8; 2] = [0x42, 0x82];
 const DOC_TYPES: &[&[u8]] = &[b"matroska", b"webm"];
 const MAX_EBML_HEADER: u64 = 4096;
 const ISOBMFF_LEADS: &[&[u8; 4]] = &[b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"pnot"];
+const STILL_IMAGE_BRANDS: &[&[u8; 4]] = &[b"avif", b"heic", b"heix", b"heim", b"heis", b"mif1"];
+const SEQUENCE_BRANDS: &[&[u8; 4]] = &[b"avis", b"msf1", b"hevs"];
+const MAX_FTYP: u64 = 256;
 
 pub fn find_damage(path: &Path) -> io::Result<Option<String>> {
 	let mut file = File::open(path)?;
@@ -30,6 +33,8 @@ pub fn find_damage(path: &Path) -> io::Result<Option<String>> {
 fn isobmff_damage(file: &mut File, len: u64) -> io::Result<Option<String>> {
 	let mut offset = 0;
 	let mut has_moov = false;
+	let mut has_meta = false;
+	let mut brands = Vec::new();
 
 	while len - offset >= 8 {
 		file.seek(SeekFrom::Start(offset))?;
@@ -59,11 +64,34 @@ fn isobmff_damage(file: &mut File, len: u64) -> io::Result<Option<String>> {
 			)));
 		}
 
+		if kind == b"ftyp" && offset == 0 {
+			brands = read_brands(file, size.min(MAX_FTYP))?;
+		}
 		has_moov |= kind == b"moov";
+		has_meta |= kind == b"meta";
 		offset = end;
 	}
 
+	let brand = |set: &[&[u8; 4]]| brands.iter().any(|brand| set.contains(&brand));
+	if brand(STILL_IMAGE_BRANDS) && !brand(SEQUENCE_BRANDS) {
+		return Ok((!has_meta).then(|| "no 'meta' box".to_owned()));
+	}
 	Ok((!has_moov).then(|| "no 'moov' box".to_owned()))
+}
+
+fn read_brands(file: &mut File, ftyp_size: u64) -> io::Result<Vec<[u8; 4]>> {
+	file.seek(SeekFrom::Start(8))?;
+	let mut payload = vec![0u8; usize::try_from(ftyp_size.saturating_sub(8)).expect("at most MAX_FTYP")];
+	let read = read_up_to(file, &mut payload)?;
+	payload.truncate(read);
+
+	let mut brands: Vec<[u8; 4]> = payload
+		.get(..4)
+		.and_then(|major| major.try_into().ok())
+		.into_iter()
+		.collect();
+	brands.extend(payload.get(8..).unwrap_or_default().as_chunks::<4>().0.iter().copied());
+	Ok(brands)
 }
 
 fn matroska_damage(file: &mut File, len: u64) -> io::Result<Option<String>> {

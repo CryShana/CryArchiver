@@ -431,6 +431,7 @@ dependencies = [
  "avif-serialize",
  "brotli-decompressor",
  "clap",
+ "crc32fast",
  "directories",
  "infer",
  "libc",

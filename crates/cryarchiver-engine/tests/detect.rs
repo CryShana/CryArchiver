@@ -4,6 +4,42 @@ use cryarchiver_engine::detect::{MediaClass, detect};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn raw_camera_files_are_kept_without_probing() {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("DSC_0001.nef");
+	std::fs::write(&path, b"II*\0\x08\0\0\0\0\0\0\0\0\0").unwrap();
+	let tools = support::toolchain().await;
+
+	let detection = detect(&tools, &path, &CancellationToken::new()).await.unwrap();
+
+	assert!(matches!(detection.class, MediaClass::Kept(reason) if reason.contains("RAW")));
+}
+
+#[tokio::test]
+async fn animated_png_is_an_animated_image() {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("anim.apng");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=32x32:d=0.5:r=10",
+		"-f",
+		"apng",
+		path.to_str().unwrap(),
+	]);
+	let tools = support::toolchain().await;
+
+	let detection = detect(&tools, &path, &CancellationToken::new()).await.unwrap();
+
+	assert!(
+		matches!(detection.class, MediaClass::AnimatedImage(_)),
+		"{:?}",
+		detection.class
+	);
+}
+
+#[tokio::test]
 async fn plain_text_named_mp3_is_other() {
 	let dir = tempfile::tempdir().unwrap();
 	let path = dir.path().join("notes.mp3");

@@ -28,6 +28,18 @@ const TEXT_LIKE_FORMATS: &[&str] = &[
 	"vplayer",
 	"aqtitle",
 ];
+const RAW_EXTENSIONS: &[&str] = &[
+	"nef", "nrw", "cr2", "cr3", "arw", "srf", "sr2", "dng", "orf", "rw2", "raf", "pef", "srw", "x3f", "3fr", "iiq",
+	"erf", "mef", "mos",
+];
+const LAYERED_EXTENSIONS: &[&str] = &["psd", "psb", "xcf", "kra", "ora"];
+const VECTOR_EXTENSIONS: &[&str] = &["svg", "svgz"];
+const ICON_EXTENSIONS: &[&str] = &["ico", "cur"];
+const ICON_MIME_TYPES: &[&str] = &["image/vnd.microsoft.icon", "image/x-icon"];
+const TEXTURE_SIGNATURES: &[&[u8]] = &[b"DDS ", b"\xABKTX 11\xBB", b"\xABKTX 20\xBB"];
+const FLOAT_SIGNATURES: &[&[u8]] = &[&[0x76, 0x2F, 0x31, 0x01], b"#?RADIANCE", b"#?RGBE"];
+const ANIMATED_FORMATS: &[&str] = &["apng", "webp_anim"];
+const ANIMATED_CODECS: &[&str] = &["jpegxl_anim"];
 // Any unreadable signature not listed here must stay Damaged: archival mode copies Other files as they are.
 const UNSUPPORTED_MIME_TYPES: &[&str] = &[
 	"audio/midi",
@@ -43,6 +55,7 @@ pub enum MediaClass {
 	Audio(MediaInfo),
 	StillImage(MediaInfo),
 	AnimatedImage(MediaInfo),
+	Kept(String),
 	Damaged(String),
 	Other(String),
 }
@@ -56,6 +69,17 @@ pub struct Detection {
 
 pub async fn detect(tools: &Toolchain, path: &Path, cancel: &CancellationToken) -> Result<Detection, JobError> {
 	let (meta, header) = read_header(path).map_err(|err| JobError::io(IoSide::Source(path), &err))?;
+
+	if meta.len() > 0
+		&& let Some(reason) = never_transcoded(path, &header)
+	{
+		return Ok(Detection {
+			meta,
+			class: MediaClass::Kept(reason),
+			probe_log: Vec::new(),
+		});
+	}
+
 	if let Some(class) = classify_header(meta.len(), &header) {
 		return Ok(Detection {
 			meta,
@@ -84,6 +108,35 @@ pub fn read_header(path: &Path) -> io::Result<(Metadata, Vec<u8>)> {
 	let mut header = Vec::new();
 	file.take(HEADER_BYTES).read_to_end(&mut header)?;
 	Ok((meta, header))
+}
+
+pub fn never_transcoded(path: &Path, header: &[u8]) -> Option<String> {
+	let extension = path
+		.extension()
+		.map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+		.unwrap_or_default();
+	let extension = extension.as_str();
+	let mime = infer::get(header).map(|kind| kind.mime_type());
+
+	let kind = if RAW_EXTENSIONS.contains(&extension) {
+		"RAW camera"
+	} else if header.starts_with(b"8BPS") || header.starts_with(b"gimp xcf") || LAYERED_EXTENSIONS.contains(&extension)
+	{
+		"layered image"
+	} else if VECTOR_EXTENSIONS.contains(&extension) {
+		"vector image"
+	} else if mime.is_some_and(|mime| ICON_MIME_TYPES.contains(&mime))
+		|| (ICON_EXTENSIONS.contains(&extension) && matches!(header, [0, 0, 1 | 2, 0, ..]))
+	{
+		"icon"
+	} else if TEXTURE_SIGNATURES.iter().any(|signature| header.starts_with(signature)) {
+		"GPU texture"
+	} else if FLOAT_SIGNATURES.iter().any(|signature| header.starts_with(signature)) {
+		"floating-point HDR image"
+	} else {
+		return None;
+	};
+	Some(format!("{kind} files are never converted"))
 }
 
 pub fn classify_header(size: u64, header: &[u8]) -> Option<MediaClass> {
@@ -124,7 +177,12 @@ pub fn classify(header: &[u8], info: Option<MediaInfo>) -> MediaClass {
 	}
 
 	if image_magic {
-		let animated = info.format.duration.is_some_and(|duration| duration > 0.05);
+		let animated = ANIMATED_FORMATS.contains(&format)
+			|| info
+				.streams
+				.iter()
+				.any(|stream| ANIMATED_CODECS.contains(&stream.codec_name.as_str()))
+			|| info.format.duration.is_some_and(|duration| duration > 0.05);
 		return if animated {
 			MediaClass::AnimatedImage(info)
 		} else {
@@ -232,6 +290,55 @@ mod tests {
 		assert!(matches!(classify(PNG, png), MediaClass::StillImage(_)));
 		assert!(matches!(classify(b"GIF89a\x40\x01", gif), MediaClass::AnimatedImage(_)));
 		assert!(matches!(classify(HEIC, heic), MediaClass::StillImage(_)));
+	}
+
+	#[test]
+	fn apng_and_animated_webp_are_animated_without_a_duration() {
+		let apng = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"apng"}],"format":{"format_name":"apng"}}"#,
+		);
+		let webp = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"webp_anim"}],"format":{"format_name":"webp_anim"}}"#,
+		);
+		let still_webp = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"webp"}],"format":{"format_name":"webp_pipe"}}"#,
+		);
+
+		assert!(matches!(classify(PNG, apng), MediaClass::AnimatedImage(_)));
+		assert!(matches!(
+			classify(b"RIFF\0\0\0\0WEBPVP8X", webp),
+			MediaClass::AnimatedImage(_)
+		));
+		assert!(matches!(
+			classify(b"RIFF\0\0\0\0WEBPVP8 ", still_webp),
+			MediaClass::StillImage(_)
+		));
+	}
+
+	#[test]
+	fn never_transcoded_images_are_recognised_by_extension_or_signature() {
+		let tiff = b"II*\0\x08\0\0\0";
+		let never = |name: &str, header: &[u8]| never_transcoded(std::path::Path::new(name), header);
+
+		assert_eq!(
+			never("DSC_0001.NEF", tiff).as_deref(),
+			Some("RAW camera files are never converted")
+		);
+		assert!(never("art.png", b"8BPS\0\x01").unwrap().contains("layered"));
+		assert!(never("logo.svg", b"<?xml version").unwrap().contains("vector"));
+		assert!(
+			never("favicon.ico", &[0, 0, 1, 0, 1, 0, 16, 16])
+				.unwrap()
+				.contains("icon")
+		);
+		assert!(never("normal.dds", b"DDS \x7c\0\0\0").unwrap().contains("texture"));
+		assert!(
+			never("sky.exr", &[0x76, 0x2F, 0x31, 0x01, 2, 0, 0, 0])
+				.unwrap()
+				.contains("floating-point")
+		);
+		assert_eq!(never("photo.tif", tiff), None);
+		assert_eq!(never("photo.png", PNG), None);
 	}
 
 	#[test]

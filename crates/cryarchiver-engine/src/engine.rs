@@ -176,6 +176,11 @@ impl Engine {
 			MediaClass::StillImage(_) | MediaClass::AnimatedImage(_) => {
 				return Ok(skipped("image support is not implemented yet"));
 			}
+			MediaClass::Kept(reason) => {
+				return Ok(JobOutcome::KeptOriginal {
+					reason: KeepReason::Unsupported(reason),
+				});
+			}
 			MediaClass::Damaged(reason) => return Err(JobError::with_log(ErrorKind::SourceDamaged(reason), probe_log)),
 			MediaClass::Other(reason) => return Ok(JobOutcome::Skipped { reason }),
 		};

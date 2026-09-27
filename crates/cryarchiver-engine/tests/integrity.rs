@@ -60,6 +60,50 @@ fn truncated_boxes_and_missing_moov_are_damage() {
 	);
 }
 
+fn ftyp(major: [u8; 4], compatible: &[[u8; 4]]) -> Vec<u8> {
+	let mut payload = major.to_vec();
+	payload.extend_from_slice(&[0; 4]);
+	for brand in compatible {
+		payload.extend_from_slice(brand);
+	}
+	let mut bytes = u32::try_from(payload.len() + 8).unwrap().to_be_bytes().to_vec();
+	bytes.extend_from_slice(b"ftyp");
+	bytes.extend(payload);
+	bytes
+}
+
+#[test]
+fn still_images_need_meta_and_sequences_need_moov() {
+	let dir = tempfile::tempdir().unwrap();
+	let avif = [
+		ftyp(*b"avif", &[*b"mif1", *b"miaf"]),
+		mp4_box(b"meta", 64),
+		mp4_box(b"mdat", 100),
+	]
+	.concat();
+	let heic_without_meta = [ftyp(*b"heic", &[*b"mif1"]), mp4_box(b"mdat", 100)].concat();
+	let sequence_without_moov = [
+		ftyp(*b"avis", &[*b"avif", *b"msf1"]),
+		mp4_box(b"meta", 64),
+		mp4_box(b"mdat", 100),
+	]
+	.concat();
+
+	assert_eq!(find_damage(&write(dir.path(), "a.avif", &avif)).unwrap(), None);
+	assert_eq!(
+		find_damage(&write(dir.path(), "a.heic", &heic_without_meta))
+			.unwrap()
+			.as_deref(),
+		Some("no 'meta' box")
+	);
+	assert_eq!(
+		find_damage(&write(dir.path(), "seq.avif", &sequence_without_moov))
+			.unwrap()
+			.as_deref(),
+		Some("no 'moov' box")
+	);
+}
+
 #[test]
 fn a_last_box_running_to_the_end_of_file_is_fine() {
 	let dir = tempfile::tempdir().unwrap();
