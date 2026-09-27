@@ -3,13 +3,16 @@
 //! until those jobs end or the user restarts them.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Instant;
 
 use cryarchiver_engine::commit::free_space;
+use cryarchiver_engine::detect::read_header;
 use cryarchiver_engine::process::limits::{self, Applied, Limits};
+use infer::MatcherType;
 
 use super::owner::Owner;
-use crate::schedule::{least_progress_first, space_estimate};
+use crate::schedule::{Work, least_progress_first, space_estimate};
 use crate::settings::SettingsChange;
 use crate::tree::{FileId, FolderId};
 use crate::view::{LogKind, NoticeLevel, Update};
@@ -17,7 +20,8 @@ use crate::view::{LogKind, NoticeLevel, Update};
 #[derive(Debug)]
 pub(crate) struct LiveState {
 	pub(super) applied: Applied,
-	/// Jobs that started before the image thread count last changed; they keep their old count until they end.
+	/// Image encodes that started before the image thread count last changed; they keep their old count until they
+	/// end.
 	pub(super) stale: HashSet<FileId>,
 	last_space_check: Option<Instant>,
 	space_warned: bool,
@@ -40,6 +44,11 @@ pub(crate) fn apply_limit(cap: Option<u8>) -> Applied {
 		low_priority: cap.is_some(),
 		cpu_cap: cap,
 	})
+}
+
+fn is_image(path: &Path) -> bool {
+	read_header(path)
+		.is_ok_and(|(_, header)| infer::get(&header).is_some_and(|kind| kind.matcher_type() == MatcherType::Image))
 }
 
 /// Image encoder threads for new jobs: the whole machine, or the capped share where the cap can't be applied live.
@@ -88,11 +97,23 @@ impl Owner {
 		if threads != self.pipeline.image_threads {
 			self.pipeline.image_threads = threads;
 			self.pipeline.encoder = self.backend.encoder(threads, self.pipeline.memory.clone());
-			self.live.stale = self.pipeline.jobs.keys().copied().collect();
+			self.live.stale = self.image_jobs();
 		}
 
 		self.pipeline.workers_dirty = true;
 		self.view.status_dirty = true;
+	}
+
+	/// The running jobs the image thread count reaches: encodes of files whose content is an image. Reads each such
+	/// job's source header.
+	fn image_jobs(&self) -> HashSet<FileId> {
+		self.pipeline
+			.jobs
+			.iter()
+			.filter(|(_, job)| job.work == Work::Encode)
+			.map(|(file, _)| *file)
+			.filter(|file| is_image(&self.source_path(&self.tree.file(*file).key)))
+			.collect()
 	}
 
 	/// Part of the limit waits for running jobs: more of them run than the limit allows, or their thread count can
@@ -155,5 +176,57 @@ impl Owner {
 			);
 		}
 		self.live.space_warned = short;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::ffi::OsStr;
+	use std::fs;
+
+	use super::*;
+	use crate::project::pipeline::tests::running_job;
+	use crate::project::scanning::tests::owner;
+	use crate::record::FileRecord;
+
+	#[test]
+	fn only_image_encodes_wait_for_the_new_image_thread_count() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		let jobs: [(&str, &[u8], Work); 4] = [
+			("photo.jpg", b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00", Work::Encode),
+			(
+				"clip.mp4",
+				b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom",
+				Work::Encode,
+			),
+			("notes.txt", b"notes", Work::Copy),
+			("kept.jpg", b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00", Work::Delete),
+		];
+		let files: Vec<FileId> = jobs
+			.iter()
+			.map(|(name, content, work)| {
+				fs::write(source.join(name), content).unwrap();
+				let file = owner
+					.tree
+					.add_file(FolderId::ROOT, OsStr::new(name), FileRecord::default());
+				owner.pipeline.jobs.insert(file, running_job(*work));
+				file
+			})
+			.collect();
+
+		owner.live.stale = owner.image_jobs();
+		assert_eq!(owner.live.stale, HashSet::from([files[0]]));
+
+		owner.settings.performance_limit = Some(25);
+		assert!(owner.limit_pending());
+		owner.pipeline.jobs.remove(&files[0]);
+		owner.live.stale.remove(&files[0]);
+		assert!(
+			!owner.limit_pending(),
+			"the video, the copy and the delete never keep it pending"
+		);
 	}
 }

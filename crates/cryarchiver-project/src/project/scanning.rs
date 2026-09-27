@@ -281,6 +281,7 @@ impl Owner {
 		}
 
 		self.set_state(file, FileState::Done(output));
+		self.queue_delete(file);
 	}
 
 	/// The file leaves the project; the placeholders that point at it adopt its verified output, or are released.

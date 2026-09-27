@@ -621,7 +621,7 @@ impl Owner {
 	}
 
 	/// The files whose recorded output is a placeholder pointing at `canonical`, shallowest first.
-	fn placeholders_of(&self, canonical: FileId) -> Vec<FileId> {
+	pub(super) fn placeholders_of(&self, canonical: FileId) -> Vec<FileId> {
 		let key = &self.tree.file(canonical).key;
 		let mut found: Vec<FileId> = self
 			.dedup
@@ -736,6 +736,8 @@ impl Owner {
 		for path in own {
 			self.remove_once_durable(heir, path);
 		}
+
+		self.queue_delete(heir);
 	}
 
 	/// A dependent whose canonical copy holds no content it can adopt. A gone original keeps its record, its
@@ -946,7 +948,7 @@ mod tests {
 
 	use super::*;
 	use crate::issues::{IssueKey, Verb};
-	use crate::project::jobs::{JobMessage, Target};
+	use crate::project::jobs::{JobMessage, SourceIdentity, Target};
 	use crate::project::pipeline::tests::{committing_job, running_job};
 	use crate::project::scanning::tests::{key, list, list_queued, owner, reopen};
 	use crate::record::{CopyReason, FileRecord};
@@ -1264,7 +1266,7 @@ mod tests {
 			JobMessage::Commit {
 				staged,
 				made,
-				identity: None,
+				identity: SourceIdentity::default(),
 				reply,
 			},
 		);
@@ -1444,7 +1446,7 @@ mod tests {
 			JobMessage::Commit {
 				staged,
 				made,
-				identity: None,
+				identity: SourceIdentity::default(),
 				reply,
 			},
 		);

@@ -1,7 +1,8 @@
 //! Deleting originals, the dangerous mode (project layer spec §9). An original is deleted only after its archived
 //! file was read back from disk and matched its BLAKE3 (for a placeholder, the canonical copy's archived file too),
 //! the source is unchanged since the job, and the file has no open issue. `DeletePending` is written durably before
-//! the permanent delete, and only the delete's own result makes a file `OriginalDeleted`.
+//! the permanent delete. A file becomes `OriginalDeleted` only from `DeletePending`: by the delete's own result, by a
+//! listing that finds the source missing, or at open by `recover_delete` when the source is provably gone.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -62,6 +63,15 @@ impl Owner {
 
 		if let Some(queue) = self.pipeline.queues.get_mut(&Work::Delete) {
 			queue.push(file);
+		}
+	}
+
+	/// A canonical copy archived again holds its content once more: its placeholders are checked again, also those
+	/// refused meanwhile.
+	pub(super) fn queue_placeholder_deletes(&mut self, canonical: FileId) {
+		for placeholder in self.placeholders_of(canonical) {
+			self.danger.refused.remove(&placeholder);
+			self.queue_delete(placeholder);
 		}
 	}
 
@@ -499,12 +509,7 @@ mod tests {
 			let _entered = self.runtime.enter();
 			self.owner.start_jobs(Instant::now());
 			while !self.owner.pipeline.jobs.is_empty() {
-				let message = self
-					.runtime
-					.block_on(tokio::time::timeout(Duration::from_secs(20), self.inbox.recv()))
-					.unwrap()
-					.unwrap();
-				if let Message::Job(file, message) = message {
+				if let Message::Job(file, message) = self.next_message() {
 					self.owner.on_job(file, message);
 				}
 			}
@@ -526,6 +531,29 @@ mod tests {
 
 		fn job(&mut self, file: FileId, message: JobMessage) {
 			self.owner.on_job(file, message);
+		}
+
+		/// The copied file `canonical`'s archived file goes missing, and the user redoes it.
+		fn redo_with_its_output_missing(&mut self, canonical: FileId, content: &[u8]) {
+			fs::remove_file(self.destination("a.bin")).unwrap();
+			self.owner.set_state(
+				canonical,
+				FileState::Issue {
+					kind: IssueKind::OutputMissing,
+					attempt: 0,
+					reason: "the archived file is missing".into(),
+					output: Some(copied("a.bin", content)),
+				},
+			);
+			let issue = self.owner.issue_ids.id(&IssueKey::File(canonical));
+			self.owner.resolve(issue, Verb::Retry);
+		}
+
+		fn next_message(&mut self) -> Message {
+			self.runtime
+				.block_on(tokio::time::timeout(Duration::from_secs(20), self.inbox.recv()))
+				.unwrap()
+				.unwrap()
 		}
 
 		/// The log lines and warnings sent so far.
@@ -582,6 +610,18 @@ mod tests {
 		fs::rename(&replacement, path).unwrap();
 	}
 
+	/// Writes `content` into the same file, then sets its modification time back.
+	fn rewrite_keeping_the_time(path: &Path, content: &[u8]) {
+		let modified = fs::metadata(path).unwrap().modified().unwrap();
+		fs::write(path, content).unwrap();
+		fs::File::options()
+			.write(true)
+			.open(path)
+			.unwrap()
+			.set_modified(modified)
+			.unwrap();
+	}
+
 	#[test]
 	fn a_run_started_without_confirmation_never_deletes_even_when_the_setting_turns_on() {
 		for confirmed_at_start in [false, true] {
@@ -608,7 +648,9 @@ mod tests {
 		let notes = fixture.copy("notes.txt", b"notes");
 		fixture.owner.start(true);
 		assert_eq!(fixture.queued(), [notes]);
-		replace_keeping_the_time(&fixture.source("notes.txt"), b"notes, and more");
+		let identity = file_id(&fixture.source("notes.txt")).unwrap();
+		rewrite_keeping_the_time(&fixture.source("notes.txt"), b"notes, and more");
+		assert_eq!(file_id(&fixture.source("notes.txt")).unwrap(), identity);
 
 		fixture.run_deletes();
 
@@ -728,18 +770,7 @@ mod tests {
 		fixture.past_its_intent(duplicate);
 		assert!(matches!(fixture.state(duplicate), FileState::DeletePending(_)));
 
-		fs::remove_file(fixture.destination("a.bin")).unwrap();
-		fixture.owner.set_state(
-			canonical,
-			FileState::Issue {
-				kind: IssueKind::OutputMissing,
-				attempt: 0,
-				reason: "the archived file is missing".into(),
-				output: Some(copied("a.bin", &content)),
-			},
-		);
-		let issue = fixture.owner.issue_ids.id(&IssueKey::File(canonical));
-		fixture.owner.resolve(issue, Verb::Retry);
+		fixture.redo_with_its_output_missing(canonical, &content);
 
 		assert!(matches!(fixture.state(duplicate), FileState::DeletePending(_)));
 		assert!(fixture.owner.pipeline.jobs[&duplicate].cancel.is_cancelled());
@@ -774,6 +805,110 @@ mod tests {
 				.said()
 				.contains(&"the only archived copy of b.bin is missing".to_owned())
 		);
+	}
+
+	#[test]
+	fn a_placeholder_released_right_after_its_intent_is_never_deleted() {
+		let content = vec![7; 1000];
+		let mut fixture = Fixture::new();
+		let canonical = fixture.copy("a.bin", &content);
+		let duplicate = fixture.placeholder("b.bin", &content, "a.bin");
+		fixture.owner.start(true);
+		fixture
+			.owner
+			.pipeline
+			.queues
+			.get_mut(&Work::Delete)
+			.unwrap()
+			.remove(canonical);
+		let _entered = fixture.runtime.enter();
+		fixture.owner.start_jobs(Instant::now());
+
+		while !fixture.owner.pipeline.jobs.is_empty() {
+			let Message::Job(file, message) = fixture.next_message() else {
+				continue;
+			};
+
+			match message {
+				JobMessage::DeleteIntent { reply } => {
+					let go_on = fixture.owner.delete_intent(file);
+					assert!(go_on);
+					fixture.redo_with_its_output_missing(canonical, &content);
+					let _ = reply.send(go_on);
+				}
+				message => fixture.owner.on_job(file, message),
+			}
+		}
+
+		assert!(fixture.source("b.bin").exists());
+		let record = &fixture.owner.tree.file(duplicate).record;
+		assert!(matches!(record.state, FileState::Ready | FileState::Queued));
+		assert_eq!(record.replaces, Some(key("placeholder_b.bin.txt")));
+	}
+
+	#[test]
+	fn an_original_that_cant_be_reached_is_checked_again_and_never_called_changed() {
+		let mut fixture = Fixture::new();
+		let notes = fixture.copy("notes.txt", b"notes");
+		fixture.owner.start(true);
+		fs::remove_dir_all(&fixture.owner.settings.source).unwrap();
+
+		fixture.run_deletes();
+
+		assert_eq!(fixture.state(notes), FileState::Done(copied("notes.txt", b"notes")));
+		assert!(!fixture.owner.danger.refused.contains(&notes));
+		assert!(fixture.owner.delete_retries_pending());
+		let said = fixture.said();
+		assert!(
+			said.iter()
+				.any(|line| line.starts_with("notes.txt: original kept for now: ")),
+			"{said:?}"
+		);
+		assert!(!said.iter().any(|line| line.contains("changed since")), "{said:?}");
+	}
+
+	#[test]
+	fn an_heir_and_a_returned_source_are_queued_once_they_can_be_deleted() {
+		let content = vec![7; 1000];
+		let mut fixture = Fixture::new();
+		let canonical = fixture.copy("a.bin", &content);
+		let duplicate = fixture.placeholder("b.bin", &content, "a.bin");
+		let notes = fixture.copy("notes.txt", b"notes");
+		fixture
+			.owner
+			.set_state(notes, FileState::SourceGone(copied("notes.txt", b"notes")));
+		fixture.owner.start(true);
+		*fixture.owner.pipeline.queues.get_mut(&Work::Delete).unwrap() = Queue::default();
+
+		fs::write(fixture.source("a.bin"), b"changed").unwrap();
+		fixture.owner.source_changed(canonical, 7, 1);
+		assert_eq!(fixture.state(duplicate), FileState::Done(copied("a.bin", &content)));
+		assert_eq!(
+			fixture.queued(),
+			[duplicate],
+			"an heir that adopted its canonical copy's output"
+		);
+
+		fixture.owner.source_returned(notes);
+		assert_eq!(fixture.queued(), [duplicate, notes], "a source that returned");
+	}
+
+	#[test]
+	fn a_refused_placeholder_is_queued_again_once_its_canonical_copy_is_archived_again() {
+		let content = vec![7; 1000];
+		let mut fixture = Fixture::new();
+		let canonical = fixture.copy("a.bin", &content);
+		let duplicate = fixture.placeholder("b.bin", &content, "a.bin");
+		fixture.owner.start(true);
+		*fixture.owner.pipeline.queues.get_mut(&Work::Delete).unwrap() = Queue::default();
+		fixture.owner.danger.refused.insert(duplicate);
+
+		fixture.owner.pipeline.governor.started(Work::Copy, Instant::now());
+		fixture.owner.pipeline.jobs.insert(canonical, running_job(Work::Copy));
+		fixture.job(canonical, JobMessage::Finished(Ok(())));
+
+		assert_eq!(fixture.queued(), [canonical, duplicate]);
+		assert!(!fixture.owner.danger.refused.contains(&duplicate));
 	}
 
 	#[test]

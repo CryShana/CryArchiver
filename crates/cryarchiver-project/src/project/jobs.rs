@@ -54,8 +54,7 @@ pub(crate) enum JobMessage {
 	Commit {
 		staged: Staged,
 		made: Made,
-		/// The source's identity, read once its content was: what a later delete checks the original against.
-		identity: Option<Identity>,
+		identity: SourceIdentity,
 		reply: oneshot::Sender<Option<Target>>,
 	},
 	Placed,
@@ -74,6 +73,28 @@ pub(crate) enum JobMessage {
 	/// Nothing was deleted, and why.
 	DeleteRefused(Refusal),
 	Finished(Result<(), JobError>),
+}
+
+/// The source's identity read with the content a job archives, and again at its commit: what a later delete checks
+/// the original against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SourceIdentity {
+	pub(crate) at_start: Option<Identity>,
+	pub(crate) at_commit: Option<Identity>,
+}
+
+impl SourceIdentity {
+	/// Whether every identity read and the one recorded, where known, name the same file.
+	pub(crate) fn agrees_with(self, recorded: Option<Identity>) -> bool {
+		let mut known = [self.at_start, self.at_commit, recorded].into_iter().flatten();
+		let first = known.next();
+		known.all(|identity| Some(identity) == first)
+	}
+
+	/// Kept only when it was read at both points: without it, the original is never deleted.
+	pub(crate) fn to_record(self) -> Option<Identity> {
+		self.at_start.and(self.at_commit)
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +154,9 @@ pub(crate) struct JobContext {
 	pub(crate) source: PathBuf,
 	pub(crate) size: u64,
 	pub(crate) mtime_ns: i64,
+	/// The source's identity when the job starts: the record's, which for a placeholder or a take-over was read with
+	/// its dedup hash; a copy or an encode reads its own before it reads the content.
+	pub(crate) identity: Option<Identity>,
 	pub(crate) sink: ArchivalSink,
 	pub(crate) encoder: Arc<dyn Encode>,
 	pub(crate) messages: UnboundedSender<Message>,
@@ -144,7 +168,11 @@ impl JobContext {
 		let _ = self.messages.send(Message::Job(self.file, message));
 	}
 
-	pub(crate) async fn run(self, task: Task) {
+	pub(crate) async fn run(mut self, task: Task) {
+		if matches!(task, Task::Encode(_) | Task::Copy(_)) {
+			self.identity = self.source_identity().await;
+		}
+
 		let result = match task {
 			Task::Encode(job) => self.encode(&job).await,
 			Task::Copy(reason) => self.copy(reason).await,
@@ -255,7 +283,9 @@ impl JobContext {
 	async fn delete(&self, check: DeleteCheck) -> Result<(), JobError> {
 		let (source, size, mtime_ns) = (self.source.clone(), self.size, self.mtime_ns);
 		let verify = check.clone();
-		let verdict = blocking(move || verify_before_delete(&verify, &source, size, mtime_ns)).await?;
+		let verdict = blocking(move || verify_before_delete(&verify, &source, size, mtime_ns))
+			.await?
+			.map_err(|err| JobError::io(IoSide::Source(&self.source), &err))?;
 		if let Err(refusal) = verdict {
 			self.send(JobMessage::DeleteRefused(refusal));
 			return Ok(());
@@ -263,7 +293,7 @@ impl JobContext {
 
 		let (reply, answer) = oneshot::channel();
 		self.send(JobMessage::DeleteIntent { reply });
-		if !answer.await.unwrap_or(false) {
+		if !answer.await.unwrap_or(false) || self.cancel.is_cancelled() {
 			return Err(ErrorKind::Cancelled.into());
 		}
 
@@ -316,7 +346,10 @@ impl JobContext {
 			}
 		};
 
-		let identity = self.source_identity().await;
+		let identity = SourceIdentity {
+			at_start: self.identity,
+			at_commit: self.source_identity().await,
+		};
 		loop {
 			if self.cancel.is_cancelled() {
 				discard_unplaced(&staged);
@@ -351,46 +384,72 @@ impl JobContext {
 	}
 }
 
-/// The read-back and source checks of spec §9, cheapest first.
-fn verify_before_delete(check: &DeleteCheck, source: &Path, size: u64, mtime_ns: i64) -> Result<(), Refusal> {
+/// The read-back and source checks of spec §9, cheapest first. A source that can't be reached is an error: it proves
+/// neither a change nor that the original is gone.
+fn verify_before_delete(
+	check: &DeleteCheck,
+	source: &Path,
+	size: u64,
+	mtime_ns: i64,
+) -> io::Result<Result<(), Refusal>> {
 	let matches = |path: &Path, size, hash| run::read_back(path, size, hash).unwrap_or(false);
 
-	if !run::source_unchanged(source, size, mtime_ns) {
-		return Err(Refusal::SourceChanged(size_and_time(source)));
+	if let Err(refusal) = source_as_archived(source, size, mtime_ns)? {
+		return Ok(Err(refusal));
 	}
 
 	if !matches(&check.output, check.size, check.hash) {
-		return Err(Refusal::OutputDamaged);
+		return Ok(Err(Refusal::OutputDamaged));
 	}
 
 	let Some(placeholder) = &check.placeholder else {
-		return Ok(());
+		return Ok(Ok(()));
 	};
 
 	let names_link =
 		fs::read_to_string(&check.output).is_ok_and(|text| run::placeholder_links_to(&text, &placeholder.link));
 	if !names_link {
-		return Err(Refusal::Kept(
+		return Ok(Err(Refusal::Kept(
 			"the placeholder no longer names the archived copy".into(),
-		));
+		)));
 	}
 
 	if !matches(&placeholder.output, placeholder.size, placeholder.hash) {
-		return Err(Refusal::Kept(
+		return Ok(Err(Refusal::Kept(
 			"the archived copy it points to doesn't match its BLAKE3".into(),
-		));
+		)));
 	}
 
 	if let Some(canonical) = &placeholder.same_file {
 		let same = matches!((file_id(source), file_id(canonical)), (Ok(a), Ok(b)) if a == b);
 		if !same {
-			return Err(Refusal::Kept(
+			return Ok(Err(Refusal::Kept(
 				"it is no longer the same file as the archived copy's source".into(),
-			));
+			)));
 		}
 	}
 
-	Ok(())
+	Ok(Ok(()))
+}
+
+/// The original has the size and time it was archived with, or it changed, or it is provably gone: its folder is
+/// there and the file isn't.
+fn source_as_archived(source: &Path, size: u64, modified_ns: i64) -> io::Result<Result<(), Refusal>> {
+	match fs::metadata(source) {
+		Ok(meta) => {
+			let now = meta.modified().ok().map(|modified| (meta.len(), mtime_ns(modified)));
+			let unchanged = meta.is_file() && now == Some((size, modified_ns));
+			Ok(if unchanged {
+				Ok(())
+			} else {
+				Err(Refusal::SourceChanged(now))
+			})
+		}
+		Err(err) if err.kind() == io::ErrorKind::NotFound && source.parent().is_some_and(Path::is_dir) => {
+			Ok(Err(Refusal::SourceChanged(None)))
+		}
+		Err(err) => Err(err),
+	}
 }
 
 fn size_and_time(path: &Path) -> Option<(u64, i64)> {
@@ -452,6 +511,7 @@ mod tests {
 			source: source.to_path_buf(),
 			size: seen.len() as u64,
 			mtime_ns: mtime_ns(meta.modified().unwrap()),
+			identity: None,
 			sink: ArchivalSink::new(destination),
 			encoder: Arc::new(NoEncoder),
 			messages,
@@ -510,6 +570,22 @@ mod tests {
 			},
 			same_file,
 		}
+	}
+
+	#[test]
+	fn an_identity_is_kept_only_when_every_read_names_the_same_file() {
+		let (a, b) = (Identity { volume: 1, index: 1 }, Identity { volume: 1, index: 2 });
+		let read = |at_start, at_commit| SourceIdentity { at_start, at_commit };
+
+		assert!(read(Some(a), Some(a)).agrees_with(Some(a)));
+		assert_eq!(read(Some(a), Some(a)).to_record(), Some(a));
+		assert!(!read(Some(a), Some(b)).agrees_with(None), "replaced during the job");
+		assert!(!read(Some(b), Some(b)).agrees_with(Some(a)), "replaced after the hash");
+		assert!(!read(None, Some(b)).agrees_with(Some(a)));
+
+		assert!(read(None, Some(a)).agrees_with(Some(a)));
+		assert_eq!(read(None, Some(a)).to_record(), None, "not read at the start");
+		assert_eq!(read(Some(a), None).to_record(), None, "not read at the commit");
 	}
 
 	#[test]

@@ -15,11 +15,11 @@ use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError};
 use cryarchiver_engine::sink::ArchivalSink;
 use tokio_util::sync::CancellationToken;
 
-use super::jobs::{JobContext, JobMessage, Made, Target, Task};
+use super::jobs::{JobContext, JobMessage, Made, SourceIdentity, Target, Task};
 use super::owner::{Message, Owner};
 use crate::keys::RelPath;
 use crate::memory::MemoryBudget;
-use crate::record::{CopyReason, FailureLog, FileRecord, FileState, How, Identity, IssueKind, MediaClass, Output};
+use crate::record::{CopyReason, FailureLog, FileRecord, FileState, How, IssueKind, MediaClass, Output};
 use crate::references::{self, RefKind};
 use crate::run::Staged;
 use crate::schedule::{DiskGuard, Governor, GovernorConfig, Queue, Waits, Work, retry_delay};
@@ -302,6 +302,7 @@ impl Owner {
 			source: self.source_path(&entry.key),
 			size: entry.record.size,
 			mtime_ns: entry.record.mtime_ns,
+			identity: entry.record.identity,
 			sink: self.pipeline.sink.clone(),
 			encoder: self.pipeline.encoder.clone(),
 			messages: self.messages.clone(),
@@ -416,7 +417,7 @@ impl Owner {
 		file: FileId,
 		staged: &Staged,
 		made: &Made,
-		identity: Option<Identity>,
+		identity: SourceIdentity,
 	) -> Option<Target> {
 		let attempt = self
 			.pipeline
@@ -430,6 +431,16 @@ impl Owner {
 			FileState::InProgress { .. } | FileState::Committing { .. }
 		);
 		if self.stopping || entry.removed || !ours {
+			return None;
+		}
+
+		if !identity.agrees_with(entry.record.identity) {
+			let (size, mtime_ns) = (entry.record.size, entry.record.mtime_ns);
+			self.note(
+				file,
+				"the source was replaced by another file: archiving it again".into(),
+			);
+			self.source_changed(file, size, mtime_ns);
 			return None;
 		}
 
@@ -466,7 +477,7 @@ impl Owner {
 
 		let entry = self.tree.file(file);
 		let mut record = entry.record.clone();
-		record.identity = identity.or(record.identity);
+		record.identity = identity.to_record();
 		record.state = FileState::Committing {
 			attempt,
 			output: output.clone(),
@@ -643,10 +654,12 @@ impl Owner {
 			} else {
 				self.member_done(file);
 				self.queue_delete(file);
+				self.queue_placeholder_deletes(file);
 			}
 			return;
 		};
 		if !still_ours || self.tree.file(file).removed {
+			self.queue_delete(file);
 			return;
 		}
 
@@ -962,7 +975,7 @@ pub(super) mod tests {
 				JobMessage::Commit {
 					staged,
 					made: Made::Copied(CopyReason::NotMedia),
-					identity: None,
+					identity: SourceIdentity::default(),
 					reply,
 				},
 			);

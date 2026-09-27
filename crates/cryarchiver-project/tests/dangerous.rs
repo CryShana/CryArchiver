@@ -203,6 +203,59 @@ fn a_duplicate_whose_canonical_copy_no_longer_checks_out_keeps_its_original() {
 }
 
 #[test]
+fn an_original_replaced_during_its_encode_is_archived_again_before_it_is_deleted() {
+	let setup = setup(|settings| settings.delete_originals = true);
+	let photo = write(&setup.source, "a.jpg", &jpeg(1, 500));
+	let encoder = FakeEncoder::new();
+	encoder.rule(
+		"a.jpg",
+		Rule::Replace {
+			path: photo.clone(),
+			content: jpeg(2, 500),
+		},
+	);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start_deleting(&project);
+	wait_for(&project, &mut snapshot, "the delete", |s| deleted(s) == 1);
+	drop(project);
+
+	assert_eq!(encoder.calls(), ["a.jpg", "a.jpg"], "the replacement was archived too");
+	assert!(!photo.exists());
+}
+
+#[test]
+fn a_duplicate_replaced_between_its_hash_and_its_placeholder_is_archived_again_before_it_is_deleted() {
+	let setup = setup(|settings| settings.delete_originals = true);
+	write(&setup.source, "a.jpg", &jpeg(4, BIG));
+	let duplicate = write(&setup.source, "Copies/b.jpg", &jpeg(4, BIG));
+	let encoder = FakeEncoder::new();
+	encoder.rule(
+		"a.jpg",
+		Rule::Replace {
+			path: duplicate.clone(),
+			content: jpeg(5, BIG),
+		},
+	);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start_deleting(&project);
+	wait_for(&project, &mut snapshot, "both deleted", |s| deleted(s) == 2);
+	drop(project);
+
+	assert_eq!(
+		encoder.calls(),
+		["a.jpg", "b.jpg"],
+		"the replacement was archived on its own"
+	);
+	assert!(!duplicate.exists());
+	assert!(setup.destination.join("Copies").join("b.avif").exists());
+	assert!(!setup.destination.join("Copies").join("placeholder_b.jpg.txt").exists());
+}
+
+#[test]
 fn a_file_reached_through_a_link_out_of_the_source_is_kept() {
 	let setup = setup(|settings| settings.delete_originals = true);
 	let outside = setup.dir.path().join("outside");

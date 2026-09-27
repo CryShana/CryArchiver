@@ -723,6 +723,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "cryarchiver-engine",
+ "infer",
  "libc",
  "notify",
  "redb",

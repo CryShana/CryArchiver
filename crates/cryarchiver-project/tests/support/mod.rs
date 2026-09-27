@@ -35,6 +35,12 @@ pub enum Rule {
 	Hold,
 	/// Takes this long without looking at a cancel, then comes back as not media, so the job copies the source.
 	Slow(Duration),
+	/// Puts a new file with `content` in `path`'s place, by rename and with its modification time, then encodes. Only
+	/// once: later calls encode.
+	Replace {
+		path: PathBuf,
+		content: Vec<u8>,
+	},
 }
 
 #[derive(Default)]
@@ -122,12 +128,32 @@ impl Encode for FakeEncoder {
 						reason: "not media".into(),
 					}
 				}
+				Rule::Replace { path, content } => {
+					replace_keeping_the_time(&path, &content, &sink.work_root(&job.source));
+					self.rule(&name, Rule::Encode("avif"));
+					on_event(JobEvent::Stage(Stage::Encode));
+					stage(job, sink, "avif", &name)
+				}
 			};
 
 			self.running.fetch_sub(1, Ordering::SeqCst);
 			outcome
 		})
 	}
+}
+
+fn replace_keeping_the_time(path: &Path, content: &[u8], scratch: &Path) {
+	let modified = fs::metadata(path).unwrap().modified().unwrap();
+	fs::create_dir_all(scratch).unwrap();
+	let replacement = scratch.join(format!("replacement-{}", ulid::Ulid::generate()));
+	fs::write(&replacement, content).unwrap();
+	fs::File::options()
+		.write(true)
+		.open(&replacement)
+		.unwrap()
+		.set_modified(modified)
+		.unwrap();
+	fs::rename(&replacement, path).unwrap();
 }
 
 fn stage(job: &Job, sink: &dyn OutputSink, extension: &str, name: &str) -> JobOutcome {
