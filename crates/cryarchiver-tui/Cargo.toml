@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 cryarchiver-engine = { path = "../cryarchiver-engine" }
+cryarchiver-project = { path = "../cryarchiver-project" }
 ratatui.workspace = true
 thiserror.workspace = true
 throbber-widgets-tui.workspace = true
@@ -18,3 +19,6 @@ tui-input.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

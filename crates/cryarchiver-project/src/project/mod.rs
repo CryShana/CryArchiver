@@ -12,6 +12,7 @@ mod owner;
 mod pipeline;
 mod publish;
 mod resolve;
+mod reveal;
 mod scanning;
 mod watching;
 
@@ -128,6 +129,19 @@ pub enum Command {
 	Filter(String),
 	Details(FileId),
 	IssueLog(IssueId, u32),
+	/// Opens the folder, or the file's folder, in the system's file manager: the source side, or the archive's.
+	Reveal {
+		target: Target,
+		destination: bool,
+	},
+	/// Answers with a notice that carries the full source path.
+	ShowPath(Target),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+	Folder(FolderId),
+	File(FileId),
 }
 
 #[derive(Debug, thiserror::Error)]

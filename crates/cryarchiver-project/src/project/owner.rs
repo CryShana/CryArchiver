@@ -195,6 +195,8 @@ impl Owner {
 			Command::Filter(query) => self.set_filter(query),
 			Command::Details(file) => self.send_details(file),
 			Command::IssueLog(issue, attempt) => self.send_issue_log(issue, attempt),
+			Command::Reveal { target, destination } => self.reveal(target, destination),
+			Command::ShowPath(target) => self.show_path(target),
 			Command::Resolve(issue, verb) => self.resolve(issue, verb),
 			Command::RetryFailedIn(folder) => self.retry_failed_in(folder),
 			Command::RestartPendingJobs => self.restart_pending_jobs(),
