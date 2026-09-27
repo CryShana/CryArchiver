@@ -1,4 +1,5 @@
 pub mod av1;
+pub mod avif;
 pub mod isobmff;
 pub mod jxl;
 

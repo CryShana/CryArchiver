@@ -13,6 +13,7 @@ workspace = true
 clap = ["dep:clap"]
 
 [dependencies]
+avif-serialize.workspace = true
 brotli-decompressor.workspace = true
 clap = { workspace = true, optional = true }
 directories.workspace = true

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/cryarchiver-engine", "crates/cryarchiver-tui", "crates/cryarchiver"]
+exclude = ["vendor/avif-serialize"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +21,7 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 
 [workspace.dependencies]
+avif-serialize = "0.8.9"
 brotli-decompressor = "6.0.1"
 clap = { version = "4.6.7", features = ["derive"] }
 directories = "6.0.0"
@@ -45,6 +47,9 @@ ulid = "3.0.0"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+
+[patch.crates-io]
+avif-serialize = { path = "vendor/avif-serialize" }
 
 [profile.release]
 lto = "thin"
