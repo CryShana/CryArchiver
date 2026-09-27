@@ -1,3 +1,4 @@
+pub mod avif;
 pub mod decode;
 pub mod plan;
 pub mod props;
