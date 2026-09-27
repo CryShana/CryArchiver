@@ -20,6 +20,7 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 
 [workspace.dependencies]
+brotli-decompressor = "6.0.1"
 clap = { version = "4.6.7", features = ["derive"] }
 directories = "6.0.0"
 globset = "0.4.20"

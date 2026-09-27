@@ -101,3 +101,58 @@ pub fn mp3_with_cover(dir: &Path, name: &str, title: &str) -> PathBuf {
 	]);
 	path
 }
+
+pub fn exif_block(orientation: u16, width: u32, height: u32) -> Vec<u8> {
+	let mut tiff = b"II*\0".to_vec();
+	tiff.extend_from_slice(&8u32.to_le_bytes());
+
+	let exif_at = 8 + 2 + 3 * 12 + 4;
+	tiff.extend_from_slice(&3u16.to_le_bytes());
+	for (tag, kind, value) in [
+		(0x0112u16, 3u16, u32::from(orientation)),
+		(0x0131, 2, 0x0074_7874),
+		(0x8769, 4, exif_at),
+	] {
+		tiff.extend_from_slice(&tag.to_le_bytes());
+		tiff.extend_from_slice(&kind.to_le_bytes());
+		tiff.extend_from_slice(&(if kind == 2 { 4u32 } else { 1 }).to_le_bytes());
+		tiff.extend_from_slice(&value.to_le_bytes());
+	}
+	tiff.extend_from_slice(&0u32.to_le_bytes());
+
+	tiff.extend_from_slice(&2u16.to_le_bytes());
+	for (tag, value) in [(0xA002u16, width), (0xA003, height)] {
+		tiff.extend_from_slice(&tag.to_le_bytes());
+		tiff.extend_from_slice(&4u16.to_le_bytes());
+		tiff.extend_from_slice(&1u32.to_le_bytes());
+		tiff.extend_from_slice(&value.to_le_bytes());
+	}
+	tiff.extend_from_slice(&0u32.to_le_bytes());
+	tiff
+}
+
+pub fn jpeg_with_exif(dir: &Path, name: &str, width: u32, height: u32, orientation: u16) -> PathBuf {
+	let path = dir.join(name);
+	let source = format!("testsrc2=s={width}x{height}");
+	ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		source.as_str(),
+		"-frames:v",
+		"1",
+		"-q:v",
+		"2",
+		path.to_str().unwrap(),
+	]);
+
+	let jpeg = std::fs::read(&path).unwrap();
+	let payload = [b"Exif\0\0".as_slice(), &exif_block(orientation, width, height)].concat();
+	let mut out = jpeg[..2].to_vec();
+	out.extend_from_slice(&[0xFF, 0xE1]);
+	out.extend_from_slice(&u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+	out.extend_from_slice(&payload);
+	out.extend_from_slice(&jpeg[2..]);
+	std::fs::write(&path, out).unwrap();
+	path
+}

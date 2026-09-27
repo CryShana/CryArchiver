@@ -13,6 +13,7 @@ workspace = true
 clap = ["dep:clap"]
 
 [dependencies]
+brotli-decompressor.workspace = true
 clap = { workspace = true, optional = true }
 directories.workspace = true
 infer.workspace = true

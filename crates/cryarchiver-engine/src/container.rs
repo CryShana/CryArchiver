@@ -1,5 +1,6 @@
 pub mod av1;
 pub mod isobmff;
+pub mod jxl;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cover {
