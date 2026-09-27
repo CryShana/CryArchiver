@@ -96,6 +96,7 @@ fn put_box(out: &mut Vec<u8>, kind: [u8; 4], payload: &[u8]) {
 		out.extend_from_slice(&kind);
 		out.extend_from_slice(&(size + 8).to_be_bytes());
 	}
+
 	out.extend_from_slice(payload);
 }
 
@@ -138,7 +139,7 @@ fn exif_tiff(payload: &[u8]) -> Result<Vec<u8>, JxlError> {
 		.ok_or_else(|| JxlError("short 'Exif' box".into()))?;
 	usize::try_from(offset)
 		.ok()
-		.and_then(|offset| payload.get(4 + offset..))
+		.and_then(|offset| payload.get(offset.checked_add(4)?..))
 		.map(<[u8]>::to_vec)
 		.ok_or_else(|| JxlError("the 'Exif' box's TIFF offset is outside the box".into()))
 }

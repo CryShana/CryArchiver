@@ -15,6 +15,19 @@ fn generated(dir: &Path, name: &str, args: &[&str]) -> Vec<u8> {
 }
 
 #[test]
+fn a_heif_still_without_meta_is_damaged() {
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(&20u32.to_be_bytes());
+	bytes.extend_from_slice(b"ftypheic");
+	bytes.extend_from_slice(&0u32.to_be_bytes());
+	bytes.extend_from_slice(b"mif1");
+	bytes.extend_from_slice(&16u32.to_be_bytes());
+	bytes.extend_from_slice(b"mdat\0\0\0\0\0\0\0\0");
+
+	assert!(check(&bytes).damage.is_some());
+}
+
+#[test]
 fn complete_images_pass_and_trailing_data_after_the_jpeg_is_allowed() {
 	let dir = tempfile::tempdir().unwrap();
 	let jpeg = generated(dir.path(), "a.jpg", &["-frames:v", "1"]);

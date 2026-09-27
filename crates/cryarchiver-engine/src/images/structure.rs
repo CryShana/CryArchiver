@@ -3,7 +3,6 @@ use crate::metadata::{ImageFormat, sniff};
 
 const PNG_SIGNATURE_LEN: usize = 8;
 const GIF_HEADER_LEN: usize = 13;
-const SEQUENCE_BRANDS: &[[u8; 4]] = &[*b"avis", *b"msf1", *b"hevs"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Structure {
@@ -172,8 +171,9 @@ fn heif(bytes: &[u8]) -> Structure {
 	if let Some(problem) = meta.extent_problem(bytes.len() as u64) {
 		return Structure::damaged(problem);
 	}
-	let sequence =
-		isobmff::brands(bytes).is_some_and(|brands| brands.iter().any(|brand| SEQUENCE_BRANDS.contains(brand)));
+
+	let sequence = isobmff::brands(bytes)
+		.is_some_and(|brands| brands.iter().any(|brand| isobmff::SEQUENCE_BRANDS.contains(brand)));
 	if sequence && !boxes.iter().any(|found| &found.kind == b"moov") {
 		return Structure::damaged("the image sequence has no 'moov' box");
 	}

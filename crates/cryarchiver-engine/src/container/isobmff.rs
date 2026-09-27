@@ -3,6 +3,7 @@ pub const ALPHA_URNS: &[&str] = &[
 	"urn:mpeg:hevc:2015:auxid:1",
 ];
 pub const XMP_CONTENT_TYPE: &str = "application/rdf+xml";
+pub const SEQUENCE_BRANDS: [[u8; 4]; 3] = [*b"avis", *b"msf1", *b"hevs"];
 
 // EXIF orientations 1..=8 as 2×2 matrices acting on (x, y) with y pointing down.
 const EXIF_MATRICES: [[i8; 4]; 8] = [

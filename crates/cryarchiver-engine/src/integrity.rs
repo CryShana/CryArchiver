@@ -1,3 +1,4 @@
+use crate::container::isobmff::SEQUENCE_BRANDS;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -8,8 +9,7 @@ const DOC_TYPE_ID: [u8; 2] = [0x42, 0x82];
 const DOC_TYPES: &[&[u8]] = &[b"matroska", b"webm"];
 const MAX_EBML_HEADER: u64 = 4096;
 const ISOBMFF_LEADS: &[&[u8; 4]] = &[b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"pnot"];
-const STILL_IMAGE_BRANDS: &[&[u8; 4]] = &[b"avif", b"heic", b"heix", b"heim", b"heis", b"mif1"];
-const SEQUENCE_BRANDS: &[&[u8; 4]] = &[b"avis", b"msf1", b"hevs"];
+const STILL_IMAGE_BRANDS: [[u8; 4]; 6] = [*b"avif", *b"heic", *b"heix", *b"heim", *b"heis", *b"mif1"];
 const MAX_FTYP: u64 = 256;
 
 pub fn find_damage(path: &Path) -> io::Result<Option<String>> {
@@ -72,8 +72,8 @@ fn isobmff_damage(file: &mut File, len: u64) -> io::Result<Option<String>> {
 		offset = end;
 	}
 
-	let brand = |set: &[&[u8; 4]]| brands.iter().any(|brand| set.contains(&brand));
-	if brand(STILL_IMAGE_BRANDS) && !brand(SEQUENCE_BRANDS) {
+	let brand = |set: &[[u8; 4]]| brands.iter().any(|brand| set.contains(brand));
+	if brand(&STILL_IMAGE_BRANDS) && !brand(&SEQUENCE_BRANDS) {
 		return Ok((!has_meta).then(|| "no 'meta' box".to_owned()));
 	}
 	Ok((!has_moov).then(|| "no 'moov' box".to_owned()))

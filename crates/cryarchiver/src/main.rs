@@ -179,7 +179,9 @@ fn launch() -> Launch {
 
 fn block_on<F: Future>(future: F) -> F::Output {
 	let runtime = tokio::runtime::Runtime::new().expect("tokio runtime starts");
+
 	let output = runtime.block_on(future);
+
 	// A cancelled image encode keeps running in its blocking thread; waiting for it would delay the exit.
 	runtime.shutdown_background();
 	output

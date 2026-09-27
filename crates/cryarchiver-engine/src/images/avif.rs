@@ -36,6 +36,7 @@ pub fn encode(image: &DynamicImage, alpha: bool, settings: RavifSettings, thread
 			.with_bit_depth(BitDepth::Ten)
 			.with_alpha_color_mode(AlphaColorMode::UnassociatedClean)
 			.with_num_threads(None);
+
 		let (width, height) = image.dimensions();
 		let (width, height) = (width as usize, height as usize);
 
