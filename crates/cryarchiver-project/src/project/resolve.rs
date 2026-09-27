@@ -3,6 +3,7 @@
 use std::fs;
 
 use super::owner::Owner;
+use crate::dedup::full_hash;
 use crate::issues::{IssueId, IssueKey, Problem, Verb};
 use crate::record::{FileState, IssueKind, Output};
 use crate::tree::{FileId, FolderId};
@@ -69,7 +70,8 @@ impl Owner {
 				self.observe(file);
 			}
 			(IssueKind::OutputMissing, Verb::Retry) => {
-				let adopted = self.release_dependents(file, output.clone());
+				let intact = output.clone().filter(|output| self.output_intact(output));
+				let adopted = self.release_dependents(file, intact);
 				let mut record = self.tree.file(file).record.clone();
 				record.replaces = output.filter(|_| !adopted).map(|output| output.path);
 				self.tree.set_record(file, record);
@@ -105,6 +107,18 @@ impl Owner {
 			None => self.set_state(file, FileState::Excluded),
 		}
 		self.file_settled(file);
+	}
+
+	/// Whether the recorded output is on disk as it was archived: only then may a placeholder of a gone original adopt
+	/// it. Blocking: reads the file when its size matches.
+	fn output_intact(&self, output: &Output) -> bool {
+		let path = self.destination_path(&output.path);
+		let sized = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() == output.size);
+
+		sized
+			&& output
+				.hash
+				.is_some_and(|hash| full_hash(&path).is_ok_and(|found| found == hash))
 	}
 
 	fn acknowledge_cycle(&mut self, folder: FolderId) {

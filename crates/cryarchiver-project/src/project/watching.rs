@@ -183,7 +183,7 @@ impl Owner {
 		self.watching.destination_walk = false;
 		let sizes: HashMap<&RelPath, u64> = files.iter().map(|file| (&file.path, file.size)).collect();
 
-		let mut ours: HashSet<RelPath> = HashSet::new();
+		let mut ours: HashSet<RelPath> = self.placeholders_to_remove().cloned().collect();
 		let ids: Vec<FileId> = self.tree.file_ids().collect();
 		for file in ids {
 			ours.extend(self.recorded_outputs(file));

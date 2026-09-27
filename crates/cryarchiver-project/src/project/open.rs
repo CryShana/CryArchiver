@@ -99,6 +99,7 @@ impl Owner {
 		};
 		owner.load(loaded);
 		owner.recover();
+		owner.restore_releases();
 
 		sweep(&ArchivalSink::new(&owner.settings.destination).archive_work_root());
 		owner.store.flush()?;

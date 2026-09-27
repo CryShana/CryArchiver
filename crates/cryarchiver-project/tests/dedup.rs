@@ -31,6 +31,21 @@ fn record(setup: &support::Setup, path: &str) -> FileRecord {
 		.map_or_else(|| panic!("no record for {path}"), |(_, record)| record)
 }
 
+/// How many records name `path` as their output.
+fn owners(setup: &support::Setup, path: &str) -> usize {
+	let (_, _, loaded) = Store::open(&setup.project).unwrap();
+	loaded
+		.files
+		.iter()
+		.filter(|(_, record)| {
+			record
+				.state
+				.output()
+				.is_some_and(|output| output.path.display() == path)
+		})
+		.count()
+}
+
 fn run_to_completion(setup: &support::Setup, encoder: &std::sync::Arc<FakeEncoder>) -> Snapshot {
 	let project = support::open(setup, encoder);
 	let mut snapshot = Snapshot::default();
@@ -386,4 +401,131 @@ fn identical_sidecars_beside_different_videos_are_both_copied() {
 	);
 	assert_eq!(fs::read(setup.destination.join("B").join("film.srt")).unwrap(), data(5));
 	assert!(!setup.destination.join("B").join("placeholder_film.srt.txt").exists());
+}
+
+#[test]
+fn a_crash_right_after_an_adoption_leaves_the_output_one_owner() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+	fs::remove_file(duplicate).unwrap();
+	drop(run_to_completion(&setup, &encoder));
+
+	fs::write(&canonical, data(2)).unwrap();
+	let project = support::open_with(&setup, &encoder, Some(Fault::AfterAdoption));
+	let mut snapshot = Snapshot::default();
+	wait_for(&project, &mut snapshot, "the crash", |s| s.stopped);
+	drop(project);
+
+	assert_eq!(owners(&setup, "a.bin"), 1);
+	assert!(setup.destination.join("Backup").join("placeholder_a.bin.txt").exists());
+
+	run_to_completion(&setup, &encoder);
+
+	assert_the_gone_duplicate_kept_the_old_content(&setup);
+	assert_eq!(owners(&setup, "a.bin"), 1);
+}
+
+#[test]
+fn a_placeholder_archived_again_still_holds_its_content_after_a_close() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+
+	fs::write(&canonical, data(2)).unwrap();
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	wait_for(&project, &mut snapshot, "the scan", Snapshot::scan_complete);
+	drop(project);
+	assert!(record(&setup, "Backup/a.bin").held_output.is_some());
+
+	fs::remove_file(duplicate).unwrap();
+	run_to_completion(&setup, &encoder);
+
+	assert_the_gone_duplicate_kept_the_old_content(&setup);
+}
+
+#[test]
+fn a_placeholder_archived_again_still_holds_its_content_after_a_crash() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+
+	fs::write(&canonical, data(2)).unwrap();
+	let project = support::open_with(&setup, &encoder, Some(Fault::AfterCommitIntent));
+	let mut snapshot = Snapshot::default();
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+	wait_for(&project, &mut snapshot, "the crash", |s| s.stopped);
+	drop(project);
+	let held = record(&setup, "Backup/a.bin");
+	assert!(matches!(held.state, FileState::Committing { .. }), "{:?}", held.state);
+	assert!(held.held_output.is_some());
+
+	fs::remove_file(duplicate).unwrap();
+	run_to_completion(&setup, &encoder);
+
+	assert_the_gone_duplicate_kept_the_old_content(&setup);
+}
+
+#[test]
+fn a_placeholder_whose_gone_canonical_copy_is_replaced_by_a_new_file_keeps_its_content_when_it_vanishes() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+	fs::remove_file(&canonical).unwrap();
+	drop(run_to_completion(&setup, &encoder));
+	assert!(matches!(record(&setup, "a.bin").state, FileState::SourceGone(_)));
+
+	fs::write(&canonical, data(2)).unwrap();
+	fs::remove_file(duplicate).unwrap();
+	run_to_completion(&setup, &encoder);
+
+	assert_the_gone_duplicate_kept_the_old_content(&setup);
+}
+
+#[test]
+fn a_redo_of_a_missing_output_never_hands_it_to_a_gone_placeholder() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.bin", &data(1));
+	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+	fs::remove_file(duplicate).unwrap();
+	drop(run_to_completion(&setup, &encoder));
+	fs::remove_file(setup.destination.join("a.bin")).unwrap();
+
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	wait_for(&project, &mut snapshot, "the missing output", |s| !s.issues.is_empty());
+	project.send(Command::Resolve(snapshot.issues[0].id, Verb::Retry));
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+	wait_for(&project, &mut snapshot, "the run to finish", |s| {
+		s.overall.as_ref().is_some_and(|o| o.parity.is_some())
+	});
+	drop(project);
+
+	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(1));
+	assert_eq!(record(&setup, "a.bin").state.output().unwrap().path.display(), "a.bin");
+	assert!(setup.destination.join("Backup").join("placeholder_a.bin.txt").exists());
+	let FileState::SourceGone(kept) = record(&setup, "Backup/a.bin").state else {
+		panic!("the gone duplicate lost its record")
+	};
+	assert_eq!(
+		kept.how,
+		How::Placeholder {
+			canonical: RelPath::from_bytes(b"a.bin".to_vec())
+		}
+	);
 }

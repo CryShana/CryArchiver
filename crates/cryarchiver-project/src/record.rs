@@ -78,6 +78,10 @@ pub struct FileRecord {
 	/// The output of an earlier archive that a re-archive after a source change replaces.
 	pub replaces: Option<RelPath>,
 	pub state: FileState,
+	/// For a placeholder archived again: its canonical copy's key and earlier output, which still holds the content
+	/// and which that copy doesn't replace until this file has an output of its own or adopts it.
+	#[serde(default)]
+	pub held_output: Option<(RelPath, Output)>,
 }
 
 impl FileRecord {

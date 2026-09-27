@@ -391,6 +391,10 @@ impl Owner {
 			return None;
 		}
 
+		if matches!(made, Made::Moved { .. }) && !self.take_over_holds(file, &staged.path) {
+			return None;
+		}
+
 		let path = self.output_path(file, made);
 		let (how, hash) = match made {
 			Made::Encoded { .. } => (How::Encoded, Some(staged.hash)),
@@ -420,6 +424,7 @@ impl Owner {
 			self.fail(err);
 			return None;
 		}
+		self.after_flush();
 
 		let replaces = record
 			.replaces
@@ -797,7 +802,7 @@ fn numbered(name: &OsString, number: u32) -> OsString {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
 	use std::path::PathBuf;
 	use std::sync::mpsc::Receiver;
 	use std::time::Duration;
@@ -872,26 +877,14 @@ mod tests {
 
 		/// What `start_job` does, without spawning the job.
 		fn running(&mut self) -> CancellationToken {
-			let cancel = CancellationToken::new();
 			for queue in self.owner.pipeline.queues.values_mut() {
 				queue.remove(self.file);
 			}
 
 			self.owner.pipeline.governor.started(Work::Copy, Instant::now());
-			self.owner.pipeline.jobs.insert(
-				self.file,
-				RunningJob {
-					work: Work::Copy,
-					attempt: 1,
-					cancel: cancel.clone(),
-					fraction: 0.0,
-					stage: None,
-					video_waiting: false,
-					requeue: false,
-					not_same_file: false,
-					pending: None,
-				},
-			);
+			let job = running_job(Work::Copy);
+			let cancel = job.cancel.clone();
+			self.owner.pipeline.jobs.insert(self.file, job);
 			self.owner.set_state(self.file, FileState::InProgress { attempt: 1 });
 			cancel
 		}
@@ -930,6 +923,21 @@ mod tests {
 
 		fn record(&self) -> &FileRecord {
 			&self.owner.tree.file(self.file).record
+		}
+	}
+
+	/// A first attempt's job record, as `start_job` makes it.
+	pub(crate) fn running_job(work: Work) -> RunningJob {
+		RunningJob {
+			work,
+			attempt: 1,
+			cancel: CancellationToken::new(),
+			fraction: 0.0,
+			stage: None,
+			video_waiting: false,
+			requeue: false,
+			not_same_file: false,
+			pending: None,
 		}
 	}
 

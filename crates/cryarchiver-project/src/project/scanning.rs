@@ -232,6 +232,7 @@ impl Owner {
 			full_hash: None,
 			replaces,
 			state: FileState::Discovered,
+			held_output: None,
 		};
 		self.tree.set_record(file, record);
 		self.set_state(file, FileState::Discovered);
@@ -273,7 +274,7 @@ impl Owner {
 
 	/// An unreadable entry is an issue, unless the file is archived already: then its output stays and a warning says
 	/// what happened.
-	fn source_broken(&mut self, folder: FolderId, name: &OsStr, reason: &str) {
+	pub(super) fn source_broken(&mut self, folder: FolderId, name: &OsStr, reason: &str) {
 		let key = self.tree.folder(folder).key.join(name);
 		let known = self.tree.file_id(&key).filter(|&file| !self.tree.file(file).removed);
 		if known.is_some_and(|file| self.tree.file(file).record.state.output().is_some()) {
@@ -285,7 +286,7 @@ impl Owner {
 		}
 
 		let file = if let Some(file) = known {
-			self.withdraw(file);
+			self.withdraw_keeping_release(file);
 			file
 		} else {
 			let file = self.tree.add_file(folder, name, FileRecord::default());

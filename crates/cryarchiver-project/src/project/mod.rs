@@ -101,6 +101,8 @@ pub enum Fault {
 	AfterCommitIntent,
 	/// The output is in place, but its `Done` is still in the unwritten batch.
 	AfterPlaced,
+	/// A gone original's placeholder adopted its canonical copy's earlier output, still in the unwritten batch.
+	AfterAdoption,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

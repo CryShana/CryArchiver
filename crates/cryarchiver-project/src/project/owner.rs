@@ -247,8 +247,9 @@ impl Owner {
 	}
 
 	fn settle(&mut self, now: Instant) {
-		if let Err(err) = self.store.flush_if_due(now) {
-			self.fail(err);
+		match self.store.flush_if_due(now) {
+			Ok(_) => self.after_flush(),
+			Err(err) => self.fail(err),
 		}
 		self.publish_if_due(now);
 	}
@@ -274,8 +275,9 @@ impl Owner {
 			}
 		}
 
-		if let Err(err) = self.store.flush() {
-			self.fail(err);
+		match self.store.flush() {
+			Ok(()) => self.after_flush(),
+			Err(err) => self.fail(err),
 		}
 		let _ = std::fs::remove_dir(self.pipeline.sink.staged_dir());
 		let _ = std::fs::remove_dir(self.pipeline.sink.archive_work_root());
