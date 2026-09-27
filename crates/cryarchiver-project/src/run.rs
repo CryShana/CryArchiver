@@ -102,7 +102,7 @@ pub fn read_back(path: &Path, size: u64, hash: Hash) -> io::Result<bool> {
 	let mut buffer = native::AlignedBuffer::new(READ_BACK_BUFFER);
 	#[cfg(not(windows))]
 	let mut buffer = vec![0; READ_BACK_BUFFER];
-	let (read, actual) = hash_through(&mut file, &mut buffer, |_| Ok(()))?;
+	let (read, actual) = hash_through(&mut file, &mut buffer, true, |_| Ok(()))?;
 
 	Ok(read == size && actual == hash)
 }
@@ -147,10 +147,7 @@ pub fn delete_original(path: &Path, source_root: &Path, expected: &Expected) -> 
 	// An unreachable source root (an unplugged drive) is an error, never proof that the original is gone.
 	let root = fs::canonicalize(source_root)?;
 
-	match native::delete_checked(path, &root, expected) {
-		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Deletion::AlreadyGone),
-		result => result,
-	}
+	native::delete_checked(path, &root, expected)
 }
 
 pub fn apply_folder_times(source: &Path, destination: &Path) -> io::Result<()> {
@@ -172,7 +169,7 @@ fn create_staged(path: &Path) -> io::Result<File> {
 
 fn copy_hashed(input: &mut File, mut output: File, times: &SourceTimes) -> io::Result<(u64, Hash)> {
 	let mut buffer = vec![0; COPY_BUFFER];
-	let (size, hash) = hash_through(input, &mut buffer, |chunk| output.write_all(chunk))?;
+	let (size, hash) = hash_through(input, &mut buffer, false, |chunk| output.write_all(chunk))?;
 
 	output.set_times(times.file_times())?;
 	output.sync_all()?;
@@ -197,9 +194,13 @@ fn discard_on_error<T>(staged: &Path, result: io::Result<T>) -> io::Result<T> {
 	result
 }
 
+/// `short_read_is_eof` skips the extra read a full pass would otherwise issue after a short read. Unbuffered Windows
+/// reads need this: a short read that lands past the sector-aligned end of file leaves the position unaligned, and
+/// another `ReadFile` there fails instead of confirming EOF.
 fn hash_through(
 	input: &mut File,
 	buffer: &mut [u8],
+	short_read_is_eof: bool,
 	mut each: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<(u64, Hash)> {
 	let mut hasher = blake3::Hasher::new();
@@ -215,6 +216,10 @@ fn hash_through(
 		hasher.update(&buffer[..read]);
 		each(&buffer[..read])?;
 		size += read as u64;
+
+		if short_read_is_eof && read < buffer.len() {
+			break;
+		}
 	}
 
 	Ok((size, Hash(*hasher.finalize().as_bytes())))
@@ -262,12 +267,12 @@ mod native {
 	use cryarchiver_engine::outcome::is_sharing_violation;
 	use windows::Win32::Foundation::HANDLE;
 	use windows::Win32::Storage::FileSystem::{
-		BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-		FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
-		FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_NO_BUFFERING,
-		FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED,
-		FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES, FileDispositionInfo, FileDispositionInfoEx,
-		GETFINALPATHNAMEBYHANDLE_FLAGS, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+		BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
+		FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+		FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS,
+		FILE_FLAG_NO_BUFFERING, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_INFO_BY_HANDLE_CLASS,
+		FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES, FileDispositionInfo,
+		FileDispositionInfoEx, GETFINALPATHNAMEBYHANDLE_FLAGS, GetFileInformationByHandle, GetFinalPathNameByHandleW,
 		MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle, VOLUME_NAME_DOS,
 	};
 	use windows::core::PCWSTR;
@@ -276,8 +281,11 @@ mod native {
 	use crate::record::{Identity, mtime_ns};
 
 	const SECTOR_ALIGNMENT: usize = 4096;
+	const READ_ONLY: &str = "read-only";
 
 	pub fn delete_checked(path: &Path, root: &Path, expected: &Expected) -> io::Result<Deletion> {
+		const ERROR_FILE_NOT_FOUND: i32 = 2;
+
 		let file = match OpenOptions::new()
 			.access_mode(DELETE.0 | FILE_READ_ATTRIBUTES.0)
 			.share_mode(FILE_SHARE_READ.0)
@@ -286,6 +294,7 @@ mod native {
 		{
 			Ok(file) => file,
 			Err(err) if is_sharing_violation(&err) => return Ok(Deletion::Busy),
+			Err(err) if err.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) => return Ok(Deletion::AlreadyGone),
 			Err(err) => return Err(err),
 		};
 
@@ -302,8 +311,13 @@ mod native {
 			return Ok(Deletion::Changed);
 		}
 
+		if meta.file_attributes() & FILE_ATTRIBUTE_READONLY.0 != 0 {
+			return Ok(Deletion::Refused(READ_ONLY));
+		}
+
 		mark_for_deletion(&file)?;
 		drop(file);
+
 		Ok(Deletion::Deleted)
 	}
 
@@ -381,6 +395,7 @@ mod native {
 		// SAFETY: the handle is owned by `file` and valid for the call.
 		unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut info) }
 			.map_err(|err| to_io(&err))?;
+
 		Ok(Identity {
 			volume: u64::from(info.dwVolumeSerialNumber),
 			index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
@@ -486,7 +501,10 @@ mod native {
 			return Ok(Deletion::Changed);
 		}
 
-		let stat = stat_entry(&folder, &name)?;
+		let stat = match stat_entry(&folder, &name) {
+			Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Deletion::AlreadyGone),
+			result => result?,
+		};
 		if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
 			return Ok(Deletion::Refused(NOT_A_REGULAR_FILE));
 		}
@@ -498,8 +516,14 @@ mod native {
 
 		// SAFETY: the folder descriptor is open and the name is NUL-terminated.
 		if unsafe { libc::unlinkat(folder.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-			return Err(io::Error::last_os_error());
+			let err = io::Error::last_os_error();
+			return if err.kind() == io::ErrorKind::NotFound {
+				Ok(Deletion::AlreadyGone)
+			} else {
+				Err(err)
+			};
 		}
+
 		Ok(Deletion::Deleted)
 	}
 
@@ -807,10 +831,7 @@ mod tests {
 			delete_original(&inside, &root, &archived).unwrap(),
 			Deletion::AlreadyGone
 		);
-		assert_eq!(
-			delete_original(&root.join("gone").join("a.jpg"), &root, &archived).unwrap(),
-			Deletion::AlreadyGone
-		);
+		assert!(delete_original(&root.join("gone").join("a.jpg"), &root, &archived).is_err());
 		assert!(delete_original(&inside, &dir.path().join("unplugged"), &archived).is_err());
 		assert_eq!(
 			delete_original(&root.join("sub"), &root, &archived).unwrap(),
@@ -890,6 +911,32 @@ mod tests {
 		drop(writer);
 		assert_eq!(delete_original(&original, &root, &archived).unwrap(), Deletion::Deleted);
 		assert!(!original.exists());
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[allow(clippy::permissions_set_readonly_false)]
+	fn a_read_only_original_is_refused() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().join("source");
+		fs::create_dir_all(&root).unwrap();
+		let original = root.join("a.jpg");
+		fs::write(&original, b"a").unwrap();
+		let archived = expected(&original);
+
+		let mut permissions = fs::metadata(&original).unwrap().permissions();
+		permissions.set_readonly(true);
+		fs::set_permissions(&original, permissions).unwrap();
+
+		assert_eq!(
+			delete_original(&original, &root, &archived).unwrap(),
+			Deletion::Refused("read-only")
+		);
+		assert!(original.exists());
+
+		let mut permissions = fs::metadata(&original).unwrap().permissions();
+		permissions.set_readonly(false);
+		fs::set_permissions(&original, permissions).unwrap();
 	}
 
 	#[test]
