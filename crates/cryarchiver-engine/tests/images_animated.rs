@@ -93,6 +93,9 @@ fn frames_are_sampled_evenly_and_zero_gif_delays_use_ffmpegs_default() {
 
 	assert_eq!(sampled_frames(3), [0, 1, 2]);
 	assert_eq!(sampled_frames(422), [0, 42, 84, 126, 168, 211, 253, 295, 337, 379]);
+	let huge = sampled_frames(u32::MAX);
+	assert_eq!(huge.len(), 10);
+	assert!(huge.windows(2).all(|pair| pair[0] < pair[1]) && huge[9] < u32::MAX);
 	assert_eq!(expected_delays(&timeline, true), [100, 50, 100]);
 	assert_eq!(expected_delays(&timeline, false), [0, 50, 0]);
 }

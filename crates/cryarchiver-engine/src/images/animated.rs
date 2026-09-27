@@ -21,6 +21,7 @@ use crate::toolchain::Toolchain;
 use crate::video::run_ffmpeg;
 
 pub const MAX_SAMPLED_FRAMES: u32 = 10;
+const MAX_FRAMES: u32 = 100_000;
 const GIF_DEFAULT_DELAY_MS: u32 = 100;
 const DELAY_TOLERANCE_MS: u32 = 1;
 const TRANSPARENT_FRAMES: &str = r"format=rgba,alphaextract,signalstats,metadata=mode=select:key=lavfi.signalstats.YMIN:value=255:function=expr:expr='lt(VALUE1\,VALUE2)'";
@@ -91,6 +92,10 @@ fn walk_frames(frames: Frames<'_>, plays: Option<u32>) -> Result<Timeline, Strin
 	};
 
 	for frame in frames {
+		if timeline.frames == MAX_FRAMES {
+			return Err(format!("the animation has more than {MAX_FRAMES} frames"));
+		}
+
 		let frame = frame.map_err(|err| format!("frame {} is unreadable: {err}", timeline.frames + 1))?;
 		let (numer, denom) = frame.delay().numer_denom_ms();
 		timeline
@@ -183,7 +188,12 @@ pub fn expected_delays(timeline: &Timeline, gif: bool) -> Vec<u32> {
 
 pub fn sampled_frames(frames: u32) -> Vec<u32> {
 	let count = frames.min(MAX_SAMPLED_FRAMES);
-	(0..count).map(|index| index * frames / count).collect()
+	(0..count)
+		.map(|index| {
+			let frame = u64::from(index) * u64::from(frames) / u64::from(count);
+			u32::try_from(frame).expect("a sampled index is below the frame count")
+		})
+		.collect()
 }
 
 pub fn plays(bytes: &[u8]) -> Option<Option<u64>> {
