@@ -137,6 +137,23 @@ fn cmyk_jpegs_and_broken_icc_profiles_are_visible() {
 }
 
 #[test]
+fn an_extended_xmp_size_bomb_is_refused() {
+	let main = format!(
+		"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:xmpNote='http://ns.adobe.com/xmp/note/' xmpNote:HasExtendedXMP='{EXTENDED_GUID}'/></rdf:RDF></x:xmpmeta>"
+	);
+	let mut payload = b"http://ns.adobe.com/xmp/extension/\0".to_vec();
+	payload.extend_from_slice(EXTENDED_GUID.as_bytes());
+	payload.extend_from_slice(&u32::MAX.to_be_bytes());
+	payload.extend_from_slice(&0u32.to_be_bytes());
+	payload.extend_from_slice(b"<x:xmpmeta/>");
+
+	let metadata = extract(&jpeg(&[xmp_segment(&main), segment(0xE1, &payload)], 3));
+
+	assert!(metadata.xmp_extended.is_empty());
+	assert!(!metadata.warnings.is_empty(), "{:?}", metadata.warnings);
+}
+
+#[test]
 fn referenced_extended_xmp_is_reassembled() {
 	let main = format!(
 		"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:xmpNote='http://ns.adobe.com/xmp/note/' xmpNote:HasExtendedXMP='{EXTENDED_GUID}'/></rdf:RDF></x:xmpmeta>"

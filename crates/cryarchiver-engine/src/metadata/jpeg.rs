@@ -5,6 +5,7 @@ use crate::metadata::{SourceMetadata, auxiliary, xmp};
 const EXIF: &[u8] = b"Exif\0\0";
 const XMP: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 const EXTENDED_XMP: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
+const MAX_EXTENDED_XMP: usize = 64 << 20;
 const ICC: &[u8] = b"ICC_PROFILE\0";
 const MPF: &[u8] = b"MPF\0";
 const ISO_GAIN_MAP: &[u8] = b"urn:iso:std:iso:ts:21496:-1\0";
@@ -176,16 +177,20 @@ fn reassemble_icc(mut chunks: Vec<(u8, u8, &[u8])>) -> Result<Vec<u8>, String> {
 
 fn reassemble_extended(parts: &[ExtendedPart<'_>]) -> Option<String> {
 	let full = usize::try_from(parts.first()?.full).ok()?;
-	let mut packet = vec![0u8; full];
-	let mut filled = 0;
+	let supplied: usize = parts.iter().map(|part| part.data.len()).sum();
+	if full > MAX_EXTENDED_XMP || supplied != full {
+		return None;
+	}
 
+	let mut packet = vec![0u8; full];
 	for part in parts {
 		let offset = usize::try_from(part.offset).ok()?;
-		if usize::try_from(part.full).ok()? != full || offset + part.data.len() > full {
+		let end = offset.checked_add(part.data.len())?;
+		if usize::try_from(part.full).ok()? != full || end > full {
 			return None;
 		}
-		packet[offset..offset + part.data.len()].copy_from_slice(part.data);
-		filled += part.data.len();
+		packet[offset..end].copy_from_slice(part.data);
 	}
-	(filled == full).then(|| String::from_utf8(packet).ok()).flatten()
+
+	String::from_utf8(packet).ok()
 }
