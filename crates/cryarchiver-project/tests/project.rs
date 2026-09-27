@@ -135,6 +135,15 @@ fn nested_roots_are_refused_at_creation() {
 	let inside = cryarchiver_project::create(&source, &source.join("archive"), OsStr::new("a"), |_| {});
 
 	assert!(matches!(inside, Err(ProjectError::Settings(_))));
+	assert!(
+		!source.join("archive").exists(),
+		"a refused destination is never created in the source"
+	);
+
+	let deeper = cryarchiver_project::create(&source, &source.join("a").join("b"), OsStr::new("a"), |_| {});
+
+	assert!(matches!(deeper, Err(ProjectError::Settings(_))));
+	assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
 }
 
 #[test]

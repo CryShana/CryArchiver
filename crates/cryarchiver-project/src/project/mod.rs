@@ -161,6 +161,7 @@ pub fn create(
 	name: &OsStr,
 	configure: impl FnOnce(&mut Settings),
 ) -> Result<PathBuf, ProjectError> {
+	refuse_a_destination_inside(source, destination)?;
 	fs::create_dir_all(destination)?;
 	let (source, destination) = check_roots(source, destination)?;
 
@@ -173,6 +174,32 @@ pub fn create(
 	configure(&mut settings);
 	Store::create(&path, &settings)?;
 	Ok(path)
+}
+
+/// The destination may not exist yet; creating it inside the source would already write to the source, so its
+/// nearest existing ancestor is checked first.
+fn refuse_a_destination_inside(source: &Path, destination: &Path) -> Result<(), ProjectError> {
+	let source = fs::canonicalize(source)?;
+	let mut existing = destination;
+	let mut missing = Vec::new();
+	while !existing.exists() {
+		let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+			return Ok(());
+		};
+		missing.push(name);
+		existing = if parent.as_os_str().is_empty() {
+			Path::new(".")
+		} else {
+			parent
+		};
+	}
+
+	let mut planned = fs::canonicalize(existing)?;
+	planned.extend(missing.iter().rev());
+	if planned.starts_with(&source) {
+		return Err(SettingsError::Roots("the destination is inside the source".into()).into());
+	}
+	Ok(())
 }
 
 /// An open project. Dropping it stops the run safely, like [`Project::shutdown`].
