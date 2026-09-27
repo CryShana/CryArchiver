@@ -18,6 +18,8 @@ pub(crate) struct ScanState {
 	queue: VecDeque<(RelPath, bool)>,
 	active: usize,
 	pub(super) complete: bool,
+	/// A rescan asked for while one already runs: exactly one more starts once it lands.
+	rescan_pending: bool,
 }
 
 impl Owner {
@@ -31,6 +33,16 @@ impl Owner {
 	pub(super) fn queue_listing(&mut self, folder: RelPath, recursive: bool) {
 		self.scan.queue.push_back((folder, recursive));
 		self.pump_listings();
+	}
+
+	/// A rescan the watcher lost events asked for: coalesced into the running scan when one is already going, so a
+	/// burst of hints never queues more than one follow-up.
+	pub(super) fn request_rescan(&mut self) {
+		if self.scanning() {
+			self.scan.rescan_pending = true;
+		} else {
+			self.start_scan();
+		}
 	}
 
 	pub(super) fn pump_listings(&mut self) {
@@ -167,6 +179,10 @@ impl Owner {
 				LogKind::Action,
 				format!("scan complete: {} files", self.tree.totals(FolderId::ROOT).files),
 			);
+
+			if std::mem::take(&mut self.scan.rescan_pending) {
+				self.start_scan();
+			}
 		}
 	}
 
@@ -409,6 +425,7 @@ pub(super) mod tests {
 	use super::*;
 	use crate::project::{Backend, ProjectOptions, SystemSample, Tuning, create};
 	use crate::store::Store;
+	use crate::watch::Hint;
 
 	struct NoBackend;
 
@@ -500,5 +517,24 @@ pub(super) mod tests {
 		list_queued(&mut owner);
 		let b = owner.tree.folder_id(&key("A/B")).unwrap();
 		assert!(!owner.tree.folder(b).vanished);
+	}
+
+	#[test]
+	fn many_rescan_hints_during_a_scan_produce_exactly_one_follow_up_scan() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		owner.scan.active = 1;
+
+		for _ in 0..5 {
+			owner.on_hint(Hint::Rescan);
+		}
+		assert!(owner.scan.queue.is_empty(), "no scan queued while one runs");
+
+		owner.scan.active = 0;
+		owner.after_listing();
+
+		assert_eq!(Vec::from(owner.scan.queue.clone()), [(RelPath::root(), true)]);
 	}
 }

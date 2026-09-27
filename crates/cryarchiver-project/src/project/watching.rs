@@ -27,10 +27,14 @@ pub(crate) struct WatchState {
 	last_safety_pass: Option<Instant>,
 	safety_pass_running: bool,
 	destination_walk: bool,
+	/// A walk asked for while one already runs: one more starts once it lands.
+	walk_pending: bool,
 	placed_during_walk: HashSet<FileId>,
 	/// Outputs the project removed while the walk ran, which it may still have listed.
 	vacated_during_walk: HashSet<RelPath>,
 	pub(super) unknown: HashMap<RelPath, bool>,
+	/// Gone files whose missing or changed output already raised its warning this session.
+	notified_missing: HashSet<FileId>,
 }
 
 impl WatchState {
@@ -41,9 +45,11 @@ impl WatchState {
 			last_safety_pass: None,
 			safety_pass_running: false,
 			destination_walk: false,
+			walk_pending: false,
 			placed_during_walk: HashSet::new(),
 			vacated_during_walk: HashSet::new(),
 			unknown,
+			notified_missing: HashSet::new(),
 		}
 	}
 }
@@ -81,7 +87,7 @@ impl Owner {
 					LogKind::Action,
 					"the watcher lost events: scanning the source again".into(),
 				);
-				self.start_scan();
+				self.request_rescan();
 			}
 		}
 	}
@@ -152,6 +158,7 @@ impl Owner {
 	/// Compares the destination with the outputs the project wrote: missing or changed outputs and unknown files.
 	pub(super) fn reconcile_destination(&mut self) {
 		if self.watching.destination_walk {
+			self.watching.walk_pending = true;
 			return;
 		}
 
@@ -192,11 +199,14 @@ impl Owner {
 			let Some(output) = entry.record.state.output().cloned() else {
 				continue;
 			};
+			let confirmed = sizes.get(&output.path).copied() == Some(output.size);
+			if confirmed {
+				self.watching.notified_missing.remove(&file);
+			}
 			if entry.removed
 				|| self.watching.placed_during_walk.contains(&file)
 				|| self.pipeline.jobs.contains_key(&file)
-				|| sizes.get(&output.path).copied() == Some(output.size)
-				|| self.output_taken_over(file, &output)
+				|| confirmed || self.output_taken_over(file, &output)
 			{
 				continue;
 			}
@@ -206,6 +216,10 @@ impl Owner {
 
 		self.reconcile_unknown(files, &ours);
 		self.view.issues_dirty = true;
+
+		if std::mem::take(&mut self.watching.walk_pending) {
+			self.reconcile_destination();
+		}
 	}
 
 	/// Every destination path the file's record names as its own, now or until a re-archive replaces it.
@@ -228,7 +242,8 @@ impl Owner {
 			.collect()
 	}
 
-	/// The walk didn't find the output as recorded; only a direct look decides.
+	/// The walk didn't find the output as recorded; only a direct look decides. A gone original's only copy going
+	/// missing or changing raises a Warning too, remembered so it isn't repeated on every reconcile.
 	fn check_output(&mut self, file: FileId, output: Output) {
 		let found = match fs::symlink_metadata(self.destination_path(&output.path)) {
 			Ok(meta) if meta.is_file() => Found::Size(meta.len()),
@@ -237,10 +252,10 @@ impl Owner {
 			Err(err) => Found::Unclear(err.to_string()),
 		};
 
-		let reason = match found {
+		let (reason, changed) = match found {
 			Found::Size(size) if size == output.size => return,
-			Found::Size(_) => "the archived file changed size",
-			Found::Missing => "the archived file is missing",
+			Found::Size(_) => ("the archived file changed size", true),
+			Found::Missing => ("the archived file is missing", false),
 			Found::Unclear(reason) => {
 				self.log(
 					LogKind::Action,
@@ -253,6 +268,7 @@ impl Owner {
 			}
 		};
 
+		let name = self.tree.file(file).key.display();
 		match self.tree.file(file).record.state {
 			FileState::Done(_) => self.set_state(
 				file,
@@ -263,6 +279,13 @@ impl Owner {
 					output: Some(output),
 				},
 			),
+			FileState::SourceGone(_) | FileState::OriginalDeleted(_) => {
+				self.log(LogKind::Action, format!("{}: {reason}", output.path.display()));
+				if self.watching.notified_missing.insert(file) {
+					let verb = if changed { "has changed" } else { "is missing" };
+					self.notice(NoticeLevel::Warning, format!("the only archived copy of {name} {verb}"));
+				}
+			}
 			_ => self.log(LogKind::Action, format!("{}: {reason}", output.path.display())),
 		}
 	}
@@ -394,6 +417,16 @@ mod tests {
 			.collect()
 	}
 
+	fn warnings(updates: &Receiver<Update>) -> Vec<String> {
+		updates
+			.try_iter()
+			.filter_map(|update| match update {
+				Update::Notice(notice) if notice.level == NoticeLevel::Warning => Some(notice.text),
+				_ => None,
+			})
+			.collect()
+	}
+
 	#[test]
 	fn an_output_the_walk_missed_is_looked_up_before_it_is_reported() {
 		let (_dir, mut owner, _updates, destination) = fixture();
@@ -457,6 +490,46 @@ mod tests {
 			"{:?}",
 			logs(&updates)
 		);
+	}
+
+	#[test]
+	fn a_gone_originals_missing_output_warns_once() {
+		let (_dir, mut owner, updates, _) = fixture();
+		add(&mut owner, "heir.txt", FileState::SourceGone(copied("adopted.txt", 4)));
+
+		owner.on_destination_listed(&[]);
+		owner.on_destination_listed(&[]);
+
+		assert_eq!(warnings(&updates), ["the only archived copy of heir.txt is missing"]);
+	}
+
+	#[test]
+	fn a_commit_placed_during_the_walk_is_never_reported_missing_or_unknown() {
+		let (_dir, mut owner, _updates, _destination) = fixture();
+		owner.watching.destination_walk = true;
+		let file = add(&mut owner, "new.txt", FileState::Done(copied("new.txt", 4)));
+		owner.output_placed_during_walk(file);
+
+		owner.on_destination_listed(&[]);
+
+		assert_eq!(*state(&owner, file), FileState::Done(copied("new.txt", 4)));
+		assert!(owner.watching.unknown.is_empty());
+	}
+
+	#[test]
+	fn a_reconcile_asked_for_during_a_walk_runs_once_more_once_it_lands() {
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		let _entered = runtime.enter();
+		let (_dir, mut owner, _updates, _destination) = fixture();
+		owner.watching.destination_walk = true;
+
+		owner.reconcile_destination();
+		assert!(owner.watching.walk_pending);
+
+		owner.on_destination_listed(&[]);
+
+		assert!(owner.watching.destination_walk, "a new walk started");
+		assert!(!owner.watching.walk_pending);
 	}
 
 	#[test]

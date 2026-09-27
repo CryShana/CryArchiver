@@ -570,7 +570,7 @@ impl Owner {
 						&& dedup::canonical_order(&self.tree.file(member).key, &entry.key).is_lt()
 						&& self.canonical_output(member).is_some_and(|held| {
 							held.hash == Some(hash) && held.size == output.size && held.path != output.path
-						})
+						}) && self.sources_match(file, member)
 				})
 		});
 
@@ -578,6 +578,19 @@ impl Owner {
 			self.dedup.dirty.insert(size);
 		}
 		taken
+	}
+
+	/// Whether two files' own sources are provably the same content, not merely their archived outputs: their full
+	/// hash when both are known, else their window hash. Neither known is not proof, so it is never a match: a
+	/// same-hash, same-size output at another path could still belong to a different source.
+	fn sources_match(&self, file: FileId, other: FileId) -> bool {
+		let a = &self.tree.file(file).record;
+		let b = &self.tree.file(other).record;
+		match (a.full_hash, b.full_hash) {
+			(Some(left), Some(right)) => left == right,
+			(None, None) => false,
+			_ => a.window_hash.is_some() && a.window_hash == b.window_hash && a.size == b.size,
+		}
 	}
 
 	pub(super) fn is_duplicate(&self, file: FileId) -> bool {
@@ -1070,6 +1083,44 @@ mod tests {
 			fixture.owner.tree.file(holder).record.state,
 			FileState::Done(copied("held.bin"))
 		);
+	}
+
+	#[test]
+	fn a_real_missing_output_beside_a_different_source_twin_is_still_flagged() {
+		let mut fixture = Fixture::new();
+		let shared_hash = Some(Hash([7; 32]));
+		let twin = fixture.add(
+			"a.bin",
+			FileRecord {
+				full_hash: Some(Hash([1; 32])),
+				state: FileState::Done(Output {
+					hash: shared_hash,
+					..copied("a.bin")
+				}),
+				..ready(None, 1)
+			},
+		);
+		let lost_output = Output {
+			hash: shared_hash,
+			..copied("b.bin")
+		};
+		let lost = fixture.add(
+			"b.bin",
+			FileRecord {
+				full_hash: Some(Hash([2; 32])),
+				state: FileState::Done(lost_output.clone()),
+				..ready(None, 2)
+			},
+		);
+		fixture
+			.owner
+			.dedup
+			.by_size
+			.entry(SIZE)
+			.or_default()
+			.extend([twin, lost]);
+
+		assert!(!fixture.owner.output_taken_over(lost, &lost_output));
 	}
 
 	#[test]
