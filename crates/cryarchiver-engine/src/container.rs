@@ -34,4 +34,13 @@ pub const MATROSKA_VIDEO: Container = Container {
 	cover: Cover::Attachment,
 };
 
-pub const OUTPUT_EXTENSIONS: [&str; 3] = [OGG_OPUS.extension, MATROSKA_AUDIO.extension, MATROSKA_VIDEO.extension];
+pub const AVIF_EXTENSION: &str = "avif";
+pub const JXL_EXTENSION: &str = "jxl";
+
+pub const OUTPUT_EXTENSIONS: [&str; 5] = [
+	OGG_OPUS.extension,
+	MATROSKA_AUDIO.extension,
+	MATROSKA_VIDEO.extension,
+	AVIF_EXTENSION,
+	JXL_EXTENSION,
+];

@@ -9,7 +9,9 @@ use crate::audio::{cover, encode, verify};
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::Cover;
 use crate::detect::{self, Detection, MediaClass};
+use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
 use crate::integrity;
+use crate::metadata::MetadataMode;
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use crate::preset::Speed;
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -31,6 +33,7 @@ pub struct Job {
 	pub source: PathBuf,
 	pub speed: Speed,
 	pub keep_metadata: bool,
+	pub drop_aux: bool,
 	pub min_savings: f64,
 }
 
@@ -59,6 +62,7 @@ pub enum JobEvent {
 pub struct Engine {
 	tools: Toolchain,
 	video_slots: Semaphore,
+	image_threads: usize,
 }
 
 struct Context<'a> {
@@ -82,6 +86,7 @@ enum Produced {
 enum Planned {
 	Audio { info: Box<MediaInfo>, plan: FilePlan },
 	Video,
+	Image(Box<ImageInput>),
 }
 
 struct VideoJob<'a> {
@@ -109,6 +114,7 @@ impl Engine {
 		Self {
 			tools,
 			video_slots: Semaphore::new(1),
+			image_threads: std::thread::available_parallelism().map_or(1, usize::from),
 		}
 	}
 
@@ -116,6 +122,14 @@ impl Engine {
 	pub fn with_video_jobs(self, jobs: usize) -> Self {
 		Self {
 			video_slots: Semaphore::new(jobs.max(1)),
+			..self
+		}
+	}
+
+	#[must_use]
+	pub fn with_image_threads(self, threads: usize) -> Self {
+		Self {
+			image_threads: threads.max(1),
 			..self
 		}
 	}
@@ -145,6 +159,7 @@ impl Engine {
 
 		on_event(JobEvent::Stage(Stage::Detect));
 		let Detection { meta, class, probe_log } = detect::detect(&self.tools, &job.source, cancel).await?;
+		let animated = matches!(class, MediaClass::AnimatedImage(_));
 		let planned = match class {
 			MediaClass::Audio(info) => {
 				self.require(MediaKind::Audio)?;
@@ -173,8 +188,13 @@ impl Engine {
 				}
 				Planned::Video
 			}
-			MediaClass::StillImage(_) | MediaClass::AnimatedImage(_) => {
-				return Ok(skipped("image support is not implemented yet"));
+			MediaClass::StillImage(info) | MediaClass::AnimatedImage(info) => {
+				self.require(MediaKind::Image)?;
+				on_event(JobEvent::Stage(Stage::Plan));
+				match image_job::prepare(&job.source, &info, animated, job.drop_aux, metadata_mode(job))? {
+					Ok(input) => Planned::Image(Box::new(input)),
+					Err(reason) => return Ok(JobOutcome::KeptOriginal { reason }),
+				}
 			}
 			MediaClass::Kept(reason) => {
 				return Ok(JobOutcome::KeptOriginal {
@@ -200,6 +220,7 @@ impl Engine {
 		let produced = match &planned {
 			Planned::Audio { info, plan } => self.produce_audio(&cx, info, plan, &workspace).await,
 			Planned::Video => Box::pin(self.produce_video(&cx, &workspace)).await,
+			Planned::Image(input) => Box::pin(self.produce_image(&cx, input, &workspace)).await,
 		};
 		let staged = match produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes))? {
 			Produced::Output(staged) => staged,
@@ -217,6 +238,37 @@ impl Engine {
 		} else {
 			Err(ErrorKind::Toolchain(problems.join("; ")).into())
 		}
+	}
+
+	fn image_caps(&self) -> ImageCaps {
+		ImageCaps {
+			libjxl: self.tools.has_libjxl(),
+			libaom: self.tools.has_libaom(),
+		}
+	}
+
+	async fn produce_image(
+		&self,
+		cx: &Context<'_>,
+		input: &ImageInput,
+		workspace: &Workspace,
+	) -> Result<Produced, JobError> {
+		let image = ImageContext {
+			tools: &self.tools,
+			source: &cx.job.source,
+			source_bytes: cx.source_bytes,
+			speed: cx.job.speed,
+			min_savings: cx.job.min_savings,
+			mode: metadata_mode(cx.job),
+			threads: self.image_threads,
+			caps: self.image_caps(),
+			on_event: cx.on_event,
+			cancel: cx.cancel,
+		};
+		Ok(match image_job::produce(&image, input, workspace).await? {
+			ImageOutcome::Output { path, bytes, warnings } => Produced::Output(Staged { path, bytes, warnings }),
+			ImageOutcome::Kept(reason) => Produced::Kept(reason),
+		})
 	}
 
 	fn video_caps(&self) -> VideoCaps {
@@ -511,6 +563,14 @@ impl Engine {
 		let output_levels = verify::measure_output(&self.tools, audio_temp, plan, cancel).await?;
 		verify::check_tracks(plan, source_levels, &output_levels)
 			.map_err(|reason| ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into())
+	}
+}
+
+fn metadata_mode(job: &Job) -> MetadataMode {
+	if job.keep_metadata {
+		MetadataMode::Full
+	} else {
+		MetadataMode::IccOnly
 	}
 }
 

@@ -22,6 +22,8 @@ tokio-util.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
+crc32fast.workspace = true
+image.workspace = true
 lofty.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

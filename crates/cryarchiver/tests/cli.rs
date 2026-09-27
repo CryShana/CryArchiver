@@ -247,3 +247,64 @@ fn mixed_audio_and_video_batches_run_together() {
 	assert!(dir.path().join("b.cry.mkv").is_file());
 	assert!(dir.path().join("c.cry.opus").is_file());
 }
+
+#[test]
+fn compresses_an_image_next_to_the_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = support::photo_png(dir.path(), "photo.png", 320, 240);
+	let before = fs::read(&source).unwrap();
+
+	let out = cryarchiver(dir.path(), &["-s", "fast", "photo.png"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	assert!(
+		stdout(&out).contains("✓ photo.png → photo.cry.avif"),
+		"{}",
+		stdout(&out)
+	);
+	assert_eq!(fs::read(&source).unwrap(), before);
+	assert!(!dir.path().join(".cry-work").exists());
+}
+
+#[test]
+fn rerun_skips_existing_image_outputs() {
+	let dir = tempfile::tempdir().unwrap();
+	support::photo_png(dir.path(), "photo.png", 320, 240);
+	assert!(cryarchiver(dir.path(), &["-s", "fast", "photo.png"]).status.success());
+
+	let out = cryarchiver(dir.path(), &["-s", "fast", "photo.png"]);
+
+	assert!(out.status.success());
+	assert!(
+		stdout(&out).contains("· photo.png  skipped: output already exists"),
+		"{}",
+		stdout(&out)
+	);
+}
+
+#[test]
+fn raw_camera_files_are_kept_as_they_are() {
+	let dir = tempfile::tempdir().unwrap();
+	fs::write(dir.path().join("DSC_0001.NEF"), b"II*\0\x08\0\0\0\0\0\0\0\0\0").unwrap();
+
+	let out = cryarchiver(dir.path(), &["DSC_0001.NEF"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+	assert!(
+		stdout(&out).contains("= DSC_0001.NEF  kept: RAW camera files are never converted"),
+		"{}",
+		stdout(&out)
+	);
+}
+
+#[test]
+fn help_and_doctor_mention_images() {
+	let dir = tempfile::tempdir().unwrap();
+
+	let help = cryarchiver(dir.path(), &["--help"]);
+	let doctor = cryarchiver(dir.path(), &["doctor"]);
+
+	assert!(stdout(&help).contains("--drop-aux"), "{}", stdout(&help));
+	assert!(stdout(&doctor).contains("image filters"), "{}", stdout(&doctor));
+	assert!(stdout(&doctor).contains("libjxl"), "{}", stdout(&doctor));
+}

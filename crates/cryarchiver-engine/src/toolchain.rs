@@ -117,20 +117,27 @@ pub const VIDEO_FILTERS: &[&str] = &[
 	"scale",
 ];
 pub const ALPHA_FILTERS: &[&str] = &["alphaextract", "ssim"];
+pub const IMAGE_FILTERS: &[&str] = &["alphaextract", "alphamerge", "signalstats", "metadata", "sidedata"];
+const PAM: &str = "pam";
+const LIBJXL: &str = "libjxl";
 const AV1_DECODERS: &[&str] = &["libdav1d", "libaom-av1"];
 const LIBAOM: &str = "libaom-av1";
 const EVERY_KIND: &[MediaKind] = MediaKind::ALL;
+const AUDIO_AND_VIDEO: &[MediaKind] = &[MediaKind::Audio, MediaKind::Video];
 const VIDEO_ONLY: &[MediaKind] = &[MediaKind::Video];
+const VIDEO_AND_IMAGES: &[MediaKind] = &[MediaKind::Video, MediaKind::Image];
+const IMAGES_ONLY: &[MediaKind] = &[MediaKind::Image];
 const OPTIONAL: &[MediaKind] = &[];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
 	Audio,
 	Video,
+	Image,
 }
 
 impl MediaKind {
-	pub const ALL: &'static [Self] = &[Self::Audio, Self::Video];
+	pub const ALL: &'static [Self] = &[Self::Audio, Self::Video, Self::Image];
 }
 
 impl fmt::Display for MediaKind {
@@ -138,6 +145,7 @@ impl fmt::Display for MediaKind {
 		f.write_str(match self {
 			Self::Audio => "audio",
 			Self::Video => "video",
+			Self::Image => "image",
 		})
 	}
 }
@@ -293,6 +301,10 @@ impl Toolchain {
 		self.encoders.contains(LIBAOM)
 	}
 
+	pub fn has_libjxl(&self) -> bool {
+		self.encoders.contains(LIBJXL)
+	}
+
 	fn missing(&self, selected: impl Fn(&ReportLine) -> bool) -> Vec<String> {
 		self.report()
 			.into_iter()
@@ -318,6 +330,12 @@ impl Toolchain {
 			.copied()
 			.filter(|name| !self.filters.contains(*name))
 			.collect();
+		let missing_image_tools: Vec<&str> = IMAGE_FILTERS
+			.iter()
+			.copied()
+			.filter(|name| !self.filters.contains(*name))
+			.chain((!self.encoders.contains(PAM)).then_some(PAM))
+			.collect();
 
 		vec![
 			self.ffmpeg_line(),
@@ -331,15 +349,21 @@ impl Toolchain {
 				"libopus",
 				self.encoders.contains("libopus"),
 				Status::Missing,
-				EVERY_KIND,
+				AUDIO_AND_VIDEO,
 				"audio encoder",
 			),
-			check("soxr", self.soxr, Status::Missing, EVERY_KIND, "high-quality resampler"),
+			check(
+				"soxr",
+				self.soxr,
+				Status::Missing,
+				AUDIO_AND_VIDEO,
+				"high-quality resampler",
+			),
 			check(
 				"Opus 5.1",
 				self.opus_surround,
 				Status::Missing,
-				EVERY_KIND,
+				AUDIO_AND_VIDEO,
 				"surround audio",
 			),
 			self.svt_line(),
@@ -361,9 +385,23 @@ impl Toolchain {
 				"AV1 decoder",
 				self.has_av1_decoder(),
 				Status::Missing,
-				VIDEO_ONLY,
-				"checks encoded video",
+				VIDEO_AND_IMAGES,
+				"checks encoded video and images",
 			),
+			ReportLine {
+				status: if missing_image_tools.is_empty() {
+					Status::Ok
+				} else {
+					Status::Missing
+				},
+				label: "image filters".into(),
+				detail: if missing_image_tools.is_empty() {
+					"image decoding and checks".to_owned()
+				} else {
+					format!("image decoding and checks · missing {}", missing_image_tools.join(", "))
+				},
+				needed_for: IMAGES_ONLY,
+			},
 			ReportLine {
 				status: if missing_filters.is_empty() {
 					Status::Ok
@@ -390,11 +428,11 @@ impl Toolchain {
 				self.has_libaom(),
 				Status::Warn,
 				OPTIONAL,
-				"animated images with alpha, video larger than 16384×8704",
+				"animated images, video larger than 16384×8704",
 			),
 			check(
-				"libjxl",
-				self.encoders.contains("libjxl"),
+				LIBJXL,
+				self.has_libjxl(),
 				Status::Warn,
 				OPTIONAL,
 				"large and high-bit-depth images",
@@ -762,7 +800,7 @@ mod tests {
 			ffmpeg: PathBuf::from("ffmpeg"),
 			ffprobe: PathBuf::from("ffprobe"),
 			build: FfmpegBuild::Release(Version { major: 9, minor: 0 }),
-			encoders: ["libopus", "libsvtav1", "libvpx-vp9", "libaom-av1", "libjxl"]
+			encoders: ["libopus", "libsvtav1", "libvpx-vp9", "libaom-av1", "libjxl", "pam"]
 				.into_iter()
 				.map(String::from)
 				.collect(),
@@ -770,6 +808,7 @@ mod tests {
 			filters: VIDEO_FILTERS
 				.iter()
 				.chain(ALPHA_FILTERS)
+				.chain(IMAGE_FILTERS)
 				.chain(&["libvmaf"])
 				.map(|name| (*name).to_owned())
 				.collect(),
@@ -793,7 +832,9 @@ mod tests {
 		);
 		assert!(tools.problems(MediaKind::Audio).is_empty());
 		assert!(tools.problems(MediaKind::Video).is_empty());
+		assert!(tools.problems(MediaKind::Image).is_empty());
 		assert!(tools.has_libaom());
+		assert!(tools.has_libjxl());
 	}
 
 	#[test]
@@ -846,13 +887,38 @@ mod tests {
 				.iter()
 				.any(|p| p.starts_with("ffmpeg: 7.1") && p.contains("8.1 or newer required"))
 		);
-		assert!(universal.iter().any(|p| p.starts_with("libopus:")));
+		assert!(!universal.iter().any(|p| p.starts_with("libopus:")));
+		assert!(
+			tools
+				.problems(MediaKind::Audio)
+				.iter()
+				.any(|p| p.starts_with("libopus:"))
+		);
+		assert!(
+			tools
+				.problems(MediaKind::Image)
+				.iter()
+				.all(|p| !p.starts_with("libopus:"))
+		);
 		assert!(
 			tools
 				.problems(MediaKind::Video)
 				.iter()
 				.any(|p| p.starts_with("libsvtav1:"))
 		);
+	}
+
+	#[test]
+	fn images_need_the_pam_encoder_and_their_filters_but_not_opus() {
+		let mut tools = complete_toolchain();
+		tools.encoders.remove("pam");
+		tools.encoders.remove("libopus");
+		tools.filters.remove("alphamerge");
+
+		let problems = tools.problems(MediaKind::Image);
+
+		assert_eq!(problems.len(), 1, "{problems:?}");
+		assert!(problems[0].contains("missing alphamerge, pam"), "{problems:?}");
 	}
 
 	#[test]

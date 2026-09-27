@@ -52,6 +52,7 @@ enum Command {
 	Tui { project: Option<PathBuf> },
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Args)]
 struct CompressArgs {
 	#[arg(
@@ -70,6 +71,8 @@ struct CompressArgs {
 	speed: Speed,
 	#[arg(long, help = "Keep personal metadata and the source's file timestamps")]
 	keep_metadata: bool,
+	#[arg(long, help = "Convert photos that have gain or depth maps, dropping the extras")]
+	drop_aux: bool,
 	#[arg(long, help = "Replace existing outputs (never sources)")]
 	overwrite: bool,
 	#[arg(
@@ -298,6 +301,7 @@ async fn compress(args: CompressArgs) -> u8 {
 			source,
 			speed: args.speed,
 			keep_metadata: args.keep_metadata,
+			drop_aux: args.drop_aux,
 			min_savings,
 		})
 		.collect();

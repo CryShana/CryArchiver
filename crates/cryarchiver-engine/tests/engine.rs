@@ -17,6 +17,7 @@ fn job(source: &Path) -> Job {
 		source: source.to_path_buf(),
 		speed: Speed::Moderate,
 		keep_metadata: false,
+		drop_aux: false,
 		min_savings: 0.10,
 	}
 }

@@ -156,3 +156,54 @@ pub fn jpeg_with_exif(dir: &Path, name: &str, width: u32, height: u32, orientati
 	std::fs::write(&path, out).unwrap();
 	path
 }
+
+pub fn smooth_png(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
+	let path = dir.join(name);
+	image::ImageBuffer::from_fn(width, height, |x, y| {
+		image::Rgb([
+			u8::try_from((x * 255) / width.max(1)).unwrap(),
+			u8::try_from((y * 255) / height.max(1)).unwrap(),
+			u8::try_from((x / 8 + y / 8) % 2 * 100 + 50).unwrap(),
+		])
+	})
+	.save(&path)
+	.unwrap();
+	path
+}
+
+pub fn png_chunk(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
+	let mut bytes = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+	bytes.extend_from_slice(&kind);
+	bytes.extend_from_slice(body);
+	bytes.extend_from_slice(&crc32fast::hash(&[kind.as_slice(), body].concat()).to_be_bytes());
+	bytes
+}
+
+pub fn with_png_chunk(png: &[u8], chunk: &[u8]) -> Vec<u8> {
+	let idat = png.windows(4).position(|window| window == b"IDAT").unwrap() - 4;
+	[&png[..idat], chunk, &png[idat..]].concat()
+}
+
+pub fn with_jpeg_segment(jpeg: &[u8], marker: u8, payload: &[u8]) -> Vec<u8> {
+	let mut out = jpeg[..2].to_vec();
+	out.extend_from_slice(&[0xFF, marker]);
+	out.extend_from_slice(&u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+	out.extend_from_slice(payload);
+	out.extend_from_slice(&jpeg[2..]);
+	out
+}
+
+pub fn photo_png(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
+	let path = dir.join(name);
+	let source = format!("gradients=s={width}x{height}:speed=0,noise=alls=3:allf=u,format=rgb24");
+	ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		source.as_str(),
+		"-frames:v",
+		"1",
+		path.to_str().unwrap(),
+	]);
+	path
+}
