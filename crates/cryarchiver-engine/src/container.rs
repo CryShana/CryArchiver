@@ -1,3 +1,5 @@
+pub mod isobmff;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cover {
 	Stream,
