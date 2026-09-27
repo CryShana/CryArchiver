@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use cryarchiver_engine::commit::{Artifact, OutputSink, SourceTimes};
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate, Stage};
+use cryarchiver_engine::naming::is_media_name;
 use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome, KeepReason};
 use cryarchiver_project::issues::IssueId;
 use cryarchiver_project::settings::Settings;
@@ -18,7 +19,7 @@ use cryarchiver_project::tree::{FileId, FolderId, FolderStats};
 use cryarchiver_project::view::{
 	Details, FileRow, FilterView, IssueView, LogEntry, Notice, Overall, Status, SystemView, Update, Worker,
 };
-use cryarchiver_project::{Backend, Project, ProjectOptions, SystemSample, Tuning};
+use cryarchiver_project::{Backend, Fault, Project, ProjectOptions, SystemSample, Tuning};
 use tokio_util::sync::CancellationToken;
 
 pub const WAIT: Duration = Duration::from_secs(20);
@@ -47,7 +48,8 @@ impl FakeEncoder {
 		Arc::new(Self::default())
 	}
 
-	/// Files whose name ends with `suffix` follow `rule`; the latest matching rule wins. The default encodes to AVIF.
+	/// Files whose name ends with `suffix` follow `rule`; the latest matching rule wins. Like the engine, media names
+	/// are encoded (to AVIF) and anything else comes back as not media.
 	pub fn rule(&self, suffix: &str, rule: Rule) {
 		self.rules.lock().unwrap().push((suffix.to_owned(), rule));
 	}
@@ -63,7 +65,16 @@ impl FakeEncoder {
 			.iter()
 			.rev()
 			.find(|(suffix, _)| name.ends_with(suffix.as_str()))
-			.map_or(Rule::Encode("avif"), |(_, rule)| rule.clone())
+			.map_or_else(
+				|| {
+					if is_media_name(OsStr::new(name)) {
+						Rule::Encode("avif")
+					} else {
+						Rule::NotMedia
+					}
+				},
+				|(_, rule)| rule.clone(),
+			)
 	}
 }
 
@@ -197,6 +208,10 @@ pub fn setup(configure: impl FnOnce(&mut Settings)) -> Setup {
 }
 
 pub fn open(setup: &Setup, encoder: &Arc<FakeEncoder>) -> Project {
+	open_with(setup, encoder, None)
+}
+
+pub fn open_with(setup: &Setup, encoder: &Arc<FakeEncoder>, fault: Option<Fault>) -> Project {
 	Project::open(
 		&setup.project,
 		ProjectOptions {
@@ -204,6 +219,7 @@ pub fn open(setup: &Setup, encoder: &Arc<FakeEncoder>) -> Project {
 				encoder: encoder.clone(),
 			}),
 			tuning: tuning(),
+			fault,
 		},
 	)
 	.unwrap()

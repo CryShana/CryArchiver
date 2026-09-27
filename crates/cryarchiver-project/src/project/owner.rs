@@ -11,9 +11,11 @@ use cryarchiver_engine::text::display_name;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 
+use super::jobs::JobMessage;
+use super::pipeline::Pipeline;
 use super::publish::ViewState;
 use super::scanning::ScanState;
-use super::{Backend, Command, SystemSample, Tuning};
+use super::{Backend, Command, Fault, SystemSample, Tuning};
 use crate::issues::IssueIds;
 use crate::keys::RelPath;
 use crate::record::{FileState, Identity};
@@ -22,8 +24,10 @@ use crate::settings::{Settings, SettingsChange};
 use crate::store::{Store, StoreError};
 use crate::tree::{FileId, FolderId, Tree};
 use crate::view::{NoticeLevel, SystemView, Update};
+use crate::watch::ReadyCheck;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) enum Input {
 	Command(Command),
@@ -33,8 +37,11 @@ pub(crate) enum Input {
 /// What the project task's own helpers send back to it.
 pub(crate) enum Message {
 	Listed(Listing, bool),
+	ReadyChecked(FileId, ReadyCheck),
+	Job(FileId, JobMessage),
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Owner {
 	pub(super) settings: Settings,
 	pub(super) store: Store,
@@ -49,8 +56,12 @@ pub(crate) struct Owner {
 	pub(super) enclosing_identities: Vec<Identity>,
 	pub(super) started: bool,
 	pub(super) paused: bool,
+	pub(super) stopping: bool,
 	pub(super) delete_confirmed: bool,
+	pub(super) fault: Option<Fault>,
+	pub(super) crashed: bool,
 	pub(super) scan: ScanState,
+	pub(super) pipeline: Pipeline,
 	pub(super) view: ViewState,
 	pub(super) issue_ids: IssueIds,
 	pub(super) issue_files: BTreeSet<FileId>,
@@ -76,13 +87,17 @@ impl Owner {
 				_ = ticker.tick() => self.tick(Instant::now()),
 			}
 
+			if self.crashed {
+				break;
+			}
+
 			self.settle(Instant::now());
 			if self.failure.is_some() {
 				break;
 			}
 		}
 
-		self.finish();
+		self.finish(&mut inbox).await;
 	}
 
 	fn begin(&mut self) {
@@ -103,20 +118,45 @@ impl Owner {
 		self.view.issues_dirty = true;
 		self.publish();
 
+		self.resume_queued();
 		self.start_scan();
+	}
+
+	/// Files the last run left waiting go back into the pipeline.
+	fn resume_queued(&mut self) {
+		let files: Vec<FileId> = self.tree.file_ids().collect();
+		for file in files {
+			if self.tree.file(file).removed {
+				continue;
+			}
+
+			match self.tree.file(file).record.state {
+				FileState::Discovered => self.observe(file),
+				FileState::Ready => self.gate(file),
+				FileState::Queued => self.enqueue(file),
+				_ => {}
+			}
+		}
 	}
 
 	fn command(&mut self, command: Command) {
 		match command {
 			Command::Start { delete_confirmed } => self.start(delete_confirmed),
-			Command::Pause | Command::StopNow => self.paused = true,
+			Command::Pause => self.paused = true,
+			Command::StopNow => {
+				self.paused = true;
+				let running: Vec<FileId> = self.pipeline.jobs.keys().copied().collect();
+				self.cancel_and_requeue(&running);
+			}
 			Command::Rescan => self.start_scan(),
 			Command::ChangeSettings(change) => self.change_settings(change),
 			Command::Watch(folder, watched) => self.watch_folder(folder, watched),
 			Command::Filter(query) => self.set_filter(query),
 			Command::Details(file) => self.send_details(file),
 			Command::IssueLog(issue, attempt) => self.send_issue_log(issue, attempt),
-			Command::Resolve(..) | Command::RetryFailedIn(_) | Command::RestartPendingJobs => {}
+			Command::Resolve(issue, verb) => self.resolve(issue, verb),
+			Command::RetryFailedIn(folder) => self.retry_failed_in(folder),
+			Command::RestartPendingJobs => {}
 		}
 
 		self.view.status_dirty = true;
@@ -125,12 +165,18 @@ impl Owner {
 	fn message(&mut self, message: Message) {
 		match message {
 			Message::Listed(listing, recursive) => self.on_listed(&listing, recursive),
+			Message::ReadyChecked(file, check) => self.on_ready_checked(file, check),
+			Message::Job(file, message) => self.on_job(file, message),
 		}
 	}
 
 	fn tick(&mut self, now: Instant) {
 		self.pump_listings();
 		self.sample_system(now);
+		self.check_discovered(now);
+		self.retry_due(now);
+		self.check_disk(now);
+		self.start_jobs(now);
 	}
 
 	fn sample_system(&mut self, now: Instant) {
@@ -143,6 +189,10 @@ impl Owner {
 
 		let sample = self.backend.sample();
 		self.sample = Some((now, sample));
+		self.pipeline.governor.observe_cpu(now, sample.cpu_busy);
+		self.pipeline
+			.memory
+			.observe(sample.memory_available, sample.memory_total);
 		self.send(Update::System(SystemView {
 			cpu_percent: percent(sample.cpu_busy),
 			ram_used: sample.memory_total.saturating_sub(sample.memory_available),
@@ -160,10 +210,32 @@ impl Owner {
 		self.publish_if_due(now);
 	}
 
-	fn finish(&mut self) {
+	/// Stop now: running jobs are cancelled and requeued, then everything is written down. After a simulated crash
+	/// nothing more is written.
+	async fn finish(&mut self, inbox: &mut UnboundedReceiver<Message>) {
+		self.stopping = true;
+		self.view.status_dirty = true;
+		let running: Vec<FileId> = self.pipeline.jobs.keys().copied().collect();
+		self.cancel_and_requeue(&running);
+		if self.crashed {
+			self.send(Update::Stopped);
+			return;
+		}
+
+		self.publish();
+		let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+		while !self.pipeline.jobs.is_empty() {
+			match tokio::time::timeout_at(deadline, inbox.recv()).await {
+				Ok(Some(message)) => self.message(message),
+				Ok(None) | Err(_) => break,
+			}
+		}
+
 		if let Err(err) = self.store.flush() {
 			self.fail(err);
 		}
+		let _ = std::fs::remove_dir(self.pipeline.sink.staged_dir());
+		let _ = std::fs::remove_dir(self.pipeline.sink.archive_work_root());
 		self.publish();
 
 		if let Some(err) = self.failure.take() {
@@ -238,6 +310,14 @@ impl Owner {
 
 	pub(super) fn fail(&mut self, err: StoreError) {
 		self.failure.get_or_insert(err);
+	}
+
+	/// Whether the test's crash point is here; the task then stops without writing anything more.
+	pub(super) fn crash_point(&mut self, fault: Fault) -> bool {
+		if self.fault == Some(fault) {
+			self.crashed = true;
+		}
+		self.crashed
 	}
 
 	pub(super) fn source_path(&self, key: &RelPath) -> PathBuf {

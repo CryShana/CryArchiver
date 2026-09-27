@@ -1,9 +1,12 @@
 //! The project task and its handle (project layer spec §11). One task owns the in-memory state and the project file;
 //! every change goes through it. Front ends send [`Command`]s and fold the [`Update`]s it sends back.
 
+mod jobs;
 mod open;
 mod owner;
+mod pipeline;
 mod publish;
+mod resolve;
 mod scanning;
 
 use std::ffi::OsStr;
@@ -79,6 +82,18 @@ pub trait Backend: Send + Sync {
 pub struct ProjectOptions {
 	pub backend: Arc<dyn Backend>,
 	pub tuning: Tuning,
+	/// Only for crash-recovery tests.
+	pub fault: Option<Fault>,
+}
+
+/// A point where the project task stops dead, as if the process crashed: nothing more is written, not even the
+/// batch in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+	/// `Committing` is durable; the job never renames its output.
+	AfterCommitIntent,
+	/// The output is in place, but its `Done` is still in the unwritten batch.
+	AfterPlaced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

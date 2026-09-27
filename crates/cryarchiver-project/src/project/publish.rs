@@ -6,15 +6,17 @@ use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cryarchiver_engine::engine::Stage;
 use cryarchiver_engine::text::display_name;
 
 use super::owner::Owner;
 use crate::issues::{IssueId, IssueKey, Problem, Verbs};
 use crate::record::{CopyReason, FileState, How, IssueKind, MediaClass};
+use crate::schedule::Work;
 use crate::tree::{FileId, FolderId};
 use crate::view::{
 	Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, LogEntry, LogKind, Notice,
-	NoticeLevel, Overall, RowState, RunState, Status, Update,
+	NoticeLevel, Overall, RowState, RunState, Status, Update, Worker,
 };
 
 const THROUGHPUT_WINDOW: Duration = Duration::from_mins(5);
@@ -144,11 +146,50 @@ impl Owner {
 			let issues = self.issues_view();
 			self.send(Update::Issues(issues));
 		}
+
+		if self.pipeline.workers_dirty {
+			self.pipeline.workers_dirty = false;
+			self.send(Update::Workers(self.workers()));
+		}
+	}
+
+	fn workers(&self) -> Vec<Worker> {
+		let over_limit = self.pipeline.governor.over_limit();
+		let mut jobs: Vec<(&FileId, &super::pipeline::RunningJob)> = self.pipeline.jobs.iter().collect();
+		jobs.sort_by(|a, b| b.1.fraction.total_cmp(&a.1.fraction).then(a.0.cmp(b.0)));
+
+		jobs.iter()
+			.enumerate()
+			.map(|(index, (file, job))| {
+				let entry = self.tree.file(**file);
+				Worker {
+					file: **file,
+					folder: entry.folder,
+					work: job.work,
+					codec: match job.work {
+						Work::Encode => "encode",
+						Work::Copy => "copy",
+						Work::Hash => "hash",
+						Work::Placeholder => "dup",
+						Work::Delete => "delete",
+					}
+					.to_owned(),
+					name: display_name(&entry.name),
+					state: self.row_state(**file),
+					fraction: job.fraction,
+					over_limit: index >= jobs.len() - over_limit,
+				}
+			})
+			.collect()
 	}
 
 	pub(super) fn status(&self) -> Status {
-		let run_state = if !self.started || self.paused {
+		let run_state = if self.stopping {
+			RunState::Stopping
+		} else if !self.started || self.paused {
 			RunState::Paused
+		} else if self.pipeline.disk.is_paused() {
+			RunState::PausedLowDisk
 		} else {
 			RunState::Running
 		};
@@ -175,8 +216,10 @@ impl Owner {
 
 		Overall {
 			files_done: root.settled,
-			files_active: 0,
-			files_queued: root.files.saturating_sub(root.settled + u64::from(root.issues)),
+			files_active: self.pipeline.jobs.len() as u64,
+			files_queued: root
+				.files
+				.saturating_sub(root.settled + u64::from(root.issues) + self.pipeline.jobs.len() as u64),
 			files_total: root.files,
 			scan_complete: self.scan.complete,
 			progress: stats.progress,
@@ -225,8 +268,14 @@ impl Owner {
 	}
 
 	pub(super) fn row_state(&self, file: FileId) -> RowState {
+		let job = self.pipeline.jobs.get(&file);
 		match &self.tree.file(file).record.state {
+			FileState::Queued if self.waiting(file) => RowState::Waiting,
 			FileState::Discovered | FileState::Ready | FileState::Queued => RowState::Queued,
+			FileState::InProgress { .. } if job.is_some_and(|job| job.video_waiting) => RowState::Waiting,
+			FileState::InProgress { .. } if job.is_some_and(|job| job.stage == Some(Stage::Verify)) => {
+				RowState::Verifying
+			}
 			FileState::InProgress { .. } => RowState::Encoding,
 			FileState::Committing { .. } => RowState::Verifying,
 			FileState::Done(output) => match &output.how {
@@ -247,13 +296,18 @@ impl Owner {
 		}
 	}
 
+	/// Queued, but held back: a retry delay, or a dependency that isn't done.
+	pub(super) fn waiting(&self, file: FileId) -> bool {
+		self.pipeline.waits.is_waiting(file) || self.pipeline.retry_at.iter().any(|(_, waiting)| *waiting == file)
+	}
+
 	pub(super) fn file_status(&self, file: FileId) -> FileStatus {
 		let record = &self.tree.file(file).record;
 		let output = record.state.output();
 
 		FileStatus {
 			state: self.row_state(file),
-			progress: None,
+			progress: self.pipeline.jobs.get(&file).map(|job| job.fraction),
 			codec: output.map(|output| codec_label(&output.how, &output.path.name())),
 			bytes_in: record.size,
 			bytes_out: output.map(|output| output.size),
@@ -377,6 +431,13 @@ impl Owner {
 		let output = record.state.output();
 		let status = self.file_status(file);
 
+		let notes = self.pipeline.notes.get(&file).cloned().unwrap_or_default();
+		let stage = self
+			.pipeline
+			.jobs
+			.get(&file)
+			.and_then(|job| job.stage)
+			.map(|stage| format!("{stage:?}"));
 		let mut plan = vec![(
 			"Kind".to_owned(),
 			match record.class {
@@ -397,12 +458,12 @@ impl Owner {
 			}),
 			source_info: format!("{} bytes", record.size),
 			state: status.state,
-			stage: None,
+			stage,
 			fraction: status.progress,
 			bytes_in: record.size,
 			bytes_out: status.bytes_out,
 			plan,
-			log_tail: Vec::new(),
+			log_tail: notes,
 			duplicates: Duplicates::None,
 			issue,
 		}

@@ -114,6 +114,9 @@ pub enum FileState {
 		kind: IssueKind,
 		attempt: u32,
 		reason: String,
+		/// The output a missing-or-changed issue is about.
+		#[serde(default)]
+		output: Option<Output>,
 	},
 	Excluded,
 	/// The source was deleted by the user after its archive; the output stays.
@@ -277,7 +280,8 @@ mod tests {
 			!FileState::Issue {
 				kind: IssueKind::SourceUnreadable,
 				attempt: 1,
-				reason: String::new()
+				reason: String::new(),
+				output: None,
 			}
 			.is_settled()
 		);

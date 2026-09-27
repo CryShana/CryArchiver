@@ -168,6 +168,7 @@ fn a_second_open_is_refused() {
 		ProjectOptions {
 			backend: Arc::new(FakeBackend { encoder }),
 			tuning: support::tuning(),
+			fault: None,
 		},
 	);
 
@@ -313,7 +314,10 @@ fn changed_and_deleted_sources_are_reconciled() {
 
 	let all = records(&setup);
 	let edited = &all.iter().find(|(key, _)| key == "edited.txt").unwrap().1;
-	assert_eq!(edited.state, FileState::Discovered);
+	assert!(matches!(
+		edited.state,
+		FileState::Discovered | FileState::Ready | FileState::Queued
+	));
 	assert_eq!(edited.size, 11);
 	assert_eq!(edited.replaces, Some(key("edited.txt")));
 	assert_eq!(
@@ -666,7 +670,13 @@ fn archived_files_whose_source_comes_back_are_picked_up() {
 
 	for name in ["back.txt", "edited.txt"] {
 		let record = record_of(&setup, name);
-		assert_eq!(record.state, FileState::Discovered, "{name}");
+		assert!(
+			matches!(
+				record.state,
+				FileState::Discovered | FileState::Ready | FileState::Queued
+			),
+			"{name}"
+		);
 		assert_eq!(record.replaces, Some(key(name)), "{name}");
 	}
 	assert_eq!(

@@ -161,6 +161,12 @@ impl Queue {
 		}
 	}
 
+	pub fn pop_front(&mut self) -> Option<FileId> {
+		let file = self.order.pop_front()?;
+		self.members.remove(&file);
+		Some(file)
+	}
+
 	pub fn remove(&mut self, file: FileId) {
 		if self.members.remove(&file) {
 			self.order.retain(|queued| *queued != file);
@@ -370,6 +376,8 @@ mod tests {
 		queue.remove(FileId(1));
 		assert!(!queue.contains(FileId(1)));
 		assert_eq!(queue.len(), 2);
+		assert_eq!(queue.pop_front(), Some(FileId(3)));
+		assert!(!queue.contains(FileId(3)));
 	}
 
 	#[test]

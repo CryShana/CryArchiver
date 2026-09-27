@@ -453,6 +453,7 @@ mod tests {
 				kind: IssueKind::Unrecoverable { damaged: true },
 				attempt: 1,
 				reason: "truncated".into(),
+				output: None,
 			},
 		);
 

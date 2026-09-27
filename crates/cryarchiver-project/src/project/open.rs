@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use cryarchiver_engine::commit::file_id;
@@ -10,13 +11,16 @@ use cryarchiver_engine::workspace::sweep;
 use tokio::sync::mpsc::unbounded_channel;
 
 use super::owner::Owner;
+use super::pipeline::Pipeline;
 use super::publish::ViewState;
 use super::scanning::ScanState;
 use super::{ProjectError, ProjectOptions};
 use crate::dedup::full_hash;
 use crate::issues::IssueIds;
 use crate::keys::RelPath;
+use crate::memory::MemoryBudget;
 use crate::record::{FileState, Identity, Output};
+use crate::schedule::GovernorConfig;
 use crate::settings::Settings;
 use crate::store::{Loaded, Store};
 use crate::tree::{FileId, FolderId, Tree};
@@ -32,6 +36,17 @@ impl Owner {
 	) -> Result<Self, ProjectError> {
 		fs::create_dir_all(&settings.destination)?;
 		let (messages, inbox) = unbounded_channel();
+		let memory = Arc::new(MemoryBudget::default());
+		let image_threads = std::thread::available_parallelism().map_or(1, usize::from);
+		let pipeline = Pipeline::new(
+			&settings.destination,
+			GovernorConfig {
+				ramp: options.tuning.ramp,
+				max_encodes: options.tuning.max_encodes,
+			},
+			options.backend.encoder(image_threads, memory.clone()),
+			memory,
+		);
 
 		let mut owner = Self {
 			destination_identity: file_id(&settings.destination).ok().map(Identity::from),
@@ -51,8 +66,12 @@ impl Owner {
 			inbox: Some(inbox),
 			started: false,
 			paused: true,
+			stopping: false,
 			delete_confirmed: false,
+			fault: options.fault,
+			crashed: false,
 			scan: ScanState::default(),
+			pipeline,
 			view: ViewState::default(),
 			issue_ids: IssueIds::default(),
 			issue_files: BTreeSet::new(),
@@ -85,6 +104,16 @@ impl Owner {
 				.map_or(FolderId::ROOT, |parent| self.tree.ensure_folder(&parent));
 			let file = self.tree.add_file(folder, &key.name(), record);
 			self.track_issue(file);
+			if let Some(output) = self
+				.tree
+				.file(file)
+				.record
+				.state
+				.output()
+				.map(|output| output.path.clone())
+			{
+				self.claim(file, &output);
+			}
 		}
 
 		self.last_attempts = loaded.last_attempts;

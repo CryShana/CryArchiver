@@ -192,6 +192,7 @@ impl Owner {
 
 		let file = self.tree.add_file(folder, name, FileRecord::discovered(size, mtime_ns));
 		self.set_state(file, FileState::Discovered);
+		self.observe(file);
 		if !known {
 			self.file_added(file);
 		}
@@ -199,6 +200,7 @@ impl Owner {
 
 	/// The source changed after the project saw it: it is archived again, and the new output replaces the old one.
 	pub(super) fn source_changed(&mut self, file: FileId, size: u64, mtime_ns: i64) {
+		self.withdraw(file);
 		let old = &self.tree.file(file).record;
 		let replaces = old
 			.state
@@ -217,6 +219,7 @@ impl Owner {
 		};
 		self.tree.set_record(file, record);
 		self.set_state(file, FileState::Discovered);
+		self.observe(file);
 	}
 
 	/// The source file is gone. An archived file keeps its output; anything else leaves the project.
@@ -239,6 +242,7 @@ impl Owner {
 	}
 
 	pub(super) fn forget_file(&mut self, file: FileId) {
+		self.withdraw(file);
 		let folder = self.tree.file(file).folder;
 		self.tree.remove_file(file);
 		self.track_issue(file);
@@ -263,6 +267,7 @@ impl Owner {
 		}
 
 		let file = if let Some(file) = known {
+			self.withdraw(file);
 			file
 		} else {
 			let file = self.tree.add_file(folder, name, FileRecord::default());
@@ -276,8 +281,22 @@ impl Owner {
 				kind: IssueKind::SourceUnreadable,
 				attempt: 0,
 				reason: reason.to_owned(),
+				output: None,
 			},
 		);
+	}
+
+	/// Takes a file out of every queue and wait, and cancels its job; used when its source changes or vanishes.
+	pub(super) fn withdraw(&mut self, file: FileId) {
+		self.pipeline.observed.remove(&file);
+		for queue in self.pipeline.queues.values_mut() {
+			queue.remove(file);
+		}
+		self.pipeline.waits.forget(file);
+		self.pipeline.chosen_copies.remove(&file);
+		if let Some(job) = self.pipeline.jobs.get(&file) {
+			job.cancel.cancel();
+		}
 	}
 
 	/// The folder is gone, with everything below it, including any cycle it was.
@@ -354,10 +373,14 @@ impl Owner {
 mod tests {
 	use std::fs;
 	use std::path::Path;
+	use std::pin::Pin;
 	use std::sync::Arc;
 	use std::sync::mpsc::{Receiver, channel};
 
-	use cryarchiver_engine::engine::{Encode, MemoryGate};
+	use cryarchiver_engine::commit::OutputSink;
+	use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate};
+	use cryarchiver_engine::outcome::JobOutcome;
+	use tokio_util::sync::CancellationToken;
 
 	use super::*;
 	use crate::project::{Backend, ProjectOptions, SystemSample, Tuning, create};
@@ -365,9 +388,23 @@ mod tests {
 
 	struct NoBackend;
 
+	struct NoEncoder;
+
+	impl Encode for NoEncoder {
+		fn encode<'a>(
+			&'a self,
+			_job: &'a Job,
+			_sink: &'a dyn OutputSink,
+			_on_event: &'a (dyn Fn(JobEvent) + Sync),
+			_cancel: &'a CancellationToken,
+		) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>> {
+			unreachable!("scanning never encodes")
+		}
+	}
+
 	impl Backend for NoBackend {
 		fn encoder(&self, _image_threads: usize, _memory: Arc<dyn MemoryGate>) -> Arc<dyn Encode> {
-			unreachable!("scanning never encodes")
+			Arc::new(NoEncoder)
 		}
 
 		fn toolchain(&self) -> String {
@@ -390,6 +427,7 @@ mod tests {
 				listings: 0,
 				..Tuning::default()
 			},
+			fault: None,
 		};
 
 		(

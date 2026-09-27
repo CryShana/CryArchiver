@@ -4,6 +4,7 @@
 pub mod dedup;
 pub mod issues;
 pub mod keys;
+pub mod memory;
 pub mod project;
 pub mod record;
 pub mod references;
@@ -17,5 +18,5 @@ pub mod view;
 pub mod watch;
 
 pub use project::{
-	Backend, Command, PROJECT_EXTENSION, Project, ProjectError, ProjectOptions, SystemSample, Tuning, create,
+	Backend, Command, Fault, PROJECT_EXTENSION, Project, ProjectError, ProjectOptions, SystemSample, Tuning, create,
 };
