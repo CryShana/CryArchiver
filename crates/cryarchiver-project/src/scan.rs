@@ -60,7 +60,17 @@ pub fn list_folder(root: &Path, folder: &RelPath) -> Listing {
 		}
 	};
 
-	for entry in entries.flatten() {
+	for entry in entries {
+		// A partial listing would make every file it misses look deleted.
+		let entry = match entry {
+			Ok(entry) => entry,
+			Err(err) => {
+				listing.entries.clear();
+				listing.error = Some(err.to_string());
+				return listing;
+			}
+		};
+
 		let name = entry.file_name();
 		let followed = match entry.file_type() {
 			Ok(kind) if kind.is_symlink() => fs::metadata(entry.path()),
