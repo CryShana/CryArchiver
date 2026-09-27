@@ -88,6 +88,14 @@ fn is_sixteen_bit(image: &DynamicImage) -> bool {
 #[allow(clippy::cast_precision_loss)]
 pub fn graphic_metrics(rgb: &RgbImage) -> GraphicMetrics {
 	let (width, height) = rgb.dimensions();
+	if width == 0 || height == 0 {
+		return GraphicMetrics {
+			unique_colours: 0,
+			equal_right: 0.0,
+			flat_blocks: 0.0,
+		};
+	}
+
 	let mut seen = vec![0u64; (1 << 24) / 64];
 	let mut unique_colours = 0u32;
 	let mut equal_right = 0u64;
@@ -180,6 +188,16 @@ mod tests {
 			let value = samples(x, y);
 			Rgb([value, value, value])
 		}))
+	}
+
+	#[test]
+	fn empty_images_have_no_graphic_metrics() {
+		for (width, height) in [(0, 4), (4, 0), (0, 0)] {
+			let metrics = graphic_metrics(&RgbImage::new(width, height));
+
+			assert_eq!(metrics.unique_colours, 0);
+			assert!(metrics.equal_right == 0.0 && metrics.flat_blocks == 0.0);
+		}
 	}
 
 	#[test]
