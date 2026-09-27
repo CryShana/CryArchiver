@@ -30,6 +30,7 @@ pub struct ImageInput {
 	pub warnings: Vec<String>,
 	pub pix_fmt: Option<String>,
 	pub animated: bool,
+	pub memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,7 @@ pub fn prepare(
 	let metadata = metadata::extract(&bytes);
 	let video = info.streams.iter().find(|stream| stream.is_video());
 	let probed = video.and_then(|stream| Some((stream.width?, stream.height?)));
+	let dimensions = decode::header_dimensions(&bytes, probed);
 
 	let input = PrecheckInput {
 		structure: &structure,
@@ -105,7 +107,7 @@ pub fn prepare(
 		tiff_pages: (sniff(&bytes) == ImageFormat::Tiff)
 			.then(|| exif::tiff_pages(&bytes))
 			.flatten(),
-		dimensions: decode::header_dimensions(&bytes, probed),
+		dimensions,
 		drop_aux,
 		mode,
 	};
@@ -126,6 +128,7 @@ pub fn prepare(
 		warnings,
 		pix_fmt: video.and_then(|stream| stream.pix_fmt.clone()),
 		animated: animated || sequence,
+		memory_bytes: dimensions.map_or(0, |(width, height)| plan::worst_case_memory(width, height)),
 	}))
 }
 

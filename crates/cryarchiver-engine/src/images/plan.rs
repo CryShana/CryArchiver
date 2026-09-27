@@ -201,6 +201,18 @@ pub fn plan_still(facts: &StillFacts, speed: Speed, libjxl: bool) -> Result<Stil
 	})
 }
 
+/// The estimate before decoding, while the route isn't known yet: the larger of the ravif and libjxl estimates.
+pub fn worst_case_memory(width: u32, height: u32) -> u64 {
+	memory_estimate(
+		width,
+		height,
+		&[
+			Candidate::Ravif(ravif_settings(Speed::Slow)),
+			Candidate::JxlLossy(jxl_lossy_settings(Speed::Slow)),
+		],
+	)
+}
+
 pub fn memory_estimate(width: u32, height: u32, candidates: &[Candidate]) -> u64 {
 	let pixels = u64::from(width) * u64::from(height);
 	let encoder = candidates
@@ -380,6 +392,12 @@ mod tests {
 			memory_estimate(10_800, 5_400, &[Candidate::JxlLossy(jxl_lossy_settings(Speed::Fast))]),
 			pixels * (8 + 36 + 7) + (250 << 20)
 		);
+	}
+
+	#[test]
+	fn the_worst_case_covers_both_encoders() {
+		assert_eq!(worst_case_memory(4000, 3000), 12_000_000 * (8 + 36 + 34));
+		assert_eq!(worst_case_memory(100, 100), 10_000 * (8 + 36 + 7) + (250 << 20));
 	}
 
 	fn input<'a>(structure: &'a Structure, metadata: &'a SourceMetadata) -> PrecheckInput<'a> {

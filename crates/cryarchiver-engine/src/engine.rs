@@ -1,6 +1,8 @@
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +21,7 @@ use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::text::display_path;
 use crate::toolchain::{MediaKind, Toolchain};
 use crate::video::mux::{self, Attachment, MuxInputs, MuxPlan};
-use crate::video::plan::{VideoCaps, VideoPlan, plan_video, precheck};
+use crate::video::plan::{self as video_plan, VideoCaps, VideoPlan, plan_video, precheck};
 use crate::video::streams::{Extracted, StreamPlan, plan_streams};
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
@@ -28,6 +30,7 @@ use crate::video::{analyze, encode as video_encode};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
+const MEMORY_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct Job {
@@ -44,6 +47,7 @@ pub enum Stage {
 	Probe,
 	Plan,
 	Queued,
+	WaitingForMemory,
 	Analyze,
 	Sample,
 	Encode,
@@ -71,10 +75,30 @@ pub trait Encode: Send + Sync {
 	) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>>;
 }
 
+/// Admission by estimated peak memory (project layer spec §8.2). The engine asks before a job's heavy work starts,
+/// asks again every quarter second until the reservation succeeds, and releases it when the job ends.
+pub trait MemoryGate: Send + Sync {
+	fn try_reserve(&self, bytes: u64) -> bool;
+
+	fn release(&self, bytes: u64);
+}
+
+struct MemoryReservation<'a> {
+	gate: &'a dyn MemoryGate,
+	bytes: u64,
+}
+
+impl Drop for MemoryReservation<'_> {
+	fn drop(&mut self) {
+		self.gate.release(self.bytes);
+	}
+}
+
 pub struct Engine {
 	tools: Toolchain,
 	video_slots: Semaphore,
 	image_threads: usize,
+	memory_gate: Option<Arc<dyn MemoryGate>>,
 }
 
 struct Context<'a> {
@@ -127,6 +151,15 @@ impl Engine {
 			tools,
 			video_slots: Semaphore::new(1),
 			image_threads: std::thread::available_parallelism().map_or(1, usize::from),
+			memory_gate: None,
+		}
+	}
+
+	#[must_use]
+	pub fn with_memory_gate(self, gate: Arc<dyn MemoryGate>) -> Self {
+		Self {
+			memory_gate: Some(gate),
+			..self
 		}
 	}
 
@@ -217,6 +250,11 @@ impl Engine {
 			MediaClass::Other(reason) => return Ok(JobOutcome::Skipped { reason }),
 		};
 
+		let _memory = match &planned {
+			Planned::Image(input) => self.reserve_memory(input.memory_bytes, on_event, cancel).await?,
+			Planned::Audio { .. } | Planned::Video => None,
+		};
+
 		let before =
 			SourceTimes::from_metadata(&meta).map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
 		let work_root = sink.work_root(&job.source);
@@ -241,6 +279,31 @@ impl Engine {
 
 		on_event(JobEvent::Stage(Stage::Commit));
 		finish(job, sink, &work_root, &meta, before, staged)
+	}
+
+	async fn reserve_memory(
+		&self,
+		bytes: u64,
+		on_event: &(dyn Fn(JobEvent) + Sync),
+		cancel: &CancellationToken,
+	) -> Result<Option<MemoryReservation<'_>>, JobError> {
+		let Some(gate) = self.memory_gate.as_deref() else {
+			return Ok(None);
+		};
+
+		if !gate.try_reserve(bytes) {
+			on_event(JobEvent::Stage(Stage::WaitingForMemory));
+			loop {
+				tokio::select! {
+					() = tokio::time::sleep(MEMORY_POLL) => {}
+					() = cancel.cancelled() => return Err(ErrorKind::Cancelled.into()),
+				}
+				if gate.try_reserve(bytes) {
+					break;
+				}
+			}
+		}
+		Ok(Some(MemoryReservation { gate, bytes }))
 	}
 
 	fn require(&self, kind: MediaKind) -> Result<(), JobError> {
@@ -362,6 +425,8 @@ impl Engine {
 			slot = self.video_slots.acquire() => slot.expect("the semaphore is never closed"),
 			() = cx.cancel.cancelled() => return Err(ErrorKind::Cancelled.into()),
 		};
+		let estimate = video_plan::memory_estimate(main.width.unwrap_or(0), main.height.unwrap_or(0));
+		let _memory = self.reserve_memory(estimate, cx.on_event, cx.cancel).await?;
 
 		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
 		let declared_s = main.declared_duration().or(info.format.duration);

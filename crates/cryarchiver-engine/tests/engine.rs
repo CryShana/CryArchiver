@@ -2,9 +2,12 @@ mod support;
 
 use std::fs::{self, File};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, Stage};
+use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
+use cryarchiver_engine::images::plan::worst_case_memory;
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::{Stream, probe};
@@ -86,6 +89,85 @@ async fn archival_jobs_are_staged_with_the_source_times() {
 	assert_eq!(output.extension().unwrap(), "opus");
 	assert_eq!(fs::metadata(&output).unwrap().modified().unwrap(), modified);
 	assert_eq!(fs::read_dir(sink.archive_work_root()).unwrap().count(), 1);
+}
+
+#[derive(Default)]
+struct CountingGate {
+	refusals: AtomicU32,
+	requested: AtomicU64,
+	reserved: AtomicU64,
+}
+
+impl MemoryGate for CountingGate {
+	fn try_reserve(&self, bytes: u64) -> bool {
+		self.requested.store(bytes, Ordering::SeqCst);
+		if self
+			.refusals
+			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+			.is_ok()
+		{
+			return false;
+		}
+
+		self.reserved.fetch_add(bytes, Ordering::SeqCst);
+		true
+	}
+
+	fn release(&self, bytes: u64) {
+		self.reserved.fetch_sub(bytes, Ordering::SeqCst);
+	}
+}
+
+#[tokio::test]
+async fn image_jobs_wait_for_memory_and_release_it() {
+	let dir = tempfile::tempdir().unwrap();
+	let png = support::photo_png(dir.path(), "a.png", 64, 48);
+	let gate = Arc::new(CountingGate {
+		refusals: AtomicU32::new(2),
+		..CountingGate::default()
+	});
+	let engine = Engine::new(support::toolchain().await).with_memory_gate(gate.clone());
+	let stages = Mutex::new(Vec::new());
+	let on_event = |event: JobEvent| {
+		if let JobEvent::Stage(stage) = event {
+			stages.lock().unwrap().push(stage);
+		}
+	};
+
+	let outcome = engine
+		.run(&job(&png), &sink(dir.path()), &on_event, &CancellationToken::new())
+		.await;
+
+	assert!(!matches!(outcome, JobOutcome::Failed(_)), "{outcome:?}");
+	assert!(stages.lock().unwrap().contains(&Stage::WaitingForMemory));
+	assert_eq!(gate.requested.load(Ordering::SeqCst), worst_case_memory(64, 48));
+	assert_eq!(gate.refusals.load(Ordering::SeqCst), 0);
+	assert_eq!(gate.reserved.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_job_waiting_for_memory_can_be_cancelled() {
+	let dir = tempfile::tempdir().unwrap();
+	let png = support::photo_png(dir.path(), "a.png", 64, 48);
+	let gate = Arc::new(CountingGate {
+		refusals: AtomicU32::new(u32::MAX),
+		..CountingGate::default()
+	});
+	let engine = Engine::new(support::toolchain().await).with_memory_gate(gate);
+	let cancel = CancellationToken::new();
+	let canceller = cancel.clone();
+	tokio::spawn(async move {
+		tokio::time::sleep(Duration::from_millis(600)).await;
+		canceller.cancel();
+	});
+
+	let outcome = engine.run(&job(&png), &sink(dir.path()), &|_| {}, &cancel).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.kind == ErrorKind::Cancelled),
+		"{outcome:?}"
+	);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
 }
 
 #[tokio::test]

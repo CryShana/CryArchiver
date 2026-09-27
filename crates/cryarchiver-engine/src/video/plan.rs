@@ -24,6 +24,8 @@ const RATE_AGREEMENT: f64 = 0.001;
 const PACKET_AGREEMENT: f64 = 0.002;
 const MIN_PACKET_SLACK: f64 = 2.0;
 const SOURCE_FRAME_TOLERANCE: u64 = 2;
+const VIDEO_BASE_BYTES: u64 = 512 << 20;
+const VIDEO_BYTES_PER_PIXEL: u64 = 540;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoCaps {
@@ -79,6 +81,11 @@ pub struct VideoPlan {
 	pub alpha: bool,
 	pub hdr10: bool,
 	pub warnings: Vec<String>,
+}
+
+/// Decoder, filters and SVT-AV1 together: about 5 GB for 4K (project layer spec §8.2).
+pub fn memory_estimate(width: u32, height: u32) -> u64 {
+	VIDEO_BASE_BYTES + u64::from(width) * u64::from(height) * VIDEO_BYTES_PER_PIXEL
 }
 
 pub fn main_stream(info: &MediaInfo) -> Option<&Stream> {
@@ -340,6 +347,15 @@ mod tests {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,
 	};
+
+	#[test]
+	fn memory_grows_with_the_resolution() {
+		let uhd = memory_estimate(3840, 2160);
+		let full_hd = memory_estimate(1920, 1080);
+
+		assert!((4_900_000_000..5_100_000_000).contains(&uhd), "{uhd}");
+		assert!((1_500_000_000..1_800_000_000).contains(&full_hd), "{full_hd}");
+	}
 
 	fn info(json: &str) -> MediaInfo {
 		MediaInfo::parse(json.as_bytes()).unwrap()
