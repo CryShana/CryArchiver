@@ -1,5 +1,6 @@
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -57,6 +58,17 @@ pub enum JobEvent {
 	Stage(Stage),
 	Progress(f64),
 	Warning(String),
+}
+
+/// The engine's job call as an object, so the project layer can run without ffmpeg in its tests.
+pub trait Encode: Send + Sync {
+	fn encode<'a>(
+		&'a self,
+		job: &'a Job,
+		sink: &'a dyn OutputSink,
+		on_event: &'a (dyn Fn(JobEvent) + Sync),
+		cancel: &'a CancellationToken,
+	) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>>;
 }
 
 pub struct Engine {
@@ -563,6 +575,18 @@ impl Engine {
 		let output_levels = verify::measure_output(&self.tools, audio_temp, plan, cancel).await?;
 		verify::check_tracks(plan, source_levels, &output_levels)
 			.map_err(|reason| ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into())
+	}
+}
+
+impl Encode for Engine {
+	fn encode<'a>(
+		&'a self,
+		job: &'a Job,
+		sink: &'a dyn OutputSink,
+		on_event: &'a (dyn Fn(JobEvent) + Sync),
+		cancel: &'a CancellationToken,
+	) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>> {
+		Box::pin(self.run(job, sink, on_event, cancel))
 	}
 }
 

@@ -1,10 +1,13 @@
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use ulid::Ulid;
 
 use crate::commit::{Artifact, CommitError, OutputSink, Replace, commit_file};
 use crate::container::OUTPUT_EXTENSIONS;
 use crate::naming::{cli_output_dir, cli_output_path};
-use crate::workspace::CLI_WORK_DIR;
+use crate::workspace::{ARCHIVE_DIR, ARCHIVE_WORK_DIR, CLI_WORK_DIR, STAGED_DIR};
 
 #[derive(Debug, Clone)]
 pub struct CliSink {
@@ -48,16 +51,99 @@ impl OutputSink for CliSink {
 	}
 }
 
+/// The archival sink stages each finished artifact, with the source's timestamps and fsynced, in
+/// `<destination>/.cryarchiver/work/staged/`, and returns that path. The project layer records its commit intent and
+/// then renames the staged file into the mirrored tree, on the same filesystem.
+#[derive(Debug, Clone)]
+pub struct ArchivalSink {
+	destination: PathBuf,
+}
+
+impl ArchivalSink {
+	pub fn new(destination: &Path) -> Self {
+		Self {
+			destination: destination.to_path_buf(),
+		}
+	}
+
+	pub fn archive_work_root(&self) -> PathBuf {
+		self.destination.join(ARCHIVE_DIR).join(ARCHIVE_WORK_DIR)
+	}
+
+	pub fn staged_dir(&self) -> PathBuf {
+		self.archive_work_root().join(STAGED_DIR)
+	}
+
+	pub fn staged_path(&self, extension: &str) -> PathBuf {
+		let mut name = OsString::from(Ulid::generate().to_string());
+		if !extension.is_empty() {
+			name.push(".");
+			name.push(extension);
+		}
+		self.staged_dir().join(name)
+	}
+}
+
+impl OutputSink for ArchivalSink {
+	fn work_root(&self, _source: &Path) -> PathBuf {
+		self.archive_work_root()
+	}
+
+	fn commit(&self, artifact: &Artifact) -> Result<PathBuf, CommitError> {
+		let extension = artifact.path.extension().unwrap_or_default().to_string_lossy();
+		let staged = self.staged_path(&extension);
+		fs::create_dir_all(self.staged_dir())?;
+
+		commit_file(artifact, &staged, Replace::Never)?;
+		Ok(staged)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::fs;
 	use std::path::Path;
+	use std::time::{Duration, SystemTime};
 
 	use crate::commit::Artifact;
 	use crate::commit::CommitError;
+	use crate::commit::SourceTimes;
 	use crate::workspace::CLI_WORK_DIR;
 
 	use super::*;
+
+	#[test]
+	fn the_archival_sink_stages_with_the_source_times() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("a.flac");
+		let work = dir.path().join("work-output.opus");
+		fs::write(&source, b"src").unwrap();
+		fs::write(&work, b"encoded").unwrap();
+		let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+		let sink = ArchivalSink::new(&dir.path().join("archive"));
+
+		let staged = sink
+			.commit(&Artifact {
+				path: work.clone(),
+				source,
+				times: Some(SourceTimes {
+					accessed: modified,
+					modified,
+					created: None,
+				}),
+			})
+			.unwrap();
+
+		assert_eq!(
+			sink.work_root(Path::new("any")),
+			dir.path().join("archive").join(".cryarchiver").join("work")
+		);
+		assert_eq!(staged.parent().unwrap(), sink.staged_dir());
+		assert_eq!(staged.extension().unwrap(), "opus");
+		assert_eq!(fs::read(&staged).unwrap(), b"encoded");
+		assert_eq!(fs::metadata(&staged).unwrap().modified().unwrap(), modified);
+		assert!(!work.exists());
+	}
 
 	fn staged(dir: &Path, source: &Path) -> Artifact {
 		let path = dir.join("out.opus");

@@ -7,6 +7,9 @@ use ulid::Ulid;
 use crate::commit::retry_transient;
 
 pub const CLI_WORK_DIR: &str = ".cry-work";
+pub const ARCHIVE_DIR: &str = ".cryarchiver";
+pub const ARCHIVE_WORK_DIR: &str = "work";
+pub const STAGED_DIR: &str = "staged";
 
 const LOCK_FILE: &str = "job.lock";
 

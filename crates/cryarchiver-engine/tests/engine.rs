@@ -4,11 +4,11 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
+use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::{Stream, probe};
-use cryarchiver_engine::sink::CliSink;
+use cryarchiver_engine::sink::{ArchivalSink, CliSink};
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
 use tokio_util::sync::CancellationToken;
 
@@ -55,6 +55,37 @@ async fn flac_is_encoded_verified_and_committed() {
 	assert_eq!(output, dir.path().join("a.cry.opus"));
 	assert!(out_bytes < src_bytes);
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn archival_jobs_are_staged_with_the_source_times() {
+	let dir = tempfile::tempdir().unwrap();
+	let flac = support::tone(dir.path(), "a.flac", "stereo", 2, 10, &["-c:a", "flac"]);
+	let modified = SystemTime::UNIX_EPOCH + Duration::from_mins(25_000_000);
+	File::options()
+		.write(true)
+		.open(&flac)
+		.unwrap()
+		.set_modified(modified)
+		.unwrap();
+	let sink = ArchivalSink::new(&dir.path().join("archive"));
+	let engine: Box<dyn Encode> = Box::new(Engine::new(support::toolchain().await));
+	let archival = Job {
+		keep_metadata: true,
+		..job(&flac)
+	};
+
+	let outcome = engine
+		.encode(&archival, &sink, &|_| {}, &CancellationToken::new())
+		.await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output.parent().unwrap(), sink.staged_dir());
+	assert_eq!(output.extension().unwrap(), "opus");
+	assert_eq!(fs::metadata(&output).unwrap().modified().unwrap(), modified);
+	assert_eq!(fs::read_dir(sink.archive_work_root()).unwrap().count(), 1);
 }
 
 #[tokio::test]
