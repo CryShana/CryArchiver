@@ -26,7 +26,7 @@ pub(crate) struct WatchState {
 	pub(super) debouncer: Debouncer,
 	last_safety_pass: Option<Instant>,
 	safety_pass_running: bool,
-	destination_walk: bool,
+	pub(super) destination_walk: bool,
 	/// A walk asked for while one already runs: one more starts once it lands.
 	walk_pending: bool,
 	placed_during_walk: HashSet<FileId>,

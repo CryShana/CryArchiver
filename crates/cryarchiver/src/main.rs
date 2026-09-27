@@ -1,4 +1,6 @@
+mod headless;
 mod inputs;
+mod projects;
 mod report;
 
 use std::collections::{BTreeMap, HashMap};
@@ -20,7 +22,7 @@ use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::toolchain::{Status, ToolConfig, Toolchain};
 use cryarchiver_engine::workspace::sweep;
-use cryarchiver_tui::MockSource;
+use cryarchiver_tui::{MockSource, ProjectSource};
 use tokio::sync::Notify;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -49,7 +51,51 @@ enum Command {
 		ffmpeg: Option<PathBuf>,
 	},
 	#[command(about = "Open the archival TUI")]
-	Tui { project: Option<PathBuf> },
+	Tui {
+		project: Option<PathBuf>,
+		#[arg(long, value_name = "PATH", help = "ffmpeg binary or the folder containing it")]
+		ffmpeg: Option<PathBuf>,
+	},
+	#[command(about = "Run an archive project without the TUI")]
+	Run {
+		project: PathBuf,
+		#[arg(
+			long,
+			help = "Confirm that this project deletes each original once its archived copy checks out"
+		)]
+		delete_originals: bool,
+		#[arg(long, value_name = "PATH", help = "ffmpeg binary or the folder containing it")]
+		ffmpeg: Option<PathBuf>,
+	},
+	#[command(subcommand, about = "Create or inspect archive projects")]
+	Project(ProjectCommand),
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+	#[command(about = "Create a project that archives SOURCE into DESTINATION")]
+	Create {
+		source: PathBuf,
+		destination: PathBuf,
+		#[arg(
+			long,
+			help = "The project file's name, without .cryarchive [default: the source folder's name]"
+		)]
+		name: Option<String>,
+		#[arg(short, long, value_enum, default_value_t, help = "Speed preset")]
+		speed: Speed,
+		#[arg(long, help = "Keep running and archive new files as they appear")]
+		watch: bool,
+		#[arg(
+			long,
+			value_name = "PERCENT",
+			value_parser = clap::value_parser!(u8).range(1..=100),
+			help = "Run in the background: low priority, one job at a time, this much CPU at most"
+		)]
+		limit: Option<u8>,
+	},
+	#[command(about = "Print a project's tables as text, for debugging")]
+	Dump { project: PathBuf },
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -147,16 +193,36 @@ impl Drop for QueueSeat {
 }
 
 enum Launch {
-	Tui(Option<PathBuf>),
+	Tui(Option<PathBuf>, Option<PathBuf>),
 	Doctor(Option<PathBuf>),
 	Compress(CompressArgs),
+	Run {
+		project: PathBuf,
+		delete_originals: bool,
+		ffmpeg: Option<PathBuf>,
+	},
+	Project(ProjectCommand),
 }
 
 fn main() -> ExitCode {
 	let code = match launch() {
-		Launch::Tui(project) => return ExitCode::from(open_tui(project.as_deref())),
+		Launch::Tui(project, ffmpeg) => return ExitCode::from(open_tui(project.as_deref(), ffmpeg)),
 		Launch::Doctor(ffmpeg) => block_on(doctor(ffmpeg)),
 		Launch::Compress(args) => block_on(compress(args)),
+		Launch::Run {
+			project,
+			delete_originals,
+			ffmpeg,
+		} => return ExitCode::from(run_project(&project, delete_originals, ffmpeg)),
+		Launch::Project(ProjectCommand::Create {
+			source,
+			destination,
+			name,
+			speed,
+			watch,
+			limit,
+		}) => projects::create(&source, &destination, name.as_deref(), speed, watch, limit),
+		Launch::Project(ProjectCommand::Dump { project }) => projects::dump(&project),
 	};
 
 	pause_if_launched_from_explorer();
@@ -165,14 +231,26 @@ fn main() -> ExitCode {
 
 fn launch() -> Launch {
 	if std::env::args_os().len() == 1 {
-		return Launch::Tui(None);
+		return Launch::Tui(None, None);
 	}
 
 	let cli = Cli::parse();
 	match cli.command {
 		Some(Command::Doctor { ffmpeg }) => Launch::Doctor(ffmpeg),
-		Some(Command::Tui { project }) => Launch::Tui(project),
-		None if opens_project(&cli.compress.inputs) => Launch::Tui(cli.compress.inputs.into_iter().next()),
+		Some(Command::Tui { project, ffmpeg }) => Launch::Tui(project, ffmpeg),
+		Some(Command::Run {
+			project,
+			delete_originals,
+			ffmpeg,
+		}) => Launch::Run {
+			project,
+			delete_originals,
+			ffmpeg,
+		},
+		Some(Command::Project(command)) => Launch::Project(command),
+		None if opens_project(&cli.compress.inputs) => {
+			Launch::Tui(cli.compress.inputs.into_iter().next(), cli.compress.ffmpeg)
+		}
 		None => Launch::Compress(cli.compress),
 	}
 }
@@ -193,15 +271,25 @@ fn opens_project(inputs: &[PathBuf]) -> bool {
 		.is_some_and(|input| input.extension().is_some_and(|ext| ext == "cryarchive"))
 }
 
-fn open_tui(project: Option<&Path>) -> u8 {
-	if let Some(project) = project {
-		eprintln!(
-			"note: opening projects arrives with the project layer; {} is ignored and the dashboard shows demo data",
-			display_path(project)
-		);
-	}
+fn open_tui(project: Option<&Path>, ffmpeg: Option<PathBuf>) -> u8 {
+	use std::io::IsTerminal;
 
-	match cryarchiver_tui::run(MockSource::default()) {
+	let result = match project {
+		None => cryarchiver_tui::run(MockSource::default()),
+		Some(_) if !io::stdin().is_terminal() || !io::stdout().is_terminal() => {
+			Err(cryarchiver_tui::RunError::NotATerminal)
+		}
+		Some(path) => match projects::open(path, ffmpeg) {
+			Ok(project) => cryarchiver_tui::run(ProjectSource::new(project)),
+			Err(message) => {
+				eprintln!("error: {message}");
+				pause_if_launched_from_explorer();
+				return 2;
+			}
+		},
+	};
+
+	match result {
 		Ok(()) => 0,
 		Err(err) => {
 			eprintln!("error: {err}");
@@ -209,6 +297,20 @@ fn open_tui(project: Option<&Path>) -> u8 {
 			2
 		}
 	}
+}
+
+fn run_project(path: &Path, delete_originals: bool, ffmpeg: Option<PathBuf>) -> u8 {
+	let mut project = match projects::open(path, ffmpeg) {
+		Ok(project) => project,
+		Err(message) => {
+			eprintln!("error: {message}");
+			return 2;
+		}
+	};
+
+	let interrupted = Arc::new(AtomicBool::new(false));
+	projects::stop_on_ctrl_c(&interrupted);
+	headless::run(&mut project, delete_originals, &interrupted)
 }
 
 async fn doctor(ffmpeg: Option<PathBuf>) -> u8 {

@@ -1,6 +1,7 @@
 //! The archival project layer (sub-project 2): one source tree mirrored into one destination, resumable across
 //! quits and crashes.
 
+pub mod backend;
 pub mod complete;
 pub mod dedup;
 pub mod issues;

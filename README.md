@@ -63,6 +63,36 @@ cryarchiver album/ --speed slow        # slower, higher quality
 
 Exit codes: `0` everything succeeded or was kept/skipped · `1` at least one file failed · `2` no inputs, or a problem with ffmpeg.
 
-## Archive dashboard (preview)
+## Archive projects
 
-`cryarchiver` with no arguments, or `cryarchiver tui`, opens the archive dashboard in the terminal. For now it runs on demo data, so the layout can be tried before whole-folder archiving arrives. It needs a terminal of at least 100×30; press `?` for keys and `q` to quit.
+An archive project mirrors one folder tree into another: media is compressed, everything else is copied, and duplicates become small placeholder files. Its state lives in `<destination>/<name>.cryarchive`, so it can stop at any moment, even in a crash, and resumes where it left off.
+
+```
+cryarchiver project create D:\Photos E:\Archive     # creates E:\Archive\Photos.cryarchive
+cryarchiver E:\Archive\Photos.cryarchive            # opens it in the dashboard
+cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashboard
+```
+
+- The source is never modified, unless you turn on deleting originals (below).
+- Archived files keep their metadata and timestamps; each folder gets its timestamps once everything in it is archived. Empty folders are mirrored too.
+- A file that is still being written waits until it has been still for 30 seconds, and on Windows until no other program holds it open for writing.
+- Duplicates are confirmed with a full BLAKE3 before anything is replaced, then become `placeholder_<name>.txt` files that point to the archived copy in the shallowest folder. Files under 64 KiB are always archived normally.
+- Cue sheets and playlists wait for the files they name, and are copied with the new names written in. Subtitles and other sidecars keep matching their video's name.
+- A file that fails stays an open issue until you retry it, copy the original or exclude it in the dashboard (`i`). Files in the destination that the project didn't write are reported as issues until you acknowledge them; they are never deleted.
+- With watch mode on, the run keeps going once everything is archived and picks up new files as they appear.
+- The performance limit runs in the background: low priority, one job at a time, and at most the chosen share of the CPU.
+
+**Deleting originals** is off by default. It can only be turned on in the dashboard's settings (`s`), by typing `DELETE`. An original is then deleted permanently, with no Recycle Bin, once its archived copy has been read back from disk and matches its BLAKE3. A headless run of such a project also needs `--delete-originals`, or it refuses to start.
+
+| Command | Meaning |
+|---|---|
+| `project create SOURCE DESTINATION [--name N] [--speed S] [--watch] [--limit PERCENT]` | Create a project; neither folder may be inside the other |
+| `tui PROJECT`, or `PROJECT.cryarchive` alone | Open a project in the dashboard |
+| `run PROJECT [--delete-originals]` | Run a project without the dashboard |
+| `project dump PROJECT` | Print the project's tables, for debugging |
+
+`tui` and `run` also take `--ffmpeg PATH`.
+
+`run` prints a progress line every few seconds and the log as it happens, then a summary that lists the open issues. It exits with `0` once everything is archived without open issues, `1` with open issues (unacknowledged unknown files in the destination included) or when stopped with Ctrl+C before the end (a watch-mode run stopped with Ctrl+C exits with `0` when it has no open issues), and `2` when the project can't be opened or the delete confirmation doesn't agree. A second Ctrl+C exits at once; the next run resumes the jobs that were running.
+
+`cryarchiver` with no arguments, or `cryarchiver tui`, opens the dashboard on demo data. The dashboard needs a terminal of at least 100×30; press `?` for keys and `q` to quit. Quitting stops running jobs, and the project resumes them on the next open.

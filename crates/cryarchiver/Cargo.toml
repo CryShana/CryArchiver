@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 clap.workspace = true
 cryarchiver-engine = { path = "../cryarchiver-engine", features = ["clap"] }
+cryarchiver-project = { path = "../cryarchiver-project" }
 cryarchiver-tui = { path = "../cryarchiver-tui" }
 globset.workspace = true
 indicatif.workspace = true
@@ -23,6 +24,7 @@ windows.workspace = true
 
 [dev-dependencies]
 crc32fast.workspace = true
+cryarchiver-project = { path = "../cryarchiver-project" }
 image.workspace = true
 lofty.workspace = true
 serde_json.workspace = true

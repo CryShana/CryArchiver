@@ -39,7 +39,12 @@ fn prints_version() {
 fn tui_without_a_terminal_explains_and_exits_with_2() {
 	let dir = tempfile::tempdir().unwrap();
 
-	for args in [&[][..], &["tui"][..], &["family.cryarchive"][..]] {
+	for args in [
+		&[][..],
+		&["tui"][..],
+		&["family.cryarchive"][..],
+		&["tui", "family.cryarchive"][..],
+	] {
 		let out = cryarchiver(dir.path(), args);
 
 		assert_eq!(out.status.code(), Some(2), "{args:?}");
@@ -49,19 +54,115 @@ fn tui_without_a_terminal_explains_and_exits_with_2() {
 			stderr(&out)
 		);
 		assert!(stdout(&out).is_empty(), "{args:?}");
-		assert_eq!(
-			stderr(&out).contains("is ignored"),
-			!args.is_empty() && args != ["tui"],
-			"{args:?}"
-		);
 	}
+}
 
-	let out = cryarchiver(dir.path(), &["tui", "family.cryarchive"]);
-	assert!(
-		stderr(&out).contains("family.cryarchive is ignored"),
-		"{}",
-		stderr(&out)
+#[test]
+fn project_create_writes_a_project_that_dump_prints() {
+	let dir = tempfile::tempdir().unwrap();
+	fs::create_dir_all(dir.path().join("Photos")).unwrap();
+
+	let out = cryarchiver(
+		dir.path(),
+		&["project", "create", "Photos", "Archive", "--watch", "--limit", "30"],
 	);
+
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	assert!(stdout(&out).contains("Photos.cryarchive"), "{}", stdout(&out));
+	let project = dir.path().join("Archive").join("Photos.cryarchive");
+	assert!(project.is_file());
+
+	let dump = cryarchiver(dir.path(), &["project", "dump", project.to_str().unwrap()]);
+	assert_eq!(dump.status.code(), Some(0), "{}", stderr(&dump));
+	assert!(stdout(&dump).contains("format = 1"), "{}", stdout(&dump));
+	assert!(stdout(&dump).contains("watch: true"), "{}", stdout(&dump));
+	assert!(
+		stdout(&dump).contains("performance_limit: Some(30)"),
+		"{}",
+		stdout(&dump)
+	);
+}
+
+#[test]
+fn project_create_refuses_a_destination_inside_the_source() {
+	let dir = tempfile::tempdir().unwrap();
+	fs::create_dir_all(dir.path().join("Photos")).unwrap();
+
+	let out = cryarchiver(dir.path(), &["project", "create", "Photos", "Photos/Archive"]);
+
+	assert_eq!(out.status.code(), Some(2));
+	assert!(stderr(&out).contains("inside the source"), "{}", stderr(&out));
+}
+
+fn project_with(dir: &Path, delete_originals: bool) -> PathBuf {
+	fs::create_dir_all(dir.join("source")).unwrap();
+	cryarchiver_project::create(
+		&dir.join("source"),
+		&dir.join("archive"),
+		std::ffi::OsStr::new("archive"),
+		|settings| settings.delete_originals = delete_originals,
+	)
+	.unwrap()
+}
+
+#[test]
+fn run_needs_the_delete_flag_and_the_setting_to_agree() {
+	let dir = tempfile::tempdir().unwrap();
+	let deleting = project_with(&dir.path().join("a"), true);
+	let keeping = project_with(&dir.path().join("b"), false);
+
+	let refused = cryarchiver(dir.path(), &["run", deleting.to_str().unwrap()]);
+	let unwanted = cryarchiver(dir.path(), &["run", keeping.to_str().unwrap(), "--delete-originals"]);
+
+	assert_eq!(refused.status.code(), Some(2));
+	assert!(
+		stderr(&refused).contains("repeat --delete-originals"),
+		"{}",
+		stderr(&refused)
+	);
+	assert_eq!(unwanted.status.code(), Some(2));
+	assert!(
+		stderr(&unwanted).contains("needs the project's setting on"),
+		"{}",
+		stderr(&unwanted)
+	);
+}
+
+#[test]
+fn run_refuses_a_project_that_is_already_open() {
+	let dir = tempfile::tempdir().unwrap();
+	let project = project_with(dir.path(), false);
+	let _held = cryarchiver_project::store::Store::open(&project).unwrap();
+
+	let out = cryarchiver(dir.path(), &["run", project.to_str().unwrap()]);
+
+	assert_eq!(out.status.code(), Some(2));
+	assert!(stderr(&out).contains("already open"), "{}", stderr(&out));
+}
+
+#[test]
+fn run_of_a_clean_project_exits_with_0() {
+	let dir = tempfile::tempdir().unwrap();
+	let project = project_with(dir.path(), false);
+
+	let out = cryarchiver(dir.path(), &["run", project.to_str().unwrap()]);
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	assert!(stdout(&out).contains("0 source files → 0 archived"), "{}", stdout(&out));
+}
+
+#[test]
+fn run_reports_unknown_destination_files_and_exits_with_1() {
+	let dir = tempfile::tempdir().unwrap();
+	let project = project_with(dir.path(), false);
+	fs::write(dir.path().join("archive").join("old backup.txt"), b"old").unwrap();
+
+	let out = cryarchiver(dir.path(), &["run", project.to_str().unwrap()]);
+
+	assert_eq!(out.status.code(), Some(1), "{}{}", stdout(&out), stderr(&out));
+	assert!(stdout(&out).contains("1 open issues"), "{}", stdout(&out));
+	assert!(stdout(&out).contains("old backup.txt"), "{}", stdout(&out));
+	assert!(dir.path().join("archive").join("old backup.txt").is_file());
 }
 
 #[test]

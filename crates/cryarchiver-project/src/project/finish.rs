@@ -115,6 +115,7 @@ impl Owner {
 			&& !self.hashes_pending()
 			&& self.groups_planned()
 			&& self.watching.debouncer.is_empty()
+			&& !self.watching.destination_walk
 			&& self.finish.applying.is_empty()
 			&& self.finish.candidates.is_empty()
 	}
@@ -213,6 +214,23 @@ mod tests {
 		owner.on_folder_finished(photos, Ok(()));
 
 		assert!(!owner.tree.folder(photos).record.timestamps_applied);
+	}
+
+	#[test]
+	fn completion_waits_for_the_destination_reconcile() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		owner.started = true;
+		owner.finish.candidates.clear();
+		assert!(owner.idle());
+		owner.watching.destination_walk = true;
+
+		assert!(!owner.idle());
+		owner.check_completion();
+		assert_eq!(owner.finish.completion, Completion::Pending);
 	}
 
 	#[test]
