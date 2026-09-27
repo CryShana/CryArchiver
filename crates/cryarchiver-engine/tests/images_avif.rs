@@ -137,4 +137,14 @@ fn output_colour_follows_the_icc_then_the_source_cicp_then_srgb() {
 		pq
 	);
 	assert_eq!(output_cicp(AvifColour { icc: None, cicp: None }), Cicp::SRGB);
+	assert_eq!(
+		output_cicp(AvifColour {
+			icc: None,
+			cicp: Some(Cicp {
+				primaries: 22,
+				transfer: 4
+			})
+		}),
+		Cicp::UNSPECIFIED
+	);
 }

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::Read;
 
 use crate::metadata::SourceMetadata;
@@ -9,9 +10,37 @@ const XMP_KEYWORD: &str = "XML:com.adobe.xmp";
 const RAW_PROFILE: &str = "Raw profile type ";
 const MAX_INFLATED: u64 = 64 << 20;
 
+enum ChunkError {
+	OverBudget,
+	Invalid(String),
+}
+
+impl fmt::Display for ChunkError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::OverBudget => f.write_str("the compressed metadata inflates past 64 MiB in total"),
+			Self::Invalid(reason) => f.write_str(reason),
+		}
+	}
+}
+
+impl From<&str> for ChunkError {
+	fn from(reason: &str) -> Self {
+		Self::Invalid(reason.to_owned())
+	}
+}
+
+impl From<String> for ChunkError {
+	fn from(reason: String) -> Self {
+		Self::Invalid(reason)
+	}
+}
+
 pub(super) fn extract(bytes: &[u8]) -> SourceMetadata {
 	let mut metadata = SourceMetadata::default();
 	let mut at = SIGNATURE_LEN;
+	let mut budget = MAX_INFLATED;
+	let mut over_budget = false;
 
 	while at + 12 <= bytes.len() {
 		let len = u32::from_be_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
@@ -29,16 +58,21 @@ pub(super) fn extract(bytes: &[u8]) -> SourceMetadata {
 		let body = &bytes[at + 8..end];
 		match &kind {
 			b"eXIf" => metadata.exif = Some(body.strip_prefix(EXIF_PREFIX).unwrap_or(body).to_vec()),
-			b"iCCP" => read_icc(body, &mut metadata),
+			b"iCCP" => read_icc(body, &mut budget, &mut metadata),
 			b"cICP" if body.len() >= 2 => {
 				metadata.cicp = Some(Cicp {
 					primaries: body[0],
 					transfer: body[1],
 				});
 			}
-			b"tEXt" | b"zTXt" | b"iTXt" => match text_chunk(kind, body) {
+			b"tEXt" | b"zTXt" | b"iTXt" => match text_chunk(kind, body, &mut budget) {
 				Ok((keyword, value)) => read_text(keyword, value, &mut metadata),
-				Err(err) => metadata.warnings.push(format!("{name}: {err}")),
+				Err(err @ ChunkError::OverBudget) if !over_budget => {
+					over_budget = true;
+					metadata.warnings.push(format!("text chunks were not read: {err}"));
+				}
+				Err(ChunkError::OverBudget) => {}
+				Err(ChunkError::Invalid(err)) => metadata.warnings.push(format!("{name}: {err}")),
 			},
 			b"IEND" => break,
 			_ => {}
@@ -48,29 +82,36 @@ pub(super) fn extract(bytes: &[u8]) -> SourceMetadata {
 	metadata
 }
 
-fn read_icc(body: &[u8], metadata: &mut SourceMetadata) {
+fn read_icc(body: &[u8], budget: &mut u64, metadata: &mut SourceMetadata) {
 	let compressed = body
 		.iter()
 		.position(|&byte| byte == 0)
 		.filter(|&nul| body.get(nul + 1) == Some(&0))
 		.map(|nul| &body[nul + 2..]);
-	match compressed.map(inflate) {
+	match compressed.map(|compressed| inflate(compressed, budget)) {
 		Some(Ok(icc)) => metadata.icc = Some(icc),
 		Some(Err(err)) => metadata.icc_problem = Some(format!("the iCCP chunk is unreadable: {err}")),
 		None => metadata.icc_problem = Some("the iCCP chunk is malformed".into()),
 	}
 }
 
-fn inflate(compressed: &[u8]) -> Result<Vec<u8>, String> {
+fn inflate(compressed: &[u8], budget: &mut u64) -> Result<Vec<u8>, ChunkError> {
+	if *budget == 0 {
+		return Err(ChunkError::OverBudget);
+	}
+
 	let mut out = Vec::new();
 	flate2::read::ZlibDecoder::new(compressed)
-		.take(MAX_INFLATED + 1)
+		.take(*budget + 1)
 		.read_to_end(&mut out)
 		.map_err(|err| format!("zlib: {err}"))?;
 
-	if out.len() as u64 > MAX_INFLATED {
-		return Err("it inflates past 64 MiB".into());
+	let inflated = out.len() as u64;
+	if inflated > *budget {
+		*budget = 0;
+		return Err(ChunkError::OverBudget);
 	}
+	*budget -= inflated;
 	Ok(out)
 }
 
@@ -78,7 +119,7 @@ fn latin1(bytes: &[u8]) -> String {
 	bytes.iter().copied().map(char::from).collect()
 }
 
-fn text_chunk(kind: [u8; 4], body: &[u8]) -> Result<(String, Vec<u8>), String> {
+fn text_chunk(kind: [u8; 4], body: &[u8], budget: &mut u64) -> Result<(String, Vec<u8>), ChunkError> {
 	let nul = body.iter().position(|&byte| byte == 0).ok_or("no keyword terminator")?;
 	let keyword = latin1(&body[..nul]);
 	let rest = &body[nul + 1..];
@@ -90,7 +131,7 @@ fn text_chunk(kind: [u8; 4], body: &[u8]) -> Result<(String, Vec<u8>), String> {
 			if method != 0 {
 				return Err("unknown compression method".into());
 			}
-			Ok((keyword, latin1(&inflate(compressed)?).into_bytes()))
+			Ok((keyword, latin1(&inflate(compressed, budget)?).into_bytes()))
 		}
 		_ => {
 			let [flag, method, rest @ ..] = rest else {
@@ -105,7 +146,7 @@ fn text_chunk(kind: [u8; 4], body: &[u8]) -> Result<(String, Vec<u8>), String> {
 			let text = &rest[translated_end + 1..];
 			match (flag, method) {
 				(0, _) => Ok((keyword, text.to_vec())),
-				(1, 0) => Ok((keyword, inflate(text)?)),
+				(1, 0) => Ok((keyword, inflate(text, budget)?)),
 				_ => Err("unknown compression method".into()),
 			}
 		}

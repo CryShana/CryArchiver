@@ -3,12 +3,13 @@ mod support;
 use std::path::Path;
 
 use cryarchiver_engine::container::jxl::read_boxes;
-use cryarchiver_engine::images::jxl::{JxlJob, JxlPixels, encode, reference};
+use cryarchiver_engine::images::decode::layout;
+use cryarchiver_engine::images::jxl::{JxlJob, JxlPixels, encode};
 use cryarchiver_engine::images::plan::JxlSettings;
 use cryarchiver_engine::images::props::Effective;
-use cryarchiver_engine::metadata::OutputMetadata;
+use cryarchiver_engine::metadata::{OutputMetadata, extract};
 use image::codecs::png::PngEncoder;
-use image::{GenericImageView, ImageBuffer, ImageEncoder, Luma, Rgb};
+use image::{ImageBuffer, ImageEncoder, Luma, Rgb};
 use jxl_oxide::{JxlImage, PixelFormat};
 use moxcms::ColorProfile;
 use tokio_util::sync::CancellationToken;
@@ -23,9 +24,10 @@ const LOSSLESS: JxlSettings = JxlSettings {
 };
 
 fn job(source: &Path, settings: JxlSettings, pixels: JxlPixels) -> JxlJob<'_> {
+	let bytes = std::fs::read(source).unwrap();
 	JxlJob {
 		source,
-		source_is_heif: false,
+		layout: layout(&bytes, &extract(&bytes)),
 		settings,
 		pixels,
 	}
@@ -81,19 +83,17 @@ async fn deep_images_are_encoded_losslessly_with_their_level() {
 	);
 
 	let bytes = encoded(dir.path(), &job(&source, LOSSLESS, pixels), &OutputMetadata::default()).await;
-	let tools = support::toolchain().await;
-	let reference = reference(
-		&tools.ffmpeg,
-		&job(&source, LOSSLESS, pixels),
-		&CancellationToken::new(),
-	)
-	.await
-	.unwrap();
+	let image = JxlImage::builder().read(bytes.as_slice()).unwrap();
+	let render = image.render_frame(0).unwrap();
+	let mut stream = render.stream();
+	let mut samples = vec![0u16; 64 * 48 * 3];
+	stream.write_to_buffer(&mut samples);
 
 	assert_eq!(pixels, JxlPixels::Rgb16);
 	assert_eq!(read_boxes(&bytes).unwrap().level, Some(10));
-	assert_eq!(reference.dimensions(), (64, 48));
-	assert_eq!(reference.to_rgb16().get_pixel(3, 2).0, [3002, 1234, 40_000]);
+	assert_eq!((image.width(), image.height()), (64, 48));
+	let at = (2 * 64 + 3) * 3;
+	assert_eq!(samples[at..at + 3], [3002, 1234, 40_000]);
 }
 
 #[tokio::test]
@@ -101,10 +101,7 @@ async fn tiled_heic_goes_to_jxl_without_the_side_data_filter() {
 	let dir = tempfile::tempdir().unwrap();
 	let heic = dir.path().join("grid.heic");
 	std::fs::write(&heic, support::heif::heic_grid(dir.path(), 64, 48)).unwrap();
-	let heif_job = JxlJob {
-		source_is_heif: true,
-		..job(&heic, QUICK_LOSSY, JxlPixels::Rgb8)
-	};
+	let heif_job = job(&heic, QUICK_LOSSY, JxlPixels::Rgb8);
 
 	let bytes = encoded(dir.path(), &heif_job, &OutputMetadata::default()).await;
 

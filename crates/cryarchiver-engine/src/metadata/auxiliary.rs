@@ -11,8 +11,41 @@ const HDR_GAIN_MAP: &str = "http://ns.adobe.com/hdr-gain-map/1.0/";
 const GOOGLE_DEPTH: &str = "http://ns.google.com/photos/1.0/depthmap/";
 const GOOGLE_IMAGE: &str = "http://ns.google.com/photos/1.0/image/";
 const GOOGLE_ITEM: &str = "http://ns.google.com/photos/1.0/container/item/";
+const GOOGLE_CAMERA: &str = "http://ns.google.com/photos/1.0/camera/";
+
+struct MpEntry {
+	kind: u32,
+	size: u32,
+	offset: u32,
+}
 
 pub fn from_mpf(mpf: &[u8]) -> Result<Vec<AuxKind>, String> {
+	let mut found = Vec::new();
+	for entry in mp_entries(mpf)? {
+		let kind = entry.kind & 0x00FF_FFFF;
+		let aux = match kind {
+			MP_PRIMARY => continue,
+			_ if kind & 0xFF_FF00 == MP_THUMBNAIL_CLASS => continue,
+			MP_PANORAMA => AuxKind::Other("MPF panorama frame".into()),
+			MP_DISPARITY => AuxKind::Depth("MPF disparity image".into()),
+			MP_MULTI_ANGLE => AuxKind::Other("MPF multi-angle frame".into()),
+			other => AuxKind::Other(format!("MPF image type 0x{other:06X}")),
+		};
+		found.push(aux);
+	}
+	Ok(found)
+}
+
+pub fn mpf_images_end(mpf: &[u8]) -> Option<usize> {
+	mp_entries(mpf)
+		.ok()?
+		.iter()
+		.filter(|entry| entry.offset != 0)
+		.filter_map(|entry| usize::try_from(u64::from(entry.offset) + u64::from(entry.size)).ok())
+		.max()
+}
+
+fn mp_entries(mpf: &[u8]) -> Result<Vec<MpEntry>, String> {
 	let little = match mpf.get(..4) {
 		Some(b"II*\0") => true,
 		Some(b"MM\0*") => false,
@@ -48,20 +81,14 @@ pub fn from_mpf(mpf: &[u8]) -> Result<Vec<AuxKind>, String> {
 		return Err("the MPEntry table is outside the block".into());
 	}
 
-	let mut found = Vec::new();
-	for image in 0..len / 16 {
-		let kind = u32_at(start + image * 16).unwrap_or(0) & 0x00FF_FFFF;
-		let aux = match kind {
-			MP_PRIMARY => continue,
-			_ if kind & 0xFF_FF00 == MP_THUMBNAIL_CLASS => continue,
-			MP_PANORAMA => AuxKind::Other("MPF panorama frame".into()),
-			MP_DISPARITY => AuxKind::Depth("MPF disparity image".into()),
-			MP_MULTI_ANGLE => AuxKind::Other("MPF multi-angle frame".into()),
-			other => AuxKind::Other(format!("MPF image type 0x{other:06X}")),
-		};
-		found.push(aux);
-	}
-	Ok(found)
+	Ok((0..len / 16)
+		.map(|image| start + image * 16)
+		.map(|entry| MpEntry {
+			kind: u32_at(entry).unwrap_or(0),
+			size: u32_at(entry + 4).unwrap_or(0),
+			offset: u32_at(entry + 8).unwrap_or(0),
+		})
+		.collect())
 }
 
 pub fn from_xmp(xmp: &str) -> Vec<AuxKind> {
@@ -76,16 +103,25 @@ pub fn from_xmp(xmp: &str) -> Vec<AuxKind> {
 		found.push(AuxKind::Other("Google embedded image".into()));
 	}
 	let mut gain_map_item = false;
+	let mut motion_photo = ["MicroVideo", "MotionPhoto"].iter().any(|name| {
+		xmp::values(xmp, GOOGLE_CAMERA, name)
+			.iter()
+			.any(|value| value.trim() == "1")
+	});
 	for semantic in xmp::values(xmp, GOOGLE_ITEM, "Semantic") {
 		match semantic.as_str() {
 			"Primary" => {}
 			"GainMap" => gain_map_item = true,
+			"MotionPhoto" => motion_photo = true,
 			"Depth" => found.push(AuxKind::Depth("container item".into())),
 			other => found.push(AuxKind::Other(format!("container item '{other}'"))),
 		}
 	}
 	if gain_map_item && !found.iter().any(|aux| matches!(aux, AuxKind::GainMap(_))) {
 		found.push(AuxKind::GainMap("container item".into()));
+	}
+	if motion_photo {
+		found.push(AuxKind::MotionVideo("Google motion photo".into()));
 	}
 	found
 }

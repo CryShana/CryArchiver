@@ -1,7 +1,7 @@
 mod support;
 
 use cryarchiver_engine::container::isobmff::{Nclx, brands, parse_meta};
-use support::heif::{HeifFile, HeifItem, aux_c, colr_icc, colr_nclx, exif_item, imir, irot, ispe};
+use support::heif::{HeifFile, HeifItem, aux_c, boxed, colr_icc, colr_nclx, exif_item, full_box, imir, irot, ispe};
 
 const TIFF: &[u8] = b"MM\0*\0\0\0\x08\0\0\0\0\0\0";
 const ALPHA: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
@@ -117,4 +117,59 @@ fn truncated_items_and_missing_meta_are_reported() {
 			.contains("meta")
 	);
 	assert!(parse_meta(&file[..40]).is_err());
+}
+
+fn with_iloc(iloc: &[u8]) -> Vec<u8> {
+	let ftyp = boxed(*b"ftyp", b"avif\0\0\0\0mif1avif");
+	let hdlr = full_box(*b"hdlr", 0, 0, &[&[0u8; 4][..], b"pict", &[0; 13]].concat());
+	let pitm = full_box(*b"pitm", 0, 0, &1u16.to_be_bytes());
+	let meta = full_box(*b"meta", 0, 0, &[hdlr, pitm, iloc.to_vec()].concat());
+	[ftyp, meta, boxed(*b"mdat", &[0xAA; 64])].concat()
+}
+
+#[test]
+fn empty_extents_repeated_in_iloc_are_rejected() {
+	let mut body = vec![0x00, 0x00];
+	body.extend_from_slice(&1u16.to_be_bytes());
+	body.extend_from_slice(&1u16.to_be_bytes());
+	body.extend_from_slice(&0u16.to_be_bytes());
+	body.extend_from_slice(&u16::MAX.to_be_bytes());
+	let file = with_iloc(&full_box(*b"iloc", 0, 0, &body));
+
+	let err = parse_meta(&file).unwrap_err();
+
+	assert!(err.to_string().contains("empty extent"), "{err}");
+}
+
+#[test]
+fn repeated_rest_of_file_extents_cannot_outgrow_the_file() {
+	let extents = 4000u16;
+	let mut body = vec![0x40, 0x00];
+	body.extend_from_slice(&1u16.to_be_bytes());
+	body.extend_from_slice(&1u16.to_be_bytes());
+	body.extend_from_slice(&0u16.to_be_bytes());
+	body.extend_from_slice(&extents.to_be_bytes());
+	for _ in 0..extents {
+		body.extend_from_slice(&0u32.to_be_bytes());
+	}
+	let file = with_iloc(&full_box(*b"iloc", 0, 0, &body));
+	let meta = parse_meta(&file).unwrap();
+
+	let err = meta.item_data(&file, 1).unwrap_err();
+
+	assert_eq!(meta.locations[0].extents.len(), usize::from(extents));
+	assert!(err.to_string().contains("larger than the file"), "{err}");
+}
+
+#[test]
+fn iloc_extent_counts_beyond_the_box_are_truncation() {
+	let mut body = vec![0x44, 0x00];
+	body.extend_from_slice(&1u16.to_be_bytes());
+	body.extend_from_slice(&1u16.to_be_bytes());
+	body.extend_from_slice(&0u16.to_be_bytes());
+	body.extend_from_slice(&u16::MAX.to_be_bytes());
+	body.extend_from_slice(&[0; 8]);
+	let file = with_iloc(&full_box(*b"iloc", 0, 0, &body));
+
+	assert!(parse_meta(&file).unwrap_err().to_string().contains("truncated"));
 }

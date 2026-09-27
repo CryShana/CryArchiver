@@ -1,11 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-use image::DynamicImage;
 use tokio_util::sync::CancellationToken;
 
 use crate::container::jxl::{self, JxlMetadata};
-use crate::images::decode::{IMAGE_DECODE_ERRORS, run_pam};
+use crate::images::decode::{IMAGE_DECODE_ERRORS, SourceLayout};
 use crate::images::plan::JxlSettings;
 use crate::images::props::Effective;
 use crate::metadata::OutputMetadata;
@@ -13,8 +12,9 @@ use crate::outcome::{ErrorKind, IoSide, JobError};
 use crate::process::{self, STALL_TIMEOUT, ToolCommand};
 use crate::video::run_ffmpeg;
 
-const SCALE_FLAGS: &str = "bilinear+full_chroma_int+accurate_rnd";
+const FANCY_UPSAMPLING_FLAGS: &str = "bilinear+full_chroma_int+accurate_rnd";
 const DROP_EXIF_SIDE_DATA: &str = "sidedata=mode=delete:type=31";
+const DROP_DISPLAY_MATRIX: &str = "sidedata=mode=delete:type=DISPLAYMATRIX";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JxlPixels {
@@ -54,42 +54,43 @@ impl JxlPixels {
 			Self::GreyAlpha16 => "ya16le",
 		}
 	}
-
-	fn reference_format(self) -> &'static str {
-		match self {
-			Self::Rgb8 => "rgb24",
-			Self::Rgba8 => "rgba",
-			Self::Rgb16 => "rgb48be",
-			Self::Rgba16 => "rgba64be",
-			Self::Grey8 => "gray",
-			Self::GreyAlpha8 => "ya8",
-			Self::Grey16 => "gray16be",
-			Self::GreyAlpha16 => "ya16be",
-		}
-	}
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct JxlJob<'a> {
 	pub source: &'a Path,
-	pub source_is_heif: bool,
+	pub layout: SourceLayout,
 	pub settings: JxlSettings,
 	pub pixels: JxlPixels,
 }
 
 pub fn encode_command(ffmpeg: &Path, job: &JxlJob<'_>, output: &Path) -> ToolCommand {
+	let pixel_format = job.pixels.encoder_format();
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	cmd.count_lines_containing(IMAGE_DECODE_ERRORS);
-	cmd.args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
-		.arg(process::tool_path(job.source))
-		.args(["-sws_flags", SCALE_FLAGS]);
-
-	// HEIF tile grids are stitched by a complex filtergraph, which a -vf would conflict with.
-	if !job.source_is_heif {
-		cmd.args(["-vf", DROP_EXIF_SIDE_DATA]);
+	cmd.args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-noautorotate", "-i"])
+		.arg(process::tool_path(job.source));
+	if job.layout.fancy_upsampling {
+		cmd.args(["-sws_flags", FANCY_UPSAMPLING_FLAGS]);
 	}
 
-	cmd.args(["-pix_fmt", job.pixels.encoder_format(), "-c:v", "libjxl", "-distance"])
+	let filters: Vec<&str> = orientation_filter(job.layout.orientation)
+		.into_iter()
+		.chain([DROP_EXIF_SIDE_DATA, DROP_DISPLAY_MATRIX])
+		.collect();
+	if job.layout.alpha_item {
+		cmd.arg("-filter_complex").arg(format!(
+			"[0:v:0][0:v:1]alphamerge,{},format={pixel_format}",
+			filters.join(",")
+		));
+	} else if job.layout.grid {
+		// HEIF and AVIF tile grids are stitched by a complex filtergraph, which a -vf would conflict with.
+		cmd.args(["-pix_fmt", pixel_format]);
+	} else {
+		cmd.arg("-vf").arg(filters.join(",")).args(["-pix_fmt", pixel_format]);
+	}
+
+	cmd.args(["-c:v", "libjxl", "-distance"])
 		.arg(job.settings.distance.to_string())
 		.arg("-effort")
 		.arg(job.settings.effort.to_string())
@@ -98,13 +99,17 @@ pub fn encode_command(ffmpeg: &Path, job: &JxlJob<'_>, output: &Path) -> ToolCom
 	cmd
 }
 
-pub fn reference_command(ffmpeg: &Path, job: &JxlJob<'_>) -> ToolCommand {
-	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
-	cmd.args(["-hide_banner", "-nostdin", "-v", "error", "-i"])
-		.arg(process::tool_path(job.source))
-		.args(["-sws_flags", SCALE_FLAGS, "-pix_fmt", job.pixels.reference_format()])
-		.args(["-frames:v", "1", "-c:v", "pam", "-f", "image2pipe", "-"]);
-	cmd
+fn orientation_filter(orientation: u16) -> Option<&'static str> {
+	match orientation {
+		2 => Some("hflip"),
+		3 => Some("hflip,vflip"),
+		4 => Some("vflip"),
+		5 => Some("transpose=cclock_flip"),
+		6 => Some("transpose=clock"),
+		7 => Some("transpose=clock_flip"),
+		8 => Some("transpose=cclock"),
+		_ => None,
+	}
 }
 
 pub async fn encode(
@@ -127,10 +132,4 @@ pub async fn encode(
 			xmp: metadata.xmp.as_deref(),
 		},
 	))
-}
-
-pub async fn reference(ffmpeg: &Path, job: &JxlJob<'_>, cancel: &CancellationToken) -> Result<DynamicImage, JobError> {
-	run_pam(&reference_command(ffmpeg, job), cancel)
-		.await
-		.map(|(image, _)| image)
 }

@@ -34,7 +34,15 @@ pub struct AvifExpectations<'a> {
 	pub metadata: AvifMetadata<'a>,
 }
 
+pub fn writable_cicp(cicp: Cicp) -> Cicp {
+	Cicp {
+		primaries: primaries(cicp.primaries) as u8,
+		transfer: transfer(cicp.transfer) as u8,
+	}
+}
+
 pub fn rewrite(encoded: &[u8], cicp: Cicp, metadata: &AvifMetadata<'_>) -> Result<Vec<u8>, AvifError> {
+	let cicp = writable_cicp(cicp);
 	let meta = isobmff::parse_meta(encoded)?;
 	let primary = meta
 		.primary
@@ -65,8 +73,8 @@ pub fn rewrite(encoded: &[u8], cicp: Cicp, metadata: &AvifMetadata<'_>) -> Resul
 		.set_chroma_subsampling(header.subsampling)
 		.set_matrix_coefficients(matrix(matrix_value)?)
 		.set_full_color_range(header.full_range)
-		.set_color_primaries(primaries(cicp.primaries)?)
-		.set_transfer_characteristics(transfer(cicp.transfer)?)
+		.set_color_primaries(primaries(cicp.primaries))
+		.set_transfer_characteristics(transfer(cicp.transfer))
 		.set_premultiplied_alpha(meta.premultiplied())
 		.set_seq_level_idx(header.level, alpha_level);
 	if let Some(icc) = metadata.icc {
@@ -86,22 +94,20 @@ pub fn rewrite(encoded: &[u8], cicp: Cicp, metadata: &AvifMetadata<'_>) -> Resul
 	Ok(out)
 }
 
-fn primaries(value: u8) -> Result<ColorPrimaries, AvifError> {
-	Ok(match value {
+fn primaries(value: u8) -> ColorPrimaries {
+	match value {
 		1 => ColorPrimaries::Bt709,
-		2 => ColorPrimaries::Unspecified,
 		6 => ColorPrimaries::Bt601,
 		9 => ColorPrimaries::Bt2020,
 		11 => ColorPrimaries::DciP3,
 		12 => ColorPrimaries::DisplayP3,
-		other => return Err(AvifError(format!("colour primaries {other} can't be written to AVIF"))),
-	})
+		_ => ColorPrimaries::Unspecified,
+	}
 }
 
-fn transfer(value: u8) -> Result<TransferCharacteristics, AvifError> {
-	Ok(match value {
+fn transfer(value: u8) -> TransferCharacteristics {
+	match value {
 		1 => TransferCharacteristics::Bt709,
-		2 => TransferCharacteristics::Unspecified,
 		6 => TransferCharacteristics::Bt601,
 		7 => TransferCharacteristics::Smpte240,
 		8 => TransferCharacteristics::Linear,
@@ -114,12 +120,8 @@ fn transfer(value: u8) -> Result<TransferCharacteristics, AvifError> {
 		16 => TransferCharacteristics::Smpte2084,
 		17 => TransferCharacteristics::Smpte428,
 		18 => TransferCharacteristics::Hlg,
-		other => {
-			return Err(AvifError(format!(
-				"transfer characteristics {other} can't be written to AVIF"
-			)));
-		}
-	})
+		_ => TransferCharacteristics::Unspecified,
+	}
 }
 
 fn matrix(value: u8) -> Result<MatrixCoefficients, AvifError> {

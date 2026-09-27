@@ -301,6 +301,7 @@ fn locations(reader: &mut Reader<'_>) -> Result<Vec<Location>, IsobmffError> {
 	} else {
 		reader.u32()?
 	};
+	let extent_len = index_size + offset_size + length_size;
 
 	let mut found = Vec::new();
 	for _ in 0..count {
@@ -313,8 +314,18 @@ fn locations(reader: &mut Reader<'_>) -> Result<Vec<Location>, IsobmffError> {
 		reader.u16()?;
 		let base = reader.uint(base_size)?;
 
-		let mut extents = Vec::new();
-		for _ in 0..reader.u16()? {
+		let extent_count = reader.u16()?;
+		if extent_len == 0 && extent_count > 1 {
+			return Err(IsobmffError::new(format!(
+				"item {item} repeats an empty extent {extent_count} times"
+			)));
+		}
+		if usize::from(extent_count) * extent_len > reader.remaining() {
+			return Err(IsobmffError::new("truncated box"));
+		}
+
+		let mut extents = Vec::with_capacity(usize::from(extent_count));
+		for _ in 0..extent_count {
 			reader.uint(index_size)?;
 			let offset = base.saturating_add(reader.uint(offset_size)?);
 			let length = reader.uint(length_size)?;
@@ -450,6 +461,9 @@ impl Meta {
 		for extent in &location.extents {
 			let bytes = extent_bytes(source, *extent)
 				.ok_or_else(|| IsobmffError::new(format!("item {id} lies outside the file")))?;
+			if data.len() + bytes.len() > source.len() {
+				return Err(IsobmffError::new(format!("item {id} is larger than the file")));
+			}
 			data.extend_from_slice(bytes);
 		}
 		Ok(data)

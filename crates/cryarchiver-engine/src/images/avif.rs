@@ -16,10 +16,10 @@ pub struct AvifColour<'a> {
 }
 
 pub fn output_cicp(colour: AvifColour<'_>) -> Cicp {
-	match colour.icc {
+	avif::writable_cicp(match colour.icc {
 		Some(profile) => icc::cicp_for(profile),
 		None => colour.cicp.unwrap_or(Cicp::SRGB),
-	}
+	})
 }
 
 pub fn encode(image: &DynamicImage, alpha: bool, settings: RavifSettings, threads: usize) -> Result<Vec<u8>, String> {

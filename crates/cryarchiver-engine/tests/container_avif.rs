@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cryarchiver_engine::container::av1::read_sequence_header;
-use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, check, rewrite};
+use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, check, rewrite, writable_cicp};
 use cryarchiver_engine::container::isobmff::{Nclx, Property, parse_meta};
 use cryarchiver_engine::metadata::icc::Cicp;
 use moxcms::ColorProfile;
@@ -130,6 +130,43 @@ fn a_two_stream_alpha_still_keeps_its_alpha_item() {
 	)
 	.unwrap();
 	assert!(ffmpeg_decodes(&written(dir.path(), "alpha-out.avif", &avif), true));
+}
+
+#[test]
+fn colour_codes_avif_cannot_carry_become_unspecified() {
+	let dir = tempfile::tempdir().unwrap();
+	let legacy = Cicp {
+		primaries: 5,
+		transfer: 12,
+	};
+
+	let avif = rewrite(&libaom_still(dir.path(), false), legacy, &AvifMetadata::default()).unwrap();
+
+	check(
+		&avif,
+		&AvifExpectations {
+			width: 64,
+			height: 48,
+			alpha: false,
+			cicp: Cicp::UNSPECIFIED,
+			metadata: AvifMetadata::default(),
+		},
+	)
+	.unwrap();
+	for primaries in [4, 5, 7, 8, 10, 22] {
+		assert_eq!(
+			writable_cicp(Cicp {
+				primaries,
+				transfer: 13
+			})
+			.primaries,
+			2
+		);
+	}
+	for transfer in [4, 5, 12] {
+		assert_eq!(writable_cicp(Cicp { primaries: 1, transfer }).transfer, 2);
+	}
+	assert_eq!(writable_cicp(Cicp::SRGB), Cicp::SRGB);
 }
 
 #[test]

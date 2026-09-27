@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::metadata::{SourceMetadata, auxiliary, xmp};
+use crate::metadata::{AuxKind, SourceMetadata, auxiliary, xmp};
 
 const EXIF: &[u8] = b"Exif\0\0";
 const XMP: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
@@ -16,6 +16,8 @@ const APP2: u8 = 0xE2;
 const APP13: u8 = 0xED;
 const APP14: u8 = 0xEE;
 const COMMENT: u8 = 0xFE;
+const SAMSUNG_MOTION_PHOTO: &[u8] = b"MotionPhoto_Data";
+const MIN_TRAILING_CONTENT: usize = 1024;
 
 struct ExtendedPart<'a> {
 	full: u32,
@@ -29,6 +31,7 @@ struct Segments<'a> {
 	extended: BTreeMap<String, Vec<ExtendedPart<'a>>>,
 	irb: Vec<u8>,
 	mpf: Option<&'a [u8]>,
+	mpf_at: usize,
 	iso_gain_map: bool,
 }
 
@@ -61,12 +64,95 @@ pub(super) fn extract(bytes: &[u8]) -> SourceMetadata {
 			metadata.warnings.push(format!("the FF{marker:02X} segment is cut off"));
 			break;
 		};
+		if marker == APP2 && payload.starts_with(MPF) {
+			segments.mpf_at = at + 4 + MPF.len();
+		}
 		read_segment(marker, payload, &mut metadata, &mut segments);
 		at += 2 + len.max(2);
 	}
 
+	if let Some(trailer) = image_end(bytes)
+		.ok()
+		.and_then(|end| trailing_content(bytes, end, &segments))
+	{
+		metadata.aux.push(trailer);
+	}
 	finish(&mut metadata, segments);
 	metadata
+}
+
+pub fn image_end(bytes: &[u8]) -> Result<usize, String> {
+	let mut at = 2;
+	let mut scanned = false;
+
+	loop {
+		let Some(&[0xFF, marker]) = bytes.get(at..at + 2) else {
+			return Err(if scanned {
+				"truncated: no end-of-image marker after the last scan".into()
+			} else {
+				"truncated before the first scan".into()
+			});
+		};
+		match marker {
+			0xFF => at += 1,
+			0xD9 => return Ok(at + 2),
+			0x01 | 0xD0..=0xD7 => at += 2,
+			_ => {
+				let Some(len) = bytes
+					.get(at + 2..at + 4)
+					.map(|len| usize::from(u16::from_be_bytes([len[0], len[1]])))
+				else {
+					return Err("truncated inside a marker segment".into());
+				};
+				if len < 2 || at + 2 + len > bytes.len() {
+					return Err(format!("the FF{marker:02X} segment runs past the end of the file"));
+				}
+				at += 2 + len;
+				if marker == 0xDA {
+					scanned = true;
+					at = skip_entropy_data(bytes, at);
+				}
+			}
+		}
+	}
+}
+
+fn skip_entropy_data(bytes: &[u8], mut at: usize) -> usize {
+	while at + 1 < bytes.len() {
+		let next = bytes[at + 1];
+		if bytes[at] == 0xFF && next != 0x00 && next != 0xFF && !(0xD0..=0xD7).contains(&next) {
+			return at;
+		}
+		at += 1;
+	}
+	bytes.len()
+}
+
+fn trailing_content(bytes: &[u8], image_end: usize, segments: &Segments<'_>) -> Option<AuxKind> {
+	let after_image = bytes.get(image_end..)?;
+	if after_image
+		.windows(SAMSUNG_MOTION_PHOTO.len())
+		.any(|window| window == SAMSUNG_MOTION_PHOTO)
+	{
+		return Some(AuxKind::MotionVideo("Samsung motion photo".into()));
+	}
+
+	let mpf_end = segments
+		.mpf
+		.and_then(auxiliary::mpf_images_end)
+		.map(|end| segments.mpf_at.saturating_add(end));
+	let unaccounted = bytes.get(mpf_end.map_or(image_end, |end| end.max(image_end))..)?;
+	let padding = unaccounted.iter().all(|&byte| byte == 0x00 || byte == 0xFF);
+	if unaccounted.len() < MIN_TRAILING_CONTENT || padding {
+		return None;
+	}
+
+	let mp4 = unaccounted.get(4..8) == Some(b"ftyp");
+	Some(if mp4 {
+		AuxKind::MotionVideo("an MP4 video after the image".into())
+	} else {
+		AuxKind::Other(format!("{} bytes after the image", unaccounted.len()))
+	})
 }
 
 fn read_segment<'a>(marker: u8, payload: &'a [u8], metadata: &mut SourceMetadata, segments: &mut Segments<'a>) {

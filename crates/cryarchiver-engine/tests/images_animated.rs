@@ -3,8 +3,8 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::images::animated::{
-	Animation, Timeline, encode_command, expected_delays, has_alpha, plan_animation, plays, sampled_frames, scan,
-	split_pams, verify_animation,
+	Animation, ScanError, Timeline, encode_command, expected_delays, has_alpha, plan_animation, plays, sampled_frames,
+	scan, split_pams, verify_animation,
 };
 use cryarchiver_engine::outcome::KeepReason;
 use cryarchiver_engine::preset::Speed;
@@ -55,7 +55,10 @@ fn a_truncated_gif_stops_at_its_first_bad_frame() {
 
 	let err = scan(&gif[..gif.len() / 2]).unwrap_err();
 
-	assert!(err.contains("unreadable"), "{err}");
+	assert!(
+		matches!(&err, ScanError::Unreadable(reason) if reason.contains("unreadable")),
+		"{err:?}"
+	);
 }
 
 #[tokio::test]
@@ -173,4 +176,37 @@ async fn a_transparent_gif_keeps_its_alpha_track() {
 
 	assert!(animation.alpha);
 	assert!(score >= 80.0, "{score}");
+}
+
+#[test]
+fn a_gif_without_a_loop_extension_plays_once() {
+	let dir = tempfile::tempdir().unwrap();
+	let once = animation_file(dir.path(), "once.gif", "testsrc2=s=64x48:d=0.5:r=10", &["-loop", "-1"]);
+	let forever = animation_file(
+		dir.path(),
+		"forever.gif",
+		"testsrc2=s=64x48:d=0.5:r=10",
+		&["-loop", "0"],
+	);
+
+	let once = std::fs::read(once).unwrap();
+	let forever = std::fs::read(forever).unwrap();
+
+	assert!(!once.windows(11).any(|window| window == b"NETSCAPE2.0"));
+	assert_eq!(scan(&once).unwrap().unwrap().plays, Some(1));
+	assert_eq!(scan(&forever).unwrap().unwrap().plays, None);
+}
+
+#[test]
+fn animations_past_the_frame_limit_are_too_long_to_verify() {
+	let mut gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff".to_vec();
+	gif.extend_from_slice(b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00");
+	for _ in 0..100_001 {
+		gif.extend_from_slice(b"\x21\xf9\x04\x00\x01\x00\x00\x00");
+		gif.extend_from_slice(b"\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00");
+		gif.extend_from_slice(b"\x02\x02\x44\x01\x00");
+	}
+	gif.push(0x3B);
+
+	assert_eq!(scan(&gif), Err(ScanError::TooManyFrames));
 }

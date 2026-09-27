@@ -3,7 +3,8 @@ mod support;
 use std::sync::Arc;
 
 use cryarchiver_engine::images::avif::{AvifColour, encode as encode_avif, finish};
-use cryarchiver_engine::images::jxl::{JxlJob, JxlPixels, encode as encode_jxl, reference};
+use cryarchiver_engine::images::decode::SourceLayout;
+use cryarchiver_engine::images::jxl::{JxlJob, JxlPixels, encode as encode_jxl};
 use cryarchiver_engine::images::plan::{JxlSettings, RavifSettings};
 use cryarchiver_engine::images::ssim::{render_jxl_srgb, score, to_srgb};
 use cryarchiver_engine::images::verify::{Expected, check_jxl, verify_avif, verify_jxl};
@@ -13,6 +14,13 @@ use cryarchiver_engine::outcome::ErrorKind;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, Rgba};
 use moxcms::ColorProfile;
 use tokio_util::sync::CancellationToken;
+
+const UPRIGHT: SourceLayout = SourceLayout {
+	grid: false,
+	alpha_item: false,
+	orientation: 1,
+	fancy_upsampling: false,
+};
 
 fn photo_like(width: u32, height: u32) -> DynamicImage {
 	DynamicImage::ImageRgb8(ImageBuffer::from_fn(width, height, |x, y| {
@@ -81,11 +89,12 @@ fn references_are_converted_to_srgb_from_their_profile() {
 	let adobe = ColorProfile::new_adobe_rgb().encode().unwrap();
 	let grey = ColorProfile::new_gray_with_gamma(2.2).encode().unwrap();
 
-	let unchanged = to_srgb(image.clone(), Some(&srgb)).unwrap();
-	let converted = to_srgb(image.clone(), Some(&adobe)).unwrap();
-	let from_grey = to_srgb(DynamicImage::ImageLuma8(image.to_luma8()), Some(&grey)).unwrap();
+	let grey_image = DynamicImage::ImageLuma8(image.to_luma8());
+	let unchanged = to_srgb(&image, Some(&srgb)).unwrap();
+	let converted = to_srgb(&image, Some(&adobe)).unwrap();
+	let from_grey = to_srgb(&grey_image, Some(&grey)).unwrap();
 
-	assert_eq!(unchanged, image);
+	assert_eq!(*unchanged, image);
 	assert_ne!(converted.to_rgb16(), image.to_rgb16());
 	assert_eq!(from_grey.dimensions(), (16, 16));
 }
@@ -148,7 +157,7 @@ async fn a_lossless_jxl_is_rendered_to_srgb_and_scores_as_identical() {
 	};
 	let job = JxlJob {
 		source: &source,
-		source_is_heif: false,
+		layout: UPRIGHT,
 		settings: JxlSettings {
 			distance: 0.0,
 			effort: 3,
@@ -159,7 +168,7 @@ async fn a_lossless_jxl_is_rendered_to_srgb_and_scores_as_identical() {
 	let bytes = encode_jxl(&tools.ffmpeg, &job, &dir.path().join("c.tmp"), &metadata, &cancel)
 		.await
 		.unwrap();
-	let reference = reference(&tools.ffmpeg, &job, &cancel).await.unwrap();
+	let reference = Arc::new(photo_like(96, 64));
 
 	let rendered = render_jxl_srgb(&bytes).unwrap();
 	let passed = verify_jxl(Arc::new(bytes.clone()), reference, &expected(&metadata), true, &cancel)
@@ -172,5 +181,80 @@ async fn a_lossless_jxl_is_rendered_to_srgb_and_scores_as_identical() {
 		check_jxl(&bytes, &expected(&OutputMetadata::default()), true)
 			.unwrap_err()
 			.contains("Exif")
+	);
+}
+
+async fn lossless_jxl(dir: &std::path::Path, name: &str, image: &DynamicImage) -> Vec<u8> {
+	let tools = support::toolchain().await;
+	let source = dir.join(format!("{name}.png"));
+	image.save(&source).unwrap();
+	let job = JxlJob {
+		source: &source,
+		layout: UPRIGHT,
+		settings: JxlSettings {
+			distance: 0.0,
+			effort: 3,
+		},
+		pixels: JxlPixels::Rgb8,
+	};
+	encode_jxl(
+		&tools.ffmpeg,
+		&job,
+		&dir.join(format!("{name}.tmp")),
+		&OutputMetadata::default(),
+		&CancellationToken::new(),
+	)
+	.await
+	.unwrap()
+}
+
+#[tokio::test]
+async fn jxl_outputs_are_verified_against_our_own_decoded_pixels() {
+	let dir = tempfile::tempdir().unwrap();
+	let cancel = CancellationToken::new();
+	let metadata = OutputMetadata::default();
+	let upright = photo_like(96, 64);
+	let transparent = DynamicImage::ImageRgba8(ImageBuffer::from_fn(96, 64, |x, y| {
+		let [red, green, blue] = upright.to_rgb8().get_pixel(x, y).0;
+		Rgba([red, green, blue, if x < 48 { 255 } else { 0 }])
+	}));
+	let opaque = lossless_jxl(dir.path(), "opaque", &upright).await;
+	let turned = lossless_jxl(dir.path(), "turned", &upright.rotate180()).await;
+	let sideways = lossless_jxl(dir.path(), "sideways", &upright.rotate90()).await;
+	let with_alpha = Expected {
+		alpha: true,
+		..expected(&metadata)
+	};
+
+	let dropped_alpha = verify_jxl(Arc::new(opaque), Arc::new(transparent), &with_alpha, true, &cancel)
+		.await
+		.unwrap_err();
+	let turned_score = verify_jxl(
+		Arc::new(turned),
+		Arc::new(upright.clone()),
+		&expected(&metadata),
+		true,
+		&cancel,
+	)
+	.await
+	.unwrap();
+	let sideways_err = verify_jxl(
+		Arc::new(sideways),
+		Arc::new(upright),
+		&expected(&metadata),
+		true,
+		&cancel,
+	)
+	.await
+	.unwrap_err();
+
+	assert!(
+		matches!(&dropped_alpha.kind, ErrorKind::EncodeFailed(reason) if reason.contains("alpha")),
+		"{dropped_alpha:?}"
+	);
+	assert!(turned_score < 50.0, "{turned_score}");
+	assert!(
+		matches!(&sideways_err.kind, ErrorKind::EncodeFailed(reason) if reason.contains("64×96")),
+		"{sideways_err:?}"
 	);
 }

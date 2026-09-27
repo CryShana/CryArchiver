@@ -66,7 +66,7 @@ pub async fn verify_avif(
 
 pub async fn verify_jxl(
 	bytes: Arc<Vec<u8>>,
-	reference: DynamicImage,
+	reference: Arc<DynamicImage>,
 	expected: &Expected<'_>,
 	lossless: bool,
 	cancel: &CancellationToken,
@@ -75,7 +75,7 @@ pub async fn verify_jxl(
 
 	let source_icc = expected.icc.map(<[u8]>::to_vec);
 	blocking(cancel, move || {
-		let reference = ssim::to_srgb(reference, source_icc.as_deref())?;
+		let reference = ssim::to_srgb(&reference, source_icc.as_deref())?;
 		let rendered = ssim::render_jxl_srgb(&bytes)?;
 		ssim::score(&reference, &rendered)
 	})

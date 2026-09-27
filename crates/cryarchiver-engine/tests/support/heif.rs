@@ -193,9 +193,36 @@ fn nal_type(unit: &[u8]) -> u8 {
 	(unit[0] >> 1) & 0x3F
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Coding {
+	pub ten_bit: bool,
+	pub lossless: bool,
+	pub smooth: bool,
+}
+
+pub const PLAIN: Coding = Coding {
+	ten_bit: false,
+	lossless: false,
+	smooth: false,
+};
+
 pub fn hevc_item(dir: &std::path::Path, width: u32, height: u32) -> (Vec<u8>, Vec<u8>) {
-	let path = dir.join(format!("tile-{width}x{height}.hevc"));
-	let source = format!("testsrc2=s={width}x{height}");
+	hevc_item_coded(dir, width, height, PLAIN)
+}
+
+pub fn hevc_item_coded(dir: &std::path::Path, width: u32, height: u32, coding: Coding) -> (Vec<u8>, Vec<u8>) {
+	let path = dir.join(format!(
+		"tile-{width}x{height}-{}-{}-{}.hevc",
+		coding.ten_bit, coding.lossless, coding.smooth
+	));
+	let blur = if coding.smooth { ",gblur=sigma=1.5" } else { "" };
+	let source = format!("testsrc2=s={width}x{height}{blur}");
+	let pix_fmt = if coding.ten_bit { "yuv420p10le" } else { "yuv420p" };
+	let params = if coding.lossless {
+		"keyint=1:log-level=none:lossless=1"
+	} else {
+		"keyint=1:log-level=none"
+	};
 	super::ffmpeg(&[
 		"-f",
 		"lavfi",
@@ -204,11 +231,11 @@ pub fn hevc_item(dir: &std::path::Path, width: u32, height: u32) -> (Vec<u8>, Ve
 		"-frames:v",
 		"1",
 		"-pix_fmt",
-		"yuv420p",
+		pix_fmt,
 		"-c:v",
 		"libx265",
 		"-x265-params",
-		"keyint=1:log-level=none",
+		params,
 		"-f",
 		"hevc",
 		path.to_str().unwrap(),
@@ -221,7 +248,8 @@ pub fn hevc_item(dir: &std::path::Path, width: u32, height: u32) -> (Vec<u8>, Ve
 	let profile_tier_level = &without_emulation_prevention(sps)[3..15];
 	let mut config = vec![1];
 	config.extend_from_slice(profile_tier_level);
-	config.extend_from_slice(&[0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 3]);
+	let depth = if coding.ten_bit { 0xFA } else { 0xF8 };
+	config.extend_from_slice(&[0xF0, 0x00, 0xFC, 0xFD, depth, depth, 0x00, 0x00, 0x0F, 3]);
 	for (kind, unit) in [(32u8, vps), (33, sps), (34, pps)] {
 		config.push(0x80 | kind);
 		config.extend_from_slice(&1u16.to_be_bytes());
@@ -244,7 +272,18 @@ pub fn heic_still(
 	transforms: Vec<Vec<u8>>,
 	exif: Option<&[u8]>,
 ) -> Vec<u8> {
-	let (config, samples) = hevc_item(dir, width, height);
+	heic_still_coded(dir, width, height, PLAIN, transforms, exif)
+}
+
+pub fn heic_still_coded(
+	dir: &std::path::Path,
+	width: u32,
+	height: u32,
+	coding: Coding,
+	transforms: Vec<Vec<u8>>,
+	exif: Option<&[u8]>,
+) -> Vec<u8> {
+	let (config, samples) = hevc_item_coded(dir, width, height, coding);
 	let mut image = HeifItem::new(1, *b"hvc1", samples)
 		.with(true, config)
 		.with(false, ispe(width, height));
@@ -268,7 +307,17 @@ pub fn heic_still(
 }
 
 pub fn heic_grid(dir: &std::path::Path, tile_width: u32, tile_height: u32) -> Vec<u8> {
-	let (config, samples) = hevc_item(dir, tile_width, tile_height);
+	heic_grid_coded(dir, tile_width, tile_height, PLAIN, Vec::new())
+}
+
+pub fn heic_grid_coded(
+	dir: &std::path::Path,
+	tile_width: u32,
+	tile_height: u32,
+	coding: Coding,
+	transforms: Vec<Vec<u8>>,
+) -> Vec<u8> {
+	let (config, samples) = hevc_item_coded(dir, tile_width, tile_height, coding);
 	let mut items: Vec<HeifItem> = (1..=4)
 		.map(|id| {
 			HeifItem::new(id, *b"hvc1", samples.clone())
@@ -277,14 +326,81 @@ pub fn heic_grid(dir: &std::path::Path, tile_width: u32, tile_height: u32) -> Ve
 		})
 		.collect();
 
+	items.push(grid_item(tile_width, tile_height, transforms));
+
+	HeifFile {
+		brand: *b"heic",
+		primary: 5,
+		items,
+		references: vec![(*b"dimg", 5, vec![1, 2, 3, 4])],
+	}
+	.build()
+}
+
+fn grid_item(tile_width: u32, tile_height: u32, transforms: Vec<Vec<u8>>) -> HeifItem {
 	let (width, height) = (tile_width * 2, tile_height * 2);
 	let mut grid = vec![0, 0, 1, 1];
 	grid.extend_from_slice(&u16::try_from(width).unwrap().to_be_bytes());
 	grid.extend_from_slice(&u16::try_from(height).unwrap().to_be_bytes());
-	items.push(HeifItem::new(5, *b"grid", grid).with(false, ispe(width, height)));
+	let mut item = HeifItem::new(5, *b"grid", grid).with(false, ispe(width, height));
+	for transform in transforms {
+		item = item.with(true, transform);
+	}
+	item
+}
+
+pub fn av1_item(dir: &std::path::Path, width: u32, height: u32) -> (Vec<u8>, Vec<u8>) {
+	let path = dir.join(format!("tile-{width}x{height}.avif"));
+	let source = format!("testsrc2=s={width}x{height},gblur=sigma=1.5");
+	super::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		source.as_str(),
+		"-frames:v",
+		"1",
+		"-pix_fmt",
+		"yuv444p",
+		"-c:v",
+		"libaom-av1",
+		"-still-picture",
+		"1",
+		"-crf",
+		"4",
+		"-cpu-used",
+		"8",
+		path.to_str().unwrap(),
+	]);
+	let file = std::fs::read(path).unwrap();
+	let meta = cryarchiver_engine::container::isobmff::parse_meta(&file).unwrap();
+	let primary = meta.primary.unwrap();
+	let config = meta
+		.properties_of(primary)
+		.find_map(|property| match property {
+			cryarchiver_engine::container::isobmff::Property::Av1Config(body) => Some(boxed(*b"av1C", body)),
+			_ => None,
+		})
+		.unwrap();
+	(config, meta.item_data(&file, primary).unwrap())
+}
+
+pub fn avif_grid(dir: &std::path::Path, tile_width: u32, tile_height: u32, transforms: &[Vec<u8>]) -> Vec<u8> {
+	let (config, samples) = av1_item(dir, tile_width, tile_height);
+	let mut items: Vec<HeifItem> = (1..=4)
+		.map(|id| {
+			let mut tile = HeifItem::new(id, *b"av01", samples.clone())
+				.with(true, config.clone())
+				.with(false, ispe(tile_width, tile_height));
+			for transform in transforms {
+				tile = tile.with(true, transform.clone());
+			}
+			tile
+		})
+		.collect();
+	items.push(grid_item(tile_width, tile_height, transforms.to_vec()));
 
 	HeifFile {
-		brand: *b"heic",
+		brand: *b"avif",
 		primary: 5,
 		items,
 		references: vec![(*b"dimg", 5, vec![1, 2, 3, 4])],

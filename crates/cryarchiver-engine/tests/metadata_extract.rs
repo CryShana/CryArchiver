@@ -196,6 +196,76 @@ fn mpf_thumbnails_are_not_auxiliary_but_gain_maps_are() {
 	assert_eq!(ultra_hdr.aux, [AuxKind::GainMap("Ultra HDR".into())]);
 }
 
+fn mp4_bytes() -> Vec<u8> {
+	let mut mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp41".to_vec();
+	mp4.extend_from_slice(&4008u32.to_be_bytes());
+	mp4.extend_from_slice(b"mdat");
+	mp4.extend_from_slice(&[0x42; 4000]);
+	mp4
+}
+
+fn mpf_with_image(size: u32, offset: u32) -> Vec<u8> {
+	let mut tiff = b"II*\x00".to_vec();
+	tiff.extend_from_slice(&8u32.to_le_bytes());
+	tiff.extend_from_slice(&1u16.to_le_bytes());
+	tiff.extend_from_slice(&0xB002u16.to_le_bytes());
+	tiff.extend_from_slice(&7u16.to_le_bytes());
+	tiff.extend_from_slice(&32u32.to_le_bytes());
+	tiff.extend_from_slice(&26u32.to_le_bytes());
+	tiff.extend_from_slice(&0u32.to_le_bytes());
+	for (kind, size, offset) in [(0x03_0000u32, 0u32, 0u32), (0x01_0002, size, offset)] {
+		tiff.extend_from_slice(&kind.to_le_bytes());
+		tiff.extend_from_slice(&size.to_le_bytes());
+		tiff.extend_from_slice(&offset.to_le_bytes());
+		tiff.extend_from_slice(&[0; 4]);
+	}
+	segment(0xE2, &[b"MPF\x00".as_slice(), &tiff].concat())
+}
+
+#[test]
+fn videos_after_the_image_and_motion_photo_xmp_are_auxiliary() {
+	let plain = jpeg(&[], 3);
+	let samsung = [
+		plain.clone(),
+		mp4_bytes(),
+		b"MotionPhoto_Data".to_vec(),
+		b"\x00\x00\x00\x00SEFT".to_vec(),
+	]
+	.concat();
+	let appended = [plain.clone(), mp4_bytes()].concat();
+	let micro_video = jpeg(
+		&[xmp_segment(
+			"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:GCamera='http://ns.google.com/photos/1.0/camera/' GCamera:MicroVideo='1' GCamera:MicroVideoOffset='4000'/></rdf:RDF></x:xmpmeta>",
+		)],
+		3,
+	);
+	let small_trailer = [plain.clone(), vec![0x42; 100]].concat();
+	let padded = [plain.clone(), vec![0; 8192]].concat();
+	let without_image = jpeg(&[mpf_with_image(5000, 0)], 3);
+	let offset = u32::try_from(without_image.len() - 10).unwrap();
+	let thumbnail = [jpeg(&[mpf_with_image(5000, offset)], 3), vec![0x42; 5000]].concat();
+
+	assert_eq!(
+		extract(&samsung).aux,
+		[AuxKind::MotionVideo("Samsung motion photo".into())]
+	);
+	assert_eq!(
+		extract(&appended).aux,
+		[AuxKind::MotionVideo("an MP4 video after the image".into())]
+	);
+	assert_eq!(
+		extract(&micro_video).aux,
+		[AuxKind::MotionVideo("Google motion photo".into())]
+	);
+	assert!(extract(&small_trailer).aux.is_empty());
+	assert!(extract(&padded).aux.is_empty());
+	assert!(extract(&thumbnail).aux.is_empty(), "{:?}", extract(&thumbnail).aux);
+	assert_eq!(
+		extract(&[plain, vec![0x42; 5000]].concat()).aux,
+		[AuxKind::Other("5000 bytes after the image".into())]
+	);
+}
+
 fn chunk(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
 	let mut bytes = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
 	bytes.extend_from_slice(&kind);
@@ -263,6 +333,29 @@ fn png_chunks_are_collected_even_past_a_bad_crc() {
 			("Comment".to_owned(), "x".to_owned()),
 		]
 	);
+}
+
+#[test]
+fn compressed_text_shares_one_inflate_budget() {
+	let four_mib = zlib(&vec![b'a'; 4 << 20]);
+	let chunks: Vec<Vec<u8>> = (0..40)
+		.map(|index| {
+			chunk(
+				*b"zTXt",
+				&[format!("part{index}\x00\x00").as_bytes(), &four_mib].concat(),
+			)
+		})
+		.collect();
+
+	let metadata = extract(&png(&chunks));
+
+	assert_eq!(metadata.text.len(), 16);
+	let budget_warnings: Vec<&String> = metadata
+		.warnings
+		.iter()
+		.filter(|warning| warning.contains("64 MiB"))
+		.collect();
+	assert_eq!(budget_warnings.len(), 1, "{:?}", metadata.warnings);
 }
 
 #[test]

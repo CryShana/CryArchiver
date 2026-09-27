@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageBuffer, ImageReader};
+use image::{DynamicImage, GenericImageView, ImageBuffer, ImageReader};
 use jxl_oxide::JxlImage;
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +28,14 @@ pub const IMAGE_DECODE_ERRORS: &[&str] = &[
 	"Error parsing OBU data",
 	"corrupt input packet",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceLayout {
+	pub grid: bool,
+	pub alpha_item: bool,
+	pub orientation: u16,
+	pub fancy_upsampling: bool,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PamRequest {
@@ -75,14 +83,46 @@ pub fn header_dimensions(bytes: &[u8], probed: Option<(u32, u32)>) -> Option<(u3
 	}
 }
 
-pub fn orientation(bytes: &[u8], metadata: &SourceMetadata) -> u16 {
+pub fn layout(bytes: &[u8], metadata: &SourceMetadata) -> SourceLayout {
+	let stored = SourceLayout {
+		grid: false,
+		alpha_item: false,
+		orientation: 1,
+		fancy_upsampling: false,
+	};
+
 	match sniff(bytes) {
-		ImageFormat::Heif | ImageFormat::Avif => {
-			isobmff::parse_meta(bytes).map_or(1, |meta| meta.primary_orientation())
+		format @ (ImageFormat::Heif | ImageFormat::Avif) => {
+			let Ok(meta) = isobmff::parse_meta(bytes) else {
+				return stored;
+			};
+			let grid = meta.primary_item().is_some_and(|item| &item.kind == b"grid");
+			// With -noautorotate ffmpeg still applies a grid's own irot/imir (and only the grid's, not its tiles'),
+			// but leaves a single coded item as stored, so only single items are oriented by us.
+			SourceLayout {
+				grid,
+				alpha_item: format == ImageFormat::Avif && meta.alpha_item().is_some(),
+				orientation: if grid { 1 } else { meta.primary_orientation() },
+				..stored
+			}
 		}
-		ImageFormat::Jxl => 1,
-		_ => metadata.exif.as_deref().and_then(exif::orientation).unwrap_or(1),
+		ImageFormat::Jxl => stored,
+		format => SourceLayout {
+			orientation: metadata.exif.as_deref().and_then(exif::orientation).unwrap_or(1),
+			fancy_upsampling: matches!(format, ImageFormat::Jpeg | ImageFormat::WebP),
+			..stored
+		},
 	}
+}
+
+fn displayed_heif_size(bytes: &[u8]) -> Option<(u32, u32)> {
+	let meta = isobmff::parse_meta(bytes).ok()?;
+	let (width, height) = meta.primary_size()?;
+	Some(if meta.primary_orientation() >= 5 {
+		(height, width)
+	} else {
+		(width, height)
+	})
 }
 
 pub async fn decode(
@@ -101,7 +141,11 @@ pub async fn decode(
 		return Err(keep("HEIF images with transparency are not supported yet"));
 	}
 
-	let orientation = orientation(&bytes, metadata);
+	let layout = layout(&bytes, metadata);
+	if layout.grid && layout.alpha_item {
+		return Err(keep("tiled AVIF images with transparency are not supported yet"));
+	}
+
 	let from_crate = {
 		let bytes = Arc::clone(&bytes);
 		blocking(cancel, move || decode_with_crate(&bytes)).await?
@@ -111,8 +155,7 @@ pub async fn decode(
 		Some(image) => (image, 0),
 		None => {
 			let request = PamRequest {
-				alpha_item: format == ImageFormat::Avif
-					&& isobmff::parse_meta(&bytes).is_ok_and(|meta| meta.alpha_item().is_some()),
+				alpha_item: layout.alpha_item,
 				deep: source_pix_fmt.is_some_and(deep_pix_fmt),
 				keep_stored_orientation: true,
 			};
@@ -122,7 +165,14 @@ pub async fn decode(
 		}
 	};
 
-	let image = blocking(cancel, move || oriented(image, orientation)).await?;
+	let image = blocking(cancel, move || oriented(image, layout.orientation)).await?;
+	if matches!(format, ImageFormat::Heif | ImageFormat::Avif)
+		&& let Some(declared) = displayed_heif_size(&bytes)
+		&& image.dimensions() != declared
+	{
+		return Err(keep("ffmpeg decodes this image at a size its header does not declare"));
+	}
+
 	Ok(Decoded {
 		image,
 		icc: metadata.icc.clone(),

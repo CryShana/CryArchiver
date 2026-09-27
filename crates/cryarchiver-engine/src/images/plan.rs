@@ -143,7 +143,7 @@ pub fn precheck(input: &PrecheckInput<'_>) -> Result<(), Gate> {
 	if !metadata.aux.is_empty() && !input.drop_aux {
 		let kinds: Vec<String> = metadata.aux.iter().map(ToString::to_string).collect();
 		return Err(keep(format!(
-			"it has auxiliary images ({}); --drop-aux converts it without them",
+			"it has auxiliary images or video ({}); --drop-aux converts it without them",
 			kinds.join(", ")
 		)));
 	}
@@ -163,6 +163,9 @@ pub fn precheck(input: &PrecheckInput<'_>) -> Result<(), Gate> {
 			megapixels: pixels / 1_000_000,
 		}));
 	}
+	if pixels > MAX_VERIFY_PIXELS {
+		return Err(keep(format!("{} MP is too large to verify", pixels / 1_000_000)));
+	}
 	Ok(())
 }
 
@@ -172,13 +175,6 @@ fn keep(reason: String) -> Gate {
 
 pub fn plan_still(facts: &StillFacts, speed: Speed, libjxl: bool) -> Result<StillPlan, KeepReason> {
 	let pixels = u64::from(facts.width) * u64::from(facts.height);
-	if pixels > MAX_VERIFY_PIXELS {
-		return Err(KeepReason::Unsupported(format!(
-			"{} MP is too large to verify",
-			pixels / 1_000_000
-		)));
-	}
-
 	let fits_avif = facts.width <= MAX_AVIF_SIDE
 		&& facts.height <= MAX_AVIF_SIDE
 		&& pixels <= MAX_AVIF_PIXELS
@@ -298,11 +294,24 @@ mod tests {
 	}
 
 	#[test]
-	fn images_too_large_for_the_quality_metric_keep_the_original() {
+	fn images_too_large_for_the_quality_metric_keep_the_original_before_decoding() {
+		let healthy = Structure::default();
+		let plain = SourceMetadata::default();
+
 		assert!(matches!(
-			plan_still(&facts(20_000, 15_000), Speed::Fast, true),
-			Err(KeepReason::Unsupported(reason)) if reason.contains("too large to verify")
+			precheck(&PrecheckInput {
+				dimensions: Some((20_000, 15_000)),
+				..input(&healthy, &plain)
+			}),
+			Err(Gate::Keep(KeepReason::Unsupported(reason))) if reason.contains("300 MP is too large to verify")
 		));
+		assert_eq!(
+			precheck(&PrecheckInput {
+				dimensions: Some((16_000, 16_000)),
+				..input(&healthy, &plain)
+			}),
+			Ok(())
+		);
 	}
 
 	#[test]

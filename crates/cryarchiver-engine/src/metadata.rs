@@ -1,9 +1,9 @@
 pub mod auxiliary;
 pub mod exif;
-mod gif;
+pub mod gif;
 pub mod icc;
 pub mod iptc;
-mod jpeg;
+pub mod jpeg;
 mod output;
 mod png;
 mod riff;
@@ -39,6 +39,7 @@ pub enum ImageFormat {
 pub enum AuxKind {
 	GainMap(String),
 	Depth(String),
+	MotionVideo(String),
 	Other(String),
 }
 
@@ -47,6 +48,7 @@ impl fmt::Display for AuxKind {
 		match self {
 			Self::GainMap(detail) => write!(f, "gain map ({detail})"),
 			Self::Depth(detail) => write!(f, "depth map ({detail})"),
+			Self::MotionVideo(detail) => write!(f, "motion photo video ({detail})"),
 			Self::Other(detail) => write!(f, "auxiliary image ({detail})"),
 		}
 	}

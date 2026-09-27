@@ -1,5 +1,6 @@
 mod support;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -8,15 +9,18 @@ use cryarchiver_engine::container::isobmff::parse_meta;
 use cryarchiver_engine::container::jxl::read_boxes;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::images::animated;
+use cryarchiver_engine::images::decode::oriented;
+use cryarchiver_engine::images::ssim::score;
 use cryarchiver_engine::metadata::exif::orientation;
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
-use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
+use image::{DynamicImage, GenericImageView, ImageEncoder};
 use jxl_oxide::{JxlImage, PixelFormat};
 use moxcms::ColorProfile;
+use support::heif::{Coding, avif_grid, heic_grid_coded, heic_still_coded, imir, irot};
 use tokio_util::sync::CancellationToken;
 
 fn job(source: &Path) -> Job {
@@ -343,4 +347,327 @@ fn cancelling_a_long_still_encode_returns_promptly_and_leaves_nothing() {
 	);
 	assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+fn decoded_png(dir: &Path, source: &Path, name: &str) -> DynamicImage {
+	let png = dir.join(name);
+	support::ffmpeg(&["-i", source.to_str().unwrap(), "-frames:v", "1", png.to_str().unwrap()]);
+	image::open(png).unwrap()
+}
+
+async fn oriented_output(
+	dir: &Path,
+	name: &str,
+	source: &[u8],
+	upright: &[u8],
+) -> (PathBuf, DynamicImage, DynamicImage) {
+	let source_path = dir.join(name);
+	std::fs::write(&source_path, source).unwrap();
+	let upright_path = dir.join(format!("upright-{name}"));
+	std::fs::write(&upright_path, upright).unwrap();
+
+	let output = encoded(
+		run(
+			&Job {
+				min_savings: 0.0,
+				..job(&source_path)
+			},
+			dir,
+		)
+		.await,
+	);
+	let expected = decoded_png(dir, &upright_path, &format!("{name}.expected.png"));
+	let written = decoded_png(dir, &output, &format!("{name}.written.png"));
+	(output, expected, written)
+}
+
+fn assert_same_picture(name: &str, expected: &DynamicImage, written: &DynamicImage) {
+	assert_eq!(written.dimensions(), expected.dimensions(), "{name}");
+	let similarity = score(expected, written).unwrap();
+	assert!(similarity > 70.0, "{name}: {similarity}");
+}
+
+fn heic_case(dir: &Path, grid: bool, coding: Coding, transforms: Vec<Vec<u8>>) -> Vec<u8> {
+	if grid {
+		heic_grid_coded(dir, 128, 96, coding, transforms)
+	} else {
+		heic_still_coded(dir, 256, 192, coding, transforms, None)
+	}
+}
+
+async fn heic_orientation_cases(ten_bit: bool, extension: &str) {
+	let dir = tempfile::tempdir().unwrap();
+	let coding = Coding {
+		ten_bit,
+		lossless: true,
+		smooth: true,
+	};
+	let cases = [
+		("grid-rot.heic", true, irot(1), 8),
+		("grid-mirror.heic", true, imir(0), 4),
+		("single-rot.heic", false, irot(3), 6),
+	];
+
+	for (name, grid, transform, orientation) in cases {
+		let source = heic_case(dir.path(), grid, coding, vec![transform]);
+		let upright = heic_case(dir.path(), grid, coding, Vec::new());
+
+		let (output, expected, written) = oriented_output(dir.path(), name, &source, &upright).await;
+
+		assert_eq!(output.extension().unwrap(), extension, "{name}");
+		assert_same_picture(name, &oriented(expected, orientation), &written);
+	}
+}
+
+#[tokio::test]
+async fn tiled_and_single_heic_are_oriented_once_on_the_avif_route() {
+	heic_orientation_cases(false, "avif").await;
+}
+
+#[tokio::test]
+async fn tiled_and_single_heic_are_oriented_once_on_the_jxl_route() {
+	heic_orientation_cases(true, "jxl").await;
+}
+
+#[tokio::test]
+async fn a_tiled_avif_whose_tiles_repeat_the_rotation_is_rotated_once() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = avif_grid(dir.path(), 128, 96, &[irot(1)]);
+	let upright = avif_grid(dir.path(), 128, 96, &[]);
+
+	let (output, expected, written) = oriented_output(dir.path(), "tiles.avif", &source, &upright).await;
+
+	assert_eq!(output.extension().unwrap(), "avif");
+	assert_same_picture("tiles.avif", &oriented(expected, 8), &written);
+}
+
+#[tokio::test]
+async fn a_ten_bit_avif_with_alpha_keeps_its_transparency_as_jxl() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("alpha10.avif");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=256x192,gblur=sigma=1.5,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,128),255,0)'",
+		"-filter_complex",
+		"[0:v]split[c][a];[c]format=yuv444p10le[co];[a]alphaextract,format=gray10le[ao]",
+		"-map",
+		"[co]",
+		"-map",
+		"[ao]",
+		"-c:v",
+		"libaom-av1",
+		"-still-picture",
+		"1",
+		"-crf",
+		"0",
+		"-cpu-used",
+		"8",
+		"-frames:v",
+		"1",
+		source.to_str().unwrap(),
+	]);
+
+	let output = encoded(
+		run(
+			&Job {
+				min_savings: 0.0,
+				..job(&source)
+			},
+			dir.path(),
+		)
+		.await,
+	);
+
+	assert_eq!(output.extension().unwrap(), "jxl");
+	let image = JxlImage::builder()
+		.read(std::fs::read(&output).unwrap().as_slice())
+		.unwrap();
+	assert!(image.pixel_format().has_alpha());
+	let render = image.render_frame(0).unwrap();
+	let mut stream = render.stream();
+	let channels = stream.channels() as usize;
+	let mut samples = vec![0f32; 256 * 192 * channels];
+	stream.write_to_buffer(&mut samples);
+	let alpha = |x: usize, y: usize| samples[(y * 256 + x) * channels + channels - 1];
+	assert!(alpha(10, 80) > 0.99, "{}", alpha(10, 80));
+	assert!(alpha(220, 80) < 0.01, "{}", alpha(220, 80));
+}
+
+#[tokio::test]
+async fn animated_avif_is_kept_including_our_own_output() {
+	let dir = tempfile::tempdir().unwrap();
+	let sequence = dir.path().join("sequence.avif");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:d=3:r=10",
+		"-c:v",
+		"libaom-av1",
+		"-crf",
+		"30",
+		"-cpu-used",
+		"8",
+		sequence.to_str().unwrap(),
+	]);
+	let apng = dir.path().join("anim.apng");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:d=0.5:r=10",
+		"-f",
+		"apng",
+		apng.to_str().unwrap(),
+	]);
+	let ours = encoded(
+		run(
+			&Job {
+				min_savings: 0.0,
+				..job(&apng)
+			},
+			dir.path(),
+		)
+		.await,
+	);
+	let fed_back = dir.path().join("fed-back.avif");
+	std::fs::copy(&ours, &fed_back).unwrap();
+
+	for source in [sequence, fed_back] {
+		let outcome = run(
+			&Job {
+				min_savings: 0.0,
+				..job(&source)
+			},
+			dir.path(),
+		)
+		.await;
+
+		assert!(
+			matches!(&outcome, JobOutcome::KeptOriginal { reason: KeepReason::Unsupported(reason) } if reason.contains("animated AVIF")),
+			"{source:?}: {outcome:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn a_gif_without_a_loop_extension_plays_once() {
+	let dir = tempfile::tempdir().unwrap();
+	let once = dir.path().join("once.gif");
+	let forever = dir.path().join("forever.gif");
+	for (path, loops) in [(&once, "-1"), (&forever, "0")] {
+		support::ffmpeg(&[
+			"-f",
+			"lavfi",
+			"-i",
+			"testsrc2=s=320x240:d=1:r=10",
+			"-loop",
+			loops,
+			path.to_str().unwrap(),
+		]);
+	}
+	let fast = |source: &Path| Job {
+		min_savings: 0.0,
+		..job(source)
+	};
+
+	let once_output = encoded(run(&fast(&once), dir.path()).await);
+	let forever_output = encoded(run(&fast(&forever), dir.path()).await);
+
+	assert_eq!(animated::plays(&std::fs::read(once_output).unwrap()), Some(Some(1)));
+	assert_eq!(animated::plays(&std::fs::read(forever_output).unwrap()), Some(None));
+}
+
+#[tokio::test]
+async fn an_animation_with_a_colour_profile_warns_that_it_is_dropped() {
+	let dir = tempfile::tempdir().unwrap();
+	let apng = dir.path().join("profiled.apng");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=96x64:d=0.5:r=10",
+		"-f",
+		"apng",
+		apng.to_str().unwrap(),
+	]);
+	let mut compressed = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+	compressed
+		.write_all(&ColorProfile::new_srgb().encode().unwrap())
+		.unwrap();
+	let body = [b"sRGB\0\0".as_slice(), &compressed.finish().unwrap()].concat();
+	let chunk = support::png_chunk(*b"iCCP", &body);
+	std::fs::write(&apng, support::with_png_chunk(&std::fs::read(&apng).unwrap(), &chunk)).unwrap();
+
+	let outcome = run(
+		&Job {
+			min_savings: 0.0,
+			..job(&apng)
+		},
+		dir.path(),
+	)
+	.await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Encoded { warnings, .. } if warnings.iter().any(|warning| warning.contains("colour profile"))),
+		"{outcome:?}"
+	);
+}
+
+fn motion_photo_jpeg(dir: &Path, name: &str, xmp: Option<&str>, trailer: &[u8]) -> PathBuf {
+	let jpeg = support::jpeg_with_exif(dir, name, 320, 240, 1);
+	let mut bytes = std::fs::read(&jpeg).unwrap();
+	if let Some(packet) = xmp {
+		let payload = [b"http://ns.adobe.com/xap/1.0/\0".as_slice(), packet.as_bytes()].concat();
+		bytes = support::with_jpeg_segment(&bytes, 0xE1, &payload);
+	}
+	bytes.extend_from_slice(trailer);
+	std::fs::write(&jpeg, bytes).unwrap();
+	jpeg
+}
+
+#[tokio::test]
+async fn motion_photos_keep_the_original_unless_auxiliary_content_is_dropped() {
+	let dir = tempfile::tempdir().unwrap();
+	let mut samsung_trailer = b"\0\0\0\x18ftypisom\0\0\0\0isommp41".to_vec();
+	samsung_trailer.extend_from_slice(&[0x42; 4000]);
+	samsung_trailer.extend_from_slice(b"MotionPhoto_Data\0\0\0\0SEFT");
+	let samsung = motion_photo_jpeg(dir.path(), "samsung.jpg", None, &samsung_trailer);
+	let pixel = motion_photo_jpeg(
+		dir.path(),
+		"pixel.jpg",
+		Some(
+			"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:GCamera='http://ns.google.com/photos/1.0/camera/' GCamera:MicroVideo='1'/></rdf:RDF></x:xmpmeta>",
+		),
+		&[],
+	);
+
+	for source in [&samsung, &pixel] {
+		let kept = run(&job(source), dir.path()).await;
+		let dropped = run(
+			&Job {
+				drop_aux: true,
+				min_savings: 0.0,
+				..job(source)
+			},
+			dir.path(),
+		)
+		.await;
+
+		assert!(
+			matches!(&kept, JobOutcome::KeptOriginal { reason: KeepReason::Unsupported(reason) } if reason.contains("motion photo video")),
+			"{kept:?}"
+		);
+		assert!(
+			!matches!(
+				dropped,
+				JobOutcome::KeptOriginal {
+					reason: KeepReason::Unsupported(_)
+				} | JobOutcome::Failed(_)
+			),
+			"{dropped:?}"
+		);
+	}
 }

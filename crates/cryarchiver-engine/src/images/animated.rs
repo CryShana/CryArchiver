@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use image::codecs::gif::GifDecoder;
@@ -12,7 +13,7 @@ use crate::container::isobmff;
 use crate::images::blocking;
 use crate::images::decode::IMAGE_DECODE_ERRORS;
 use crate::images::ssim;
-use crate::metadata::{ImageFormat, sniff};
+use crate::metadata::{ImageFormat, gif, sniff};
 use crate::outcome::{ErrorKind, JobError, KeepReason};
 use crate::preset::Speed;
 use crate::probe::{self, MediaInfo};
@@ -43,18 +44,28 @@ pub struct Animation {
 	pub alpha: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanError {
+	Unreadable(String),
+	TooManyFrames,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnimatedSettings {
 	pub crf: u8,
 	pub cpu_used: u8,
 }
 
-pub fn scan(bytes: &[u8]) -> Result<Option<Timeline>, String> {
-	let unreadable = |err: image::ImageError| format!("the animation is unreadable: {err}");
+pub fn scan(bytes: &[u8]) -> Result<Option<Timeline>, ScanError> {
+	let unreadable = |err: image::ImageError| ScanError::Unreadable(format!("the animation is unreadable: {err}"));
 	let (loop_count, frames, counts_repeats) = match sniff(bytes) {
 		ImageFormat::Gif => {
 			let decoder = GifDecoder::new(Cursor::new(bytes)).map_err(unreadable)?;
-			(decoder.loop_count(), decoder.into_frames(), true)
+			if gif::declares_looping(bytes) {
+				(decoder.loop_count(), decoder.into_frames(), true)
+			} else {
+				(LoopCount::Finite(NonZeroU32::MIN), decoder.into_frames(), false)
+			}
 		}
 		ImageFormat::Png => {
 			let decoder = PngDecoder::new(Cursor::new(bytes)).map_err(unreadable)?;
@@ -82,7 +93,7 @@ pub fn scan(bytes: &[u8]) -> Result<Option<Timeline>, String> {
 	walk_frames(frames, plays).map(Some)
 }
 
-fn walk_frames(frames: Frames<'_>, plays: Option<u32>) -> Result<Timeline, String> {
+fn walk_frames(frames: Frames<'_>, plays: Option<u32>) -> Result<Timeline, ScanError> {
 	let mut timeline = Timeline {
 		frames: 0,
 		delays_ms: Vec::new(),
@@ -93,10 +104,11 @@ fn walk_frames(frames: Frames<'_>, plays: Option<u32>) -> Result<Timeline, Strin
 
 	for frame in frames {
 		if timeline.frames == MAX_FRAMES {
-			return Err(format!("the animation has more than {MAX_FRAMES} frames"));
+			return Err(ScanError::TooManyFrames);
 		}
 
-		let frame = frame.map_err(|err| format!("frame {} is unreadable: {err}", timeline.frames + 1))?;
+		let frame = frame
+			.map_err(|err| ScanError::Unreadable(format!("frame {} is unreadable: {err}", timeline.frames + 1)))?;
 		let (numer, denom) = frame.delay().numer_denom_ms();
 		timeline
 			.delays_ms

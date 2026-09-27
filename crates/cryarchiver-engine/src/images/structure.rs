@@ -1,5 +1,5 @@
 use crate::container::isobmff;
-use crate::metadata::{ImageFormat, sniff};
+use crate::metadata::{ImageFormat, jpeg, sniff};
 
 const PNG_SIGNATURE_LEN: usize = 8;
 const GIF_HEADER_LEN: usize = 13;
@@ -30,50 +30,10 @@ pub fn check(bytes: &[u8]) -> Structure {
 }
 
 fn jpeg(bytes: &[u8]) -> Structure {
-	let mut at = 2;
-	let mut scanned = false;
-
-	loop {
-		let Some(&[0xFF, marker]) = bytes.get(at..at + 2) else {
-			return Structure::damaged(if scanned {
-				"truncated: no end-of-image marker after the last scan"
-			} else {
-				"truncated before the first scan"
-			});
-		};
-		match marker {
-			0xFF => at += 1,
-			0xD9 => return Structure::default(),
-			0x01 | 0xD0..=0xD7 => at += 2,
-			_ => {
-				let Some(len) = bytes
-					.get(at + 2..at + 4)
-					.map(|len| usize::from(u16::from_be_bytes([len[0], len[1]])))
-				else {
-					return Structure::damaged("truncated inside a marker segment");
-				};
-				if len < 2 || at + 2 + len > bytes.len() {
-					return Structure::damaged(format!("the FF{marker:02X} segment runs past the end of the file"));
-				}
-				at += 2 + len;
-				if marker == 0xDA {
-					scanned = true;
-					at = skip_entropy_data(bytes, at);
-				}
-			}
-		}
+	match jpeg::image_end(bytes) {
+		Ok(_) => Structure::default(),
+		Err(damage) => Structure::damaged(damage),
 	}
-}
-
-fn skip_entropy_data(bytes: &[u8], mut at: usize) -> usize {
-	while at + 1 < bytes.len() {
-		let next = bytes[at + 1];
-		if bytes[at] == 0xFF && next != 0x00 && next != 0xFF && !(0xD0..=0xD7).contains(&next) {
-			return at;
-		}
-		at += 1;
-	}
-	bytes.len()
 }
 
 fn png(bytes: &[u8]) -> Structure {

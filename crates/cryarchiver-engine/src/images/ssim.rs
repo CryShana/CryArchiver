@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use fast_ssim2::{LinearRgbImage, compute_ssimulacra2, compute_ssimulacra2_strip, srgb_to_linear};
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
 use jxl_oxide::{EnumColourEncoding, JxlImage, Moxcms, RenderingIntent};
@@ -55,9 +57,9 @@ fn linear(image: &Rgba16, background: f32) -> LinearRgbImage {
 	LinearRgbImage::new(data, width as usize, height as usize)
 }
 
-pub fn to_srgb(image: DynamicImage, icc: Option<&[u8]>) -> Result<DynamicImage, String> {
+pub fn to_srgb<'a>(image: &'a DynamicImage, icc: Option<&[u8]>) -> Result<Cow<'a, DynamicImage>, String> {
 	let Some(profile) = icc.filter(|profile| icc::classify(profile) != Some(StandardSpace::Srgb)) else {
-		return Ok(image);
+		return Ok(Cow::Borrowed(image));
 	};
 
 	let source = ColorProfile::new_from_slice(profile).map_err(|err| format!("unreadable ICC profile: {err:?}"))?;
@@ -81,7 +83,7 @@ pub fn to_srgb(image: DynamicImage, icc: Option<&[u8]>) -> Result<DynamicImage, 
 		.transform(&input, &mut output)
 		.map_err(|err| format!("the transform to sRGB failed: {err:?}"))?;
 	ImageBuffer::from_raw(width, height, output)
-		.map(DynamicImage::ImageRgba16)
+		.map(|converted| Cow::Owned(DynamicImage::ImageRgba16(converted)))
 		.ok_or_else(|| "the converted image has the wrong size".to_owned())
 }
 

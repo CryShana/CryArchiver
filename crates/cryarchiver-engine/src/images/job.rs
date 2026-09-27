@@ -6,7 +6,7 @@ use image::{DynamicImage, GenericImageView};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{JobEvent, Stage};
-use crate::images::animated::{self, Animation};
+use crate::images::animated::{self, Animation, ScanError};
 use crate::images::avif::{self, AvifColour};
 use crate::images::decode::{self, Decoded, Undecodable};
 use crate::images::jxl::{self, JxlJob, JxlPixels};
@@ -71,11 +71,19 @@ struct Still {
 	warnings: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Choice {
 	best: Option<(PathBuf, u64)>,
 	best_rejected: Option<f64>,
 	smallest: Option<u64>,
+	failures: Vec<(Candidate, JobError)>,
+}
+
+#[derive(Debug)]
+enum Verdict {
+	Output(PathBuf, u64),
+	Kept(KeepReason),
+	Failed(JobError),
 }
 
 pub fn prepare(
@@ -108,12 +116,16 @@ pub fn prepare(
 	}
 
 	let warnings = structure.warnings.iter().chain(&metadata.warnings).cloned().collect();
+	let sequence = info
+		.streams
+		.iter()
+		.any(|stream| stream.is_video() && stream.nb_frames.is_some_and(|frames| frames > 1));
 	Ok(Ok(ImageInput {
 		bytes: Arc::new(bytes),
 		metadata,
 		warnings,
 		pix_fmt: video.and_then(|stream| stream.pix_fmt.clone()),
-		animated,
+		animated: animated || sequence,
 	}))
 }
 
@@ -235,17 +247,30 @@ async fn encode_and_choose(
 		}
 
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
-		let score = match candidate {
+		let verified = match candidate {
 			Candidate::Ravif(_) => {
 				let reference = Arc::clone(reference.as_ref().expect("prepared for AVIF candidates"));
-				verify::verify_avif(cx.tools, &path, &bytes, reference, &expected, cx.cancel).await?
+				verify::verify_avif(cx.tools, &path, &bytes, reference, &expected, cx.cancel).await
 			}
 			Candidate::JxlLossy(_) | Candidate::JxlLossless(_) => {
-				let job = jxl_job(cx, input, &still, *candidate);
-				let source_reference = jxl::reference(&cx.tools.ffmpeg, &job, cx.cancel).await?;
 				let lossless = matches!(candidate, Candidate::JxlLossless(_));
-				verify::verify_jxl(Arc::new(bytes), source_reference, &expected, lossless, cx.cancel).await?
+				verify::verify_jxl(
+					Arc::new(bytes),
+					Arc::clone(&still.image),
+					&expected,
+					lossless,
+					cx.cancel,
+				)
+				.await
 			}
+		};
+		let score = match verified {
+			Ok(score) => score,
+			Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => {
+				choice.failures.push((*candidate, err));
+				continue;
+			}
+			Err(err) => return Err(err),
 		};
 		if score >= still.plan.target {
 			choice.best = Some((path, size));
@@ -319,7 +344,7 @@ fn jxl_job<'a>(cx: &ImageContext<'a>, input: &ImageInput, still: &Still, candida
 	};
 	JxlJob {
 		source: cx.source,
-		source_is_heif: sniff(&input.bytes) == ImageFormat::Heif,
+		layout: decode::layout(&input.bytes, &input.metadata),
 		settings,
 		pixels: JxlPixels::for_source(still.effective, grey_profile(still.icc.as_deref())),
 	}
@@ -330,31 +355,61 @@ fn finish_choice(
 	workspace: &Workspace,
 	choice: Choice,
 	target: f64,
-	warnings: Vec<String>,
+	mut warnings: Vec<String>,
 ) -> Result<ImageOutcome, JobError> {
-	if let Some((path, bytes)) = choice.best {
-		let extension = path.extension().unwrap_or_default().to_string_lossy().into_owned();
-		let output = workspace.file(&format!("out.{extension}"));
-		fs::rename(&path, &output).map_err(|err| JobError::io(IoSide::Destination(&output), &err))?;
-		for warning in &warnings {
-			(cx.on_event)(JobEvent::Warning(warning.clone()));
-		}
-		return Ok(ImageOutcome::Output {
-			path: output,
-			bytes,
-			warnings,
-		});
+	for (candidate, err) in &choice.failures {
+		let reason = match &err.kind {
+			ErrorKind::EncodeFailed(reason) => reason.clone(),
+			other => other.to_string(),
+		};
+		warnings.push(format!(
+			"the {} candidate was discarded ({reason})",
+			candidate_name(*candidate)
+		));
 	}
 
-	Ok(ImageOutcome::Kept(match choice.best_rejected {
-		Some(score) => KeepReason::QualityUnreachable(format!(
+	match verdict(choice, target, cx.source_bytes) {
+		Verdict::Output(path, bytes) => {
+			let extension = path.extension().unwrap_or_default().to_string_lossy().into_owned();
+			let output = workspace.file(&format!("out.{extension}"));
+			fs::rename(&path, &output).map_err(|err| JobError::io(IoSide::Destination(&output), &err))?;
+			for warning in &warnings {
+				(cx.on_event)(JobEvent::Warning(warning.clone()));
+			}
+			Ok(ImageOutcome::Output {
+				path: output,
+				bytes,
+				warnings,
+			})
+		}
+		Verdict::Kept(reason) => Ok(ImageOutcome::Kept(reason)),
+		Verdict::Failed(err) => Err(err),
+	}
+}
+
+fn verdict(choice: Choice, target: f64, source_bytes: u64) -> Verdict {
+	if let Some((path, bytes)) = choice.best {
+		return Verdict::Output(path, bytes);
+	}
+	if let Some(score) = choice.best_rejected {
+		return Verdict::Kept(KeepReason::QualityUnreachable(format!(
 			"quality target not reached at a smaller size (SSIMULACRA2 {score:.1}, target {target:.0})"
-		)),
-		None => KeepReason::NotSmaller {
-			src_bytes: cx.source_bytes,
-			out_bytes: choice.smallest.unwrap_or(cx.source_bytes),
-		},
-	}))
+		)));
+	}
+	if let Some((_, err)) = choice.failures.into_iter().next() {
+		return Verdict::Failed(err);
+	}
+	Verdict::Kept(KeepReason::NotSmaller {
+		src_bytes: source_bytes,
+		out_bytes: choice.smallest.unwrap_or(source_bytes),
+	})
+}
+
+fn candidate_name(candidate: Candidate) -> &'static str {
+	match candidate {
+		Candidate::Ravif(_) => "AVIF",
+		Candidate::JxlLossy(_) | Candidate::JxlLossless(_) => "JPEG XL",
+	}
 }
 
 async fn produce_animation(
@@ -363,11 +418,19 @@ async fn produce_animation(
 	workspace: &Workspace,
 ) -> Result<Option<ImageOutcome>, JobError> {
 	(cx.on_event)(JobEvent::Stage(Stage::Analyze));
+	if matches!(
+		sniff(&input.bytes),
+		ImageFormat::Avif | ImageFormat::Heif | ImageFormat::Jxl
+	) {
+		return Ok(Some(keep("animated AVIF/HEIF/JPEG XL files are kept as they are")));
+	}
+
 	let bytes = Arc::clone(&input.bytes);
 	let timeline = match blocking(cx.cancel, move || animated::scan(&bytes)).await? {
 		Ok(Some(timeline)) if timeline.frames > 1 => timeline,
 		Ok(_) => return Ok(None),
-		Err(reason) => return Err(ErrorKind::SourceDamaged(reason).into()),
+		Err(ScanError::TooManyFrames) => return Ok(Some(keep("the animation has too many frames to verify"))),
+		Err(ScanError::Unreadable(reason)) => return Err(ErrorKind::SourceDamaged(reason).into()),
 	};
 	let animation = Animation {
 		alpha: animated::has_alpha(cx.tools, cx.source, cx.cancel).await?,
@@ -382,6 +445,9 @@ async fn produce_animation(
 	let personal = input.metadata.exif.is_some() || input.metadata.xmp.is_some() || !input.metadata.comments.is_empty();
 	if cx.mode == MetadataMode::Full && personal {
 		warnings.push("metadata is not carried into animated AVIF yet".into());
+	}
+	if input.metadata.icc.is_some() {
+		warnings.push("the colour profile is not carried into animated AVIF yet".into());
 	}
 
 	(cx.on_event)(JobEvent::Stage(Stage::Encode));
@@ -429,6 +495,10 @@ async fn produce_animation(
 	}))
 }
 
+fn keep(reason: &str) -> ImageOutcome {
+	ImageOutcome::Kept(KeepReason::Unsupported(reason.to_owned()))
+}
+
 fn grey_profile(icc: Option<&[u8]>) -> bool {
 	icc.and_then(icc::colour_space) == Some(*b"GRAY")
 }
@@ -436,4 +506,48 @@ fn grey_profile(icc: Option<&[u8]>) -> bool {
 #[allow(clippy::cast_precision_loss)]
 fn saves_enough(src_bytes: u64, out_bytes: u64, min_savings: f64) -> bool {
 	(out_bytes as f64) <= (src_bytes as f64) * (1.0 - min_savings)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn failed_verification() -> (Candidate, JobError) {
+		(
+			Candidate::Ravif(plan::ravif_settings(Speed::Fast)),
+			ErrorKind::EncodeFailed("verification failed: the alpha channel is missing".into()).into(),
+		)
+	}
+
+	#[test]
+	fn a_failed_candidate_does_not_fail_the_job_when_another_is_usable() {
+		let passed = Choice {
+			best: Some((PathBuf::from("candidate1.jxl"), 100)),
+			failures: vec![failed_verification()],
+			..Choice::default()
+		};
+		let rejected = Choice {
+			best_rejected: Some(70.0),
+			failures: vec![failed_verification()],
+			..Choice::default()
+		};
+		let only_failed = Choice {
+			failures: vec![failed_verification()],
+			..Choice::default()
+		};
+
+		assert!(matches!(verdict(passed, 80.0, 1000), Verdict::Output(_, 100)));
+		assert!(matches!(
+			verdict(rejected, 80.0, 1000),
+			Verdict::Kept(KeepReason::QualityUnreachable(_))
+		));
+		assert!(matches!(
+			verdict(only_failed, 80.0, 1000),
+			Verdict::Failed(err) if matches!(err.kind, ErrorKind::EncodeFailed(_))
+		));
+		assert!(matches!(
+			verdict(Choice::default(), 80.0, 1000),
+			Verdict::Kept(KeepReason::NotSmaller { .. })
+		));
+	}
 }
