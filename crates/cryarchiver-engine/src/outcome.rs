@@ -118,6 +118,9 @@ pub enum KeepReason {
 	PredictedNotSmaller { src_bytes: u64, predicted_bytes: u64 },
 	AlreadyEfficient(String),
 	Unsupported(String),
+	QualityUnreachable(String),
+	InvalidIcc(String),
+	DecodeBomb { megapixels: u64 },
 }
 
 #[derive(Debug, Clone)]

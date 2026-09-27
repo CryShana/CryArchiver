@@ -150,7 +150,13 @@ fn keep_reason(reason: &KeepReason) -> String {
 				DecimalBytes(*predicted_bytes)
 			)
 		}
-		KeepReason::AlreadyEfficient(why) | KeepReason::Unsupported(why) => why.clone(),
+		KeepReason::AlreadyEfficient(why) | KeepReason::Unsupported(why) | KeepReason::QualityUnreachable(why) => {
+			why.clone()
+		}
+		KeepReason::InvalidIcc(why) => format!("invalid ICC profile: {why}"),
+		KeepReason::DecodeBomb { megapixels } => {
+			format!("the header claims {megapixels} MP, above the 500 MP safety limit")
+		}
 	}
 }
 
@@ -224,6 +230,27 @@ mod tests {
 			"= 02. 試験曲.flac  kept: encoding would save too little (5.80 MB → predicted 7.10 MB)"
 		);
 		assert!(outcome_line(source, &failed).starts_with("✗ 02. 試験曲.flac  failed: source damaged"));
+	}
+
+	#[test]
+	fn image_keep_reasons_are_described() {
+		let source = Path::new("photo.jpg");
+		let line = |reason| outcome_line(source, &JobOutcome::KeptOriginal { reason });
+
+		assert_eq!(
+			line(KeepReason::QualityUnreachable(
+				"quality target not reached at a smaller size".into()
+			)),
+			"= photo.jpg  kept: quality target not reached at a smaller size"
+		);
+		assert_eq!(
+			line(KeepReason::InvalidIcc("declares 4294967295 bytes".into())),
+			"= photo.jpg  kept: invalid ICC profile: declares 4294967295 bytes"
+		);
+		assert_eq!(
+			line(KeepReason::DecodeBomb { megapixels: 10_000 }),
+			"= photo.jpg  kept: the header claims 10000 MP, above the 500 MP safety limit"
+		);
 	}
 
 	#[test]
