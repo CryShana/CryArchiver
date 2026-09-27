@@ -105,7 +105,7 @@ impl From<ErrorKind> for JobError {
 	}
 }
 
-pub(crate) fn is_sharing_violation(err: &io::Error) -> bool {
+pub fn is_sharing_violation(err: &io::Error) -> bool {
 	const ERROR_SHARING_VIOLATION: i32 = 32;
 	const ERROR_LOCK_VIOLATION: i32 = 33;
 

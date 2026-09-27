@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use cryarchiver_engine::commit::{
-	Artifact, CommitError, Replace, SourceTimes, check_space, commit_file, fallback_no_replace, free_space,
+	Artifact, CommitError, Replace, SourceTimes, check_space, commit_file, fallback_no_replace, file_id, free_space,
 	rename_no_replace, same_file,
 };
 use cryarchiver_engine::outcome::ErrorKind as JobErrorKind;
@@ -152,4 +152,57 @@ fn identifies_the_same_file_through_different_paths() {
 
 	assert!(same_file(&a, &dir.path().join(".").join("a.flac")).unwrap());
 	assert!(!same_file(&a, &b).unwrap());
+}
+
+#[test]
+fn folders_have_an_identity_too() {
+	let dir = tempfile::tempdir().unwrap();
+	let folder = dir.path().join("album");
+	fs::create_dir(&folder).unwrap();
+
+	assert_eq!(
+		file_id(&folder).unwrap(),
+		file_id(&folder.join("..").join("album")).unwrap()
+	);
+	assert_ne!(file_id(&folder).unwrap(), file_id(dir.path()).unwrap());
+}
+
+#[test]
+fn hard_links_share_an_identity() {
+	let dir = tempfile::tempdir().unwrap();
+	let original = dir.path().join("a.flac");
+	let link = dir.path().join("b.flac");
+	fs::write(&original, b"a").unwrap();
+	fs::hard_link(&original, &link).unwrap();
+
+	assert_eq!(file_id(&original).unwrap(), file_id(&link).unwrap());
+}
+
+#[test]
+fn symlinks_are_followed() {
+	let dir = tempfile::tempdir().unwrap();
+	let target = dir.path().join("a.flac");
+	let link = dir.path().join("link.flac");
+	fs::write(&target, b"a").unwrap();
+
+	#[cfg(unix)]
+	let created = std::os::unix::fs::symlink(&target, &link);
+	#[cfg(windows)]
+	let created = std::os::windows::fs::symlink_file(&target, &link);
+	if created.is_err() {
+		eprintln!("skipped: this account can't create symlinks");
+		return;
+	}
+
+	assert_eq!(file_id(&link).unwrap(), file_id(&target).unwrap());
+}
+
+#[test]
+fn a_missing_path_has_no_identity() {
+	let dir = tempfile::tempdir().unwrap();
+
+	assert_eq!(
+		file_id(&dir.path().join("missing")).unwrap_err().kind(),
+		ErrorKind::NotFound
+	);
 }

@@ -16,6 +16,7 @@ clap = ["dep:clap"]
 avif-serialize.workspace = true
 base64.workspace = true
 brotli-decompressor.workspace = true
+caseless.workspace = true
 clap = { workspace = true, optional = true }
 crc32fast.workspace = true
 directories.workspace = true
@@ -37,6 +38,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 ulid.workspace = true
+unicode-normalization.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 

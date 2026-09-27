@@ -38,6 +38,12 @@ pub trait OutputSink: Send + Sync {
 	fn commit(&self, artifact: &Artifact) -> Result<PathBuf, CommitError>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileIdentity {
+	pub volume: u64,
+	pub index: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceTimes {
 	pub accessed: SystemTime,
@@ -54,7 +60,7 @@ impl SourceTimes {
 		})
 	}
 
-	fn file_times(&self) -> FileTimes {
+	pub fn file_times(&self) -> FileTimes {
 		let times = FileTimes::new().set_accessed(self.accessed).set_modified(self.modified);
 
 		#[cfg(windows)]
@@ -129,10 +135,15 @@ pub fn free_space(path: &Path) -> io::Result<u64> {
 }
 
 pub fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
-	Ok(native::file_id(a)? == native::file_id(b)?)
+	Ok(file_id(a)? == file_id(b)?)
 }
 
-pub(crate) fn retry_transient<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+/// Follows links, and works for folders as well as files.
+pub fn file_id(path: &Path) -> io::Result<FileIdentity> {
+	native::file_id(path)
+}
+
+pub fn retry_transient<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 	let mut delay = Duration::from_millis(50);
 	for _ in 1..TRANSIENT_ATTEMPTS {
 		match op() {
@@ -166,9 +177,10 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 mod native {
-	use std::fs::File;
+	use std::fs::OpenOptions;
 	use std::io;
 	use std::os::windows::ffi::OsStrExt;
+	use std::os::windows::fs::OpenOptionsExt;
 	use std::os::windows::io::AsRawHandle;
 	use std::path::Path;
 
@@ -178,6 +190,8 @@ mod native {
 		MoveFileExW,
 	};
 	use windows::core::PCWSTR;
+
+	use super::FileIdentity;
 
 	pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 		let (from, to) = (long_wide(from)?, long_wide(to)?);
@@ -201,17 +215,22 @@ mod native {
 		Ok(available)
 	}
 
-	pub fn file_id(path: &Path) -> io::Result<(u32, u64)> {
-		let file = File::open(path)?;
+	pub fn file_id(path: &Path) -> io::Result<FileIdentity> {
+		const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+		let file = OpenOptions::new()
+			.access_mode(0)
+			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+			.open(path)?;
 		let mut info = BY_HANDLE_FILE_INFORMATION::default();
 
 		// SAFETY: the handle is owned by `file` and valid for the call.
 		unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut info) }
 			.map_err(|err| to_io(&err))?;
-		Ok((
-			info.dwVolumeSerialNumber,
-			(u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-		))
+		Ok(FileIdentity {
+			volume: u64::from(info.dwVolumeSerialNumber),
+			index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+		})
 	}
 
 	// Win32 calls outside std are limited to MAX_PATH unless the path carries the \\?\ prefix.
@@ -289,6 +308,8 @@ mod native {
 	use std::os::unix::fs::MetadataExt;
 	use std::path::Path;
 
+	use super::FileIdentity;
+
 	#[cfg(target_os = "linux")]
 	pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 		let from = CString::new(from.as_os_str().as_bytes())?;
@@ -335,8 +356,11 @@ mod native {
 		}
 	}
 
-	pub fn file_id(path: &Path) -> io::Result<(u64, u64)> {
+	pub fn file_id(path: &Path) -> io::Result<FileIdentity> {
 		let meta = std::fs::metadata(path)?;
-		Ok((meta.dev(), meta.ino()))
+		Ok(FileIdentity {
+			volume: meta.dev(),
+			index: meta.ino(),
+		})
 	}
 }
