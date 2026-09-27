@@ -2,8 +2,10 @@
 //! quits and crashes.
 
 pub mod dedup;
+pub mod issues;
 pub mod keys;
 pub mod record;
+pub mod references;
 pub mod scan;
 pub mod settings;
 pub mod store;
