@@ -303,9 +303,19 @@ impl Owner {
 				let mut record = self.tree.file(file).record.clone();
 				match request.kind {
 					HashKind::Window => {
+						// An archived record's identity is the one read with its archived content; a later read
+						// can only confirm it, never replace it.
+						if recorded_output(&record.state).is_some() {
+							if identity.is_none() || identity != record.identity {
+								self.source_changed(file, request.size, request.mtime_ns);
+								return;
+							}
+						} else {
+							record.identity = identity;
+						}
+
 						record.window_hash = Some(hash);
-						record.identity = identity;
-						if identity.is_some() {
+						if record.identity.is_some() {
 							self.dedup.fresh_identity.insert(file);
 						} else {
 							self.dedup.fresh_identity.remove(&file);

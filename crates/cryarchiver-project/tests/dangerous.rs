@@ -317,3 +317,36 @@ fn a_crash_after_the_delete_intent_keeps_the_original_and_checks_it_again() {
 	assert!(!notes.exists());
 	assert!(matches!(state(&setup, "notes.txt"), FileState::OriginalDeleted(_)));
 }
+
+#[test]
+fn an_archived_original_replaced_before_it_joins_a_size_group_is_archived_again_before_it_is_deleted() {
+	let setup = setup(|_| {});
+	let photo = write(&setup.source, "a.jpg", &jpeg(1, BIG));
+	let encoder = FakeEncoder::new();
+	archive_without_deleting(&setup, &encoder);
+
+	let modified = fs::metadata(&photo).unwrap().modified().unwrap();
+	let replacement = setup.source.parent().unwrap().join("replacement.jpg");
+	fs::write(&replacement, jpeg(2, BIG)).unwrap();
+	fs::rename(&replacement, &photo).unwrap();
+	fs::File::options()
+		.write(true)
+		.open(&photo)
+		.unwrap()
+		.set_modified(modified)
+		.unwrap();
+	write(&setup.source, "Copies/c.jpg", &jpeg(3, BIG));
+
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	enable_deleting(&project);
+	start_deleting(&project);
+	wait_for(&project, &mut snapshot, "both deleted", |s| deleted(s) == 2);
+	drop(project);
+
+	assert_eq!(
+		encoder.calls().iter().filter(|call| call.as_str() == "a.jpg").count(),
+		2,
+		"the replacement was archived before its original was deleted"
+	);
+}
