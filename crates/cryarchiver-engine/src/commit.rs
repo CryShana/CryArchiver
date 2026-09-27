@@ -143,6 +143,9 @@ pub fn file_id(path: &Path) -> io::Result<FileIdentity> {
 	native::file_id(path)
 }
 
+#[cfg(windows)]
+pub use native::long_wide;
+
 pub fn retry_transient<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 	let mut delay = Duration::from_millis(50);
 	for _ in 1..TRANSIENT_ATTEMPTS {
@@ -167,7 +170,7 @@ fn is_transient(err: &io::Error) -> bool {
 }
 
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> io::Result<()> {
+pub fn sync_parent(path: &Path) -> io::Result<()> {
 	let dir = path
 		.parent()
 		.filter(|dir| !dir.as_os_str().is_empty())
@@ -234,7 +237,7 @@ mod native {
 	}
 
 	// Win32 calls outside std are limited to MAX_PATH unless the path carries the \\?\ prefix.
-	fn long_wide(path: &Path) -> io::Result<Vec<u16>> {
+	pub fn long_wide(path: &Path) -> io::Result<Vec<u16>> {
 		const BACKSLASH: u16 = b'\\' as u16;
 		const QUESTION: u16 = b'?' as u16;
 

@@ -18,5 +18,11 @@ rmp-serde.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

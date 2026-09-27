@@ -723,12 +723,14 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "cryarchiver-engine",
+ "libc",
  "notify",
  "redb",
  "rmp-serde",
  "serde",
  "tempfile",
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]
