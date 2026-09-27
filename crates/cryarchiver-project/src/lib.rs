@@ -3,6 +3,7 @@
 
 pub mod keys;
 pub mod record;
+pub mod scan;
 pub mod settings;
 pub mod store;
 pub mod tree;
