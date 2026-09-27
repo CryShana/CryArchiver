@@ -18,6 +18,7 @@ brotli-decompressor.workspace = true
 clap = { workspace = true, optional = true }
 crc32fast.workspace = true
 directories.workspace = true
+flate2.workspace = true
 infer.workspace = true
 lofty.workspace = true
 process-wrap.workspace = true

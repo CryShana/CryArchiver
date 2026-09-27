@@ -433,6 +433,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "directories",
+ "flate2",
  "infer",
  "libc",
  "lofty",
