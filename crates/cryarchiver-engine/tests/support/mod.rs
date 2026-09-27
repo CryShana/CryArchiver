@@ -195,7 +195,7 @@ pub fn with_jpeg_segment(jpeg: &[u8], marker: u8, payload: &[u8]) -> Vec<u8> {
 
 pub fn photo_png(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
 	let path = dir.join(name);
-	let source = format!("gradients=s={width}x{height}:speed=0,noise=alls=3:allf=u,format=rgb24");
+	let source = format!("gradients=s={width}x{height}:speed=0,noise=alls=3:allf=u:all_seed=1,format=rgb24");
 	ffmpeg(&[
 		"-f",
 		"lavfi",
