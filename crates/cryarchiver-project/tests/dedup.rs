@@ -1,16 +1,18 @@
 mod support;
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::MAIN_SEPARATOR_STR;
+use std::path::{MAIN_SEPARATOR_STR, Path};
+use std::sync::Arc;
 
 use cryarchiver_engine::outcome::ErrorKind;
-use cryarchiver_project::issues::Verb;
+use cryarchiver_project::issues::{Problem, Verb};
 use cryarchiver_project::keys::RelPath;
 use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How};
 use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
 use cryarchiver_project::view::RowState;
-use cryarchiver_project::{Command, Fault};
+use cryarchiver_project::{Command, Fault, Project};
 use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
 
 const BIG: usize = 100_000;
@@ -105,7 +107,8 @@ fn duplicates_become_placeholders_pointing_at_the_shallowest_copy() {
 	assert_eq!(
 		output.how,
 		How::Placeholder {
-			canonical: RelPath::from_bytes(b"a.jpg".to_vec())
+			canonical: RelPath::from_bytes(b"a.jpg".to_vec()),
+			lost: false,
 		}
 	);
 	assert!(!setup.destination.join("Backup").join("a.avif").exists());
@@ -265,7 +268,10 @@ fn archived_content(setup: &support::Setup, path: &str) -> Vec<u8> {
 		.cloned()
 		.unwrap_or_else(|| panic!("{path} has no output"));
 	let held = match output.how {
-		How::Placeholder { canonical } => record(setup, &canonical.display()).state.output().unwrap().path.clone(),
+		How::Placeholder { canonical, lost: false } => {
+			record(setup, &canonical.display()).state.output().unwrap().path.clone()
+		}
+		How::Placeholder { lost: true, .. } => panic!("{path}'s archived content is lost"),
 		How::Encoded | How::Copied(_) => output.path,
 	};
 	fs::read(setup.destination.join(native(&held.display()))).unwrap()
@@ -600,7 +606,176 @@ fn a_redo_of_a_missing_output_never_hands_it_to_a_gone_placeholder() {
 	assert_eq!(
 		kept.how,
 		How::Placeholder {
-			canonical: RelPath::from_bytes(b"a.bin".to_vec())
+			canonical: RelPath::from_bytes(b"a.bin".to_vec()),
+			lost: true,
 		}
 	);
+}
+
+/// Every placeholder's canonical copy is in the project and holds an archived file that is there.
+fn assert_no_record_points_at_a_missing_canonical_copy(setup: &support::Setup) {
+	let (_, _, loaded) = Store::open(&setup.project).unwrap();
+	let records: HashMap<String, FileRecord> = loaded
+		.files
+		.into_iter()
+		.map(|(key, record)| (key.display(), record))
+		.collect();
+
+	for (path, record) in &records {
+		let recorded = match &record.state {
+			FileState::Issue { output, .. } => output.as_ref(),
+			state => state.output(),
+		};
+		let Some(How::Placeholder { canonical, lost: false }) = recorded.map(|output| &output.how) else {
+			continue;
+		};
+
+		let held = records
+			.get(&canonical.display())
+			.and_then(|canonical| canonical.state.output())
+			.filter(|output| !matches!(output.how, How::Placeholder { .. }))
+			.unwrap_or_else(|| panic!("{path} points at {}, which holds no archived file", canonical.display()));
+		assert!(
+			setup.destination.join(native(&held.path.display())).exists(),
+			"{path} points at a missing {}",
+			held.path.display()
+		);
+	}
+}
+
+/// `lose` changes or removes the canonical copy's archived `output` after a run, and the user asks for a Redo. Returns
+/// once the canonical copy passed its ready check, which holds its source open, so the duplicate `Backup/<duplicate>`
+/// waits for it again.
+fn redo_a_lost_canonical_output(
+	setup: &support::Setup,
+	encoder: &Arc<FakeEncoder>,
+	output: &str,
+	duplicate: &str,
+	lose: impl FnOnce(&Path),
+) -> (Project, Snapshot) {
+	drop(run_to_completion(setup, encoder));
+	lose(&setup.destination.join(output));
+
+	let project = support::open(setup, encoder);
+	let mut snapshot = Snapshot::default();
+	wait_for(&project, &mut snapshot, "the lost output", |s| {
+		!s.issues.is_empty() && scans_completed(s) == 1
+	});
+	project.send(Command::Resolve(snapshot.issues[0].id, Verb::Retry));
+	wait_for(&project, &mut snapshot, "the redo", |s| s.issues.is_empty());
+
+	let backup = snapshot.folder_named("Backup");
+	project.send(Command::Watch(backup, true));
+	wait_for(&project, &mut snapshot, "the duplicate to wait", |s| {
+		s.rows
+			.get(&backup)
+			.and_then(|rows| rows.iter().find(|row| row.name == duplicate))
+			.is_some_and(|row| row.status.state == RowState::Waiting)
+	});
+	(project, snapshot)
+}
+
+fn finish(project: &Project, snapshot: &mut Snapshot) {
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+	wait_for(project, snapshot, "the run to finish", |s| {
+		s.overall.as_ref().is_some_and(|o| o.parity.is_some())
+	});
+}
+
+#[test]
+fn a_redo_of_a_changed_canonical_output_then_a_source_change_leaves_the_duplicate_its_own_content() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	let (project, mut snapshot) = redo_a_lost_canonical_output(&setup, &encoder, "a.bin", "a.bin", |path| {
+		fs::write(path, b"changed").unwrap();
+	});
+
+	fs::write(&canonical, data(2)).unwrap();
+	project.send(Command::Rescan);
+	wait_for(&project, &mut snapshot, "the change", |s| scans_completed(s) == 2);
+	finish(&project, &mut snapshot);
+	drop(project);
+
+	assert_no_record_points_at_a_missing_canonical_copy(&setup);
+	assert_eq!(archived_content(&setup, "Backup/a.bin"), data(1));
+	assert_eq!(archived_content(&setup, "a.bin"), data(2));
+}
+
+#[test]
+fn a_redo_of_a_missing_canonical_output_whose_source_then_vanishes_leaves_the_duplicate_its_own_content() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	let (project, mut snapshot) = redo_a_lost_canonical_output(&setup, &encoder, "a.bin", "a.bin", |path| {
+		fs::remove_file(path).unwrap();
+	});
+
+	fs::remove_file(canonical).unwrap();
+	project.send(Command::Rescan);
+	wait_for(&project, &mut snapshot, "the removal", |s| scans_completed(s) == 2);
+	finish(&project, &mut snapshot);
+	drop(project);
+
+	assert_no_record_points_at_a_missing_canonical_copy(&setup);
+	assert_eq!(archived_content(&setup, "Backup/a.bin"), data(1));
+}
+
+#[test]
+fn a_redo_that_fails_then_is_excluded_leaves_the_duplicate_its_own_content() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.jpg", &jpeg(4, BIG));
+	write(&setup.source, "Backup/b.jpg", &jpeg(4, BIG));
+	let encoder = FakeEncoder::new();
+	let (project, mut snapshot) = redo_a_lost_canonical_output(&setup, &encoder, "a.avif", "b.jpg", |path| {
+		assert!(path.with_file_name("Backup").join("placeholder_b.jpg.txt").exists());
+		encoder.rule("a.jpg", Rule::Fail(ErrorKind::SourceDamaged("broken".into())));
+		fs::remove_file(path).unwrap();
+	});
+
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+	wait_for(&project, &mut snapshot, "the failed redo", |s| {
+		s.issues.iter().any(|issue| issue.problem == Problem::SourceDamaged)
+	});
+	project.send(Command::Resolve(snapshot.issues[0].id, Verb::Exclude));
+	wait_for(&project, &mut snapshot, "the run to finish", |s| {
+		s.overall
+			.as_ref()
+			.and_then(|overall| overall.parity)
+			.is_some_and(|parity| parity.excluded == 1)
+	});
+	drop(project);
+
+	assert_no_record_points_at_a_missing_canonical_copy(&setup);
+	assert_eq!(archived_content(&setup, "Backup/b.jpg"), b"encoded b.jpg");
+}
+
+#[test]
+fn accepting_a_missing_canonical_output_leaves_the_duplicate_its_own_content() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.bin", &data(1));
+	write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+	fs::remove_file(setup.destination.join("a.bin")).unwrap();
+
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	wait_for(&project, &mut snapshot, "the missing output", |s| {
+		!s.issues.is_empty() && scans_completed(s) == 1
+	});
+	project.send(Command::Resolve(snapshot.issues[0].id, Verb::Accept));
+	wait_for(&project, &mut snapshot, "the accept", |s| s.issues.is_empty());
+	finish(&project, &mut snapshot);
+	drop(project);
+
+	assert_eq!(record(&setup, "a.bin").state, FileState::Excluded);
+	assert_no_record_points_at_a_missing_canonical_copy(&setup);
+	assert_eq!(archived_content(&setup, "Backup/a.bin"), data(1));
 }

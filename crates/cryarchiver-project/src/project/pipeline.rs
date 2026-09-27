@@ -403,6 +403,7 @@ impl Owner {
 			Made::Placeholder { canonical, .. } => (
 				How::Placeholder {
 					canonical: canonical.clone(),
+					lost: false,
 				},
 				Some(staged.hash),
 			),
@@ -643,6 +644,7 @@ impl Owner {
 		self.last_attempts.insert(key.clone(), attempt);
 		self.pipeline.retries.remove(&file);
 
+		self.give_up_output(file);
 		self.set_state(
 			file,
 			FileState::Issue {

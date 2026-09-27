@@ -117,7 +117,8 @@ impl Owner {
 	fn content_output(&self, file: FileId) -> Option<&Output> {
 		let output = self.tree.file(file).record.state.output()?;
 		match &output.how {
-			How::Placeholder { canonical } => self.canonical_output(self.tree.file_id(canonical)?),
+			How::Placeholder { canonical, lost: false } => self.canonical_output(self.tree.file_id(canonical)?),
+			How::Placeholder { lost: true, .. } => None,
 			How::Encoded | How::Copied(_) => Some(output),
 		}
 	}

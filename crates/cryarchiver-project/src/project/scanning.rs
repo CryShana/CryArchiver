@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 
 use cryarchiver_engine::text::display_name;
 
-use super::duplicates::recorded_output;
+use super::duplicates::is_lost;
 use super::owner::{Message, Owner};
 use crate::keys::RelPath;
 use crate::record::{CycleRecord, FileRecord, FileState, FolderRecord, Identity, IssueKind, MediaClass};
@@ -223,13 +223,7 @@ impl Owner {
 	/// A file that appears where a gone source was is a new file: the old output stays, and the new one gets a name
 	/// of its own. So does a re-archive whose old output a placeholder adopted.
 	pub(super) fn source_changed(&mut self, file: FileId, size: u64, mtime_ns: i64) {
-		let earlier = match &self.tree.file(file).record.state {
-			FileState::Committing { .. } => None,
-			state => recorded_output(state).cloned(),
-		};
-		let adopted = earlier
-			.as_ref()
-			.is_some_and(|earlier| self.transfer_dependents(file, earlier));
+		let adopted = self.give_up_output(file);
 		self.withdraw(file);
 
 		let old = &self.tree.file(file).record;
@@ -269,19 +263,29 @@ impl Owner {
 	}
 
 	/// An archived file listed again unchanged, after its source was gone or its original deleted, is Done as it was.
-	fn source_returned(&mut self, file: FileId) {
-		if let FileState::SourceGone(output) | FileState::OriginalDeleted(output) = &self.tree.file(file).record.state {
-			let output = output.clone();
-			self.set_state(file, FileState::Done(output));
+	/// One whose archived content is lost is archived again from its source, replacing its placeholder.
+	pub(super) fn source_returned(&mut self, file: FileId) {
+		let record = &self.tree.file(file).record;
+		let (FileState::SourceGone(output) | FileState::OriginalDeleted(output)) = &record.state else {
+			return;
+		};
+		let output = output.clone();
+
+		if is_lost(&record.state) {
+			let mut record = record.clone();
+			record.replaces = Some(output.path);
+			self.tree.set_record(file, record);
+			self.set_state(file, FileState::Ready);
+			self.gate(file);
+			return;
 		}
+
+		self.set_state(file, FileState::Done(output));
 	}
 
-	/// The file leaves the project; the output an issue is about stays with the placeholders that point at it.
+	/// The file leaves the project; the placeholders that point at it adopt its verified output, or are released.
 	pub(super) fn forget_file(&mut self, file: FileId) {
-		if let Some(output) = recorded_output(&self.tree.file(file).record.state).cloned() {
-			self.transfer_dependents(file, &output);
-		}
-
+		self.give_up_output(file);
 		self.withdraw(file);
 		self.release_all_claims(file);
 		let folder = self.tree.file(file).folder;
@@ -295,8 +299,9 @@ impl Owner {
 	}
 
 	/// An unreadable entry is an issue, unless the file is archived already: then its output stays and a warning says
-	/// what happened.
-	fn source_broken(&mut self, folder: FolderId, name: &OsStr, reason: &str) {
+	/// what happened. The placeholders that point at it first adopt the output an earlier issue was about, once it is
+	/// verified, or are released.
+	pub(super) fn source_broken(&mut self, folder: FolderId, name: &OsStr, reason: &str) {
 		let key = self.tree.folder(folder).key.join(name);
 		let known = self.tree.file_id(&key).filter(|&file| !self.tree.file(file).removed);
 		if known.is_some_and(|file| self.tree.file(file).record.state.output().is_some()) {
@@ -308,6 +313,7 @@ impl Owner {
 		}
 
 		let file = if let Some(file) = known {
+			self.give_up_output(file);
 			self.withdraw(file);
 			file
 		} else {

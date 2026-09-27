@@ -165,7 +165,13 @@ pub struct Output {
 pub enum How {
 	Encoded,
 	Copied(CopyReason),
-	Placeholder { canonical: RelPath },
+	Placeholder {
+		canonical: RelPath,
+		/// The canonical copy's archived content went missing before this placeholder could take it over. The content
+		/// is lost, and the placeholder no longer depends on its canonical copy.
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		lost: bool,
+	},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +303,33 @@ mod tests {
 				state: FileState::Queued,
 				..FileRecord::discovered(3, 1_000)
 			}
+		);
+	}
+
+	#[test]
+	fn a_placeholder_reads_whether_or_not_its_content_was_marked_lost() {
+		#[derive(Serialize)]
+		enum OlderHow {
+			Placeholder { canonical: RelPath },
+		}
+
+		let canonical = RelPath::from_bytes(b"a.txt".to_vec());
+		let older = rmp_serde::to_vec_named(&OlderHow::Placeholder {
+			canonical: canonical.clone(),
+		})
+		.unwrap();
+		let lost = How::Placeholder {
+			canonical: canonical.clone(),
+			lost: true,
+		};
+
+		assert_eq!(
+			rmp_serde::from_slice::<How>(&older).unwrap(),
+			How::Placeholder { canonical, lost: false }
+		);
+		assert_eq!(
+			rmp_serde::from_slice::<How>(&rmp_serde::to_vec_named(&lost).unwrap()).unwrap(),
+			lost
 		);
 	}
 

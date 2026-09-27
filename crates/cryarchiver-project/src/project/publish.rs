@@ -506,7 +506,7 @@ impl Owner {
 
 	fn placeholder_target(&self, file: FileId) -> Option<FileId> {
 		match &self.tree.file(file).record.state.output()?.how {
-			How::Placeholder { canonical } => self.tree.file_id(canonical),
+			How::Placeholder { canonical, lost: false } => self.tree.file_id(canonical),
 			_ => None,
 		}
 	}

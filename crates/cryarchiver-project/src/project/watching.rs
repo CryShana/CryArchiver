@@ -268,7 +268,6 @@ impl Owner {
 			}
 		};
 
-		let name = self.tree.file(file).key.display();
 		match self.tree.file(file).record.state {
 			FileState::Done(_) => self.set_state(
 				file,
@@ -281,12 +280,17 @@ impl Owner {
 			),
 			FileState::SourceGone(_) | FileState::OriginalDeleted(_) => {
 				self.log(LogKind::Action, format!("{}: {reason}", output.path.display()));
-				if self.watching.notified_missing.insert(file) {
-					let verb = if changed { "has changed" } else { "is missing" };
-					self.notice(NoticeLevel::Warning, format!("the only archived copy of {name} {verb}"));
-				}
+				self.warn_only_copy(file, if changed { "has changed" } else { "is missing" });
 			}
 			_ => self.log(LogKind::Action, format!("{}: {reason}", output.path.display())),
+		}
+	}
+
+	/// A gone original's only archived copy is missing or changed: a Warning, once a session.
+	pub(super) fn warn_only_copy(&mut self, file: FileId, verb: &str) {
+		if self.watching.notified_missing.insert(file) {
+			let name = self.tree.file(file).key.display();
+			self.notice(NoticeLevel::Warning, format!("the only archived copy of {name} {verb}"));
 		}
 	}
 

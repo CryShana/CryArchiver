@@ -19,7 +19,8 @@ const LISTED_GAPS: usize = 10;
 pub(crate) enum Completion {
 	#[default]
 	Pending,
-	Checking,
+	/// The destination walk with this number is under way.
+	Checking(u64),
 	Done(ParityReport),
 }
 
@@ -28,6 +29,7 @@ pub(crate) struct FinishState {
 	candidates: HashSet<FolderId>,
 	applying: HashSet<FolderId>,
 	pub(super) completion: Completion,
+	walks: u64,
 }
 
 impl Owner {
@@ -129,18 +131,27 @@ impl Owner {
 			return;
 		}
 
-		self.finish.completion = Completion::Checking;
+		self.finish.walks += 1;
+		let walk = self.finish.walks;
+		self.finish.completion = Completion::Checking(walk);
 		let root = self.settings.destination.clone();
 		let project_file = self.project_file.file_name().unwrap_or_default().to_os_string();
 		let messages = self.messages.clone();
 		tokio::task::spawn_blocking(move || {
 			let files = walk_destination(&root, &project_file);
-			let _ = messages.send(Message::DestinationWalked(files));
+			let _ = messages.send(Message::DestinationWalked(walk, files));
 		});
 	}
 
-	pub(super) fn on_destination_walked(&mut self, files: &[DestinationFile]) {
-		if self.finish.completion != Completion::Checking {
+	/// Only the latest walk counts, and only while the run is still idle: whatever changed since it started may not be
+	/// in its listing.
+	pub(super) fn on_destination_walked(&mut self, walk: u64, files: &[DestinationFile]) {
+		if self.finish.completion != Completion::Checking(walk) {
+			return;
+		}
+
+		if !self.idle() {
+			self.finish.completion = Completion::Pending;
 			return;
 		}
 
@@ -174,7 +185,7 @@ impl Owner {
 	pub(super) fn parity(&self) -> Option<&ParityReport> {
 		match &self.finish.completion {
 			Completion::Done(report) => Some(report),
-			Completion::Pending | Completion::Checking => None,
+			Completion::Pending | Completion::Checking(_) => None,
 		}
 	}
 }
@@ -201,5 +212,27 @@ mod tests {
 		owner.on_folder_finished(photos, Ok(()));
 
 		assert!(!owner.tree.folder(photos).record.timestamps_applied);
+	}
+
+	#[test]
+	fn a_destination_walk_that_ends_after_the_run_went_on_reports_nothing() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		owner.started = true;
+		owner.finish.candidates.clear();
+		assert!(owner.idle());
+		owner.finish.completion = Completion::Checking(2);
+
+		owner.on_destination_walked(1, &[]);
+		assert_eq!(owner.finish.completion, Completion::Checking(2));
+
+		fs::write(source.join("a.txt"), b"a").unwrap();
+		list(&mut owner, &RelPath::root(), false);
+		owner.on_destination_walked(2, &[]);
+
+		assert_eq!(owner.finish.completion, Completion::Pending);
 	}
 }

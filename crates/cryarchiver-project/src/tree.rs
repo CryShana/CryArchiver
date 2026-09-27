@@ -505,6 +505,7 @@ mod tests {
 			b,
 			FileState::Done(output(How::Placeholder {
 				canonical: RelPath::root(),
+				lost: false,
 			})),
 		);
 		tree.set_state(c, FileState::OriginalDeleted(output(How::Encoded)));
