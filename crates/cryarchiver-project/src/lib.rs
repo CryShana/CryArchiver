@@ -6,6 +6,7 @@ pub mod issues;
 pub mod keys;
 pub mod record;
 pub mod references;
+pub mod run;
 pub mod scan;
 pub mod schedule;
 pub mod settings;
