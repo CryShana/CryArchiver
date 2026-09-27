@@ -779,3 +779,27 @@ fn accepting_a_missing_canonical_output_leaves_the_duplicate_its_own_content() {
 	assert_no_record_points_at_a_missing_canonical_copy(&setup);
 	assert_eq!(archived_content(&setup, "Backup/a.bin"), data(1));
 }
+
+#[test]
+fn accepting_a_changed_canonical_output_leaves_the_duplicate_its_own_content() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.bin", &data(1));
+	write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+	fs::write(setup.destination.join("a.bin"), b"changed").unwrap();
+
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	wait_for(&project, &mut snapshot, "the changed output", |s| {
+		!s.issues.is_empty() && scans_completed(s) == 1
+	});
+	project.send(Command::Resolve(snapshot.issues[0].id, Verb::Accept));
+	wait_for(&project, &mut snapshot, "the accept", |s| s.issues.is_empty());
+	finish(&project, &mut snapshot);
+	drop(project);
+
+	assert_no_record_points_at_a_missing_canonical_copy(&setup);
+	assert_eq!(archived_content(&setup, "Backup/a.bin"), data(1));
+	assert_eq!(archived_content(&setup, "a.bin"), b"changed");
+}

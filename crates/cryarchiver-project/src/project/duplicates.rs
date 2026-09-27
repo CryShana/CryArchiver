@@ -175,9 +175,9 @@ impl Owner {
 							..
 						} => false,
 						FileState::SourceGone(_) | FileState::DeletePending(_) | FileState::OriginalDeleted(_) => {
-							hashed && !is_lost(&file.record.state)
+							hashed && !is_lost(&file.record.state) && verifiable(&file.record.state)
 						}
-						_ => true,
+						_ => verifiable(&file.record.state),
 					}
 			})
 			.map(|id| {
@@ -871,6 +871,11 @@ pub(super) fn is_lost(state: &FileState) -> bool {
 		recorded_output(state).map(|output| &output.how),
 		Some(How::Placeholder { lost: true, .. })
 	)
+}
+
+/// An output accepted as it is carries no hash: nothing it holds can stand in for another file's content.
+fn verifiable(state: &FileState) -> bool {
+	recorded_output(state).is_none_or(|output| output.hash.is_some())
 }
 
 fn is_gone(state: &FileState) -> bool {

@@ -90,10 +90,19 @@ impl Owner {
 		self.log(LogKind::Action, format!("{name}: {} chosen", verb_label(verb)));
 	}
 
-	/// "Accept as is": the output as it now is on disk becomes the archive. Nothing can be verified against it, so it
-	/// carries no hash; a missing output leaves the file excluded. The placeholders that point at it are archived again
-	/// from their own sources, unless the output is still as it was archived.
+	/// "Accept as is": an output still as it was archived stays as it is, hash and placeholders included. Otherwise the
+	/// output as it now is on disk becomes the archive with no hash, so it can never be a canonical copy, and the
+	/// placeholders that pointed at it are archived again from their own sources; a missing output leaves the file
+	/// excluded.
 	fn accept_output(&mut self, file: FileId, output: Option<&Output>) {
+		if let Some(output) = output
+			&& self.output_intact(output)
+		{
+			self.set_state(file, FileState::Done(output.clone()));
+			self.file_settled(file);
+			return;
+		}
+
 		let current = output.and_then(|output| {
 			let size = fs::metadata(self.destination_path(&output.path)).ok()?.len();
 			Some(Output {
@@ -102,16 +111,14 @@ impl Owner {
 				..output.clone()
 			})
 		});
-
-		if current.is_none() || !self.verified_for_dependents(file, output) {
-			self.transfer_dependents(file, output, false);
-		}
+		self.transfer_dependents(file, output, false);
 
 		if let Some(current) = current {
 			self.set_state(file, FileState::Done(current));
 		} else {
 			self.set_state(file, FileState::Excluded);
 		}
+		self.leave_dedup(file);
 		self.file_settled(file);
 	}
 
