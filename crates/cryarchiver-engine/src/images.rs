@@ -1,3 +1,4 @@
+pub mod animated;
 pub mod avif;
 pub mod decode;
 pub mod jxl;

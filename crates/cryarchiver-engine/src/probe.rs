@@ -81,6 +81,8 @@ pub struct Stream {
 	#[serde(default, deserialize_with = "number")]
 	pub nb_read_packets: Option<u64>,
 	#[serde(default, deserialize_with = "number")]
+	pub nb_frames: Option<u64>,
+	#[serde(default, deserialize_with = "number")]
 	pub start_time: Option<f64>,
 	#[serde(default, deserialize_with = "number")]
 	pub duration: Option<f64>,
