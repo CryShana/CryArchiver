@@ -23,6 +23,7 @@ fast-ssim2.workspace = true
 flate2.workspace = true
 image.workspace = true
 infer.workspace = true
+jxl-oxide.workspace = true
 lofty.workspace = true
 process-wrap.workspace = true
 quick-xml.workspace = true
