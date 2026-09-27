@@ -3,7 +3,9 @@ pub mod decode;
 pub mod jxl;
 pub mod plan;
 pub mod props;
+pub mod ssim;
 pub mod structure;
+pub mod verify;
 
 use tokio_util::sync::CancellationToken;
 
