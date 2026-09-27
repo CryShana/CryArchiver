@@ -20,7 +20,7 @@ impl ParityReport {
 		self.missing.is_empty() && self.source_files == self.archive_files + self.excluded
 	}
 
-	/// "N archived", or "N + K excluded".
+	/// "N archived", or "N archived + K excluded".
 	pub fn summary(&self) -> String {
 		if self.excluded == 0 {
 			format!("{} archived", self.archive_files)
@@ -53,6 +53,7 @@ pub fn check<'a, S: BuildHasher>(
 			}
 		}
 	}
+
 	report.missing.sort();
 	report
 }

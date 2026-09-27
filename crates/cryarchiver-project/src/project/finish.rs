@@ -40,6 +40,10 @@ impl Owner {
 		candidates.sort_by_key(|folder| std::cmp::Reverse(self.tree.folder(*folder).key.depth()));
 
 		for folder in candidates {
+			if self.tree.folder(folder).vanished {
+				continue;
+			}
+
 			let complete = self.tree.is_complete(folder);
 			let entry = self.tree.folder(folder);
 			if !complete {
@@ -56,8 +60,8 @@ impl Owner {
 			}
 
 			let children_pending = entry.children.iter().any(|child| {
-				let record = &self.tree.folder(*child).record;
-				!record.timestamps_applied && record.cycle.is_none()
+				let child = self.tree.folder(*child);
+				!child.record.timestamps_applied && child.record.cycle.is_none() && !child.vanished
 			});
 			if children_pending {
 				self.finish.candidates.insert(folder);
@@ -77,11 +81,16 @@ impl Owner {
 		}
 	}
 
+	/// A folder that received a file while its timestamps were set stays pending; it finishes again once complete.
 	pub(super) fn on_folder_finished(&mut self, folder: FolderId, result: Result<(), String>) {
 		self.finish.applying.remove(&folder);
 		if let Err(reason) = result {
 			let label = self.folder_label(folder);
 			self.log(LogKind::Action, format!("{label}: folder timestamps not set: {reason}"));
+		}
+
+		if !self.tree.is_complete(folder) {
+			return;
 		}
 
 		self.tree.folder_mut(folder).record.timestamps_applied = true;
@@ -101,6 +110,7 @@ impl Owner {
 			&& self.pipeline.observed.is_empty()
 			&& self.pipeline.retry_at.is_empty()
 			&& !self.hashes_pending()
+			&& self.groups_planned()
 			&& self.finish.applying.is_empty()
 			&& self.finish.candidates.is_empty()
 	}
@@ -165,5 +175,30 @@ impl Owner {
 			Completion::Done(report) => Some(report),
 			Completion::Pending | Completion::Checking => None,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::project::scanning::tests::{key, list, owner};
+
+	use super::*;
+
+	#[test]
+	fn a_folder_that_got_a_new_file_while_its_timestamps_were_set_stays_pending() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(source.join("Photos")).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		list(&mut owner, &key("Photos"), true);
+		let photos = owner.tree.folder_id(&key("Photos")).unwrap();
+		assert!(owner.tree.is_complete(photos));
+
+		fs::write(source.join("Photos").join("a.txt"), b"a").unwrap();
+		list(&mut owner, &key("Photos"), false);
+		owner.on_folder_finished(photos, Ok(()));
+
+		assert!(!owner.tree.folder(photos).record.timestamps_applied);
 	}
 }

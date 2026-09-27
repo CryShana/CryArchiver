@@ -199,11 +199,21 @@ impl Owner {
 	}
 
 	/// The source changed after the project saw it: it is archived again, and the new output replaces the old one.
+	/// A file that appears where a gone source was is a new file: the old output stays, and the new one gets a name
+	/// of its own. So does a re-archive whose old output a placeholder of a gone original adopted.
 	pub(super) fn source_changed(&mut self, file: FileId, size: u64, mtime_ns: i64) {
+		let earlier = match &self.tree.file(file).record.state {
+			FileState::Committing { .. } => None,
+			state => state.output().cloned(),
+		};
+		let adopted = self.release_dependents(file, earlier);
 		self.withdraw(file);
+
 		let old = &self.tree.file(file).record;
 		let replaces = match &old.state {
+			_ if adopted => None,
 			FileState::Committing { .. } => old.replaces.clone(),
+			FileState::SourceGone(_) | FileState::DeletePending(_) | FileState::OriginalDeleted(_) => None,
 			state => state
 				.output()
 				.map(|output| output.path.clone())
@@ -231,6 +241,7 @@ impl Owner {
 			FileState::Done(output) => self.set_state(file, FileState::SourceGone(output)),
 			FileState::DeletePending(output) => self.set_state(file, FileState::OriginalDeleted(output)),
 			FileState::SourceGone(_) | FileState::OriginalDeleted(_) => {}
+			_ if self.keep_released(file) => {}
 			_ => self.forget_file(file),
 		}
 	}

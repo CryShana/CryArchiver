@@ -68,8 +68,9 @@ impl Owner {
 				self.observe(file);
 			}
 			(IssueKind::OutputMissing, Verb::Retry) => {
+				let adopted = self.release_dependents(file, output.clone());
 				let mut record = self.tree.file(file).record.clone();
-				record.replaces = output.map(|output| output.path);
+				record.replaces = output.filter(|_| !adopted).map(|output| output.path);
 				self.tree.set_record(file, record);
 				self.set_state(file, FileState::Discovered);
 				self.observe(file);

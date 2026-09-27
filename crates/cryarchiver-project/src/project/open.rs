@@ -112,6 +112,7 @@ impl Owner {
 				.parent()
 				.map_or(FolderId::ROOT, |parent| self.tree.ensure_folder(&parent));
 			let file = self.tree.add_file(folder, &key.name(), record);
+			self.note_placeholder(file);
 			self.track_issue(file);
 			if let Some(output) = self
 				.tree

@@ -78,12 +78,6 @@ pub fn plan_group(members: &[Member]) -> GroupPlan {
 			None => representatives.push(member),
 		}
 	}
-	let with_mates = |representative: &Member| -> Vec<&Member> {
-		representative
-			.identity
-			.and_then(|identity| same_file.get(&identity).cloned())
-			.unwrap_or_else(|| vec![members.iter().find(|m| m.id == representative.id).expect("a member")])
-	};
 
 	if representatives.len() > 1 {
 		plan.window_needed = representatives
@@ -109,7 +103,7 @@ pub fn plan_group(members: &[Member]) -> GroupPlan {
 	let mut resolved: Vec<Vec<&Member>> = Vec::new();
 	for group in by_window.into_values() {
 		if group.len() == 1 {
-			resolved.push(with_mates(group[0]));
+			resolved.push(with_mates(group[0], &same_file));
 			continue;
 		}
 
@@ -128,7 +122,7 @@ pub fn plan_group(members: &[Member]) -> GroupPlan {
 			by_full
 				.entry(member.full.expect("checked above"))
 				.or_default()
-				.extend(with_mates(member));
+				.extend(with_mates(member, &same_file));
 		}
 		resolved.extend(by_full.into_values());
 	}
@@ -148,6 +142,13 @@ pub fn plan_group(members: &[Member]) -> GroupPlan {
 	plan.unique.sort();
 	plan.sets.sort();
 	plan
+}
+
+fn with_mates<'m>(representative: &'m Member, same_file: &HashMap<Identity, Vec<&'m Member>>) -> Vec<&'m Member> {
+	representative
+		.identity
+		.and_then(|identity| same_file.get(&identity).cloned())
+		.unwrap_or_else(|| vec![representative])
 }
 
 /// The shallowest folder first; ties go to the first in name order.

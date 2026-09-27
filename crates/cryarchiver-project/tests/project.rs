@@ -689,7 +689,7 @@ fn archived_files_whose_source_comes_back_are_picked_up() {
 			),
 			"{name}"
 		);
-		assert_eq!(record.replaces, Some(key(name)), "{name}");
+		assert_eq!(record.replaces, None, "{name}");
 	}
 	assert_eq!(
 		state_of(&setup, "restored.txt"),

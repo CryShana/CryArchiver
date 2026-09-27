@@ -6,12 +6,21 @@ use std::path::MAIN_SEPARATOR_STR;
 use cryarchiver_engine::outcome::ErrorKind;
 use cryarchiver_project::issues::Verb;
 use cryarchiver_project::keys::RelPath;
-use cryarchiver_project::record::{FileRecord, FileState, How};
+use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How};
 use cryarchiver_project::store::Store;
+use cryarchiver_project::tree::FolderId;
+use cryarchiver_project::view::RowState;
 use cryarchiver_project::{Command, Fault};
 use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
 
 const BIG: usize = 100_000;
+
+/// Bytes no header check takes for media, so the file is copied as it is.
+fn data(seed: u8) -> Vec<u8> {
+	(0..BIG)
+		.map(|index| u8::try_from(index % 251).unwrap().wrapping_mul(7).wrapping_add(seed))
+		.collect()
+}
 
 fn record(setup: &support::Setup, path: &str) -> FileRecord {
 	let (_, _, loaded) = Store::open(&setup.project).unwrap();
@@ -231,4 +240,150 @@ fn excluding_a_failed_canonical_copy_makes_the_next_one_canonical() {
 	);
 	assert!(!setup.destination.join("Sub").join("placeholder_b.jpg.txt").exists());
 	assert_eq!(record(&setup, "a.jpg").state, FileState::Excluded);
+}
+
+#[test]
+fn a_changed_canonical_copy_lets_its_placeholders_archive_their_own_content() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+	assert!(setup.destination.join("Backup").join("placeholder_a.bin.txt").exists());
+
+	fs::write(&canonical, data(2)).unwrap();
+	run_to_completion(&setup, &encoder);
+
+	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(2));
+	assert_eq!(
+		fs::read(setup.destination.join("Backup").join("a.bin")).unwrap(),
+		data(1)
+	);
+	assert!(!setup.destination.join("Backup").join("placeholder_a.bin.txt").exists());
+	assert_eq!(
+		record(&setup, "Backup/a.bin").state.output().unwrap().how,
+		How::Copied(CopyReason::NotMedia)
+	);
+}
+
+fn assert_the_gone_duplicate_kept_the_old_content(setup: &support::Setup) {
+	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(1));
+	assert_eq!(fs::read(setup.destination.join("a (2).bin")).unwrap(), data(2));
+	assert!(!setup.destination.join("Backup").join("placeholder_a.bin.txt").exists());
+
+	let FileState::SourceGone(kept) = record(setup, "Backup/a.bin").state else {
+		panic!("the gone duplicate has no output of its own")
+	};
+	assert_eq!(kept.path.display(), "a.bin");
+	assert_eq!(kept.how, How::Copied(CopyReason::NotMedia));
+	assert_eq!(
+		record(setup, "a.bin").state.output().unwrap().path.display(),
+		"a (2).bin"
+	);
+}
+
+#[test]
+fn a_changed_canonical_copy_leaves_its_output_to_a_placeholder_whose_original_is_gone() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+	fs::remove_file(duplicate).unwrap();
+	drop(run_to_completion(&setup, &encoder));
+	assert!(matches!(record(&setup, "Backup/a.bin").state, FileState::SourceGone(_)));
+
+	fs::write(&canonical, data(2)).unwrap();
+	run_to_completion(&setup, &encoder);
+
+	assert_the_gone_duplicate_kept_the_old_content(&setup);
+}
+
+#[test]
+fn a_duplicate_deleted_in_the_same_scan_its_canonical_copy_changed_in_keeps_its_content() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+
+	fs::remove_file(duplicate).unwrap();
+	fs::write(&canonical, data(2)).unwrap();
+	run_to_completion(&setup, &encoder);
+
+	assert_the_gone_duplicate_kept_the_old_content(&setup);
+}
+
+#[test]
+fn a_new_file_where_a_gone_source_was_never_replaces_its_output() {
+	let setup = setup(|_| {});
+	let source = write(&setup.source, "a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+	fs::remove_file(&source).unwrap();
+	drop(run_to_completion(&setup, &encoder));
+
+	let newer = [data(3), b"more".to_vec()].concat();
+	fs::write(&source, &newer).unwrap();
+	run_to_completion(&setup, &encoder);
+
+	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(1));
+	assert_eq!(fs::read(setup.destination.join("a (2).bin")).unwrap(), newer);
+}
+
+#[test]
+fn a_candidate_gone_before_the_hashes_start_leaves_nothing_pending() {
+	let setup = setup(|_| {});
+	write(&setup.source, "x.bin", &data(1));
+	let y = write(&setup.source, "y.bin", &data(2));
+	let encoder = FakeEncoder::new();
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	project.send(Command::Watch(FolderId::ROOT, true));
+	wait_for(&project, &mut snapshot, "both to wait for their hashes", |s| {
+		["x.bin", "y.bin"].iter().all(|name| {
+			s.rows
+				.get(&FolderId::ROOT)
+				.and_then(|rows| rows.iter().find(|row| row.name == *name))
+				.is_some_and(|row| row.status.state == RowState::Waiting)
+		})
+	});
+
+	fs::remove_file(y).unwrap();
+	project.send(Command::Rescan);
+	wait_for(&project, &mut snapshot, "y to go", |s| {
+		s.rows
+			.get(&FolderId::ROOT)
+			.is_some_and(|rows| rows.iter().all(|row| row.name != "y.bin"))
+	});
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+	wait_for(&project, &mut snapshot, "the run to finish", |s| {
+		s.overall.as_ref().is_some_and(|o| o.parity.is_some())
+	});
+	drop(project);
+
+	assert_eq!(fs::read(setup.destination.join("x.bin")).unwrap(), data(1));
+}
+
+#[test]
+fn identical_sidecars_beside_different_videos_are_both_copied() {
+	let setup = setup(|_| {});
+	write(&setup.source, "A/movie.mp4", &jpeg(1, 100));
+	write(&setup.source, "B/film.mp4", &jpeg(2, 100));
+	write(&setup.source, "A/movie.srt", &data(5));
+	write(&setup.source, "B/film.srt", &data(5));
+	let encoder = FakeEncoder::new();
+	encoder.rule(".mp4", Rule::Encode("mkv"));
+	drop(run_to_completion(&setup, &encoder));
+
+	run_to_completion(&setup, &encoder);
+
+	assert_eq!(
+		fs::read(setup.destination.join("A").join("movie.srt")).unwrap(),
+		data(5)
+	);
+	assert_eq!(fs::read(setup.destination.join("B").join("film.srt")).unwrap(), data(5));
+	assert!(!setup.destination.join("B").join("placeholder_film.srt.txt").exists());
 }

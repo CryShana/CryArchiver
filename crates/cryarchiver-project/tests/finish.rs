@@ -186,3 +186,68 @@ fn watch_mode_waits_idle_instead_of_finishing() {
 			.is_some_and(|status| status.run_state == RunState::Watching)
 	});
 }
+
+#[test]
+fn a_cue_sheet_naming_a_duplicate_points_at_the_canonical_copy() {
+	let setup = setup(|_| {});
+	let audio = [FLAC, &vec![0; 100_000]].concat();
+	write(&setup.source, "disc.flac", &audio);
+	write(&setup.source, "Album/disc.flac", &audio);
+	write(&setup.source, "Album/disc.cue", b"FILE \"disc.flac\" WAVE\r\n");
+	let encoder = FakeEncoder::new();
+	encoder.rule(".flac", Rule::Encode("opus"));
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "the run to finish", finished);
+	drop(project);
+
+	assert!(
+		setup
+			.destination
+			.join("Album")
+			.join("placeholder_disc.flac.txt")
+			.exists()
+	);
+	assert_eq!(
+		fs::read(setup.destination.join("Album").join("disc.cue")).unwrap(),
+		b"FILE \"../disc.opus\" WAVE\r\n"
+	);
+}
+
+#[test]
+fn a_sidecar_of_a_duplicate_video_keeps_its_own_name() {
+	let setup = setup(|_| {});
+	write(&setup.source, "movie.mp4", &jpeg(4, 100_000));
+	write(&setup.source, "Copy/movie.mp4", &jpeg(4, 100_000));
+	write(
+		&setup.source,
+		"Copy/movie.en.srt",
+		b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+	);
+	let encoder = FakeEncoder::new();
+	encoder.rule(".mp4", Rule::Encode("mkv"));
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "the run to finish", finished);
+	drop(project);
+
+	assert!(
+		setup
+			.destination
+			.join("Copy")
+			.join("placeholder_movie.mp4.txt")
+			.exists()
+	);
+	assert!(setup.destination.join("Copy").join("movie.en.srt").exists());
+	assert!(
+		!setup
+			.destination
+			.join("Copy")
+			.join("placeholder_movie.mp4.en.srt")
+			.exists()
+	);
+}

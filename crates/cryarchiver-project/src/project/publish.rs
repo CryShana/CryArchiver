@@ -308,9 +308,12 @@ impl Owner {
 		}
 	}
 
-	/// Queued, but held back: a retry delay, or a dependency that isn't done.
+	/// Queued, but held back: a retry delay, a dependency that isn't done, or an earlier output a placeholder still
+	/// needs.
 	pub(super) fn waiting(&self, file: FileId) -> bool {
-		self.pipeline.waits.is_waiting(file) || self.pipeline.retry_at.iter().any(|(_, waiting)| *waiting == file)
+		self.pipeline.waits.is_waiting(file)
+			|| self.held_back(file)
+			|| self.pipeline.retry_at.iter().any(|(_, waiting)| *waiting == file)
 	}
 
 	pub(super) fn file_status(&self, file: FileId) -> FileStatus {

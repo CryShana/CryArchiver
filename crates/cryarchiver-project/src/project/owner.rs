@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 
 use super::dependencies::ReferenceState;
-use super::duplicates::{DedupState, HashRequest};
+use super::duplicates::{DedupState, HashOutcome, HashRequest};
 use super::finish::FinishState;
 use super::jobs::JobMessage;
 use super::pipeline::Pipeline;
@@ -21,7 +21,7 @@ use super::scanning::ScanState;
 use super::{Backend, Command, Fault, SystemSample, Tuning};
 use crate::issues::IssueIds;
 use crate::keys::RelPath;
-use crate::record::{FileState, Hash, Identity};
+use crate::record::{FileState, Identity};
 use crate::references;
 use crate::scan::{DestinationFile, Listing};
 use crate::settings::{Settings, SettingsChange};
@@ -43,7 +43,7 @@ pub(crate) enum Message {
 	Listed(Listing, bool),
 	ReadyChecked(FileId, ReadyCheck),
 	Job(FileId, JobMessage),
-	Hashed(FileId, HashRequest, Result<(Option<Identity>, Hash), String>),
+	Hashed(FileId, HashRequest, HashOutcome),
 	FolderFinished(FolderId, Result<(), String>),
 	DestinationWalked(Vec<DestinationFile>),
 }
@@ -201,6 +201,7 @@ impl Owner {
 		self.check_discovered(now);
 		self.retry_due(now);
 		self.check_disk(now);
+		self.plan_dirty_groups();
 		self.start_jobs(now);
 		self.finish_folders();
 		self.check_completion();
@@ -299,6 +300,7 @@ impl Owner {
 
 	pub(super) fn set_state(&mut self, file: FileId, state: FileState) {
 		self.tree.set_state(file, state);
+		self.note_placeholder(file);
 		self.track_issue(file);
 		self.save_file(file);
 		self.touch_file(file);

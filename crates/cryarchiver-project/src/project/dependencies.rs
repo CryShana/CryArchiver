@@ -7,7 +7,7 @@ use std::ffi::OsString;
 
 use super::jobs::{Made, Task};
 use super::owner::Owner;
-use crate::record::{CopyReason, FileState};
+use crate::record::{CopyReason, FileState, How, Output};
 use crate::references::{self, RefKind, Reference};
 use crate::tree::FileId;
 
@@ -20,7 +20,7 @@ pub(crate) struct ReferenceState {
 
 impl Owner {
 	pub(super) fn remember_content(&mut self, file: FileId, content: Vec<u8>) {
-		if let Some(kind) = references::kind_of(&self.tree.file(file).name) {
+		if let Some(kind @ (RefKind::CueSheet | RefKind::Playlist)) = references::kind_of(&self.tree.file(file).name) {
 			self.references.contents.insert(file, (kind, content));
 		}
 	}
@@ -96,7 +96,7 @@ impl Owner {
 		let renames: Vec<(Vec<u8>, Vec<u8>)> = named
 			.iter()
 			.filter_map(|(reference, target)| {
-				let output = self.tree.file(*target).record.state.output()?;
+				let output = self.content_output(*target)?;
 				let relative = output.path.relative_from(&folder);
 				let text = references::reference_text(&reference.text, &relative);
 				(text != reference.text).then(|| (reference.text.clone(), text))
@@ -109,14 +109,30 @@ impl Owner {
 		Some(Task::Write {
 			content: references::rewrite(*kind, content, &renames),
 			made: Made::Copied(CopyReason::Rewritten),
+			same_file: None,
 		})
 	}
 
-	/// A sidecar follows its media file's new stem; everything else keeps its name.
+	/// Where a named file's content is archived: a placeholder stands for its canonical copy's output.
+	fn content_output(&self, file: FileId) -> Option<&Output> {
+		let output = self.tree.file(file).record.state.output()?;
+		match &output.how {
+			How::Placeholder { canonical } => self.canonical_output(self.tree.file_id(canonical)?),
+			How::Encoded | How::Copied(_) => Some(output),
+		}
+	}
+
+	/// A sidecar follows its media file's new stem, unless that is a placeholder; everything else keeps its name.
 	pub(super) fn copied_output_name(&self, file: FileId) -> OsString {
 		let entry = self.tree.file(file);
 		let renamed = self.references.sidecar_of.get(&file).and_then(|&media| {
-			let output = self.tree.file(media).record.state.output()?;
+			let output = self
+				.tree
+				.file(media)
+				.record
+				.state
+				.output()
+				.filter(|output| !matches!(output.how, How::Placeholder { .. }))?;
 			Some(references::sidecar_name(
 				&entry.name,
 				&self.tree.file(media).name,
@@ -127,8 +143,47 @@ impl Owner {
 	}
 
 	pub(super) fn forget_reference(&mut self, file: FileId) {
+		self.forget_reference_content(file);
+		self.references.sidecar_of.remove(&file);
+	}
+
+	/// An archived reference file needs its content and names no more.
+	pub(super) fn forget_reference_content(&mut self, file: FileId) {
 		self.references.contents.remove(&file);
 		self.references.names.remove(&file);
-		self.references.sidecar_of.remove(&file);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::fs;
+
+	use crate::keys::RelPath;
+	use crate::project::scanning::tests::{key, list, owner};
+
+	#[test]
+	fn only_cue_sheets_and_playlists_keep_their_content() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		for name in ["movie.srt", "album.cue", "mix.m3u"] {
+			fs::write(source.join(name), b"FILE \"a.flac\" WAVE\n").unwrap();
+		}
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+
+		for name in ["movie.srt", "album.cue", "mix.m3u"] {
+			let file = owner.tree.file_id(&key(name)).unwrap();
+			owner.remember_content(file, b"FILE \"a.flac\" WAVE\n".to_vec());
+		}
+
+		let mut kept: Vec<String> = owner
+			.references
+			.contents
+			.keys()
+			.map(|file| owner.tree.file(*file).key.display())
+			.collect();
+		kept.sort();
+		assert_eq!(kept, ["album.cue", "mix.m3u"]);
 	}
 }

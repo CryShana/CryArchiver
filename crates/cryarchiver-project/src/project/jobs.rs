@@ -6,7 +6,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cryarchiver_engine::commit::{SourceTimes, check_space, free_space};
+use cryarchiver_engine::commit::{SourceTimes, check_space, file_id, free_space};
 use cryarchiver_engine::engine::{Encode, Job, JobEvent};
 use cryarchiver_engine::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use cryarchiver_engine::sink::ArchivalSink;
@@ -29,6 +29,8 @@ pub(crate) enum Made {
 	Copied(CopyReason),
 	Placeholder {
 		canonical: RelPath,
+		/// The canonical copy's output the placeholder's text links to.
+		target: RelPath,
 	},
 	/// Another member's archived output, taken over by rename.
 	Moved {
@@ -59,6 +61,8 @@ pub(crate) enum JobMessage {
 	Taken,
 	/// The engine kept the original; the job copies it next.
 	Kept(String),
+	/// A placeholder's source and its canonical copy's source are no longer the same file.
+	NotSameFile,
 	Finished(Result<(), JobError>),
 }
 
@@ -69,6 +73,9 @@ pub(crate) enum Task {
 	Write {
 		content: Vec<u8>,
 		made: Made,
+		/// For a placeholder matched by file identity alone: the canonical copy's source, which must still be the
+		/// same file.
+		same_file: Option<PathBuf>,
 	},
 	Move {
 		from: PathBuf,
@@ -97,7 +104,11 @@ impl JobContext {
 		let result = match task {
 			Task::Encode(job) => self.encode(&job).await,
 			Task::Copy(reason) => self.copy(reason).await,
-			Task::Write { content, made } => self.write(content, made).await,
+			Task::Write {
+				content,
+				made,
+				same_file,
+			} => self.write(content, made, same_file).await,
 			Task::Move { from, made } => self.take_over(from, made).await,
 		};
 
@@ -147,7 +158,7 @@ impl JobContext {
 		self.commit(staged, Made::Copied(reason)).await
 	}
 
-	async fn write(&self, content: Vec<u8>, made: Made) -> Result<(), JobError> {
+	async fn write(&self, content: Vec<u8>, made: Made, same_file: Option<PathBuf>) -> Result<(), JobError> {
 		let (source, staged_path) = (self.source.clone(), self.sink.staged_path(""));
 		let staged = blocking(move || {
 			let times = fs::metadata(&source)
@@ -162,6 +173,17 @@ impl JobContext {
 		if !run::source_unchanged(&self.source, self.size, self.mtime_ns) {
 			discard(&staged);
 			return Err(ErrorKind::SourceChanged.into());
+		}
+
+		if let Some(canonical) = same_file {
+			let source = self.source.clone();
+			let same =
+				blocking(move || matches!((file_id(&source), file_id(&canonical)), (Ok(a), Ok(b)) if a == b)).await?;
+			if !same {
+				discard(&staged);
+				self.send(JobMessage::NotSameFile);
+				return Err(ErrorKind::Cancelled.into());
+			}
 		}
 
 		self.commit(staged, made).await
@@ -252,5 +274,150 @@ fn keep_reason(reason: &KeepReason) -> String {
 		| KeepReason::QualityUnreachable(why)
 		| KeepReason::InvalidIcc(why) => why.clone(),
 		KeepReason::DecodeBomb { megapixels } => format!("the header claims {megapixels} MP"),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::Path;
+	use std::pin::Pin;
+
+	use cryarchiver_engine::commit::OutputSink;
+	use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+	use super::*;
+	use crate::record::mtime_ns;
+
+	struct NoEncoder;
+
+	impl Encode for NoEncoder {
+		fn encode<'a>(
+			&'a self,
+			_job: &'a Job,
+			_sink: &'a dyn OutputSink,
+			_on_event: &'a (dyn Fn(JobEvent) + Sync),
+			_cancel: &'a CancellationToken,
+		) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>> {
+			unreachable!("these jobs never encode")
+		}
+	}
+
+	/// A job for `source` as the project last saw it, run to its end with every commit refused; returns what it sent.
+	fn run_job(source: &Path, destination: &Path, seen: &[u8], task: Task) -> Vec<JobMessage> {
+		let meta = fs::metadata(source).unwrap();
+		let (messages, mut inbox): (_, UnboundedReceiver<Message>) = unbounded_channel();
+		let context = JobContext {
+			file: FileId(0),
+			source: source.to_path_buf(),
+			size: seen.len() as u64,
+			mtime_ns: mtime_ns(meta.modified().unwrap()),
+			sink: ArchivalSink::new(destination),
+			encoder: Arc::new(NoEncoder),
+			messages,
+			cancel: CancellationToken::new(),
+		};
+
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		runtime.block_on(async move {
+			tokio::spawn(context.run(task));
+
+			let mut sent = Vec::new();
+			while let Some(Message::Job(_, message)) = inbox.recv().await {
+				let message = match message {
+					JobMessage::Commit { staged, made, reply } => {
+						let _ = reply.send(None);
+						let (unanswered, _) = oneshot::channel();
+						JobMessage::Commit {
+							staged,
+							made,
+							reply: unanswered,
+						}
+					}
+					message => message,
+				};
+
+				let finished = matches!(message, JobMessage::Finished(_));
+				sent.push(message);
+				if finished {
+					break;
+				}
+			}
+			sent
+		})
+	}
+
+	fn failed_with(sent: &[JobMessage], kind: &ErrorKind) -> bool {
+		matches!(sent.last(), Some(JobMessage::Finished(Err(err))) if err.kind == *kind)
+	}
+
+	fn staged_files(destination: &Path) -> usize {
+		fs::read_dir(ArchivalSink::new(destination).staged_dir()).map_or(0, Iterator::count)
+	}
+
+	fn placeholder(same_file: Option<PathBuf>) -> Task {
+		Task::Write {
+			content: b"placeholder".to_vec(),
+			made: Made::Placeholder {
+				canonical: RelPath::from_bytes(b"a.bin".to_vec()),
+				target: RelPath::from_bytes(b"a.bin".to_vec()),
+			},
+			same_file,
+		}
+	}
+
+	#[test]
+	fn a_placeholder_is_never_committed_for_a_source_that_changed() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("b.bin");
+		fs::write(&source, b"seen").unwrap();
+		let destination = dir.path().join("archive");
+
+		let sent = run_job(&source, &destination, b"seen, then more", placeholder(None));
+
+		assert!(failed_with(&sent, &ErrorKind::SourceChanged));
+		assert!(!sent.iter().any(|message| matches!(message, JobMessage::Commit { .. })));
+		assert_eq!(staged_files(&destination), 0);
+	}
+
+	#[test]
+	fn an_output_is_never_taken_over_for_a_source_that_changed() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("a.bin");
+		fs::write(&source, b"seen").unwrap();
+		let destination = dir.path().join("archive");
+		let held = dir.path().join("archive").join("Deep").join("a.bin");
+		fs::create_dir_all(held.parent().unwrap()).unwrap();
+		fs::write(&held, b"archived").unwrap();
+		let task = Task::Move {
+			from: held.clone(),
+			made: Made::Moved {
+				how: How::Copied(CopyReason::NotMedia),
+				hash: None,
+				extension: "bin".into(),
+			},
+		};
+
+		let sent = run_job(&source, &destination, b"seen, then more", task);
+
+		assert!(failed_with(&sent, &ErrorKind::SourceChanged));
+		assert!(!sent.iter().any(|message| matches!(message, JobMessage::Commit { .. })));
+		assert_eq!(fs::read(&held).unwrap(), b"archived");
+	}
+
+	#[test]
+	fn a_placeholder_of_the_same_file_is_written_only_while_it_still_is() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("b.bin");
+		let other = dir.path().join("a.bin");
+		fs::write(&source, b"seen").unwrap();
+		fs::write(&other, b"seen").unwrap();
+		let destination = dir.path().join("archive");
+
+		let sent = run_job(&source, &destination, b"seen", placeholder(Some(other)));
+
+		assert!(sent.iter().any(|message| matches!(message, JobMessage::NotSameFile)));
+		assert!(failed_with(&sent, &ErrorKind::Cancelled));
+		assert!(!sent.iter().any(|message| matches!(message, JobMessage::Commit { .. })));
+		assert_eq!(staged_files(&destination), 0);
 	}
 }

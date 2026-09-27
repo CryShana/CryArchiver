@@ -20,7 +20,7 @@ use super::owner::{Message, Owner};
 use crate::keys::RelPath;
 use crate::memory::MemoryBudget;
 use crate::record::{CopyReason, FailureLog, FileRecord, FileState, How, IssueKind, MediaClass, Output};
-use crate::references;
+use crate::references::{self, RefKind};
 use crate::run::Staged;
 use crate::schedule::{DiskGuard, Governor, GovernorConfig, Queue, Waits, Work, retry_delay};
 use crate::tree::{FileId, FolderId};
@@ -38,6 +38,8 @@ pub(crate) struct RunningJob {
 	pub(super) stage: Option<Stage>,
 	pub(super) video_waiting: bool,
 	pub(super) requeue: bool,
+	/// The job found that the duplicate it was writing a placeholder for is no longer the same file.
+	pub(super) not_same_file: bool,
 	pending: Option<Output>,
 }
 
@@ -58,8 +60,9 @@ pub(crate) struct Pipeline {
 	pub(super) disk: DiskGuard,
 	last_disk_check: Option<Instant>,
 	pub(super) chosen_copies: HashSet<FileId>,
-	pub(super) claims: HashMap<(FolderId, String), FileId>,
-	taken: HashSet<(FolderId, String)>,
+	/// Output names by destination folder and collision key.
+	pub(super) claims: HashMap<(RelPath, String), FileId>,
+	taken: HashSet<(RelPath, String)>,
 	pub(super) notes: HashMap<FileId, Vec<String>>,
 	pub(super) workers_dirty: bool,
 }
@@ -120,7 +123,10 @@ impl Owner {
 			let entry = self.tree.file(file);
 			let path = self.source_path(&entry.key);
 			let (size, mtime_ns) = (entry.record.size, entry.record.mtime_ns);
-			let want_content = references::kind_of(&entry.name).is_some();
+			let want_content = matches!(
+				references::kind_of(&entry.name),
+				Some(RefKind::CueSheet | RefKind::Playlist)
+			);
 			let messages = self.messages.clone();
 			tokio::task::spawn_blocking(move || {
 				let check = check_ready(&path, size, mtime_ns, want_content);
@@ -187,6 +193,10 @@ impl Owner {
 	pub(super) fn enqueue(&mut self, file: FileId) {
 		if self.tree.file(file).record.state != FileState::Queued {
 			self.set_state(file, FileState::Queued);
+		}
+
+		if self.hold_for_released(file) {
+			return;
 		}
 
 		let work = self.work_for(file);
@@ -274,6 +284,7 @@ impl Owner {
 				stage: None,
 				video_waiting: false,
 				requeue: false,
+				not_same_file: false,
 				pending: None,
 			},
 		);
@@ -309,6 +320,11 @@ impl Owner {
 			JobMessage::Placed => self.placed(file),
 			JobMessage::Taken => self.name_taken(file),
 			JobMessage::Kept(reason) => self.note(file, format!("kept the original: {reason}")),
+			JobMessage::NotSameFile => {
+				if let Some(job) = self.pipeline.jobs.get_mut(&file) {
+					job.not_same_file = true;
+				}
+			}
 			JobMessage::Finished(result) => self.job_finished(file, result),
 		}
 	}
@@ -362,11 +378,17 @@ impl Owner {
 			return None;
 		}
 
+		if let Made::Placeholder { canonical, target } = made
+			&& !self.still_points_at(canonical, target)
+		{
+			return None;
+		}
+
 		let path = self.output_path(file, made);
 		let (how, hash) = match made {
 			Made::Encoded { .. } => (How::Encoded, Some(staged.hash)),
 			Made::Copied(reason) => (How::Copied(*reason), Some(staged.hash)),
-			Made::Placeholder { canonical } => (
+			Made::Placeholder { canonical, .. } => (
 				How::Placeholder {
 					canonical: canonical.clone(),
 				},
@@ -398,6 +420,7 @@ impl Owner {
 			.filter(|previous| **previous == path)
 			.map(|previous| self.destination_path(previous));
 		self.tree.set_record(file, record);
+		self.note_placeholder(file);
 		self.touch_file(file);
 		self.claim(file, &path);
 		if self.crash_point(super::Fault::AfterCommitIntent) {
@@ -453,7 +476,10 @@ impl Owner {
 		self.tree.set_record(file, record);
 		self.pipeline.retries.remove(&file);
 		self.set_state(file, FileState::Done(output));
-		self.file_settled(file);
+		self.forget_reference_content(file);
+		if self.dedup_placed(file) {
+			self.file_settled(file);
+		}
 	}
 
 	/// The file left the project because its source vanished during the rename: the output stays, tracked.
@@ -468,6 +494,7 @@ impl Owner {
 			..entry.record.clone()
 		};
 		self.tree.add_file(folder, &name, record);
+		self.note_placeholder(file);
 		self.track_issue(file);
 		self.save_file(file);
 		self.touch_file(file);
@@ -495,9 +522,8 @@ impl Owner {
 			return;
 		};
 
-		let folder = self.tree.file(file).folder;
 		self.release_claim(file, &output.path);
-		self.pipeline.taken.insert((folder, collision_key(&output.path.name())));
+		self.pipeline.taken.insert(name_key(&output.path));
 
 		let mut record = self.tree.file(file).record.clone();
 		if record.replaces.as_ref() == Some(&output.path) {
@@ -530,9 +556,14 @@ impl Owner {
 			self.tree.file(file).record.state,
 			FileState::InProgress { .. } | FileState::Committing { .. }
 		);
+		if job.not_same_file && still_ours && !self.tree.file(file).removed {
+			self.not_the_same_file(file);
+			return;
+		}
+
 		let Err(err) = result else {
 			if still_ours {
-				self.requeue(file, job.work);
+				self.requeue(file);
 			} else {
 				self.member_done(file);
 			}
@@ -543,7 +574,7 @@ impl Owner {
 		}
 
 		if job.requeue || err.kind == ErrorKind::Cancelled {
-			self.requeue(file, job.work);
+			self.requeue(file);
 			return;
 		}
 
@@ -553,7 +584,7 @@ impl Owner {
 				NoticeLevel::Warning,
 				format!("paused: low disk space ({free} bytes free, {need} needed)"),
 			);
-			self.requeue(file, job.work);
+			self.requeue(file);
 			return;
 		}
 
@@ -571,8 +602,14 @@ impl Owner {
 		self.raise_issue(file, job.attempt, &err);
 	}
 
-	fn requeue(&mut self, file: FileId, work: Work) {
+	/// Back to the front of the queue for the file's current role, which may have changed while its job ran.
+	fn requeue(&mut self, file: FileId) {
 		self.set_state(file, FileState::Queued);
+		if self.hold_for_released(file) {
+			return;
+		}
+
+		let work = self.work_for(file);
 		if let Some(queue) = self.pipeline.queues.get_mut(&work) {
 			queue.push_front(file);
 		}
@@ -669,7 +706,7 @@ impl Owner {
 		let destination = self.destination_folder(folder);
 		let mut candidate = base.clone();
 		for number in 2.. {
-			let key = (folder, collision_key(&candidate));
+			let key = (destination.clone(), collision_key(&candidate));
 			let held = self.pipeline.claims.get(&key).is_some_and(|holder| *holder != file);
 			if !held && !self.pipeline.taken.contains(&key) {
 				let path = destination.join(&candidate);
@@ -697,18 +734,18 @@ impl Owner {
 	}
 
 	pub(super) fn claimed_by_other(&self, file: FileId, path: &RelPath) -> bool {
-		let key = (self.tree.file(file).folder, collision_key(&path.name()));
-		self.pipeline.claims.get(&key).is_some_and(|holder| *holder != file)
+		self.pipeline
+			.claims
+			.get(&name_key(path))
+			.is_some_and(|holder| *holder != file)
 	}
 
 	pub(super) fn claim(&mut self, file: FileId, path: &RelPath) {
-		let folder = self.tree.file(file).folder;
-		self.pipeline.claims.insert((folder, collision_key(&path.name())), file);
+		self.pipeline.claims.insert(name_key(path), file);
 	}
 
 	pub(super) fn release_claim(&mut self, file: FileId, path: &RelPath) {
-		let folder = self.tree.file(file).folder;
-		let key = (folder, collision_key(&path.name()));
+		let key = name_key(path);
 		if self.pipeline.claims.get(&key) == Some(&file) {
 			self.pipeline.claims.remove(&key);
 		}
@@ -724,6 +761,10 @@ impl Owner {
 	pub(super) fn release_all_claims(&mut self, file: FileId) {
 		self.pipeline.claims.retain(|_, holder| *holder != file);
 	}
+}
+
+fn name_key(path: &RelPath) -> (RelPath, String) {
+	(path.parent().unwrap_or_else(RelPath::root), collision_key(&path.name()))
 }
 
 fn issue_kind(kind: &ErrorKind) -> IssueKind {
@@ -763,31 +804,37 @@ mod tests {
 		_dir: tempfile::TempDir,
 		owner: Owner,
 		_updates: Receiver<Update>,
+		name: &'static str,
 		file: FileId,
 	}
 
 	impl Fixture {
 		fn new(content: &[u8]) -> Self {
+			Self::named("notes.txt", content)
+		}
+
+		fn named(name: &'static str, content: &[u8]) -> Self {
 			let dir = tempfile::tempdir().unwrap();
 			let source = dir.path().join("source");
 			fs::create_dir_all(&source).unwrap();
-			fs::write(source.join("notes.txt"), content).unwrap();
+			fs::write(source.join(name), content).unwrap();
 
 			let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
 			list(&mut owner, &RelPath::root(), true);
-			let file = owner.tree.file_id(&key("notes.txt")).unwrap();
+			let file = owner.tree.file_id(&key(name)).unwrap();
 			let mut fixture = Self {
 				_dir: dir,
 				owner,
 				_updates: updates,
+				name,
 				file,
 			};
-			fixture.queue();
+			fixture.queue(Some(content.to_vec()));
 			fixture
 		}
 
 		fn source(&self) -> PathBuf {
-			self.owner.settings.source.join("notes.txt")
+			self.owner.settings.source.join(self.name)
 		}
 
 		fn destination(&self, name: &str) -> PathBuf {
@@ -804,12 +851,12 @@ mod tests {
 			list(&mut self.owner, &RelPath::root(), false);
 		}
 
-		fn queue(&mut self) {
+		fn queue(&mut self, content: Option<Vec<u8>>) {
 			self.owner.on_ready_checked(
 				self.file,
 				ReadyCheck::Ready {
 					class: MediaClass::Other,
-					content: None,
+					content,
 				},
 			);
 		}
@@ -832,6 +879,7 @@ mod tests {
 					stage: None,
 					video_waiting: false,
 					requeue: false,
+					not_same_file: false,
 					pending: None,
 				},
 			);
@@ -902,7 +950,7 @@ mod tests {
 		fixture.job(cancelled());
 		assert_eq!(fixture.record().replaces, None);
 
-		fixture.queue();
+		fixture.queue(None);
 		fixture.running();
 		let second = fixture.commit(b"second version").unwrap();
 		assert_eq!(second.path, fixture.destination("notes (2).txt"));
@@ -927,7 +975,7 @@ mod tests {
 		assert_eq!(fixture.record().replaces, Some(key("notes.txt")));
 		assert_eq!(fixture.record().state, FileState::Discovered);
 
-		fixture.queue();
+		fixture.queue(None);
 		fixture.running();
 		let again = fixture.commit(b"second version").unwrap();
 		assert_eq!(again.path, fixture.destination("notes.txt"));
@@ -946,7 +994,7 @@ mod tests {
 		let earlier = fixture.running();
 		fixture.change_source(b"second version");
 		assert!(earlier.is_cancelled());
-		fixture.queue();
+		fixture.queue(None);
 		fixture.owner.start_jobs(Instant::now());
 		assert_eq!(fixture.owner.pipeline.governor.total(), 1);
 		assert_eq!(fixture.record().state, FileState::Queued);
@@ -1016,6 +1064,22 @@ mod tests {
 		fixture.remove_source();
 		assert!(fixture.owner.tree.file(fixture.file).removed);
 		assert_eq!(fixture.claims(), 0, "a forgotten file");
+	}
+
+	#[test]
+	fn an_archived_reference_file_forgets_what_it_named() {
+		const PLAYLIST: &[u8] = b"#EXTM3U\na.flac\n";
+
+		let mut fixture = Fixture::named("mix.m3u", PLAYLIST);
+		assert!(fixture.owner.is_reference(fixture.file));
+
+		fixture.running();
+		let target = fixture.commit(PLAYLIST).unwrap();
+		place(&target, PLAYLIST);
+		fixture.job(JobMessage::Placed);
+
+		assert!(matches!(fixture.record().state, FileState::Done(_)));
+		assert!(!fixture.owner.is_reference(fixture.file));
 	}
 
 	#[test]
