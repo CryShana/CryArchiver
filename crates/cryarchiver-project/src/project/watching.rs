@@ -223,7 +223,7 @@ impl Owner {
 	}
 
 	/// Every destination path the file's record names as its own, now or until a re-archive replaces it.
-	fn recorded_outputs(&self, file: FileId) -> Vec<RelPath> {
+	pub(super) fn recorded_outputs(&self, file: FileId) -> Vec<RelPath> {
 		let record = &self.tree.file(file).record;
 		let issue_output = match &record.state {
 			FileState::Issue { output, .. } => output.as_ref(),

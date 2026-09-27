@@ -99,7 +99,6 @@ impl Owner {
 		};
 		owner.load(loaded);
 		owner.recover();
-		owner.restore_releases();
 
 		sweep(&ArchivalSink::new(&owner.settings.destination).archive_work_root());
 		owner.store.flush()?;
@@ -157,7 +156,7 @@ impl Owner {
 
 	/// A re-archive into its own earlier output's place can find the old output there, with the same size, so only
 	/// the new content's hash proves the rename happened. A file someone else put at the named path isn't ours either:
-	/// a recorded hash must match.
+	/// a recorded hash must match. An earlier output stays while a record depends on it.
 	fn recover_commit(&mut self, file: FileId, output: Output, replaces: Option<&RelPath>) {
 		let target = self.destination_path(&output.path);
 		let hash_matches = |hash| full_hash(&target).is_ok_and(|found| found == hash);
@@ -174,7 +173,7 @@ impl Owner {
 			return;
 		}
 
-		if let Some(previous) = replaces {
+		if let Some(previous) = replaces.filter(|_| !self.has_dependents(file)) {
 			self.remove_replaced_output(previous, &output.path);
 		}
 

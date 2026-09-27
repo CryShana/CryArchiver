@@ -72,6 +72,10 @@ impl RunningJob {
 	pub(super) fn pending_output(&self) -> Option<&Output> {
 		self.pending.as_ref()
 	}
+
+	pub(super) fn pending_output_mut(&mut self) -> Option<&mut Output> {
+		self.pending.as_mut()
+	}
 }
 
 impl Pipeline {
@@ -200,10 +204,6 @@ impl Owner {
 	pub(super) fn enqueue(&mut self, file: FileId) {
 		if self.tree.file(file).record.state != FileState::Queued {
 			self.set_state(file, FileState::Queued);
-		}
-
-		if self.hold_for_released(file) {
-			return;
 		}
 
 		let work = self.work_for(file);
@@ -395,6 +395,7 @@ impl Owner {
 			return None;
 		}
 
+		self.keep_depended_output(file);
 		let path = self.output_path(file, made);
 		let (how, hash) = match made {
 			Made::Encoded { .. } => (How::Encoded, Some(staged.hash)),
@@ -449,7 +450,9 @@ impl Owner {
 	}
 
 	/// The output is in place, and only now proven ours. A file whose source changed meanwhile keeps the state that
-	/// change gave it, and its re-archive replaces this output; a file whose source vanished keeps it as `SourceGone`.
+	/// change gave it, and its re-archive replaces this output; a file whose source vanished keeps it as `SourceGone`;
+	/// a placeholder that adopted its canonical copy's output meanwhile lets this one go once that is durable. An
+	/// earlier output stays while a record depends on it.
 	fn placed(&mut self, file: FileId) {
 		let Some(output) = self.pipeline.jobs.get_mut(&file).and_then(|job| job.pending.take()) else {
 			return;
@@ -464,9 +467,9 @@ impl Owner {
 			matches!(entry.record.state, FileState::Committing { .. }),
 		);
 		let previous = entry.record.replaces.clone();
-		if let Some(previous) =
-			previous.filter(|previous| *previous != output.path && !self.claimed_by_other(file, previous))
-		{
+		if let Some(previous) = previous.filter(|previous| {
+			*previous != output.path && !self.claimed_by_other(file, previous) && !self.has_dependents(file)
+		}) {
 			self.release_claim(file, &previous);
 			self.remove_replaced_output(&previous, &output.path);
 		}
@@ -477,6 +480,11 @@ impl Owner {
 		}
 
 		let mut record = self.tree.file(file).record.clone();
+		if !committing && record.state.output().is_some_and(|kept| kept.path != output.path) {
+			self.remove_once_durable(file, output.path);
+			return;
+		}
+
 		if !committing {
 			record.replaces = Some(output.path);
 			self.tree.set_record(file, record);
@@ -490,9 +498,7 @@ impl Owner {
 		self.set_state(file, FileState::Done(output));
 		self.output_placed_during_walk(file);
 		self.forget_reference_content(file);
-		if self.dedup_placed(file) {
-			self.file_settled(file);
-		}
+		self.file_settled(file);
 	}
 
 	/// The file left the project because its source vanished during the rename: the output stays, tracked.
@@ -619,10 +625,6 @@ impl Owner {
 	/// Back to the front of the queue for the file's current role, which may have changed while its job ran.
 	fn requeue(&mut self, file: FileId) {
 		self.set_state(file, FileState::Queued);
-		if self.hold_for_released(file) {
-			return;
-		}
-
 		let work = self.work_for(file);
 		if let Some(queue) = self.pipeline.queues.get_mut(&work) {
 			queue.push_front(file);
@@ -938,6 +940,14 @@ pub(super) mod tests {
 			requeue: false,
 			not_same_file: false,
 			pending: None,
+		}
+	}
+
+	/// A job whose commit intent named `output`, before its rename was confirmed.
+	pub(crate) fn committing_job(output: Output) -> RunningJob {
+		RunningJob {
+			pending: Some(output),
+			..running_job(Work::Placeholder)
 		}
 	}
 

@@ -70,16 +70,21 @@ impl Owner {
 				self.observe(file);
 			}
 			(IssueKind::OutputMissing, Verb::Retry) => {
-				let intact = output.clone().filter(|output| self.output_intact(output));
-				let adopted = self.release_dependents(file, intact);
+				let adopted = output
+					.as_ref()
+					.is_some_and(|output| self.output_intact(output) && self.transfer_dependents(file, output));
 				let mut record = self.tree.file(file).record.clone();
 				record.replaces = output.filter(|_| !adopted).map(|output| output.path);
 				self.tree.set_record(file, record);
 				self.set_state(file, FileState::Discovered);
 				self.observe(file);
 			}
-			(IssueKind::OutputMissing, Verb::Accept) => self.accept_output(file, output),
+			(IssueKind::OutputMissing, Verb::Accept) => self.accept_output(file, output.as_ref()),
 			(_, Verb::Exclude) => {
+				if let Some(output) = &output {
+					self.transfer_dependents(file, output);
+				}
+
 				self.set_state(file, FileState::Excluded);
 				self.leave_dedup(file);
 				self.file_settled(file);
@@ -91,26 +96,31 @@ impl Owner {
 	}
 
 	/// "Accept as is": the output as it now is on disk becomes the archive. Nothing can be verified against it, so it
-	/// carries no hash; a missing output leaves the file excluded.
-	fn accept_output(&mut self, file: FileId, output: Option<Output>) {
+	/// carries no hash; a missing output leaves the file excluded, and the recorded output to the placeholders that
+	/// point at it.
+	fn accept_output(&mut self, file: FileId, output: Option<&Output>) {
 		let current = output.and_then(|output| {
 			let size = fs::metadata(self.destination_path(&output.path)).ok()?.len();
 			Some(Output {
 				size,
 				hash: None,
-				..output
+				..output.clone()
 			})
 		});
 
-		match current {
-			Some(output) => self.set_state(file, FileState::Done(output)),
-			None => self.set_state(file, FileState::Excluded),
+		if let Some(current) = current {
+			self.set_state(file, FileState::Done(current));
+		} else {
+			if let Some(recorded) = output {
+				self.transfer_dependents(file, recorded);
+			}
+			self.set_state(file, FileState::Excluded);
 		}
 		self.file_settled(file);
 	}
 
-	/// Whether the recorded output is on disk as it was archived: only then may a placeholder of a gone original adopt
-	/// it. Blocking: reads the file when its size matches.
+	/// Whether the recorded output is on disk as it was archived: only then may a placeholder adopt it. Blocking: reads
+	/// the file when its size matches.
 	fn output_intact(&self, output: &Output) -> bool {
 		let path = self.destination_path(&output.path);
 		let sized = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() == output.size);

@@ -2,8 +2,8 @@
 //! the shallowest, duplicates wait for it and become placeholders, and a later shallower copy takes the archived
 //! output over by rename. That swap is two ordinary commits: the canonical copy's move, then the placeholder.
 //!
-//! A canonical copy's output is never replaced while a placeholder's content lives only there: a placeholder whose
-//! original is still there is archived again first, and one whose original is gone adopts the output.
+//! A placeholder's content lives in its canonical copy's output, so that output is never replaced or removed while a
+//! record depends on it: before the canonical copy gives it up, a placeholder adopts it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -15,6 +15,7 @@ use cryarchiver_engine::commit::file_id;
 
 use super::jobs::{Made, Task};
 use super::owner::{Message, Owner};
+use super::pipeline::RunningJob;
 use crate::dedup::{self, MIN_DEDUP_SIZE, Member};
 use crate::keys::RelPath;
 use crate::record::{FileState, Hash, How, Identity, IssueKind, Output, mtime_ns};
@@ -67,12 +68,6 @@ pub(crate) struct DedupState {
 	moves: HashMap<FileId, FileId>,
 	/// A canonical copy's key to the files whose recorded output was a placeholder pointing at it; checked on use.
 	placeholders: HashMap<RelPath, HashSet<FileId>>,
-	/// A placeholder archived again, to the canonical copy whose earlier output still holds its content: that copy
-	/// doesn't replace the output until the placeholder is archived or adopts it. Mirrored in the placeholder's
-	/// `FileRecord::held_output`, so it survives a close or a crash.
-	released: HashMap<FileId, (FileId, Output)>,
-	/// Canonical copies held back by `released`.
-	held: HashSet<FileId>,
 	/// Heirs' own placeholder files, removed once the batch that records their adoption is durable.
 	remove_after_durable: Vec<(FileId, RelPath)>,
 }
@@ -98,8 +93,6 @@ impl Owner {
 		self.dedup.moves.remove(&file);
 		self.dedup.pending.remove(&file);
 		self.dedup.fresh_identity.remove(&file);
-		self.dedup.held.remove(&file);
-		self.settle_release(file);
 
 		let size = self.tree.file(file).record.size;
 		if self
@@ -413,20 +406,13 @@ impl Owner {
 					return;
 				}
 
-				let adopted = holds && self.release_dependents(duplicate, (!moved).then(|| output.clone()));
+				let adopted = holds && !moved && self.transfer_dependents(duplicate, output);
 				let mut record = self.tree.file(duplicate).record.clone();
 				record.replaces = (!adopted).then(|| output.path.clone());
 				self.tree.set_record(duplicate, record);
 			}
 			FileState::Ready | FileState::Queued => {}
 			_ => return,
-		}
-
-		// A duplicate of the very copy it was released from would wait for that copy while holding it back; that copy's
-		// new output holds the same content.
-		let released_by = self.dedup.released.get(&duplicate).map(|(of, _)| *of);
-		if self.canonical_output(canonical).is_some() || released_by == Some(canonical) {
-			self.settle_release(duplicate);
 		}
 
 		self.set_state(duplicate, FileState::Queued);
@@ -439,19 +425,15 @@ impl Owner {
 		}
 	}
 
-	/// Done with an output that holds the content itself, encoded or copied, that no placeholder of a gone original
-	/// points at: such an output must stay where it is.
+	/// Done with an output that holds the content itself, encoded or copied, that no placeholder points at: such an
+	/// output must stay where it is.
 	fn holds_content(&self, file: FileId) -> bool {
 		let content = match &self.tree.file(file).record.state {
 			FileState::Done(output) => !matches!(output.how, How::Placeholder { .. }),
 			_ => false,
 		};
 
-		content
-			&& !self
-				.placeholders_of(file)
-				.iter()
-				.any(|&dependent| is_gone(&self.tree.file(dependent).record.state))
+		content && !self.has_dependents(file)
 	}
 
 	/// Whether the member whose output a canonical copy's move takes over still holds its content at `from`. When it
@@ -486,10 +468,12 @@ impl Owner {
 		}
 	}
 
-	/// Whether the canonical copy still holds its content at `target`, the output a placeholder's text links to.
+	/// Whether the canonical copy still holds its content at `target`, the output a placeholder's text links to, and
+	/// no take-over is moving it away.
 	pub(super) fn still_points_at(&self, canonical: &RelPath, target: &RelPath) -> bool {
 		self.tree
 			.file_id(canonical)
+			.filter(|canonical| !self.dedup.moves.values().any(|holder| holder == canonical))
 			.and_then(|canonical| self.canonical_output(canonical))
 			.is_some_and(|output| output.path == *target)
 	}
@@ -624,14 +608,14 @@ impl Owner {
 		}
 	}
 
+	fn points_at(&self, file: FileId, canonical: &RelPath) -> bool {
+		let entry = self.tree.file(file);
+		!entry.removed && placeholder_of(&entry.record.state) == Some(canonical)
+	}
+
 	/// The files whose recorded output is a placeholder pointing at `canonical`, shallowest first.
 	fn placeholders_of(&self, canonical: FileId) -> Vec<FileId> {
 		let key = &self.tree.file(canonical).key;
-		let points_here = |file: FileId| {
-			let entry = self.tree.file(file);
-			!entry.removed && placeholder_of(&entry.record.state) == Some(key)
-		};
-
 		let mut found: Vec<FileId> = self
 			.dedup
 			.placeholders
@@ -639,313 +623,178 @@ impl Owner {
 			.into_iter()
 			.flatten()
 			.copied()
-			.filter(|&file| file != canonical && points_here(file))
+			.filter(|&file| file != canonical && self.points_at(file, key))
 			.collect();
 		found.sort_by(|a, b| dedup::canonical_order(&self.tree.file(*a).key, &self.tree.file(*b).key));
 		found
 	}
 
-	/// `canonical`'s output, `earlier`, is about to be replaced or removed; `None` when it was moved away. The
-	/// placeholders pointing at it whose originals are still there are archived again, and while one of them still
-	/// needs `earlier`, the canonical copy doesn't replace it. When an original is gone, the shallowest such
-	/// placeholder adopts `earlier` instead, and the others point at it. Returns whether `earlier` was adopted: the
-	/// canonical copy then leaves it in place. A canonical copy whose source is gone doesn't replace `earlier`, so its
-	/// releases hold nothing back; they still let a placeholder adopt `earlier` if its original vanishes before it is
-	/// archived.
-	pub(super) fn release_dependents(&mut self, canonical: FileId, earlier: Option<Output>) -> bool {
-		let dependents = self.placeholders_of(canonical);
-		if dependents.is_empty() {
+	/// Whether a record depends on the file's content output: some record's output, in any state, is a placeholder
+	/// pointing at it.
+	pub(super) fn has_dependents(&self, file: FileId) -> bool {
+		let key = &self.tree.file(file).key;
+		self.dedup.placeholders.get(key).is_some_and(|files| {
+			files
+				.iter()
+				.any(|&dependent| dependent != file && self.points_at(dependent, key))
+		})
+	}
+
+	/// An output file that any record depends on is never replaced or removed. `canonical` is about to give up
+	/// `earlier`, its content output, so its dependents take it over, in the same batch as that change: the first in
+	/// canonical order adopts it as its own record (nothing moves on disk), and the others point at that heir. Returns
+	/// whether there was an heir; the canonical copy's next output then takes a name of its own.
+	pub(super) fn transfer_dependents(&mut self, canonical: FileId, earlier: &Output) -> bool {
+		if matches!(earlier.how, How::Placeholder { .. }) {
 			return false;
 		}
 
+		let dependents = self.placeholders_of(canonical);
+		let Some((&heir, others)) = dependents.split_first() else {
+			return false;
+		};
+
 		let key = self.tree.file(canonical).key.clone();
 		self.dedup.placeholders.remove(&key);
-		let earlier = earlier.filter(|output| !matches!(output.how, How::Placeholder { .. }));
-		let (gone, present): (Vec<FileId>, Vec<FileId>) = dependents
-			.into_iter()
-			.partition(|&file| is_gone(&self.tree.file(file).record.state));
-
-		let adopted = if let (Some((&heir, others)), Some(output)) = (gone.split_first(), &earlier) {
-			self.adopt(heir, canonical, output);
-			for &other in others {
-				self.point_at(other, heir);
-			}
-			true
-		} else {
-			for file in gone {
-				self.note_placeholder(file);
-			}
-			false
-		};
-
-		for file in present {
-			if !adopted && let Some(output) = &earlier {
-				self.hold_release(file, canonical, output.clone());
-			}
-
-			if matches!(self.tree.file(file).record.state, FileState::Done(_)) {
-				self.archive_again(file);
-			} else {
-				self.note_placeholder(file);
-			}
+		for &other in others {
+			self.point_at(other, heir);
 		}
-
-		adopted
-	}
-
-	/// A placeholder whose canonical copy lets its output go is archived again from the hashes it has, replacing the
-	/// placeholder.
-	fn archive_again(&mut self, file: FileId) {
-		let mut record = self.tree.file(file).record.clone();
-		record.replaces = record.state.output().map(|output| output.path.clone());
-		self.tree.set_record(file, record);
-		self.dedup.canonical_of.remove(&file);
-
-		self.set_state(file, FileState::Ready);
-		self.gate(file);
-	}
-
-	/// `heir`, whose original is gone, takes `canonical`'s earlier output over as its own record: nothing moves on
-	/// disk. Its own placeholder file goes once that is durable.
-	fn adopt(&mut self, heir: FileId, canonical: FileId, output: &Output) {
-		let entry = self.tree.file(heir);
-		let placeholder = match &entry.record.state {
-			state if is_gone(state) => state.output().map(|output| output.path.clone()),
-			_ => entry.record.replaces.clone(),
-		};
-		let state = match &entry.record.state {
-			FileState::DeletePending(_) => FileState::DeletePending(output.clone()),
-			FileState::OriginalDeleted(_) => FileState::OriginalDeleted(output.clone()),
-			_ => FileState::SourceGone(output.clone()),
-		};
-
-		let mut record = entry.record.clone();
-		record.replaces = None;
-		record.held_output = None;
-		self.tree.set_record(heir, record);
-		self.set_state(heir, state);
-		self.release_claim(canonical, &output.path);
-		self.claim(heir, &output.path);
-
-		let mut record = self.tree.file(canonical).record.clone();
-		if record.replaces.as_ref() == Some(&output.path) {
-			record.replaces = None;
-			self.tree.set_record(canonical, record);
-			self.save_file(canonical);
-		}
-
-		let others: Vec<FileId> = self
-			.dedup
-			.released
-			.iter()
-			.filter(|(_, (of, _))| *of == canonical)
-			.map(|(file, _)| *file)
-			.collect();
-		for other in others {
-			self.drop_release(other);
-		}
-		self.unhold(canonical);
-
-		if let Some(placeholder) = placeholder.filter(|placeholder| *placeholder != output.path) {
-			self.dedup.remove_after_durable.push((heir, placeholder));
-		}
+		self.adopt(heir, canonical, earlier);
 
 		let name = self.tree.file(heir).key.display();
 		self.log(
 			LogKind::Action,
-			format!(
-				"{name}: its original is gone, so it keeps the archived copy {}",
-				output.path.display()
-			),
+			format!("{name}: keeps the archived copy {}", earlier.path.display()),
 		);
 		self.crash_point(super::Fault::AfterAdoption);
+		true
 	}
 
-	/// Once everything batched is durable, removes the heirs' own placeholder files, each only while no other file
-	/// holds its name and no record of the heir names it.
+	/// `heir` takes `canonical`'s earlier output over as its own record: a gone original keeps its gone state, anything
+	/// else is Done with it. Its placed placeholder, and the earlier output its own commit would replace, go once that
+	/// is durable; a placeholder still being committed is left to `placed`.
+	fn adopt(&mut self, heir: FileId, canonical: FileId, output: &Output) {
+		let entry = self.tree.file(heir);
+		let placed = match &entry.record.state {
+			FileState::Done(placeholder)
+			| FileState::SourceGone(placeholder)
+			| FileState::DeletePending(placeholder)
+			| FileState::OriginalDeleted(placeholder) => Some(placeholder.path.clone()),
+			_ => None,
+		};
+		let mut own: Vec<RelPath> = placed
+			.into_iter()
+			.chain(entry.record.replaces.clone())
+			.filter(|path| *path != output.path)
+			.collect();
+		own.dedup();
+		let state = match &entry.record.state {
+			FileState::SourceGone(_) => FileState::SourceGone(output.clone()),
+			FileState::DeletePending(_) => FileState::DeletePending(output.clone()),
+			FileState::OriginalDeleted(_) => FileState::OriginalDeleted(output.clone()),
+			_ => FileState::Done(output.clone()),
+		};
+
+		let mut record = entry.record.clone();
+		record.replaces = None;
+		self.tree.set_record(heir, record);
+		self.dedup.canonical_of.remove(&heir);
+		self.set_state(heir, state);
+		self.release_claim(canonical, &output.path);
+		self.claim(heir, &output.path);
+
+		for path in own {
+			self.remove_once_durable(heir, path);
+		}
+	}
+
+	/// A placeholder now points at `canonical`; its text still links to the same archived file.
+	fn point_at(&mut self, file: FileId, canonical: FileId) {
+		let how = How::Placeholder {
+			canonical: self.tree.file(canonical).key.clone(),
+		};
+		let mut state = self.tree.file(file).record.state.clone();
+		if let Some(output) = recorded_output_mut(&mut state) {
+			output.how = how.clone();
+		}
+		self.set_state(file, state);
+
+		if let Some(pending) = self
+			.pipeline
+			.jobs
+			.get_mut(&file)
+			.and_then(RunningJob::pending_output_mut)
+		{
+			pending.how = how;
+		}
+	}
+
+	/// A file with dependents doesn't replace its earlier output: its new output takes a name of its own.
+	pub(super) fn keep_depended_output(&mut self, file: FileId) {
+		if self.tree.file(file).record.replaces.is_none() || !self.has_dependents(file) {
+			return;
+		}
+
+		let mut record = self.tree.file(file).record.clone();
+		record.replaces = None;
+		self.tree.set_record(file, record);
+	}
+
+	/// An heir's own file, removed once the batch that records its adoption is durable.
+	pub(super) fn remove_once_durable(&mut self, heir: FileId, path: RelPath) {
+		self.dedup.remove_after_durable.push((heir, path));
+	}
+
+	/// Once everything batched is durable, removes the heirs' own files, each only while no other file holds its name
+	/// and no record of the heir names it.
 	pub(super) fn after_flush(&mut self) {
 		if self.store.pending_changes() > 0 || self.dedup.remove_after_durable.is_empty() {
 			return;
 		}
 
-		for (heir, placeholder) in std::mem::take(&mut self.dedup.remove_after_durable) {
-			let record = &self.tree.file(heir).record;
-			let Some(kept) = record.state.output().map(|output| output.path.clone()) else {
-				continue;
-			};
-			let named = kept == placeholder || record.replaces.as_ref() == Some(&placeholder);
-			if named || self.claimed_by_other(heir, &placeholder) {
+		for (heir, path) in std::mem::take(&mut self.dedup.remove_after_durable) {
+			if self.recorded_outputs(heir).contains(&path) || self.claimed_by_other(heir, &path) {
 				continue;
 			}
 
-			self.remove_replaced_output(&placeholder, &kept);
-			self.release_claim(heir, &placeholder);
+			self.remove_own_output(&path);
+			self.release_claim(heir, &path);
 		}
 	}
 
-	/// Placeholder files whose removal waits for a flush; still the project's own.
+	/// Files whose removal waits for a flush; still the project's own.
 	pub(super) fn placeholders_to_remove(&self) -> impl Iterator<Item = &RelPath> {
-		self.dedup
-			.remove_after_durable
-			.iter()
-			.map(|(_, placeholder)| placeholder)
+		self.dedup.remove_after_durable.iter().map(|(_, path)| path)
 	}
+}
 
-	/// A gone original's placeholder now points at `canonical`; its text still links to the same archived file.
-	fn point_at(&mut self, file: FileId, canonical: FileId) {
-		let key = self.tree.file(canonical).key.clone();
-		let mut state = self.tree.file(file).record.state.clone();
-		if let FileState::SourceGone(output) | FileState::DeletePending(output) | FileState::OriginalDeleted(output) =
-			&mut state
-		{
-			output.how = How::Placeholder { canonical: key };
-		}
-		self.set_state(file, state);
+/// The output a record names: its state's, or the one an output issue is about.
+pub(super) fn recorded_output(state: &FileState) -> Option<&Output> {
+	match state {
+		FileState::Issue { output, .. } => output.as_ref(),
+		state => state.output(),
 	}
+}
 
-	/// A placeholder archived again whose original vanished before it was archived keeps its content: it adopts the
-	/// canonical copy's earlier output, which was held back for it. Returns whether it did.
-	pub(super) fn keep_released(&mut self, file: FileId) -> bool {
-		let Some((canonical, output)) = self.drop_release(file) else {
-			return false;
-		};
-
-		self.withdraw(file);
-		self.adopt(file, canonical, &output);
-		self.join_dedup(file);
-		true
-	}
-
-	/// The placeholder no longer needs its canonical copy's earlier output.
-	fn settle_release(&mut self, file: FileId) {
-		if let Some((canonical, _)) = self.drop_release(file) {
-			self.unhold(canonical);
-		}
-	}
-
-	fn hold_release(&mut self, file: FileId, canonical: FileId, output: Output) {
-		let key = self.tree.file(canonical).key.clone();
-		let mut record = self.tree.file(file).record.clone();
-		record.held_output = Some((key, output.clone()));
-		self.tree.set_record(file, record);
-		self.save_file(file);
-		self.dedup.released.insert(file, (canonical, output));
-	}
-
-	fn drop_release(&mut self, file: FileId) -> Option<(FileId, Output)> {
-		let release = self.dedup.released.remove(&file)?;
-		let mut record = self.tree.file(file).record.clone();
-		record.held_output = None;
-		self.tree.set_record(file, record);
-		self.save_file(file);
-		Some(release)
-	}
-
-	/// Withdraws a file whose source can't be read for now: a placeholder archived again still needs its canonical
-	/// copy's earlier output, so its release stays.
-	pub(super) fn withdraw_keeping_release(&mut self, file: FileId) {
-		let release = self.dedup.released.remove(&file);
-		self.withdraw(file);
-		if let Some(release) = release {
-			self.dedup.released.insert(file, release);
-		}
-	}
-
-	/// Rebuilds the releases the project file records, once recovery settled every commit: a placeholder archived
-	/// again that still has no output of its own holds its canonical copy's earlier output again.
-	pub(super) fn restore_releases(&mut self) {
-		let files: Vec<FileId> = self.tree.file_ids().collect();
-		for file in files {
-			let entry = self.tree.file(file);
-			let Some((key, output)) = entry.record.held_output.clone() else {
-				continue;
-			};
-
-			let unarchived = matches!(
-				entry.record.state,
-				FileState::Discovered
-					| FileState::Ready
-					| FileState::Queued
-					| FileState::InProgress { .. }
-					| FileState::Committing { .. }
-					| FileState::Issue { .. }
-			);
-			let canonical = self
-				.tree
-				.file_id(&key)
-				.filter(|&canonical| !self.tree.file(canonical).removed);
-			match canonical {
-				Some(canonical) if unarchived && !entry.removed => {
-					self.dedup.released.insert(file, (canonical, output));
-				}
-				_ => {
-					let mut record = entry.record.clone();
-					record.held_output = None;
-					self.tree.set_record(file, record);
-					self.save_file(file);
-				}
-			}
-		}
-	}
-
-	/// Whether a placeholder archived again still needs the earlier output the canonical copy's re-archive replaces.
-	fn needs_hold(&self, canonical: FileId) -> bool {
-		let Some(replaces) = &self.tree.file(canonical).record.replaces else {
-			return false;
-		};
-
-		self.dedup
-			.released
-			.values()
-			.any(|(of, output)| *of == canonical && output.path == *replaces)
-	}
-
-	fn unhold(&mut self, canonical: FileId) {
-		if !self.needs_hold(canonical) && self.dedup.held.remove(&canonical) {
-			self.released(canonical);
-		}
-	}
-
-	/// Whether the file must wait: a placeholder archived again still needs the output it would replace.
-	pub(super) fn hold_for_released(&mut self, file: FileId) -> bool {
-		let needed = self.needs_hold(file);
-		if needed {
-			self.dedup.held.insert(file);
-		}
-		needed
-	}
-
-	pub(super) fn held_back(&self, file: FileId) -> bool {
-		self.dedup.held.contains(&file)
-	}
-
-	/// A placeholder placed after its canonical copy let its output go is archived again at once. Returns whether the
-	/// file stays Done.
-	pub(super) fn dedup_placed(&mut self, file: FileId) -> bool {
-		let pointed = match self.tree.file(file).record.state.output().map(|output| &output.how) {
-			Some(How::Placeholder { canonical }) => self.tree.file_id(canonical),
-			_ => None,
-		};
-		if let Some(canonical) = pointed
-			&& self.canonical_output(canonical).is_none()
-		{
-			self.archive_again(file);
-			return false;
-		}
-
-		self.settle_release(file);
-		true
+fn recorded_output_mut(state: &mut FileState) -> Option<&mut Output> {
+	match state {
+		FileState::Issue { output, .. } => output.as_mut(),
+		FileState::Committing { output, .. }
+		| FileState::Done(output)
+		| FileState::SourceGone(output)
+		| FileState::DeletePending(output)
+		| FileState::OriginalDeleted(output) => Some(output),
+		FileState::Discovered
+		| FileState::Ready
+		| FileState::Queued
+		| FileState::InProgress { .. }
+		| FileState::Excluded => None,
 	}
 }
 
 /// The canonical copy a recorded placeholder points at, also when an output issue is about the placeholder.
 fn placeholder_of(state: &FileState) -> Option<&RelPath> {
-	let output = match state {
-		FileState::Issue { output, .. } => output.as_ref(),
-		state => state.output(),
-	};
-
-	match output.map(|output| &output.how) {
+	match recorded_output(state).map(|output| &output.how) {
 		Some(How::Placeholder { canonical }) => Some(canonical),
 		_ => None,
 	}
@@ -1000,15 +849,16 @@ fn changed(path: &Path) -> HashOutcome {
 #[cfg(test)]
 mod tests {
 	use std::ffi::OsStr;
+	use std::path::PathBuf;
 	use std::sync::mpsc::Receiver;
 	use std::time::Duration;
 
 	use tokio::sync::oneshot;
 
 	use super::*;
-	use crate::project::jobs::JobMessage;
-	use crate::project::pipeline::tests::running_job;
-	use crate::project::scanning::tests::{key, list, owner};
+	use crate::project::jobs::{JobMessage, Target};
+	use crate::project::pipeline::tests::{committing_job, running_job};
+	use crate::project::scanning::tests::{key, list, list_queued, owner, reopen};
 	use crate::record::{CopyReason, FileRecord};
 	use crate::run::Staged;
 	use crate::tree::FolderId;
@@ -1030,6 +880,18 @@ mod tests {
 			let (owner, updates) = owner(&source, &dir.path().join("archive"));
 			Self {
 				dir,
+				owner,
+				_updates: updates,
+			}
+		}
+
+		/// The same project opened again, as after a crash: whatever wasn't flushed is lost.
+		fn reopened(self) -> Self {
+			let project = self.owner.project_file.clone();
+			drop(self.owner);
+			let (owner, updates) = reopen(&project);
+			Self {
+				dir: self.dir,
 				owner,
 				_updates: updates,
 			}
@@ -1298,83 +1160,7 @@ mod tests {
 		assert_eq!(fixture.owner.canonical_of(former), Some(shallowest));
 	}
 
-	/// A canonical copy whose re-archive replaces its earlier output `a.bin`.
-	fn replacing() -> FileRecord {
-		FileRecord {
-			replaces: Some(key("a.bin")),
-			state: FileState::Queued,
-			..ready(None, 1)
-		}
-	}
-
-	#[test]
-	fn a_placeholder_archived_again_keeps_its_release_until_its_new_canonical_copy_is_archived() {
-		let mut fixture = Fixture::new();
-		let earlier = fixture.add("a.bin", replacing());
-		let canonical = fixture.gated("b.bin", ready(None, 2));
-		let duplicate = fixture.gated("c.bin", ready(None, 2));
-		fixture.owner.hold_release(duplicate, earlier, copied("a.bin"));
-
-		fixture.owner.route_duplicate(duplicate, canonical, false);
-
-		assert!(fixture.owner.dedup.released.contains_key(&duplicate));
-		assert!(fixture.owner.hold_for_released(earlier));
-
-		fixture.owner.set_state(canonical, FileState::Done(copied("b.bin")));
-		fixture.owner.route_duplicate(duplicate, canonical, false);
-
-		assert!(!fixture.owner.dedup.released.contains_key(&duplicate));
-		assert_eq!(fixture.owner.tree.file(duplicate).record.held_output, None);
-		assert!(!fixture.owner.hold_for_released(earlier));
-	}
-
-	#[test]
-	fn a_placeholder_archived_again_that_duplicates_its_own_canonical_copy_lets_it_go() {
-		let mut fixture = Fixture::new();
-		let canonical = fixture.gated("a.bin", replacing());
-		let duplicate = fixture.gated("b.bin", ready(None, 1));
-		fixture.owner.hold_release(duplicate, canonical, copied("a.bin"));
-		assert!(fixture.owner.hold_for_released(canonical));
-
-		fixture.owner.route_duplicate(duplicate, canonical, false);
-
-		assert!(!fixture.owner.dedup.released.contains_key(&duplicate));
-		assert!(!fixture.owner.held_back(canonical));
-		assert!(
-			fixture
-				.owner
-				.pipeline
-				.queues
-				.values()
-				.any(|queue| queue.contains(canonical))
-		);
-	}
-
-	#[test]
-	fn an_unreadable_placeholder_archived_again_keeps_its_release() {
-		let mut fixture = Fixture::new();
-		let canonical = fixture.add("a.bin", replacing());
-		let duplicate = fixture.gated("b.bin", ready(None, 1));
-		fixture.owner.hold_release(duplicate, canonical, copied("a.bin"));
-
-		fixture
-			.owner
-			.source_broken(FolderId::ROOT, OsStr::new("b.bin"), "access denied");
-
-		let record = &fixture.owner.tree.file(duplicate).record;
-		assert!(matches!(
-			record.state,
-			FileState::Issue {
-				kind: IssueKind::SourceUnreadable,
-				..
-			}
-		));
-		assert_eq!(record.held_output, Some((key("a.bin"), copied("a.bin"))));
-		assert!(fixture.owner.dedup.released.contains_key(&duplicate));
-		assert!(fixture.owner.hold_for_released(canonical));
-	}
-
-	fn take_over(fixture: &mut Fixture, canonical: FileId) -> Option<crate::project::jobs::Target> {
+	fn take_over(fixture: &mut Fixture, canonical: FileId) -> Option<Target> {
 		let (reply, answer) = oneshot::channel();
 		let staged = Staged {
 			path: fixture.owner.destination_path(&key("held.bin")),
@@ -1434,8 +1220,19 @@ mod tests {
 		assert!(!fixture.owner.dedup.moves.contains_key(&canonical));
 	}
 
+	fn placeholder(name: &str, canonical: &str) -> Output {
+		Output {
+			how: How::Placeholder {
+				canonical: key(canonical),
+			},
+			path: key(&format!("placeholder_{name}.txt")),
+			size: 10,
+			hash: Some(Hash([2; 32])),
+		}
+	}
+
 	#[test]
-	fn a_placeholder_with_an_output_issue_still_holds_back_its_canonical_copy() {
+	fn every_placeholder_of_a_changed_canonical_copy_keeps_its_content_whatever_its_state() {
 		let mut fixture = Fixture::new();
 		let canonical = fixture.add(
 			"a.bin",
@@ -1444,30 +1241,298 @@ mod tests {
 				..ready(None, 1)
 			},
 		);
-		let missing = fixture.add(
-			"b.bin",
-			FileRecord {
-				state: FileState::Issue {
-					kind: IssueKind::OutputMissing,
-					attempt: 0,
-					reason: "the archived file is missing".into(),
-					output: Some(Output {
-						how: How::Placeholder {
-							canonical: key("a.bin"),
-						},
-						path: key("placeholder_b.bin.txt"),
-						size: 10,
-						hash: Some(Hash([2; 32])),
-					}),
+		fixture.owner.claim(canonical, &key("a.bin"));
+		let missing = FileState::Issue {
+			kind: IssueKind::OutputMissing,
+			attempt: 0,
+			reason: "the archived file is missing".into(),
+			output: Some(placeholder("e.bin", "a.bin")),
+		};
+		let dependents = [
+			("b.bin", FileState::OriginalDeleted(placeholder("b.bin", "a.bin"))),
+			("c.bin", FileState::DeletePending(placeholder("c.bin", "a.bin"))),
+			(
+				"d.bin",
+				FileState::Committing {
+					attempt: 1,
+					output: placeholder("d.bin", "a.bin"),
 				},
-				..ready(None, 1)
-			},
-		);
-		fixture.owner.note_placeholder(missing);
+			),
+			("e.bin", missing),
+		]
+		.map(|(name, state)| {
+			let file = fixture.add(
+				name,
+				FileRecord {
+					state,
+					..FileRecord::discovered(SIZE, 1)
+				},
+			);
+			fixture.owner.note_placeholder(file);
+			file
+		});
+		let [heir, pending, committing, missing] = dependents;
+		fixture
+			.owner
+			.pipeline
+			.jobs
+			.insert(committing, committing_job(placeholder("d.bin", "a.bin")));
 
 		fixture.owner.source_changed(canonical, SIZE, 2);
 
-		assert_eq!(fixture.owner.tree.file(canonical).record.replaces, Some(key("a.bin")));
-		assert!(fixture.owner.hold_for_released(canonical));
+		let state = |file: FileId| fixture.owner.tree.file(file).record.state.clone();
+		assert_eq!(state(heir), FileState::OriginalDeleted(copied("a.bin")));
+		assert_eq!(state(pending), FileState::DeletePending(placeholder("c.bin", "b.bin")));
+		assert_eq!(
+			state(committing),
+			FileState::Committing {
+				attempt: 1,
+				output: placeholder("d.bin", "b.bin"),
+			}
+		);
+		assert_eq!(
+			fixture.owner.pipeline.jobs[&committing].pending_output(),
+			Some(&placeholder("d.bin", "b.bin"))
+		);
+		assert!(matches!(
+			state(missing),
+			FileState::Issue { output: Some(output), .. } if output == placeholder("e.bin", "b.bin")
+		));
+		assert_eq!(fixture.owner.tree.file(canonical).record.replaces, None);
+		assert!(fixture.owner.claimed_by_other(canonical, &key("a.bin")));
+		assert!(!fixture.owner.claimed_by_other(heir, &key("a.bin")));
+	}
+
+	#[test]
+	fn a_canonical_copy_that_becomes_a_placeholder_leaves_its_output_to_its_own_placeholders() {
+		let mut fixture = Fixture::new();
+		let done = |output| FileRecord {
+			full_hash: Some(Hash([4; 32])),
+			state: FileState::Done(output),
+			..ready(None, 4)
+		};
+		let shallowest = fixture.add("a.bin", done(copied("a.bin")));
+		let former = fixture.add("b.bin", done(copied("b.bin")));
+		let dependent = fixture.add("c.bin", done(placeholder("c.bin", "b.bin")));
+		fixture.owner.note_placeholder(dependent);
+		fixture.owner.dedup.canonical_of.insert(former, shallowest);
+
+		fixture.owner.route_duplicate(former, shallowest, false);
+
+		assert_eq!(
+			fixture.owner.tree.file(dependent).record.state,
+			FileState::Done(copied("b.bin"))
+		);
+		assert_eq!(fixture.owner.tree.file(former).record.replaces, None);
+		assert!(fixture.owner.pipeline.queues[&Work::Placeholder].contains(former));
+	}
+
+	fn commit(fixture: &mut Fixture, file: FileId, made: Made, content: &[u8]) -> Option<Target> {
+		let (reply, answer) = oneshot::channel();
+		let staged = Staged {
+			path: PathBuf::from("staged"),
+			size: content.len() as u64,
+			hash: Hash(*blake3::hash(content).as_bytes()),
+		};
+
+		fixture.owner.on_job(file, JobMessage::Commit { staged, made, reply });
+		answer.blocking_recv().unwrap()
+	}
+
+	fn running(fixture: &mut Fixture, file: FileId, work: Work) {
+		fixture.owner.pipeline.jobs.insert(file, running_job(work));
+		fixture.owner.set_state(file, FileState::InProgress { attempt: 1 });
+	}
+
+	fn scan(fixture: &mut Fixture) {
+		list(&mut fixture.owner, &RelPath::root(), true);
+		list_queued(&mut fixture.owner);
+	}
+
+	#[test]
+	fn an_output_a_record_depends_on_is_never_replaced_or_removed() {
+		let mut fixture = Fixture::new();
+		let canonical = fixture.add(
+			"a.bin",
+			FileRecord {
+				replaces: Some(key("a.bin")),
+				..ready(None, 1)
+			},
+		);
+		let dependent = fixture.add(
+			"b.bin",
+			FileRecord {
+				state: FileState::Done(placeholder("b.bin", "a.bin")),
+				..ready(None, 1)
+			},
+		);
+		fixture.owner.note_placeholder(dependent);
+		let archived = fixture.owner.destination_path(&key("a.bin"));
+		fs::create_dir_all(archived.parent().unwrap()).unwrap();
+		fs::write(&archived, b"old").unwrap();
+
+		running(&mut fixture, canonical, Work::Copy);
+		let target = commit(&mut fixture, canonical, Made::Copied(CopyReason::NotMedia), b"new").unwrap();
+
+		assert_eq!(
+			(target.path.clone(), target.replaces),
+			(fixture.owner.destination_path(&key("a (2).bin")), None)
+		);
+
+		let mut record = fixture.owner.tree.file(canonical).record.clone();
+		record.replaces = Some(key("a.bin"));
+		fixture.owner.tree.set_record(canonical, record);
+		fs::write(&target.path, b"new").unwrap();
+		fixture.owner.on_job(canonical, JobMessage::Placed);
+
+		assert_eq!(fs::read(&archived).unwrap(), b"old");
+	}
+
+	#[test]
+	fn an_output_a_placeholder_points_at_is_never_taken_over() {
+		let mut fixture = Fixture::new();
+		let hashed = |state| FileRecord {
+			full_hash: Some(Hash([4; 32])),
+			state,
+			..ready(None, 4)
+		};
+		let shallowest = fixture.gated("a.bin", hashed(FileState::Ready));
+		let holder = fixture.gated("b.bin", hashed(FileState::Done(copied("b.bin"))));
+		let dependent = fixture.add(
+			"c.bin",
+			FileRecord {
+				state: FileState::Done(placeholder("c.bin", "b.bin")),
+				..FileRecord::discovered(SIZE, 1)
+			},
+		);
+		fixture.owner.note_placeholder(dependent);
+
+		fixture.owner.plan_dirty_groups();
+
+		assert!(!fixture.owner.dedup.moves.contains_key(&shallowest));
+		assert_eq!(fixture.owner.canonical_of(holder), Some(shallowest));
+	}
+
+	#[test]
+	fn a_placeholder_is_never_committed_against_an_output_a_take_over_is_moving() {
+		let mut fixture = Fixture::new();
+		let holder = fixture.add(
+			"held.bin",
+			FileRecord {
+				state: FileState::Done(copied("held.bin")),
+				..ready(None, 1)
+			},
+		);
+		let taker = fixture.add("a.bin", ready(None, 1));
+		let duplicate = fixture.add("b.bin", ready(None, 1));
+		fixture.owner.dedup.moves.insert(taker, holder);
+
+		running(&mut fixture, duplicate, Work::Placeholder);
+		let made = Made::Placeholder {
+			canonical: key("held.bin"),
+			target: key("held.bin"),
+		};
+
+		assert!(commit(&mut fixture, duplicate, made, b"placeholder").is_none());
+	}
+
+	static OLD: [u8; 100_000] = [1; 100_000];
+	static NEW: [u8; 100_001] = [2; 100_001];
+	const TEXT: &[u8] = b"This file is a duplicate.";
+
+	/// `a.bin` is archived, and the intent of its duplicate `Backup/a.bin`'s placeholder is durable when `a.bin`
+	/// changes. Returns the archived output and the placeholder's target.
+	fn placeholder_committed_as_its_canonical_copy_changes(fixture: &mut Fixture) -> (Output, Target) {
+		let source = fixture.dir.path().join("source");
+		fs::create_dir_all(source.join("Backup")).unwrap();
+		fs::write(source.join("a.bin"), OLD).unwrap();
+		fs::write(source.join("Backup").join("a.bin"), OLD).unwrap();
+		scan(fixture);
+		let canonical = fixture.owner.tree.file_id(&key("a.bin")).unwrap();
+		let duplicate = fixture.owner.tree.file_id(&key("Backup/a.bin")).unwrap();
+		let archived = fixture.owner.destination_path(&key("a.bin"));
+		fs::create_dir_all(archived.parent().unwrap()).unwrap();
+		fs::write(&archived, OLD).unwrap();
+		let output = Output {
+			hash: Some(Hash(*blake3::hash(&OLD).as_bytes())),
+			..copied("a.bin")
+		};
+		fixture.owner.set_state(canonical, FileState::Done(output.clone()));
+		fixture.owner.claim(canonical, &key("a.bin"));
+
+		running(fixture, duplicate, Work::Placeholder);
+		let made = Made::Placeholder {
+			canonical: key("a.bin"),
+			target: key("a.bin"),
+		};
+		let target = commit(fixture, duplicate, made, TEXT).unwrap();
+		fs::write(source.join("a.bin"), NEW).unwrap();
+		list(&mut fixture.owner, &RelPath::root(), false);
+		fs::create_dir_all(target.path.parent().unwrap()).unwrap();
+		fs::write(&target.path, TEXT).unwrap();
+		(output, target)
+	}
+
+	#[test]
+	fn a_placeholder_placed_after_it_adopted_its_canonical_copys_output_goes_once_that_is_durable() {
+		let mut fixture = Fixture::new();
+		let (output, target) = placeholder_committed_as_its_canonical_copy_changes(&mut fixture);
+		let duplicate = fixture.owner.tree.file_id(&key("Backup/a.bin")).unwrap();
+
+		fixture.owner.on_job(duplicate, JobMessage::Placed);
+
+		assert_eq!(fixture.owner.tree.file(duplicate).record.state, FileState::Done(output));
+		assert!(target.path.exists());
+
+		fixture.owner.store.flush().unwrap();
+		fixture.owner.after_flush();
+
+		assert!(!target.path.exists());
+	}
+
+	/// The project crashes before the placeholder's rename is recorded; `flushed`: the change was durable by then.
+	fn a_placeholder_committed_as_its_canonical_copy_changes_then_a_crash(flushed: bool) {
+		let mut fixture = Fixture::new();
+		let (output, _) = placeholder_committed_as_its_canonical_copy_changes(&mut fixture);
+		let duplicate = fixture.owner.tree.file_id(&key("Backup/a.bin")).unwrap();
+		if flushed {
+			fixture.owner.store.flush().unwrap();
+			fixture.owner.after_flush();
+		}
+		fixture.owner.fault = Some(crate::project::Fault::AfterPlaced);
+		fixture.owner.on_job(duplicate, JobMessage::Placed);
+
+		let mut fixture = fixture.reopened();
+		scan(&mut fixture);
+		let canonical = fixture.owner.tree.file_id(&key("a.bin")).unwrap();
+		let duplicate = fixture.owner.tree.file_id(&key("Backup/a.bin")).unwrap();
+
+		assert_eq!(fixture.owner.tree.file(duplicate).record.state, FileState::Done(output));
+
+		running(&mut fixture, canonical, Work::Copy);
+		let again = commit(&mut fixture, canonical, Made::Copied(CopyReason::NotMedia), &NEW).unwrap();
+		assert_eq!(
+			(again.path.clone(), again.replaces),
+			(fixture.owner.destination_path(&key("a (2).bin")), None)
+		);
+		fs::write(&again.path, NEW).unwrap();
+		fixture.owner.on_job(canonical, JobMessage::Placed);
+
+		let archived = fixture.owner.destination_path(&key("a.bin"));
+		assert_eq!(fs::read(archived).unwrap(), OLD);
+		assert_eq!(
+			fixture.owner.tree.file(canonical).record.state.output().unwrap().path,
+			key("a (2).bin")
+		);
+	}
+
+	#[test]
+	fn a_placeholder_committed_as_its_canonical_copy_changes_keeps_the_content_through_a_crash() {
+		a_placeholder_committed_as_its_canonical_copy_changes_then_a_crash(false);
+	}
+
+	#[test]
+	fn a_placeholder_committed_as_its_canonical_copy_changes_keeps_the_content_once_that_is_durable() {
+		a_placeholder_committed_as_its_canonical_copy_changes_then_a_crash(true);
 	}
 }

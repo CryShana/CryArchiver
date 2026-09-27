@@ -140,7 +140,8 @@ impl Owner {
 		self.reconcile_destination();
 	}
 
-	/// Files the last run left waiting go back into the pipeline.
+	/// Files the last run left waiting go back into the pipeline. A queued one is in no queue yet, and a dedup group
+	/// queues only a ready unique member, so it is ready again first.
 	fn resume_queued(&mut self) {
 		let files: Vec<FileId> = self.tree.file_ids().collect();
 		for file in files {
@@ -155,7 +156,11 @@ impl Owner {
 					self.set_state(file, FileState::Discovered);
 					self.observe(file);
 				}
-				FileState::Ready | FileState::Queued => self.gate(file),
+				FileState::Queued => {
+					self.set_state(file, FileState::Ready);
+					self.gate(file);
+				}
+				FileState::Ready => self.gate(file),
 				FileState::Done(_)
 				| FileState::SourceGone(_)
 				| FileState::DeletePending(_)
@@ -377,19 +382,27 @@ impl Owner {
 	/// Once a re-archive's new output is placed, removes the earlier output it replaces: only that exact recorded
 	/// path inside the destination, never the new output itself. Blocking: one file removal.
 	pub(super) fn remove_replaced_output(&mut self, previous: &RelPath, placed: &RelPath) {
-		let plain = previous.components().all(|name| {
+		if previous != placed {
+			self.remove_own_output(previous);
+		}
+	}
+
+	/// Removes a file the project placed: only that exact recorded path inside the destination. Blocking: one file
+	/// removal.
+	pub(super) fn remove_own_output(&mut self, path: &RelPath) {
+		let plain = path.components().all(|name| {
 			let mut parts = Path::new(&name).components();
 			matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None))
 		});
-		if previous == placed || previous.is_root() || !plain {
+		if path.is_root() || !plain {
 			return;
 		}
 
-		self.output_vacated_during_walk(previous);
-		match fs::remove_file(self.destination_path(previous)) {
+		self.output_vacated_during_walk(path);
+		match fs::remove_file(self.destination_path(path)) {
 			Err(err) if err.kind() != io::ErrorKind::NotFound => self.notice(
 				NoticeLevel::Warning,
-				format!("{} can't be removed: {err}", previous.display()),
+				format!("{} can't be removed: {err}", path.display()),
 			),
 			_ => {}
 		}

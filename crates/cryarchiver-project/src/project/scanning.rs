@@ -6,6 +6,7 @@ use std::ffi::{OsStr, OsString};
 
 use cryarchiver_engine::text::display_name;
 
+use super::duplicates::recorded_output;
 use super::owner::{Message, Owner};
 use crate::keys::RelPath;
 use crate::record::{CycleRecord, FileRecord, FileState, FolderRecord, Identity, IssueKind, MediaClass};
@@ -220,13 +221,15 @@ impl Owner {
 
 	/// The source changed after the project saw it: it is archived again, and the new output replaces the old one.
 	/// A file that appears where a gone source was is a new file: the old output stays, and the new one gets a name
-	/// of its own. So does a re-archive whose old output a placeholder of a gone original adopted.
+	/// of its own. So does a re-archive whose old output a placeholder adopted.
 	pub(super) fn source_changed(&mut self, file: FileId, size: u64, mtime_ns: i64) {
 		let earlier = match &self.tree.file(file).record.state {
 			FileState::Committing { .. } => None,
-			state => state.output().cloned(),
+			state => recorded_output(state).cloned(),
 		};
-		let adopted = self.release_dependents(file, earlier);
+		let adopted = earlier
+			.as_ref()
+			.is_some_and(|earlier| self.transfer_dependents(file, earlier));
 		self.withdraw(file);
 
 		let old = &self.tree.file(file).record;
@@ -248,7 +251,6 @@ impl Owner {
 			full_hash: None,
 			replaces,
 			state: FileState::Discovered,
-			held_output: None,
 		};
 		self.tree.set_record(file, record);
 		self.set_state(file, FileState::Discovered);
@@ -262,7 +264,6 @@ impl Owner {
 			FileState::Done(output) => self.set_state(file, FileState::SourceGone(output)),
 			FileState::DeletePending(output) => self.set_state(file, FileState::OriginalDeleted(output)),
 			FileState::SourceGone(_) | FileState::OriginalDeleted(_) => {}
-			_ if self.keep_released(file) => {}
 			_ => self.forget_file(file),
 		}
 	}
@@ -275,7 +276,12 @@ impl Owner {
 		}
 	}
 
+	/// The file leaves the project; the output an issue is about stays with the placeholders that point at it.
 	pub(super) fn forget_file(&mut self, file: FileId) {
+		if let Some(output) = recorded_output(&self.tree.file(file).record.state).cloned() {
+			self.transfer_dependents(file, &output);
+		}
+
 		self.withdraw(file);
 		self.release_all_claims(file);
 		let folder = self.tree.file(file).folder;
@@ -290,7 +296,7 @@ impl Owner {
 
 	/// An unreadable entry is an issue, unless the file is archived already: then its output stays and a warning says
 	/// what happened.
-	pub(super) fn source_broken(&mut self, folder: FolderId, name: &OsStr, reason: &str) {
+	fn source_broken(&mut self, folder: FolderId, name: &OsStr, reason: &str) {
 		let key = self.tree.folder(folder).key.join(name);
 		let known = self.tree.file_id(&key).filter(|&file| !self.tree.file(file).removed);
 		if known.is_some_and(|file| self.tree.file(file).record.state.output().is_some()) {
@@ -302,7 +308,7 @@ impl Owner {
 		}
 
 		let file = if let Some(file) = known {
-			self.withdraw_keeping_release(file);
+			self.withdraw(file);
 			file
 		} else {
 			let file = self.tree.add_file(folder, name, FileRecord::default());
@@ -460,7 +466,12 @@ pub(super) mod tests {
 	/// An owner whose listings run only when the test lists a folder: nothing is spawned.
 	pub(crate) fn owner(source: &Path, destination: &Path) -> (Owner, Receiver<Update>) {
 		let project = create(source, destination, OsStr::new("archive"), |_| {}).unwrap();
-		let (store, meta, loaded) = Store::open(&project).unwrap();
+		reopen(&project)
+	}
+
+	/// Opens the project file; an owner dropped before it, without a flush, loses its unwritten batch as in a crash.
+	pub(crate) fn reopen(project: &Path) -> (Owner, Receiver<Update>) {
+		let (store, meta, loaded) = Store::open(project).unwrap();
 		let (updates, received) = channel();
 		let options = ProjectOptions {
 			backend: Arc::new(NoBackend),
@@ -472,7 +483,7 @@ pub(super) mod tests {
 		};
 
 		(
-			Owner::open(&project, store, meta.settings, loaded, options, updates).unwrap(),
+			Owner::open(project, store, meta.settings, loaded, options, updates).unwrap(),
 			received,
 		)
 	}

@@ -78,10 +78,6 @@ pub struct FileRecord {
 	/// The output of an earlier archive that a re-archive after a source change replaces.
 	pub replaces: Option<RelPath>,
 	pub state: FileState,
-	/// For a placeholder archived again: its canonical copy's key and earlier output, which still holds the content
-	/// and which that copy doesn't replace until this file has an output of its own or adopts it.
-	#[serde(default)]
-	pub held_output: Option<(RelPath, Output)>,
 }
 
 impl FileRecord {
@@ -273,6 +269,35 @@ mod tests {
 		let record: FileRecord = rmp_serde::from_slice(&bytes).unwrap();
 
 		assert_eq!(record, FileRecord::discovered(5, 9));
+	}
+
+	#[test]
+	fn a_record_written_with_a_held_output_still_reads() {
+		#[derive(Serialize)]
+		struct Older {
+			size: u64,
+			mtime_ns: i64,
+			state: FileState,
+			held_output: Option<(RelPath, Output)>,
+		}
+
+		let held = done(b"a.txt").state.output().cloned();
+		let bytes = rmp_serde::to_vec_named(&Older {
+			size: 3,
+			mtime_ns: 1_000,
+			state: FileState::Queued,
+			held_output: held.map(|output| (RelPath::from_bytes(b"a.txt".to_vec()), output)),
+		})
+		.unwrap();
+		let record: FileRecord = rmp_serde::from_slice(&bytes).unwrap();
+
+		assert_eq!(
+			record,
+			FileRecord {
+				state: FileState::Queued,
+				..FileRecord::discovered(3, 1_000)
+			}
+		);
 	}
 
 	#[test]

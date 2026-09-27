@@ -257,8 +257,47 @@ fn excluding_a_failed_canonical_copy_makes_the_next_one_canonical() {
 	assert_eq!(record(&setup, "a.jpg").state, FileState::Excluded);
 }
 
+/// The content a file's record says is archived: its own output's, or its canonical copy's.
+fn archived_content(setup: &support::Setup, path: &str) -> Vec<u8> {
+	let output = record(setup, path)
+		.state
+		.output()
+		.cloned()
+		.unwrap_or_else(|| panic!("{path} has no output"));
+	let held = match output.how {
+		How::Placeholder { canonical } => record(setup, &canonical.display()).state.output().unwrap().path.clone(),
+		How::Encoded | How::Copied(_) => output.path,
+	};
+	fs::read(setup.destination.join(native(&held.display()))).unwrap()
+}
+
+/// The canonical copy `a.bin` changed after `Backup/a.bin` was archived as its placeholder: the duplicate owns the
+/// old output, and the new content has a name of its own. Returns the duplicate's state.
+fn assert_the_duplicate_kept_the_old_content(setup: &support::Setup) -> FileState {
+	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(1));
+	assert_eq!(fs::read(setup.destination.join("a (2).bin")).unwrap(), data(2));
+	assert!(!setup.destination.join("Backup").join("placeholder_a.bin.txt").exists());
+
+	let kept = record(setup, "Backup/a.bin").state;
+	let output = kept
+		.output()
+		.unwrap_or_else(|| panic!("the duplicate has no output: {kept:?}"));
+	assert_eq!(output.path.display(), "a.bin");
+	assert_eq!(output.how, How::Copied(CopyReason::NotMedia));
+	assert_eq!(
+		record(setup, "a.bin").state.output().unwrap().path.display(),
+		"a (2).bin"
+	);
+	kept
+}
+
+fn assert_the_gone_duplicate_kept_the_old_content(setup: &support::Setup) {
+	let kept = assert_the_duplicate_kept_the_old_content(setup);
+	assert!(matches!(kept, FileState::SourceGone(_)), "{kept:?}");
+}
+
 #[test]
-fn a_changed_canonical_copy_lets_its_placeholders_archive_their_own_content() {
+fn a_changed_canonical_copy_leaves_its_output_to_its_placeholder() {
 	let setup = setup(|_| {});
 	let canonical = write(&setup.source, "a.bin", &data(1));
 	write(&setup.source, "Backup/a.bin", &data(1));
@@ -267,34 +306,30 @@ fn a_changed_canonical_copy_lets_its_placeholders_archive_their_own_content() {
 	assert!(setup.destination.join("Backup").join("placeholder_a.bin.txt").exists());
 
 	fs::write(&canonical, data(2)).unwrap();
-	run_to_completion(&setup, &encoder);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	wait_for(&project, &mut snapshot, "the scan", Snapshot::scan_complete);
+	drop(project);
 
-	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(2));
+	let adopted = record(&setup, "Backup/a.bin").state;
 	assert_eq!(
-		fs::read(setup.destination.join("Backup").join("a.bin")).unwrap(),
-		data(1)
+		adopted.output().map(|output| output.path.display()),
+		Some("a.bin".to_owned()),
+		"{adopted:?}"
 	);
-	assert!(!setup.destination.join("Backup").join("placeholder_a.bin.txt").exists());
-	assert_eq!(
-		record(&setup, "Backup/a.bin").state.output().unwrap().how,
-		How::Copied(CopyReason::NotMedia)
-	);
-}
-
-fn assert_the_gone_duplicate_kept_the_old_content(setup: &support::Setup) {
 	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(1));
-	assert_eq!(fs::read(setup.destination.join("a (2).bin")).unwrap(), data(2));
-	assert!(!setup.destination.join("Backup").join("placeholder_a.bin.txt").exists());
 
-	let FileState::SourceGone(kept) = record(setup, "Backup/a.bin").state else {
-		panic!("the gone duplicate has no output of its own")
-	};
-	assert_eq!(kept.path.display(), "a.bin");
-	assert_eq!(kept.how, How::Copied(CopyReason::NotMedia));
-	assert_eq!(
-		record(setup, "a.bin").state.output().unwrap().path.display(),
-		"a (2).bin"
-	);
+	drop(run_to_completion(&setup, &encoder));
+	assert!(matches!(
+		assert_the_duplicate_kept_the_old_content(&setup),
+		FileState::Done(_)
+	));
+
+	run_to_completion(&setup, &encoder);
+	assert!(matches!(
+		assert_the_duplicate_kept_the_old_content(&setup),
+		FileState::Done(_)
+	));
 }
 
 #[test]
@@ -429,28 +464,7 @@ fn a_crash_right_after_an_adoption_leaves_the_output_one_owner() {
 }
 
 #[test]
-fn a_placeholder_archived_again_still_holds_its_content_after_a_close() {
-	let setup = setup(|_| {});
-	let canonical = write(&setup.source, "a.bin", &data(1));
-	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
-	let encoder = FakeEncoder::new();
-	drop(run_to_completion(&setup, &encoder));
-
-	fs::write(&canonical, data(2)).unwrap();
-	let project = support::open(&setup, &encoder);
-	let mut snapshot = Snapshot::default();
-	wait_for(&project, &mut snapshot, "the scan", Snapshot::scan_complete);
-	drop(project);
-	assert!(record(&setup, "Backup/a.bin").held_output.is_some());
-
-	fs::remove_file(duplicate).unwrap();
-	run_to_completion(&setup, &encoder);
-
-	assert_the_gone_duplicate_kept_the_old_content(&setup);
-}
-
-#[test]
-fn a_placeholder_archived_again_still_holds_its_content_after_a_crash() {
+fn a_crash_right_after_the_changed_canonical_copys_intent_leaves_the_output_one_owner() {
 	let setup = setup(|_| {});
 	let canonical = write(&setup.source, "a.bin", &data(1));
 	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
@@ -465,14 +479,75 @@ fn a_placeholder_archived_again_still_holds_its_content_after_a_crash() {
 	});
 	wait_for(&project, &mut snapshot, "the crash", |s| s.stopped);
 	drop(project);
-	let held = record(&setup, "Backup/a.bin");
-	assert!(matches!(held.state, FileState::Committing { .. }), "{:?}", held.state);
-	assert!(held.held_output.is_some());
+
+	let committing = record(&setup, "a.bin").state;
+	assert!(matches!(committing, FileState::Committing { .. }), "{committing:?}");
+	assert_eq!(owners(&setup, "a.bin"), 1);
+	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(1));
 
 	fs::remove_file(duplicate).unwrap();
 	run_to_completion(&setup, &encoder);
 
 	assert_the_gone_duplicate_kept_the_old_content(&setup);
+	assert_eq!(owners(&setup, "a.bin"), 1);
+}
+
+fn scans_completed(snapshot: &Snapshot) -> usize {
+	snapshot
+		.logs
+		.iter()
+		.filter(|entry| entry.message.starts_with("scan complete"))
+		.count()
+}
+
+#[test]
+fn a_placeholder_whose_file_went_missing_keeps_the_content_when_its_canonical_copy_changes() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+	fs::remove_file(setup.destination.join("Backup").join("placeholder_a.bin.txt")).unwrap();
+
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	wait_for(&project, &mut snapshot, "the missing placeholder", |s| {
+		!s.issues.is_empty() && scans_completed(s) == 1
+	});
+	let issue = snapshot.issues[0].id;
+	fs::write(&canonical, data(2)).unwrap();
+	project.send(Command::Rescan);
+	wait_for(&project, &mut snapshot, "the change", |s| scans_completed(s) == 2);
+	project.send(Command::Resolve(issue, Verb::Accept));
+	drop(project);
+
+	run_to_completion(&setup, &encoder);
+
+	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(1));
+	assert_eq!(archived_content(&setup, "Backup/a.bin"), data(1));
+	assert_eq!(archived_content(&setup, "a.bin"), data(2));
+}
+
+#[test]
+fn a_canonical_copy_touched_then_changed_never_costs_its_duplicate_the_content() {
+	let setup = setup(|_| {});
+	let canonical = write(&setup.source, "a.bin", &data(1));
+	let duplicate = write(&setup.source, "Backup/a.bin", &data(1));
+	let encoder = FakeEncoder::new();
+	drop(run_to_completion(&setup, &encoder));
+
+	fs::write(&canonical, data(1)).unwrap();
+	drop(run_to_completion(&setup, &encoder));
+	assert_eq!(archived_content(&setup, "Backup/a.bin"), data(1));
+
+	fs::write(&canonical, data(2)).unwrap();
+	drop(run_to_completion(&setup, &encoder));
+	fs::remove_file(duplicate).unwrap();
+	run_to_completion(&setup, &encoder);
+
+	assert!(matches!(record(&setup, "Backup/a.bin").state, FileState::SourceGone(_)));
+	assert_eq!(archived_content(&setup, "Backup/a.bin"), data(1));
+	assert_eq!(archived_content(&setup, "a.bin"), data(2));
 }
 
 #[test]
