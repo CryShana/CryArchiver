@@ -614,7 +614,8 @@ impl Owner {
 	}
 
 	/// A job that relied on an archived file by identity alone found its source changed since the record was made: it
-	/// is archived again, and its group is planned again.
+	/// is archived again, and its group is planned again. A source that can't be read at all is gone when its folder
+	/// is there without it; otherwise the folder's listing tells.
 	pub(super) fn archived_changed(&mut self, archived: &RelPath, now: Option<(u64, i64)>) {
 		let Some(file) = self
 			.tree
@@ -623,10 +624,23 @@ impl Owner {
 		else {
 			return;
 		};
-		let record = &self.tree.file(file).record;
-		let Some((size, mtime_ns)) = now.filter(|&now| now != (record.size, record.mtime_ns)) else {
+
+		let Some((size, mtime_ns)) = now else {
+			let source = self.source_path(archived);
+			let gone = fs::symlink_metadata(&source).is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+				&& source.parent().is_some_and(Path::is_dir);
+			if gone {
+				self.source_missing(file);
+			} else {
+				self.relist(self.tree.folder(self.tree.file(file).folder).key.clone());
+			}
 			return;
 		};
+
+		let record = &self.tree.file(file).record;
+		if (size, mtime_ns) == (record.size, record.mtime_ns) {
+			return;
+		}
 
 		self.note(
 			file,
@@ -1075,7 +1089,7 @@ mod tests {
 	use super::*;
 	use crate::issues::{IssueKey, Verb};
 	use crate::project::jobs::{JobMessage, SourceIdentity, Target};
-	use crate::project::pipeline::tests::{committing_job, running_job};
+	use crate::project::pipeline::tests::{committing_job, drive, not_media, running_job};
 	use crate::project::scanning::tests::{key, list, list_queued, owner, reopen};
 	use crate::record::{CopyReason, FileRecord, MediaClass};
 	use crate::run::Staged;
@@ -2344,6 +2358,64 @@ mod tests {
 		assert_eq!(fixture.owner.tree.file(canonical).record.replaces, None);
 		assert!(fixture.owner.claimed_by_other(canonical, &moved));
 		assert!(!fixture.owner.claimed_by_other(holder, &moved));
+	}
+
+	#[test]
+	fn a_hard_link_take_over_whose_holder_is_deleted_after_its_window_hash_still_completes() {
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		let _entered = runtime.enter();
+		let mut fixture = Fixture::new();
+		let content = not_media(100_000);
+		let source = fixture.dir.path().join("source");
+		let held = source.join("Deep").join("a.pdf");
+		fs::create_dir_all(held.parent().unwrap()).unwrap();
+		fs::write(&held, &content).unwrap();
+		scan(&mut fixture);
+		let owner = &mut fixture.owner;
+		owner.settings.stability_window = Duration::ZERO;
+		let mut inbox = owner.inbox.take().unwrap();
+
+		let holder = owner.tree.file_id(&key("Deep/a.pdf")).unwrap();
+		let output = Output {
+			hash: Some(Hash(*blake3::hash(&content).as_bytes())),
+			..copied("Deep/a.pdf")
+		};
+		fs::create_dir_all(owner.destination_path(&key("Deep"))).unwrap();
+		fs::write(owner.destination_path(&output.path), &content).unwrap();
+		owner.unobserve(holder);
+		let mut record = owner.tree.file(holder).record.clone();
+		record.identity = Some(file_id(&held).unwrap().into());
+		owner.tree.set_record(holder, record);
+		owner.set_state(holder, FileState::Done(output));
+		owner.claim(holder, &key("Deep/a.pdf"));
+		owner.join_dedup(holder);
+
+		fs::hard_link(&held, source.join("a.pdf")).unwrap();
+		list(owner, &RelPath::root(), false);
+		let taker = owner.tree.file_id(&key("a.pdf")).unwrap();
+		owner.start(false);
+
+		let (mut jobs, mut holder_gone) = (0, 0);
+		let finished = drive(
+			owner,
+			&mut inbox,
+			Duration::from_secs(10),
+			|message| match message {
+				Message::Hashed(file, ..) if *file == holder => fs::remove_file(&held).unwrap(),
+				Message::Job(file, JobMessage::ArchivedChanged { now: None, .. }) if *file == taker => holder_gone += 1,
+				Message::Job(file, JobMessage::Finished(_)) if *file == taker => jobs += 1,
+				_ => {}
+			},
+			|owner| owner.parity().is_some(),
+		);
+
+		assert!(finished, "the run never completed: {jobs} jobs");
+		assert!(holder_gone >= 1, "the take-over never found its holder gone");
+		assert!(jobs <= 3, "{jobs} jobs");
+		assert!(matches!(owner.tree.file(holder).record.state, FileState::SourceGone(_)));
+		assert!(matches!(owner.tree.file(taker).record.state, FileState::Done(_)));
+		assert_eq!(fs::read(owner.settings.destination.join("a.pdf")).unwrap(), content);
+		assert!(owner.parity().unwrap().is_clean(), "{:?}", owner.parity());
 	}
 
 	#[test]

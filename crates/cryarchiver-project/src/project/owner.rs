@@ -210,9 +210,9 @@ impl Owner {
 	}
 
 	/// A finished job or a ready check can make room for more work, which then starts at once rather than on the next
-	/// tick.
-	fn message(&mut self, message: Message) {
-		let checked = matches!(message, Message::ReadyChecked(..));
+	/// tick. A file found busy frees nothing: it waits for a later tick.
+	pub(super) fn message(&mut self, message: Message) {
+		let checked = matches!(&message, Message::ReadyChecked(_, check) if *check != ReadyCheck::Busy);
 		let frees = checked || matches!(message, Message::Job(..) | Message::Hashed(..));
 		match message {
 			Message::Listed(listing, recursive) => self.on_listed(&listing, recursive),
@@ -239,13 +239,14 @@ impl Owner {
 		self.start_jobs(now);
 	}
 
-	fn tick(&mut self, now: Instant) {
+	pub(super) fn tick(&mut self, now: Instant) {
 		self.relist_hinted(now);
 		self.safety_pass(now);
 		self.pump_listings();
 		self.sample_system(now);
 		self.check_discovered(now);
 		self.retry_due(now);
+		self.requeue_due();
 		self.retry_deletes(now);
 		self.check_disk(now);
 		self.check_space_estimate(now);

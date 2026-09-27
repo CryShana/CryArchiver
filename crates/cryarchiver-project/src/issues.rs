@@ -91,8 +91,16 @@ pub enum IssueKey {
 	Unreadable(FolderId),
 }
 
-/// A folder that can't be read is only ever listed again: nothing in it is known well enough to accept or exclude.
+/// A folder that can't be read is listed again, or left out once acknowledged: nothing in it is known well enough to
+/// accept or exclude.
 pub const UNREADABLE_FOLDER_VERBS: Verbs = Verbs {
+	retry: Some("Retry"),
+	accept: Some("Acknowledge"),
+	exclude: false,
+};
+
+/// Leaving out the source folder itself would leave out everything: it is only ever listed again.
+pub const UNREADABLE_SOURCE_VERBS: Verbs = Verbs {
 	retry: Some("Retry"),
 	accept: None,
 	exclude: false,

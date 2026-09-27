@@ -10,7 +10,7 @@ use cryarchiver_engine::engine::Stage;
 use cryarchiver_engine::text::{display_name, display_path};
 
 use super::owner::Owner;
-use crate::issues::{IssueId, IssueKey, Problem, UNREADABLE_FOLDER_VERBS, Verbs};
+use crate::issues::{IssueId, IssueKey, Problem, UNREADABLE_FOLDER_VERBS, UNREADABLE_SOURCE_VERBS, Verbs};
 use crate::record::{CopyReason, FileState, How, IssueKind, MediaClass};
 use crate::schedule::Work;
 use crate::tree::{FileId, FolderId};
@@ -235,7 +235,7 @@ impl Owner {
 			progress: stats.progress,
 			kept: root.kept,
 			duplicates: root.duplicates,
-			open_issues: u64::try_from(self.issue_files.len() + self.scan.unreadable.len()).unwrap_or(u64::MAX),
+			open_issues: u64::try_from(self.issue_files.len() + self.unreadable_issues().count()).unwrap_or(u64::MAX),
 			saved_bytes: saved,
 			saved_fraction,
 			eta: self.eta(root.size.saturating_sub(root.bytes_in)),
@@ -563,14 +563,17 @@ impl Owner {
 		}
 
 		let unreadable: Vec<(FolderId, String)> = self
-			.scan
-			.unreadable
-			.iter()
-			.map(|(folder, reason)| (*folder, reason.clone()))
+			.unreadable_issues()
+			.map(|(folder, reason)| (folder, reason.clone()))
 			.collect();
 		for (folder, reason) in unreadable {
 			let entry = self.tree.folder(folder);
 			let label = self.folder_label(folder);
+			let verbs = if entry.key.is_root() {
+				UNREADABLE_SOURCE_VERBS
+			} else {
+				UNREADABLE_FOLDER_VERBS
+			};
 			issues.push(IssueView {
 				id: self.issue_ids.id(&IssueKey::Unreadable(folder)),
 				problem: Problem::SourceUnreadable,
@@ -583,8 +586,8 @@ impl Owner {
 				},
 				location: label,
 				reason: format!("the folder can't be read, so nothing in it is archived or checked: {reason}"),
-				resolution: resolution(UNREADABLE_FOLDER_VERBS),
-				verbs: UNREADABLE_FOLDER_VERBS,
+				resolution: resolution(verbs),
+				verbs,
 				attempts: 0,
 			});
 		}

@@ -304,6 +304,46 @@ pub fn write(root: &Path, relative: &str, content: &[u8]) -> PathBuf {
 	path
 }
 
+/// A folder no one may list until this is dropped: an ACL denying everyone on Windows, mode 000 on Unix.
+pub struct Unlistable(PathBuf);
+
+impl Unlistable {
+	/// `None` where the denial doesn't hold, as for root, who lists any folder.
+	pub fn deny(folder: &Path) -> Option<Self> {
+		let denied = Self(folder.to_path_buf());
+		assert!(denied.set(false), "can't deny listing {}", folder.display());
+		fs::read_dir(folder).is_err().then_some(denied)
+	}
+
+	#[cfg(windows)]
+	fn set(&self, listable: bool) -> bool {
+		let change = if listable {
+			["/remove:d", "*S-1-1-0"]
+		} else {
+			["/deny", "*S-1-1-0:(RD)"]
+		};
+		std::process::Command::new("icacls")
+			.arg(&self.0)
+			.args(change)
+			.output()
+			.is_ok_and(|out| out.status.success())
+	}
+
+	#[cfg(unix)]
+	fn set(&self, listable: bool) -> bool {
+		use std::os::unix::fs::PermissionsExt;
+
+		let mode = if listable { 0o755 } else { 0o000 };
+		fs::set_permissions(&self.0, fs::Permissions::from_mode(mode)).is_ok()
+	}
+}
+
+impl Drop for Unlistable {
+	fn drop(&mut self) {
+		self.set(true);
+	}
+}
+
 /// Bytes that start like a JPEG, so the project treats the file as media.
 pub fn jpeg(seed: u8, len: usize) -> Vec<u8> {
 	let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00];

@@ -198,6 +198,15 @@ pub struct FolderRecord {
 	pub timestamps_applied: bool,
 	pub mtime_ns: Option<i64>,
 	pub cycle: Option<CycleRecord>,
+	/// The user acknowledged that the folder can't be read: it is left out until a listing of it succeeds.
+	pub unreadable_acknowledged: bool,
+}
+
+impl FolderRecord {
+	/// Nothing below it is followed: a link back into its own tree, or a folder left out as unreadable.
+	pub fn left_out(&self) -> bool {
+		self.cycle.is_some() || self.unreadable_acknowledged
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

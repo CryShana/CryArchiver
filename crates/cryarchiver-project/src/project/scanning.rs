@@ -27,8 +27,10 @@ pub(crate) struct ScanState {
 	/// A rescan asked for while one already runs: exactly one more starts once it lands.
 	rescan_pending: bool,
 	/// Folders whose last listing failed, and why. Each is an open issue and counts as not scanned until a listing
-	/// succeeds.
+	/// succeeds, unless the user acknowledged it.
 	pub(super) unreadable: BTreeMap<FolderId, String>,
+	/// The volume's own folders at the source root this run has logged as left out.
+	skipped_logged: HashSet<OsString>,
 }
 
 impl ScanState {
@@ -101,8 +103,8 @@ impl Owner {
 		self.scan.active > 0 || !self.scan.queue.is_empty()
 	}
 
-	/// A folder that is gone is left to its parent's listing, which sees it vanish; one that can't be read is an issue
-	/// and changes nothing below it.
+	/// A folder that is gone is left to the listing of the nearest folder above it that is still there, which sees it
+	/// vanish; one that can't be read is an issue and changes nothing below it.
 	pub(super) fn on_listed(&mut self, listing: &Listing, recursive: bool) {
 		self.scan.active -= 1;
 
@@ -111,15 +113,18 @@ impl Owner {
 			return;
 		};
 
-		if listing.gone {
+		if let Some(present) = &listing.gone {
 			self.folder_readable(folder);
-			if let Some(parent) = self.tree.folder(folder).parent {
-				self.scan.push(self.tree.folder(parent).key.clone(), false);
-			}
+			self.scan.push(present.clone(), false);
 		} else if let Some(error) = &listing.error {
 			self.folder_unreadable(folder, error);
 		} else {
+			if self.tree.folder(folder).record.unreadable_acknowledged {
+				let label = self.folder_label(folder);
+				self.log(LogKind::Action, format!("{label} can be read again and is archived"));
+			}
 			self.folder_readable(folder);
+			self.log_skipped(&listing.skipped);
 			if self.leads_back(folder, listing.identity) {
 				self.found_cycle(folder);
 			} else {
@@ -134,15 +139,23 @@ impl Owner {
 	}
 
 	/// The folder is an open issue and counts as not scanned, which holds the run below 100 % and its completion
-	/// check short of clean; nothing below it changes.
+	/// check short of clean; nothing below it changes. One the user acknowledged counts as settled instead.
 	fn folder_unreadable(&mut self, folder: FolderId, reason: &str) {
-		self.tree.set_scanned(folder, false);
+		let acknowledged = self.tree.folder(folder).record.unreadable_acknowledged;
+		self.tree.set_scanned(folder, acknowledged);
 		if self.scan.unreadable.get(&folder).is_some_and(|known| known == reason) {
 			return;
 		}
 
 		let label = self.folder_label(folder);
-		self.log(LogKind::Action, format!("{label} can't be read: {reason}"));
+		if acknowledged {
+			self.log(
+				LogKind::Action,
+				format!("{label} can't be read and is left out, as acknowledged: {reason}"),
+			);
+		} else {
+			self.log(LogKind::Action, format!("{label} can't be read: {reason}"));
+		}
 		self.scan.unreadable.insert(folder, reason.to_owned());
 		self.view.issues_dirty = true;
 	}
@@ -150,6 +163,46 @@ impl Owner {
 	fn folder_readable(&mut self, folder: FolderId) {
 		if self.scan.unreadable.remove(&folder).is_some() {
 			self.view.issues_dirty = true;
+		}
+		self.tree.folder_mut(folder).record.unreadable_acknowledged = false;
+	}
+
+	/// The unreadable folders the user hasn't acknowledged: each is an open issue.
+	pub(super) fn unreadable_issues(&self) -> impl Iterator<Item = (FolderId, &String)> {
+		self.scan
+			.unreadable
+			.iter()
+			.filter(|(folder, _)| !self.tree.folder(**folder).record.unreadable_acknowledged)
+			.map(|(folder, reason)| (*folder, reason))
+	}
+
+	/// The folder is left out and counts as settled, until a listing of it succeeds.
+	pub(super) fn acknowledge_unreadable(&mut self, folder: FolderId) {
+		if !self.scan.unreadable.contains_key(&folder) || self.tree.folder(folder).record.unreadable_acknowledged {
+			return;
+		}
+
+		self.tree.folder_mut(folder).record.unreadable_acknowledged = true;
+		self.tree.set_scanned(folder, true);
+		self.save_folder(folder);
+		self.touch_folder(folder);
+		self.view.issues_dirty = true;
+
+		let label = self.folder_label(folder);
+		self.log(
+			LogKind::Action,
+			format!("{label}: acknowledged; it is left out until it can be read"),
+		);
+	}
+
+	fn log_skipped(&mut self, names: &[OsString]) {
+		for name in names {
+			if self.scan.skipped_logged.insert(name.clone()) {
+				self.log(
+					LogKind::Action,
+					format!("{} is the volume's own folder and is left out", display_name(name)),
+				);
+			}
 		}
 	}
 
@@ -428,7 +481,7 @@ impl Owner {
 
 	/// Takes a file out of every queue and wait, and cancels its job; used when its source changes or vanishes.
 	pub(super) fn withdraw(&mut self, file: FileId) {
-		self.pipeline.observed.remove(&file);
+		self.unobserve(file);
 		for queue in self.pipeline.queues.values_mut() {
 			queue.remove(file);
 		}
@@ -436,6 +489,7 @@ impl Owner {
 		self.pipeline.deferred.remove(&file);
 		self.pipeline.retries.remove(&file);
 		self.pipeline.retry_at.retain(|(_, waiting)| *waiting != file);
+		self.pipeline.requeued.retain(|(waiting, _)| *waiting != file);
 		self.pipeline.chosen_copies.remove(&file);
 		self.leave_dedup(file);
 		self.forget_reference(file);
@@ -529,7 +583,7 @@ pub(super) mod tests {
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
-	use crate::issues::Problem;
+	use crate::issues::{Problem, Verb};
 	use crate::project::{Backend, ProjectOptions, SystemSample, Tuning, create};
 	use crate::record::{CopyReason, How, Output};
 	use crate::store::Store;
@@ -848,6 +902,132 @@ pub(super) mod tests {
 			_ => false,
 		});
 		assert!(!unreadable, "a deleted folder isn't reported as unreadable");
+	}
+
+	#[test]
+	fn a_queued_folder_deleted_with_the_folder_above_it_vanishes_through_the_nearest_folder_still_there() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(source.join("A").join("B")).unwrap();
+		fs::write(source.join("A").join("a.txt"), b"a").unwrap();
+		fs::write(source.join("A").join("B").join("b.txt"), b"b").unwrap();
+		let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		list_queued(&mut owner);
+		let files: Vec<FileId> = ["A/a.txt", "A/B/b.txt"]
+			.iter()
+			.map(|path| owner.tree.file_id(&key(path)).unwrap())
+			.collect();
+
+		fs::remove_dir_all(source.join("A")).unwrap();
+		list(&mut owner, &key("A/B"), false);
+
+		assert!(owner.scan.unreadable.is_empty());
+		assert!(owner.issues_view().is_empty());
+		assert_eq!(queued(&owner), [(RelPath::root(), false)]);
+		list_queued(&mut owner);
+		for folder in ["A", "A/B"] {
+			assert!(
+				owner.tree.folder(owner.tree.folder_id(&key(folder)).unwrap()).vanished,
+				"{folder}"
+			);
+		}
+		assert!(files.iter().all(|&file| owner.tree.file(file).removed));
+		assert!(owner.issues_view().is_empty());
+		let unreadable = updates.try_iter().any(|update| match update {
+			Update::Log(entry) => entry.message.contains("can't be read"),
+			Update::Notice(notice) => notice.text.contains("can't be read"),
+			_ => false,
+		});
+		assert!(!unreadable, "a deleted folder isn't reported as unreadable");
+	}
+
+	#[test]
+	fn the_volumes_own_folders_at_the_source_root_are_never_listed_and_logged_once() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		for folder in [
+			"System Volume Information",
+			"$RECYCLE.BIN",
+			"lost+found",
+			"Photos/lost+found",
+		] {
+			fs::create_dir_all(source.join(folder)).unwrap();
+			fs::write(source.join(folder).join("x.txt"), b"x").unwrap();
+		}
+		let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
+
+		for _ in 0..2 {
+			list(&mut owner, &RelPath::root(), true);
+			list_queued(&mut owner);
+		}
+
+		for folder in ["System Volume Information", "$RECYCLE.BIN", "lost+found"] {
+			assert!(owner.tree.folder_id(&key(folder)).is_none(), "{folder}");
+		}
+		assert!(owner.tree.file_id(&key("Photos/lost+found/x.txt")).is_some());
+		assert_eq!(owner.tree.totals(FolderId::ROOT).files, 1);
+		let logged: Vec<String> = updates
+			.try_iter()
+			.filter_map(|update| match update {
+				Update::Log(entry) if entry.message.contains("the volume's own folder") => Some(entry.message),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(logged.len(), 3, "{logged:?}");
+		assert!(
+			logged
+				.iter()
+				.any(|message| message.starts_with("System Volume Information "))
+		);
+	}
+
+	fn unreadable(owner: &mut Owner, folder: &str) {
+		owner.scan.active += 1;
+		owner.on_listed(
+			&Listing {
+				folder: key(folder),
+				error: Some("Access is denied. (os error 5)".into()),
+				..Listing::default()
+			},
+			false,
+		);
+	}
+
+	#[test]
+	fn an_acknowledged_unreadable_folder_is_settled_until_a_listing_of_it_succeeds() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(source.join("Private")).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), false);
+		let private = owner.tree.folder_id(&key("Private")).unwrap();
+		unreadable(&mut owner, "Private");
+		unreadable(&mut owner, "");
+
+		let issues = owner.issues_view();
+		let (root, folder) = (&issues[0], &issues[1]);
+		assert_eq!(root.location, "the source folder");
+		assert_eq!(root.verbs.accept, None, "the source folder can't be left out");
+		assert_eq!(folder.verbs.accept, Some("Acknowledge"));
+		owner.resolve(root.id, Verb::Accept);
+		owner.resolve(folder.id, Verb::Accept);
+		list(&mut owner, &RelPath::root(), false);
+
+		assert!(owner.tree.folder(private).record.unreadable_acknowledged);
+		assert!(owner.issues_view().is_empty());
+		assert_eq!(owner.overall().open_issues, 0);
+		assert!(owner.tree.is_complete(FolderId::ROOT));
+
+		unreadable(&mut owner, "Private");
+		assert!(owner.issues_view().is_empty(), "acknowledged once is enough");
+
+		fs::write(source.join("Private").join("a.txt"), b"a").unwrap();
+		list(&mut owner, &key("Private"), false);
+
+		assert!(!owner.tree.folder(private).record.unreadable_acknowledged);
+		assert!(owner.scan.unreadable.is_empty());
+		assert!(owner.tree.file_id(&key("Private/a.txt")).is_some());
 	}
 
 	#[test]

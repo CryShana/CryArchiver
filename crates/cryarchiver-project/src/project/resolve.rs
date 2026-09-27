@@ -38,6 +38,9 @@ impl Owner {
 			Some(IssueKey::Unreadable(folder)) if verb == Verb::Retry => {
 				self.queue_listing(self.tree.folder(folder).key.clone(), true);
 			}
+			Some(IssueKey::Unreadable(folder)) if verb == Verb::Accept && folder != FolderId::ROOT => {
+				self.acknowledge_unreadable(folder);
+			}
 			Some(IssueKey::Unknown(_) | IssueKey::Cycle(_) | IssueKey::Unreadable(_)) | None => {
 				self.notice(
 					NoticeLevel::Warning,

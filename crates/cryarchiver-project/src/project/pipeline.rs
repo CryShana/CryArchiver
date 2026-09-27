@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, Stage};
@@ -30,6 +30,8 @@ use crate::view::{LogKind, NoticeLevel, size_text};
 use crate::watch::{ReadyCheck, check_ready, is_stable};
 
 const READY_CHECKS: usize = 8;
+/// The longest a file another program holds open for writing waits between two ready checks.
+const BUSY_BACKOFF: Duration = Duration::from_secs(5);
 /// How often in a session a file is archived again because its identity changed.
 const IDENTITY_CHANGES: u32 = 3;
 const IDENTITY_UNSTABLE: &str = "its identity changes every time it is read";
@@ -54,10 +56,15 @@ pub(crate) struct RunningJob {
 pub(crate) struct Pipeline {
 	pub(super) observed: HashMap<FileId, Instant>,
 	checking: HashSet<FileId>,
+	/// Files a ready check found busy: not checked again before the time, and the wait that led to it.
+	busy: HashMap<FileId, (Instant, Duration)>,
 	pub(super) queues: HashMap<Work, Queue>,
 	pub(super) waits: Waits,
 	pub(super) retry_at: BTreeSet<(Instant, FileId)>,
 	pub(super) retries: HashMap<FileId, u32>,
+	/// Work whose job ended cancelled, back at the front of its queue from the next tick on, so a job cancelled every
+	/// time it starts never restarts back to back.
+	pub(super) requeued: Vec<(FileId, Work)>,
 	pub(super) jobs: HashMap<FileId, RunningJob>,
 	/// Files ready to start again while their earlier job still winds down; they start once it has finished.
 	pub(super) deferred: HashSet<FileId>,
@@ -106,10 +113,12 @@ impl Pipeline {
 		Self {
 			observed: HashMap::new(),
 			checking: HashSet::new(),
+			busy: HashMap::new(),
 			queues: START_ORDER.iter().map(|work| (*work, Queue::default())).collect(),
 			waits: Waits::default(),
 			retry_at: BTreeSet::new(),
 			retries: HashMap::new(),
+			requeued: Vec::new(),
 			jobs: HashMap::new(),
 			deferred: HashSet::new(),
 			governor: Governor::new(config),
@@ -134,6 +143,26 @@ impl Owner {
 	/// Starts watching a discovered file for the ready rule.
 	pub(super) fn observe(&mut self, file: FileId) {
 		self.pipeline.observed.insert(file, Instant::now());
+		self.pipeline.busy.remove(&file);
+	}
+
+	/// Another program holds the file open for writing: it is checked again from the next tick on, and less often
+	/// while it stays busy.
+	fn still_busy(&mut self, file: FileId) {
+		let now = Instant::now();
+		let wait = self
+			.pipeline
+			.busy
+			.get(&file)
+			.map_or(self.tuning.tick, |&(_, wait)| (wait * 2).min(BUSY_BACKOFF));
+
+		self.pipeline.observed.insert(file, now);
+		self.pipeline.busy.insert(file, (now + wait, wait));
+	}
+
+	pub(super) fn unobserve(&mut self, file: FileId) {
+		self.pipeline.observed.remove(&file);
+		self.pipeline.busy.remove(&file);
 	}
 
 	pub(super) fn check_discovered(&mut self, now: Instant) {
@@ -144,7 +173,8 @@ impl Owner {
 			.iter()
 			.filter(|(file, since)| {
 				let record = &self.tree.file(**file).record;
-				!self.pipeline.checking.contains(file) && is_stable(record.mtime_ns, **since, now, window)
+				let due = self.pipeline.busy.get(*file).is_none_or(|&(at, _)| at <= now);
+				!self.pipeline.checking.contains(file) && due && is_stable(record.mtime_ns, **since, now, window)
 			})
 			.map(|(file, _)| *file)
 			.take(READY_CHECKS.saturating_sub(self.pipeline.checking.len()))
@@ -188,9 +218,9 @@ impl Owner {
 				self.touch_file(file);
 				self.observe(file);
 			}
-			ReadyCheck::Busy => self.observe(file),
+			ReadyCheck::Busy => self.still_busy(file),
 			ReadyCheck::Unreadable(reason) => {
-				self.pipeline.observed.remove(&file);
+				self.unobserve(file);
 				self.set_state(
 					file,
 					FileState::Issue {
@@ -202,8 +232,8 @@ impl Owner {
 				);
 			}
 			ReadyCheck::Ready { class, content } => {
-				self.pipeline.observed.remove(&file);
 				let mut record = entry.record.clone();
+				self.unobserve(file);
 				record.class = class;
 				self.tree.set_record(file, record);
 				if let Some(content) = content {
@@ -703,7 +733,7 @@ impl Owner {
 
 		let Err(err) = result else {
 			if still_ours {
-				self.requeue(file);
+				self.requeue(file, job.work);
 			} else {
 				self.member_done(file);
 				self.queue_delete(file);
@@ -717,7 +747,7 @@ impl Owner {
 		}
 
 		if job.requeue || err.kind == ErrorKind::Cancelled {
-			self.requeue(file);
+			self.requeue(file, job.work);
 			return;
 		}
 
@@ -731,7 +761,7 @@ impl Owner {
 					size_text(need)
 				),
 			);
-			self.requeue(file);
+			self.requeue(file, job.work);
 			return;
 		}
 
@@ -781,12 +811,30 @@ impl Owner {
 		self.pipeline.identity_changes.remove(&file);
 	}
 
-	/// Back to the front of the queue for the file's current role, which may have changed while its job ran.
-	fn requeue(&mut self, file: FileId) {
+	/// Back to the front of the queue on the next tick.
+	fn requeue(&mut self, file: FileId, work: Work) {
 		self.set_state(file, FileState::Queued);
-		let work = self.work_for(file);
-		if let Some(queue) = self.pipeline.queues.get_mut(&work) {
-			queue.push_front(file);
+		self.pipeline.requeued.push((file, work));
+	}
+
+	/// Work requeued since the last tick goes to the front of the queue for the file's current role, which may have
+	/// changed meanwhile; a delete is checked again first.
+	pub(super) fn requeue_due(&mut self) {
+		for (file, work) in std::mem::take(&mut self.pipeline.requeued) {
+			if work == Work::Delete {
+				self.queue_delete(file);
+				continue;
+			}
+
+			let entry = self.tree.file(file);
+			if entry.removed || entry.record.state != FileState::Queued || self.pipeline.waits.is_waiting(file) {
+				continue;
+			}
+
+			let work = self.work_for(file);
+			if let Some(queue) = self.pipeline.queues.get_mut(&work) {
+				queue.push_front(file);
+			}
 		}
 	}
 
@@ -995,7 +1043,9 @@ pub(super) mod tests {
 	use std::sync::mpsc::Receiver;
 	use std::time::Duration;
 
+	use tokio::sync::mpsc::UnboundedReceiver;
 	use tokio::sync::oneshot;
+	use tokio::time::MissedTickBehavior;
 
 	use super::*;
 	use crate::issues::{IssueKey, Verb};
@@ -1144,6 +1194,41 @@ pub(super) mod tests {
 		}
 	}
 
+	/// Runs the owner as its task does, on messages and ticks, until `done` holds or `limit` passes; `seen` sees each
+	/// message before the owner does. Returns whether `done` held.
+	pub(crate) fn drive(
+		owner: &mut Owner,
+		inbox: &mut UnboundedReceiver<Message>,
+		limit: Duration,
+		mut seen: impl FnMut(&Message),
+		mut done: impl FnMut(&Owner) -> bool,
+	) -> bool {
+		tokio::runtime::Handle::current().block_on(async {
+			let deadline = tokio::time::Instant::now() + limit;
+			let mut ticker = tokio::time::interval(owner.tuning.tick);
+			ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+			while !done(owner) {
+				tokio::select! {
+					Some(message) = inbox.recv() => {
+						seen(&message);
+						owner.message(message);
+					}
+					_ = ticker.tick() => owner.tick(Instant::now()),
+					() = tokio::time::sleep_until(deadline) => return false,
+				}
+			}
+			true
+		})
+	}
+
+	/// Starts like a PDF, so the ready check copies it as it is.
+	pub(crate) fn not_media(len: usize) -> Vec<u8> {
+		let mut bytes = b"%PDF-1.4\n".to_vec();
+		bytes.resize(len, b'x');
+		bytes
+	}
+
 	fn place(target: &Target, content: &[u8]) {
 		fs::create_dir_all(target.path.parent().unwrap()).unwrap();
 		fs::write(&target.path, content).unwrap();
@@ -1259,6 +1344,83 @@ pub(super) mod tests {
 		assert_eq!(fixture.owner.pipeline.governor.total(), 0);
 		assert!(matches!(fixture.record().state, FileState::Done(_)));
 		assert_eq!(fs::read(fixture.destination("notes.txt")).unwrap(), b"second version");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn a_file_another_program_holds_open_is_checked_at_most_once_a_tick_and_archived_once_released() {
+		use std::os::windows::fs::OpenOptionsExt;
+
+		const HELD: Duration = Duration::from_secs(1);
+
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		let _entered = runtime.enter();
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let path = source.join("mailbox.pdf");
+		fs::write(&path, not_media(1000)).unwrap();
+		let held = fs::File::options()
+			.read(true)
+			.write(true)
+			.share_mode(0)
+			.open(&path)
+			.unwrap();
+		held.set_modified(std::time::SystemTime::now() - Duration::from_hours(1))
+			.unwrap();
+
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		let mut inbox = owner.inbox.take().unwrap();
+		list(&mut owner, &RelPath::root(), true);
+		let file = owner.tree.file_id(&key("mailbox.pdf")).unwrap();
+		owner.start(false);
+
+		let mut checks = 0_u32;
+		let until = Instant::now() + HELD;
+		drive(
+			&mut owner,
+			&mut inbox,
+			HELD * 2,
+			|message| checks += u32::from(matches!(message, Message::ReadyChecked(..))),
+			|_| Instant::now() >= until,
+		);
+
+		let ticks = u32::try_from(HELD.as_millis() / owner.tuning.tick.as_millis()).unwrap();
+		assert!((1..=ticks + 1).contains(&checks), "{checks} ready checks in {HELD:?}");
+		assert_eq!(owner.tree.file(file).record.state, FileState::Discovered);
+
+		drop(held);
+		let archived = drive(
+			&mut owner,
+			&mut inbox,
+			Duration::from_secs(20),
+			|_| {},
+			|owner| matches!(owner.tree.file(file).record.state, FileState::Done(_)),
+		);
+
+		assert!(archived, "{:?}", owner.tree.file(file).record.state);
+		assert_eq!(
+			fs::read(owner.settings.destination.join("mailbox.pdf")).unwrap(),
+			not_media(1000)
+		);
+	}
+
+	#[test]
+	fn a_cancelled_job_starts_again_only_on_the_next_tick() {
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		let _entered = runtime.enter();
+		let mut fixture = Fixture::new(b"first");
+		fixture.owner.start(false);
+		fixture.running();
+
+		fixture.owner.message(Message::Job(fixture.file, cancelled()));
+
+		assert_eq!(fixture.record().state, FileState::Queued);
+		assert!(fixture.owner.pipeline.jobs.is_empty(), "restarted back to back");
+
+		fixture.owner.tick(Instant::now());
+
+		assert!(fixture.owner.pipeline.jobs.contains_key(&fixture.file));
 	}
 
 	#[test]

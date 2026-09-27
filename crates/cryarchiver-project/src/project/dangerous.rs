@@ -81,6 +81,7 @@ impl Owner {
 		}
 		self.danger.retry_at.clear();
 		self.danger.retries.clear();
+		self.pipeline.requeued.retain(|(_, work)| *work != Work::Delete);
 
 		for job in self.pipeline.jobs.values().filter(|job| job.work == Work::Delete) {
 			job.cancel.cancel();
@@ -317,7 +318,7 @@ impl Owner {
 		{
 			self.retry_delete(file, &err.kind.to_string());
 		} else if cancelled {
-			self.queue_delete(file);
+			self.pipeline.requeued.push((file, Work::Delete));
 		}
 
 		if matches!(self.tree.file(file).record.state, FileState::Done(_)) {

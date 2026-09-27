@@ -1,3 +1,5 @@
+#[path = "../../cryarchiver-project/tests/support/mod.rs"]
+mod project;
 #[path = "../../cryarchiver-engine/tests/support/mod.rs"]
 mod support;
 
@@ -185,6 +187,60 @@ fn run_with_the_source_drive_gone_exits_with_1() {
 		stdout(&out)
 	);
 	assert!(dir.path().join("archive").join("a.txt").is_file());
+}
+
+#[test]
+fn run_after_an_unreadable_folder_was_acknowledged_exits_with_0() {
+	let setup = project::setup(|_| {});
+	project::write(&setup.source, "a.txt", b"a");
+	project::write(&setup.source, "Private/b.txt", b"b");
+	let Some(_denied) = project::Unlistable::deny(&setup.source.join("Private")) else {
+		eprintln!("skipped: this user may list any folder");
+		return;
+	};
+	let run = || cryarchiver(setup.dir.path(), &["run", setup.project.to_str().unwrap()]);
+
+	let unclean = run();
+	assert_eq!(
+		unclean.status.code(),
+		Some(1),
+		"{}{}",
+		stdout(&unclean),
+		stderr(&unclean)
+	);
+	assert!(
+		stdout(&unclean).contains("Private: the folder can't be read"),
+		"{}",
+		stdout(&unclean)
+	);
+
+	{
+		let session = project::open(&setup, &project::FakeEncoder::new());
+		let mut snapshot = project::Snapshot::default();
+		session.send(cryarchiver_project::Command::Start {
+			delete_confirmed: false,
+		});
+		project::wait_for(&session, &mut snapshot, "the issue", |s| {
+			s.finished() && s.issues.iter().any(|issue| issue.location == "Private")
+		});
+		let issue = snapshot
+			.issues
+			.iter()
+			.find(|issue| issue.location == "Private")
+			.unwrap();
+		session.send(cryarchiver_project::Command::Resolve(
+			issue.id,
+			cryarchiver_project::issues::Verb::Accept,
+		));
+		project::wait_for(&session, &mut snapshot, "a clean finish", |s| {
+			s.finished() && s.issues.is_empty()
+		});
+	}
+
+	let out = run();
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	assert!(stdout(&out).contains("1 source files → 1 archived"), "{}", stdout(&out));
 }
 
 #[test]

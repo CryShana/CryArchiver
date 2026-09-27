@@ -41,9 +41,15 @@ pub struct Listing {
 	pub entries: Vec<Entry>,
 	/// The folder itself couldn't be read.
 	pub error: Option<String>,
-	/// The folder no longer exists while its parent does: it was deleted or moved away, not made unreadable.
-	pub gone: bool,
+	/// The folder no longer exists, deleted or moved away rather than made unreadable: the nearest folder above it
+	/// that is still there, whose listing sees what vanished.
+	pub gone: Option<RelPath>,
+	/// Entries never listed: the volume's own folders at the source root.
+	pub skipped: Vec<OsString>,
 }
+
+/// A volume's own folders, which only ever appear at its root.
+const VOLUME_FOLDERS: [&str; 3] = ["System Volume Information", "$RECYCLE.BIN", "lost+found"];
 
 /// Blocking: run it on a blocking thread.
 pub fn list_folder(root: &Path, folder: &RelPath) -> Listing {
@@ -58,7 +64,9 @@ pub fn list_folder(root: &Path, folder: &RelPath) -> Listing {
 	let entries = match fs::read_dir(&dir) {
 		Ok(entries) => entries,
 		Err(err) => {
-			listing.gone = !folder.is_root() && err.kind() == io::ErrorKind::NotFound && vanished(&dir);
+			if !folder.is_root() && err.kind() == io::ErrorKind::NotFound && absent(&dir) {
+				listing.gone = Some(nearest_present(root, folder));
+			}
 			listing.error = Some(err.to_string());
 			return listing;
 		}
@@ -76,6 +84,11 @@ pub fn list_folder(root: &Path, folder: &RelPath) -> Listing {
 		};
 
 		let name = entry.file_name();
+		if folder.is_root() && is_volume_folder(&name) {
+			listing.skipped.push(name);
+			continue;
+		}
+
 		let followed = match entry.file_type() {
 			Ok(kind) if kind.is_symlink() => fs::metadata(entry.path()),
 			Ok(_) => entry.metadata(),
@@ -99,14 +112,26 @@ pub fn list_folder(root: &Path, folder: &RelPath) -> Listing {
 	listing
 }
 
-/// A link whose target is offline still exists itself, so only a folder with no entry at all under a parent that is
-/// there has vanished.
-fn vanished(dir: &Path) -> bool {
-	let missing = fs::symlink_metadata(dir).is_err_and(|err| err.kind() == io::ErrorKind::NotFound);
-	missing
-		&& dir
-			.parent()
-			.is_some_and(|parent| fs::metadata(parent).is_ok_and(|meta| meta.is_dir()))
+/// No folder or link by that name: a link whose target is offline still exists itself, and its listing fails as
+/// unreadable, not gone.
+fn absent(path: &Path) -> bool {
+	match fs::symlink_metadata(path) {
+		Ok(meta) => meta.is_file(),
+		Err(err) => err.kind() == io::ErrorKind::NotFound,
+	}
+}
+
+fn nearest_present(root: &Path, folder: &RelPath) -> RelPath {
+	let mut ancestor = folder.parent().unwrap_or_else(RelPath::root);
+	while !ancestor.is_root() && absent(&ancestor.to_path(root)) {
+		ancestor = ancestor.parent().unwrap_or_else(RelPath::root);
+	}
+	ancestor
+}
+
+fn is_volume_folder(name: &OsStr) -> bool {
+	name.to_str()
+		.is_some_and(|name| VOLUME_FOLDERS.iter().any(|folder| folder.eq_ignore_ascii_case(name)))
 }
 
 /// What a folder's listing changes, compared with what the project stored for it.
@@ -232,7 +257,7 @@ mod tests {
 		let listing = list_folder(dir.path(), &RelPath::root().join(OsStr::new("missing")));
 
 		assert!(listing.error.is_some());
-		assert!(listing.gone);
+		assert_eq!(listing.gone, Some(RelPath::root()));
 		assert!(listing.entries.is_empty());
 	}
 
@@ -243,7 +268,7 @@ mod tests {
 		let listing = list_folder(&dir.path().join("unplugged"), &RelPath::root());
 
 		assert!(listing.error.is_some());
-		assert!(!listing.gone);
+		assert_eq!(listing.gone, None);
 	}
 
 	fn symlink_dir(target: &Path, link: &Path) -> bool {
@@ -299,7 +324,7 @@ mod tests {
 
 		assert!(matches!(top.entries[0].kind, EntryKind::Broken(_)));
 		assert!(linked.error.is_some());
-		assert!(!linked.gone);
+		assert_eq!(linked.gone, None);
 	}
 
 	#[cfg(unix)]

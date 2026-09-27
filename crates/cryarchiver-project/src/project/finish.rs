@@ -56,14 +56,13 @@ impl Owner {
 				continue;
 			}
 
-			if entry.record.timestamps_applied || entry.record.cycle.is_some() || self.finish.applying.contains(&folder)
-			{
+			if entry.record.timestamps_applied || entry.record.left_out() || self.finish.applying.contains(&folder) {
 				continue;
 			}
 
 			let children_pending = entry.children.iter().any(|child| {
 				let child = self.tree.folder(*child);
-				!child.record.timestamps_applied && child.record.cycle.is_none() && !child.vanished
+				!child.record.timestamps_applied && !child.record.left_out() && !child.vanished
 			});
 			if children_pending {
 				self.finish.candidates.insert(folder);
@@ -112,6 +111,7 @@ impl Owner {
 			&& self.pipeline.queues.values().all(crate::schedule::Queue::is_empty)
 			&& self.pipeline.observed.is_empty()
 			&& self.pipeline.retry_at.is_empty()
+			&& self.pipeline.requeued.is_empty()
 			&& !self.delete_retries_pending()
 			&& !self.hashes_pending()
 			&& !self.verifying()
@@ -168,7 +168,7 @@ impl Owner {
 				.map(|file| (&file.key, &file.record.state)),
 			&present,
 		);
-		report.unreadable_folders = self.scan.unreadable.len() as u64;
+		report.unreadable_folders = self.unreadable_issues().count() as u64;
 
 		self.log(LogKind::Action, format!("complete: {}", report.summary()));
 		for missing in report.missing.iter().take(LISTED_GAPS) {

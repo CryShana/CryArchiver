@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use cryarchiver_project::issues::Verb;
 use cryarchiver_project::keys::RelPath;
 use cryarchiver_project::record::{CopyReason, FileRecord, FileState, Hash, How, IssueKind, Output, mtime_ns};
 use cryarchiver_project::store::{Store, StoreError};
@@ -668,6 +669,85 @@ fn recovery_removes_the_replaced_output_only_once_the_new_one_is_placed() {
 	assert_eq!(short.replaces, Some(key("short.webp")));
 	assert!(setup.destination.join("short.webp").exists());
 	assert!(setup.destination.join("unrelated.txt").exists());
+}
+
+fn start(project: &Project) {
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+}
+
+#[test]
+fn an_acknowledged_unreadable_folder_stays_quiet_across_reopens_until_it_can_be_read() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.txt", b"a");
+	write(&setup.source, "Private/b.txt", b"b");
+	let Some(denied) = support::Unlistable::deny(&setup.source.join("Private")) else {
+		eprintln!("skipped: this user may list any folder");
+		return;
+	};
+
+	{
+		let project = support::open(&setup, &FakeEncoder::new());
+		let mut snapshot = Snapshot::default();
+		start(&project);
+		wait_for(&project, &mut snapshot, "the issue", |s| {
+			s.finished() && s.issues.iter().any(|issue| issue.location == "Private")
+		});
+		let issue = snapshot
+			.issues
+			.iter()
+			.find(|issue| issue.location == "Private")
+			.unwrap();
+		assert_eq!(issue.verbs.accept, Some("Acknowledge"));
+
+		project.send(Command::Resolve(issue.id, Verb::Accept));
+		wait_for(&project, &mut snapshot, "a clean finish", |s| {
+			s.finished()
+				&& s.issues.is_empty()
+				&& s.overall.as_ref().is_some_and(|overall| {
+					overall.open_issues == 0
+						&& overall.progress >= 1.0
+						&& overall
+							.parity
+							.is_some_and(|parity| parity.source_files == 1 && parity.archive_files == 1)
+				})
+		});
+	}
+
+	{
+		let project = support::open(&setup, &FakeEncoder::new());
+		let mut snapshot = Snapshot::default();
+		start(&project);
+		wait_for(&project, &mut snapshot, "the finish", |s| {
+			s.finished()
+				&& s.logs
+					.iter()
+					.any(|entry| entry.message.starts_with("Private can't be read and is left out"))
+		});
+		support::drain(&project, &mut snapshot);
+		assert!(snapshot.issues.is_empty(), "{:?}", snapshot.issues);
+		assert_eq!(snapshot.overall.as_ref().unwrap().open_issues, 0);
+	}
+	assert!(!setup.destination.join("Private").join("b.txt").exists());
+
+	drop(denied);
+	let project = support::open(&setup, &FakeEncoder::new());
+	let mut snapshot = Snapshot::default();
+	start(&project);
+	wait_for(&project, &mut snapshot, "the folder archived", |s| {
+		s.finished() && s.overall.as_ref().is_some_and(|overall| overall.files_done == 2)
+	});
+	drop(project);
+
+	assert_eq!(fs::read(setup.destination.join("Private").join("b.txt")).unwrap(), b"b");
+	let (_, _, loaded) = Store::open(&setup.project).unwrap();
+	let (_, private) = loaded
+		.folders
+		.iter()
+		.find(|(key, _)| key.display() == "Private")
+		.unwrap();
+	assert!(!private.unreadable_acknowledged);
 }
 
 #[test]
