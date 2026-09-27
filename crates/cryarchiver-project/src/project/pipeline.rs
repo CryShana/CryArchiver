@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, Stage};
-use cryarchiver_engine::naming::{collision_key, copied_name, destination_name};
+use cryarchiver_engine::naming::{collision_key, destination_name, placeholder_name};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError};
 use cryarchiver_engine::sink::ArchivalSink;
 use tokio_util::sync::CancellationToken;
@@ -137,6 +137,7 @@ impl Owner {
 				let mut record = entry.record.clone();
 				record.size = size;
 				record.mtime_ns = mtime_ns;
+				record.identity = None;
 				record.window_hash = None;
 				record.full_hash = None;
 				self.tree.set_record(file, record);
@@ -157,20 +158,26 @@ impl Owner {
 					},
 				);
 			}
-			ReadyCheck::Ready { class, .. } => {
+			ReadyCheck::Ready { class, content } => {
 				self.pipeline.observed.remove(&file);
 				let mut record = entry.record.clone();
 				record.class = class;
 				self.tree.set_record(file, record);
+				if let Some(content) = content {
+					self.remember_content(file, content);
+				}
+
 				self.set_state(file, FileState::Ready);
 				self.gate(file);
 			}
 		}
 	}
 
-	/// Everything a ready file waits for before it is queued.
+	/// Everything a ready file waits for before it is queued: the files a reference names, or the dedup hashes.
 	pub(super) fn gate(&mut self, file: FileId) {
-		self.enqueue(file);
+		if !self.gate_references(file) && !self.gate_duplicates(file) {
+			self.enqueue(file);
+		}
 	}
 
 	pub(super) fn enqueue(&mut self, file: FileId) {
@@ -186,7 +193,12 @@ impl Owner {
 
 	pub(super) fn work_for(&self, file: FileId) -> Work {
 		let record = &self.tree.file(file).record;
-		if self.pipeline.chosen_copies.contains(&file) || record.class == MediaClass::Other {
+		if self.is_duplicate(file) {
+			Work::Placeholder
+		} else if self.pipeline.chosen_copies.contains(&file)
+			|| record.class == MediaClass::Other
+			|| self.is_reference(file)
+		{
 			Work::Copy
 		} else {
 			Work::Encode
@@ -209,7 +221,11 @@ impl Owner {
 					break;
 				};
 
-				self.start_job(file, work, now);
+				if work == Work::Hash {
+					self.start_hash(file, now);
+				} else {
+					self.start_job(file, work, now);
+				}
 			}
 		}
 	}
@@ -220,10 +236,11 @@ impl Owner {
 			return;
 		}
 
-		let attempt = self.last_attempts.get(&entry.key).copied().unwrap_or(0) + 1;
 		let Some(task) = self.task_for(file, work) else {
 			return;
 		};
+		let entry = self.tree.file(file);
+		let attempt = self.last_attempts.get(&entry.key).copied().unwrap_or(0) + 1;
 
 		let cancel = CancellationToken::new();
 		let context = JobContext {
@@ -256,7 +273,7 @@ impl Owner {
 		tokio::spawn(context.run(task));
 	}
 
-	pub(super) fn task_for(&self, file: FileId, work: Work) -> Option<Task> {
+	pub(super) fn task_for(&mut self, file: FileId, work: Work) -> Option<Task> {
 		let entry = self.tree.file(file);
 		match work {
 			Work::Encode => Some(Task::Encode(Job {
@@ -266,12 +283,10 @@ impl Owner {
 				drop_aux: !self.settings.keep_auxiliary_images,
 				min_savings: self.settings.min_savings_fraction(),
 			})),
-			Work::Copy => Some(Task::Copy(if self.pipeline.chosen_copies.contains(&file) {
-				CopyReason::Chosen
-			} else {
-				CopyReason::NotMedia
-			})),
-			Work::Placeholder | Work::Hash | Work::Delete => None,
+			Work::Copy if self.pipeline.chosen_copies.contains(&file) => Some(Task::Copy(CopyReason::Chosen)),
+			Work::Copy => Some(self.reference_task(file).unwrap_or(Task::Copy(CopyReason::NotMedia))),
+			Work::Placeholder => self.duplicate_task(file),
+			Work::Hash | Work::Delete => None,
 		}
 	}
 
@@ -339,15 +354,22 @@ impl Owner {
 		}
 
 		let path = self.output_path(file, made);
-		let how = match made {
-			Made::Encoded { .. } => How::Encoded,
-			Made::Copied(reason) => How::Copied(*reason),
+		let (how, hash) = match made {
+			Made::Encoded { .. } => (How::Encoded, Some(staged.hash)),
+			Made::Copied(reason) => (How::Copied(*reason), Some(staged.hash)),
+			Made::Placeholder { canonical } => (
+				How::Placeholder {
+					canonical: canonical.clone(),
+				},
+				Some(staged.hash),
+			),
+			Made::Moved { how, hash, .. } => (how.clone(), *hash),
 		};
 		let output = Output {
 			how,
 			path: path.clone(),
 			size: staged.size,
-			hash: Some(staged.hash),
+			hash,
 		};
 
 		let entry = self.tree.file(file);
@@ -398,7 +420,9 @@ impl Owner {
 		}
 
 		let previous = entry.record.replaces.clone();
-		if let Some(previous) = previous.filter(|previous| *previous != output.path) {
+		if let Some(previous) =
+			previous.filter(|previous| *previous != output.path && !self.claimed_by_other(file, previous))
+		{
 			self.release_claim(file, &previous);
 			self.remove_replaced_output(&previous, &output.path);
 		}
@@ -455,6 +479,8 @@ impl Owner {
 		let Err(err) = result else {
 			if still_ours {
 				self.requeue(file, job.work);
+			} else {
+				self.member_done(file);
 			}
 			return;
 		};
@@ -570,12 +596,18 @@ impl Owner {
 	fn output_path(&self, file: FileId, made: &Made) -> RelPath {
 		let entry = self.tree.file(file);
 		let base = match made {
-			Made::Encoded { extension } => self
+			Made::Encoded { extension }
+			| Made::Moved {
+				how: How::Encoded,
+				extension,
+				..
+			} => self
 				.tree
 				.folder(entry.folder)
 				.naming
 				.encoded_name(&entry.name, std::ffi::OsStr::new(extension)),
-			Made::Copied(_) => self.copied_output_name(file),
+			Made::Copied(_) | Made::Moved { .. } => self.copied_output_name(file),
+			Made::Placeholder { .. } => placeholder_name(&entry.name),
 		};
 
 		let mut candidate = base.clone();
@@ -592,10 +624,6 @@ impl Owner {
 		self.destination_folder(entry.folder).join(&candidate)
 	}
 
-	pub(super) fn copied_output_name(&self, file: FileId) -> OsString {
-		copied_name(&self.tree.file(file).name)
-	}
-
 	/// The mirrored folder: every name mapped to one the destination can hold.
 	pub(super) fn destination_folder(&self, folder: FolderId) -> RelPath {
 		self.tree
@@ -603,6 +631,11 @@ impl Owner {
 			.key
 			.components()
 			.fold(RelPath::root(), |path, name| path.join(&destination_name(&name)))
+	}
+
+	pub(super) fn claimed_by_other(&self, file: FileId, path: &RelPath) -> bool {
+		let key = (self.tree.file(file).folder, collision_key(&path.name()));
+		self.pipeline.claims.get(&key).is_some_and(|holder| *holder != file)
 	}
 
 	pub(super) fn claim(&mut self, file: FileId, path: &RelPath) {

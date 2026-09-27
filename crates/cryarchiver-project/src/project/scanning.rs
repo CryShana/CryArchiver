@@ -294,6 +294,8 @@ impl Owner {
 		}
 		self.pipeline.waits.forget(file);
 		self.pipeline.chosen_copies.remove(&file);
+		self.leave_dedup(file);
+		self.forget_reference(file);
 		if let Some(job) = self.pipeline.jobs.get(&file) {
 			job.cancel.cancel();
 		}
@@ -431,7 +433,7 @@ mod tests {
 		};
 
 		(
-			Owner::open(store, meta.settings, loaded, options, updates).unwrap(),
+			Owner::open(&project, store, meta.settings, loaded, options, updates).unwrap(),
 			received,
 		)
 	}

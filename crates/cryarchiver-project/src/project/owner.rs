@@ -11,6 +11,9 @@ use cryarchiver_engine::text::display_name;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 
+use super::dependencies::ReferenceState;
+use super::duplicates::{DedupState, HashRequest};
+use super::finish::FinishState;
 use super::jobs::JobMessage;
 use super::pipeline::Pipeline;
 use super::publish::ViewState;
@@ -18,8 +21,9 @@ use super::scanning::ScanState;
 use super::{Backend, Command, Fault, SystemSample, Tuning};
 use crate::issues::IssueIds;
 use crate::keys::RelPath;
-use crate::record::{FileState, Identity};
-use crate::scan::Listing;
+use crate::record::{FileState, Hash, Identity};
+use crate::references;
+use crate::scan::{DestinationFile, Listing};
 use crate::settings::{Settings, SettingsChange};
 use crate::store::{Store, StoreError};
 use crate::tree::{FileId, FolderId, Tree};
@@ -39,10 +43,14 @@ pub(crate) enum Message {
 	Listed(Listing, bool),
 	ReadyChecked(FileId, ReadyCheck),
 	Job(FileId, JobMessage),
+	Hashed(FileId, HashRequest, Result<(Option<Identity>, Hash), String>),
+	FolderFinished(FolderId, Result<(), String>),
+	DestinationWalked(Vec<DestinationFile>),
 }
 
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Owner {
+	pub(super) project_file: PathBuf,
 	pub(super) settings: Settings,
 	pub(super) store: Store,
 	pub(super) tree: Tree,
@@ -62,6 +70,9 @@ pub(crate) struct Owner {
 	pub(super) crashed: bool,
 	pub(super) scan: ScanState,
 	pub(super) pipeline: Pipeline,
+	pub(super) dedup: DedupState,
+	pub(super) references: ReferenceState,
+	pub(super) finish: FinishState,
 	pub(super) view: ViewState,
 	pub(super) issue_ids: IssueIds,
 	pub(super) issue_files: BTreeSet<FileId>,
@@ -130,13 +141,24 @@ impl Owner {
 				continue;
 			}
 
+			let reference = references::kind_of(&self.tree.file(file).name).is_some();
 			match self.tree.file(file).record.state {
 				FileState::Discovered => self.observe(file),
-				FileState::Ready => self.gate(file),
-				FileState::Queued => self.enqueue(file),
+				FileState::Ready | FileState::Queued if reference => {
+					self.set_state(file, FileState::Discovered);
+					self.observe(file);
+				}
+				FileState::Ready | FileState::Queued => self.gate(file),
+				FileState::Done(_)
+				| FileState::SourceGone(_)
+				| FileState::DeletePending(_)
+				| FileState::OriginalDeleted(_)
+				| FileState::Issue { .. } => self.join_dedup(file),
 				_ => {}
 			}
 		}
+
+		self.plan_dedup_groups();
 	}
 
 	fn command(&mut self, command: Command) {
@@ -167,6 +189,9 @@ impl Owner {
 			Message::Listed(listing, recursive) => self.on_listed(&listing, recursive),
 			Message::ReadyChecked(file, check) => self.on_ready_checked(file, check),
 			Message::Job(file, message) => self.on_job(file, message),
+			Message::Hashed(file, request, hash) => self.on_hashed(file, request, hash),
+			Message::FolderFinished(folder, result) => self.on_folder_finished(folder, result),
+			Message::DestinationWalked(files) => self.on_destination_walked(&files),
 		}
 	}
 
@@ -177,6 +202,8 @@ impl Owner {
 		self.retry_due(now);
 		self.check_disk(now);
 		self.start_jobs(now);
+		self.finish_folders();
+		self.check_completion();
 	}
 
 	fn sample_system(&mut self, now: Instant) {

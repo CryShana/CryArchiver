@@ -77,6 +77,7 @@ impl Owner {
 			(IssueKind::OutputMissing, Verb::Accept) => self.accept_output(file, output),
 			(_, Verb::Exclude) => {
 				self.set_state(file, FileState::Excluded);
+				self.leave_dedup(file);
 				self.file_settled(file);
 			}
 			_ => return,

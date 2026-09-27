@@ -1,6 +1,9 @@
 //! The project task and its handle (project layer spec §11). One task owns the in-memory state and the project file;
 //! every change goes through it. Front ends send [`Command`]s and fold the [`Update`]s it sends back.
 
+mod dependencies;
+mod duplicates;
+mod finish;
 mod jobs;
 mod open;
 mod owner;
@@ -173,7 +176,7 @@ impl Project {
 		let settings = meta.settings.clone();
 		let owner = {
 			let _entered = runtime.enter();
-			Owner::open(store, meta.settings, loaded, options, updates_sender)?
+			Owner::open(path, store, meta.settings, loaded, options, updates_sender)?
 		};
 		let handle = runtime.spawn(owner.run(inputs));
 

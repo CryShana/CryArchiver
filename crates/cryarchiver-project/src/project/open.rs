@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
@@ -10,6 +11,9 @@ use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::workspace::sweep;
 use tokio::sync::mpsc::unbounded_channel;
 
+use super::dependencies::ReferenceState;
+use super::duplicates::DedupState;
+use super::finish::FinishState;
 use super::owner::Owner;
 use super::pipeline::Pipeline;
 use super::publish::ViewState;
@@ -28,6 +32,7 @@ use crate::view::Update;
 
 impl Owner {
 	pub(super) fn open(
+		project_file: &Path,
 		store: Store,
 		settings: Settings,
 		loaded: Loaded,
@@ -49,6 +54,7 @@ impl Owner {
 		);
 
 		let mut owner = Self {
+			project_file: project_file.to_path_buf(),
 			destination_identity: file_id(&settings.destination).ok().map(Identity::from),
 			enclosing_identities: settings
 				.source
@@ -72,6 +78,9 @@ impl Owner {
 			crashed: false,
 			scan: ScanState::default(),
 			pipeline,
+			dedup: DedupState::default(),
+			references: ReferenceState::default(),
+			finish: FinishState::default(),
 			view: ViewState::default(),
 			issue_ids: IssueIds::default(),
 			issue_files: BTreeSet::new(),

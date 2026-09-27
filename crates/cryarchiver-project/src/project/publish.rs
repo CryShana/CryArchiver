@@ -16,7 +16,7 @@ use crate::schedule::Work;
 use crate::tree::{FileId, FolderId};
 use crate::view::{
 	Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, LogEntry, LogKind, Notice,
-	NoticeLevel, Overall, RowState, RunState, Status, Update, Worker,
+	NoticeLevel, Overall, Parity, PathLink, RowState, RunState, Status, Update, Worker,
 };
 
 const THROUGHPUT_WINDOW: Duration = Duration::from_mins(5);
@@ -79,6 +79,9 @@ impl Owner {
 
 	pub(super) fn touch_folder(&mut self, folder: FolderId) {
 		let ancestors: Vec<FolderId> = self.tree.ancestors(folder).collect();
+		for &ancestor in &ancestors {
+			self.folder_may_finish(ancestor);
+		}
 		self.view.dirty_folders.extend(ancestors);
 	}
 
@@ -190,6 +193,10 @@ impl Owner {
 			RunState::Paused
 		} else if self.pipeline.disk.is_paused() {
 			RunState::PausedLowDisk
+		} else if self.parity().is_some() && self.settings.watch {
+			RunState::Watching
+		} else if self.parity().is_some() {
+			RunState::Finished
 		} else {
 			RunState::Running
 		};
@@ -229,7 +236,11 @@ impl Owner {
 			saved_bytes: saved,
 			saved_fraction,
 			eta: self.eta(root.size.saturating_sub(root.bytes_in)),
-			parity: None,
+			parity: self.parity().map(|report| Parity {
+				source_files: report.source_files,
+				archive_files: report.archive_files,
+				excluded: report.excluded,
+			}),
 			originals_deleted: root.originals_deleted,
 		}
 	}
@@ -271,6 +282,7 @@ impl Owner {
 		let job = self.pipeline.jobs.get(&file);
 		match &self.tree.file(file).record.state {
 			FileState::Queued if self.waiting(file) => RowState::Waiting,
+			FileState::Ready if self.hashing(file) || self.is_duplicate(file) => RowState::Waiting,
 			FileState::Discovered | FileState::Ready | FileState::Queued => RowState::Queued,
 			FileState::InProgress { .. } if job.is_some_and(|job| job.video_waiting) => RowState::Waiting,
 			FileState::InProgress { .. } if job.is_some_and(|job| job.stage == Some(Stage::Verify)) => {
@@ -426,6 +438,7 @@ impl Owner {
 
 	pub(super) fn details(&mut self, file: FileId) -> Details {
 		let issue = self.issue_files.contains(&file).then(|| self.file_issue_view(file));
+		let duplicates = self.duplicate_links(file);
 		let entry = self.tree.file(file);
 		let record = &entry.record;
 		let output = record.state.output();
@@ -464,8 +477,37 @@ impl Owner {
 			bytes_out: status.bytes_out,
 			plan,
 			log_tail: notes,
-			duplicates: Duplicates::None,
+			duplicates,
 			issue,
+		}
+	}
+
+	fn duplicate_links(&self, file: FileId) -> Duplicates {
+		let link = |other: FileId| {
+			let entry = self.tree.file(other);
+			PathLink {
+				file: other,
+				folder: entry.folder,
+				path: entry.key.display(),
+			}
+		};
+
+		if let Some(canonical) = self.canonical_of(file).or_else(|| self.placeholder_target(file)) {
+			return Duplicates::PlaceholderOf(link(canonical));
+		}
+
+		let duplicates = self.duplicates_of(file);
+		if duplicates.is_empty() {
+			Duplicates::None
+		} else {
+			Duplicates::CanonicalOf(duplicates.into_iter().map(link).collect())
+		}
+	}
+
+	fn placeholder_target(&self, file: FileId) -> Option<FileId> {
+		match &self.tree.file(file).record.state.output()?.how {
+			How::Placeholder { canonical } => self.tree.file_id(canonical),
+			_ => None,
 		}
 	}
 

@@ -82,11 +82,12 @@ pub fn move_into_place(staged: &Path, target: &Path, own_previous: Option<&Path>
 }
 
 /// The placeholder's text (project layer spec §7). `link` is the path from the placeholder to the canonical output.
-pub fn placeholder_text(link: &str, source: &str, size: u64, hash: Hash) -> String {
+/// Without a hash the duplicate is the same file reached twice (a hard link or a link), which is never hashed.
+pub fn placeholder_text(link: &str, source: &str, size: u64, hash: Option<Hash>) -> String {
 	let link = link.replace('/', MAIN_SEPARATOR_STR);
+	let hash = hash.map_or_else(|| "the same file as the archived copy".to_owned(), Hash::to_hex);
 	format!(
-		"This file is a duplicate. The archived copy is here:\n{link}\n\nOriginal file: {source}\nSize: {size} · BLAKE3: {}\n",
-		hash.to_hex()
+		"This file is a duplicate. The archived copy is here:\n{link}\n\nOriginal file: {source}\nSize: {size} · BLAKE3: {hash}\n"
 	)
 }
 
@@ -771,7 +772,7 @@ mod tests {
 
 	#[test]
 	fn placeholders_name_the_archived_copy() {
-		let text = placeholder_text("../Photos/a.avif", "Backup/a.jpg", 70_000, Hash([0xAB; 32]));
+		let text = placeholder_text("../Photos/a.avif", "Backup/a.jpg", 70_000, Some(Hash([0xAB; 32])));
 
 		let link = ["..", "Photos", "a.avif"].join(MAIN_SEPARATOR_STR);
 		assert_eq!(
