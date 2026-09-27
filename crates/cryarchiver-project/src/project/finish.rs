@@ -111,6 +111,7 @@ impl Owner {
 			&& self.pipeline.retry_at.is_empty()
 			&& !self.hashes_pending()
 			&& self.groups_planned()
+			&& self.watching.debouncer.is_empty()
 			&& self.finish.applying.is_empty()
 			&& self.finish.candidates.is_empty()
 	}

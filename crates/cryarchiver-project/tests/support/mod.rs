@@ -185,6 +185,7 @@ pub fn tuning() -> Tuning {
 		disk_poll: Duration::from_millis(100),
 		listings: 4,
 		max_encodes: 4,
+		watcher: true,
 	}
 }
 

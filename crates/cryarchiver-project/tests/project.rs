@@ -626,6 +626,8 @@ fn a_folder_moved_out_and_back_is_archived_as_it_was() {
 	let setup = setup(|_| {});
 	write(&setup.source, "A/a.txt", b"a");
 	write(&setup.source, "A/B/b.txt", b"bb");
+	write(&setup.destination, "A/a.txt", b"a");
+	write(&setup.destination, "A/B/b.txt", b"bb");
 	seed(&setup, "A/a.txt", with_state(FileState::Done(copied("A/a.txt", 1))));
 	seed(&setup, "A/B/b.txt", with_state(FileState::Done(copied("A/B/b.txt", 2))));
 	let moved = setup.dir.path().join("moved");
@@ -660,6 +662,7 @@ fn archived_files_whose_source_comes_back_are_picked_up() {
 	write(&setup.source, "back.txt", b"back");
 	write(&setup.source, "restored.txt", b"restored");
 	write(&setup.source, "edited.txt", b"edited");
+	write(&setup.destination, "restored.txt", b"restored");
 	seed(
 		&setup,
 		"back.txt",

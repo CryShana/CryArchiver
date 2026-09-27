@@ -562,6 +562,8 @@ impl Owner {
 				});
 			}
 		}
+
+		issues.extend(self.unknown_issues());
 		issues
 	}
 

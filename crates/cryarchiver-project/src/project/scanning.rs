@@ -24,8 +24,12 @@ impl Owner {
 	/// The full reconcile of the source: every folder is listed again.
 	pub(super) fn start_scan(&mut self) {
 		self.scan.complete = false;
-		self.scan.queue.push_back((RelPath::root(), true));
 		self.view.status_dirty = true;
+		self.queue_listing(RelPath::root(), true);
+	}
+
+	pub(super) fn queue_listing(&mut self, folder: RelPath, recursive: bool) {
+		self.scan.queue.push_back((folder, recursive));
 		self.pump_listings();
 	}
 
@@ -461,7 +465,7 @@ pub(super) mod tests {
 		owner.on_listed(&listing, recursive);
 	}
 
-	fn list_queued(owner: &mut Owner) {
+	pub(crate) fn list_queued(owner: &mut Owner) {
 		while let Some((folder, recursive)) = owner.scan.queue.pop_front() {
 			list(owner, &folder, recursive);
 		}

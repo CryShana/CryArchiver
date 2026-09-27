@@ -18,6 +18,7 @@ use super::owner::Owner;
 use super::pipeline::Pipeline;
 use super::publish::ViewState;
 use super::scanning::ScanState;
+use super::watching::WatchState;
 use super::{ProjectError, ProjectOptions};
 use crate::dedup::full_hash;
 use crate::issues::IssueIds;
@@ -29,6 +30,7 @@ use crate::settings::Settings;
 use crate::store::{Loaded, Store};
 use crate::tree::{FileId, FolderId, Tree};
 use crate::view::Update;
+use crate::watch::Debouncer;
 
 impl Owner {
 	pub(super) fn open(
@@ -41,6 +43,12 @@ impl Owner {
 	) -> Result<Self, ProjectError> {
 		fs::create_dir_all(&settings.destination)?;
 		let (messages, inbox) = unbounded_channel();
+		let unknown = loaded
+			.unknown
+			.iter()
+			.map(|(path, record)| (path.clone(), record.acknowledged))
+			.collect();
+		let watching = WatchState::new(Debouncer::new(options.tuning.debounce), unknown);
 		let memory = Arc::new(MemoryBudget::default());
 		let image_threads = std::thread::available_parallelism().map_or(1, usize::from);
 		let pipeline = Pipeline::new(
@@ -81,6 +89,7 @@ impl Owner {
 			dedup: DedupState::default(),
 			references: ReferenceState::default(),
 			finish: FinishState::default(),
+			watching,
 			view: ViewState::default(),
 			issue_ids: IssueIds::default(),
 			issue_files: BTreeSet::new(),

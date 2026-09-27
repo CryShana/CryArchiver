@@ -67,6 +67,13 @@ pub(crate) struct Pipeline {
 	pub(super) workers_dirty: bool,
 }
 
+impl RunningJob {
+	/// The output named in the job's commit intent, until it is placed or taken.
+	pub(super) fn pending_output(&self) -> Option<&Output> {
+		self.pending.as_ref()
+	}
+}
+
 impl Pipeline {
 	pub(crate) fn new(
 		destination: &Path,
@@ -476,6 +483,7 @@ impl Owner {
 		self.tree.set_record(file, record);
 		self.pipeline.retries.remove(&file);
 		self.set_state(file, FileState::Done(output));
+		self.output_placed_during_walk(file);
 		self.forget_reference_content(file);
 		if self.dedup_placed(file) {
 			self.file_settled(file);
@@ -499,6 +507,7 @@ impl Owner {
 		self.save_file(file);
 		self.touch_file(file);
 		self.file_added(file);
+		self.output_placed_during_walk(file);
 	}
 
 	/// A file became Done or was resolved: whatever waited for it may go on.

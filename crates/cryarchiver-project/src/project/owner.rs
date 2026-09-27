@@ -18,6 +18,7 @@ use super::jobs::JobMessage;
 use super::pipeline::Pipeline;
 use super::publish::ViewState;
 use super::scanning::ScanState;
+use super::watching::WatchState;
 use super::{Backend, Command, Fault, SystemSample, Tuning};
 use crate::issues::IssueIds;
 use crate::keys::RelPath;
@@ -28,7 +29,7 @@ use crate::settings::{Settings, SettingsChange};
 use crate::store::{Store, StoreError};
 use crate::tree::{FileId, FolderId, Tree};
 use crate::view::{NoticeLevel, SystemView, Update};
-use crate::watch::ReadyCheck;
+use crate::watch::{Hint, ReadyCheck};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -46,6 +47,9 @@ pub(crate) enum Message {
 	Hashed(FileId, HashRequest, HashOutcome),
 	FolderFinished(FolderId, Result<(), String>),
 	DestinationWalked(Vec<DestinationFile>),
+	Hint(Hint),
+	FoldersChanged(Vec<RelPath>),
+	DestinationListed(Vec<DestinationFile>),
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -73,6 +77,7 @@ pub(crate) struct Owner {
 	pub(super) dedup: DedupState,
 	pub(super) references: ReferenceState,
 	pub(super) finish: FinishState,
+	pub(super) watching: WatchState,
 	pub(super) view: ViewState,
 	pub(super) issue_ids: IssueIds,
 	pub(super) issue_files: BTreeSet<FileId>,
@@ -130,7 +135,9 @@ impl Owner {
 		self.publish();
 
 		self.resume_queued();
+		self.start_watching();
 		self.start_scan();
+		self.reconcile_destination();
 	}
 
 	/// Files the last run left waiting go back into the pipeline.
@@ -170,7 +177,10 @@ impl Owner {
 				let running: Vec<FileId> = self.pipeline.jobs.keys().copied().collect();
 				self.cancel_and_requeue(&running);
 			}
-			Command::Rescan => self.start_scan(),
+			Command::Rescan => {
+				self.start_scan();
+				self.reconcile_destination();
+			}
 			Command::ChangeSettings(change) => self.change_settings(change),
 			Command::Watch(folder, watched) => self.watch_folder(folder, watched),
 			Command::Filter(query) => self.set_filter(query),
@@ -192,10 +202,15 @@ impl Owner {
 			Message::Hashed(file, request, hash) => self.on_hashed(file, request, hash),
 			Message::FolderFinished(folder, result) => self.on_folder_finished(folder, result),
 			Message::DestinationWalked(files) => self.on_destination_walked(&files),
+			Message::Hint(hint) => self.on_hint(hint),
+			Message::FoldersChanged(folders) => self.on_folders_changed(folders),
+			Message::DestinationListed(files) => self.on_destination_listed(&files),
 		}
 	}
 
 	fn tick(&mut self, now: Instant) {
+		self.relist_hinted(now);
+		self.safety_pass(now);
 		self.pump_listings();
 		self.sample_system(now);
 		self.check_discovered(now);
@@ -359,7 +374,7 @@ impl Owner {
 
 	/// Once a re-archive's new output is placed, removes the earlier output it replaces: only that exact recorded
 	/// path inside the destination, never the new output itself. Blocking: one file removal.
-	pub(super) fn remove_replaced_output(&self, previous: &RelPath, placed: &RelPath) {
+	pub(super) fn remove_replaced_output(&mut self, previous: &RelPath, placed: &RelPath) {
 		let plain = previous.components().all(|name| {
 			let mut parts = Path::new(&name).components();
 			matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None))
@@ -368,6 +383,7 @@ impl Owner {
 			return;
 		}
 
+		self.output_vacated_during_walk(previous);
 		match fs::remove_file(self.destination_path(previous)) {
 			Err(err) if err.kind() != io::ErrorKind::NotFound => self.notice(
 				NoticeLevel::Warning,

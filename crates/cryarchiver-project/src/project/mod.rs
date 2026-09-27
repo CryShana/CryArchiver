@@ -11,6 +11,7 @@ mod pipeline;
 mod publish;
 mod resolve;
 mod scanning;
+mod watching;
 
 use std::ffi::OsStr;
 use std::fs;
@@ -46,6 +47,8 @@ pub struct Tuning {
 	pub disk_poll: Duration,
 	pub listings: usize,
 	pub max_encodes: usize,
+	/// Watcher events; the safety pass runs either way.
+	pub watcher: bool,
 }
 
 impl Default for Tuning {
@@ -60,6 +63,7 @@ impl Default for Tuning {
 			disk_poll: Duration::from_mins(1),
 			listings: 4,
 			max_encodes: std::thread::available_parallelism().map_or(4, usize::from),
+			watcher: true,
 		}
 	}
 }

@@ -13,6 +13,7 @@ impl Owner {
 		match self.issue_ids.key(issue).cloned() {
 			Some(IssueKey::File(file)) => self.resolve_file(file, verb),
 			Some(IssueKey::Cycle(folder)) if verb == Verb::Accept => self.acknowledge_cycle(folder),
+			Some(IssueKey::Unknown(path)) if verb == Verb::Accept => self.acknowledge_unknown(&path),
 			Some(IssueKey::Unknown(_) | IssueKey::Cycle(_)) | None => {
 				self.notice(
 					NoticeLevel::Warning,

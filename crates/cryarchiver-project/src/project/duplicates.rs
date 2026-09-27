@@ -520,6 +520,36 @@ impl Owner {
 		self.gate(file);
 	}
 
+	/// Whether the file's archived output went, or is going, to a shallower copy by a take-over: a canonical copy's
+	/// move is planned or running, or a crash cut the swap short after the move, and a copy ahead of it in canonical
+	/// order holds that content now. The group then decides again, and the file becomes its placeholder.
+	pub(super) fn output_taken_over(&mut self, file: FileId, output: &Output) -> bool {
+		if self.dedup.moves.values().any(|holder| *holder == file) {
+			return true;
+		}
+
+		let Some(hash) = output.hash else {
+			return false;
+		};
+		let entry = self.tree.file(file);
+		let size = entry.record.size;
+		let taken = self.dedup.by_size.get(&size).is_some_and(|members| {
+			members.contains(&file)
+				&& members.iter().any(|&member| {
+					member != file
+						&& dedup::canonical_order(&self.tree.file(member).key, &entry.key).is_lt()
+						&& self.canonical_output(member).is_some_and(|held| {
+							held.hash == Some(hash) && held.size == output.size && held.path != output.path
+						})
+				})
+		});
+
+		if taken {
+			self.dedup.dirty.insert(size);
+		}
+		taken
+	}
+
 	pub(super) fn is_duplicate(&self, file: FileId) -> bool {
 		self.dedup.canonical_of.contains_key(&file) || self.dedup.moves.contains_key(&file)
 	}
@@ -865,6 +895,27 @@ mod tests {
 			size: SIZE,
 			hash: Some(Hash([1; 32])),
 		}
+	}
+
+	#[test]
+	fn an_output_a_take_over_is_moving_is_never_reported_missing() {
+		let mut fixture = Fixture::new();
+		let holder = fixture.add(
+			"held.bin",
+			FileRecord {
+				state: FileState::Done(copied("held.bin")),
+				..FileRecord::discovered(SIZE, 1)
+			},
+		);
+		let canonical = fixture.add("a.bin", ready(None, 1));
+		fixture.owner.dedup.moves.insert(canonical, holder);
+
+		fixture.owner.on_destination_listed(&[]);
+
+		assert_eq!(
+			fixture.owner.tree.file(holder).record.state,
+			FileState::Done(copied("held.bin"))
+		);
 	}
 
 	#[test]
