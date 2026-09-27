@@ -4,6 +4,7 @@ mod gif;
 pub mod icc;
 pub mod iptc;
 mod jpeg;
+mod output;
 mod png;
 mod riff;
 pub mod xmp;
@@ -12,6 +13,7 @@ use std::fmt;
 
 use crate::container::{isobmff, jxl};
 use crate::metadata::icc::Cicp;
+pub use crate::metadata::output::{MetadataMode, OutputMetadata, build_output};
 
 const TIFF_XMP: u16 = 700;
 const TIFF_IPTC: u16 = 33723;
