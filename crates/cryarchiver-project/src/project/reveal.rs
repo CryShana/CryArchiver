@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use cryarchiver_engine::process::limits;
 use cryarchiver_engine::text::display_path;
 
 use super::Target;
@@ -59,7 +60,7 @@ fn open_in_file_manager(folder: &Path) -> io::Result<()> {
 
 	let (program, mut command) = file_manager(folder);
 	command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-	let mut child = command.spawn().map_err(|err| {
+	let mut child = limits::spawn_outside_limits(&mut command).map_err(|err| {
 		if err.kind() == io::ErrorKind::NotFound {
 			io::Error::new(io::ErrorKind::NotFound, format!("{program} isn't installed"))
 		} else {

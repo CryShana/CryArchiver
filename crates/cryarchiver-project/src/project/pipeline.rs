@@ -2,7 +2,7 @@
 //! the commit intent, retries and issues.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use cryarchiver_engine::engine::{Encode, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::{collision_key, destination_name, placeholder_name};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError};
 use cryarchiver_engine::sink::ArchivalSink;
+use cryarchiver_engine::workspace::ARCHIVE_DIR;
 use tokio_util::sync::CancellationToken;
 
 use super::jobs::{JobContext, JobMessage, Made, SourceIdentity, Target, Task};
@@ -28,6 +29,9 @@ use crate::view::{LogKind, NoticeLevel};
 use crate::watch::{ReadyCheck, check_ready, is_stable};
 
 const READY_CHECKS: usize = 8;
+/// How often in a session a file is archived again because its identity changed.
+const IDENTITY_CHANGES: u32 = 3;
+const IDENTITY_UNSTABLE: &str = "its identity changes every time it is read";
 const START_ORDER: [Work; 5] = [Work::Placeholder, Work::Hash, Work::Delete, Work::Copy, Work::Encode];
 const DELETES_FIRST: [Work; 5] = [Work::Placeholder, Work::Delete, Work::Hash, Work::Copy, Work::Encode];
 
@@ -70,6 +74,7 @@ pub(crate) struct Pipeline {
 	taken: HashSet<(RelPath, String)>,
 	pub(super) notes: HashMap<FileId, Vec<String>>,
 	pub(super) workers_dirty: bool,
+	identity_changes: HashMap<FileId, u32>,
 }
 
 impl RunningJob {
@@ -113,6 +118,7 @@ impl Pipeline {
 			taken: HashSet::new(),
 			notes: HashMap::new(),
 			workers_dirty: false,
+			identity_changes: HashMap::new(),
 		}
 	}
 }
@@ -369,6 +375,8 @@ impl Owner {
 					job.not_same_file = true;
 				}
 			}
+			JobMessage::SourceChanged(now) => self.job_source_changed(file, now),
+			JobMessage::CanonicalChanged { canonical, now } => self.canonical_changed(&canonical, now),
 			JobMessage::DeleteIntent { reply } => {
 				let go_on = self.delete_intent(file);
 				let _ = reply.send(go_on);
@@ -377,6 +385,28 @@ impl Owner {
 			JobMessage::DeleteRefused(refusal) => self.delete_refused(file, refusal),
 			JobMessage::Finished(result) => self.job_finished(file, result),
 		}
+	}
+
+	/// The job found its source changed since the record was made, with no listing to say so: the file is archived
+	/// again as it is now.
+	fn job_source_changed(&mut self, file: FileId, now: Option<(u64, i64)>) {
+		let entry = self.tree.file(file);
+		let ours = matches!(
+			entry.record.state,
+			FileState::InProgress { .. } | FileState::Committing { .. }
+		);
+		let Some((size, mtime_ns)) = now.filter(|&now| now != (entry.record.size, entry.record.mtime_ns)) else {
+			return;
+		};
+		if entry.removed || !ours {
+			return;
+		}
+
+		self.note(
+			file,
+			"the source changed before it was archived: archiving it again".into(),
+		);
+		self.source_changed(file, size, mtime_ns);
 	}
 
 	fn on_job_event(&mut self, file: FileId, event: JobEvent) {
@@ -440,7 +470,7 @@ impl Owner {
 				file,
 				"the source was replaced by another file: archiving it again".into(),
 			);
-			self.source_changed(file, size, mtime_ns);
+			self.identity_changed(file, size, mtime_ns);
 			return None;
 		}
 
@@ -511,9 +541,10 @@ impl Owner {
 	}
 
 	/// The output is in place, and only now proven ours. A file whose source changed meanwhile keeps the state that
-	/// change gave it, and its re-archive replaces this output; a file whose source vanished keeps it as `SourceGone`;
-	/// a placeholder that adopted its canonical copy's output meanwhile lets this one go once that is durable. An
-	/// earlier output stays while a record depends on it.
+	/// change gave it, and its re-archive replaces this output; a file whose source vanished while still committing
+	/// keeps it as `SourceGone`, and one whose source changed first leaves it behind as a file the project doesn't
+	/// know, since its record describes the new content; a placeholder that adopted its canonical copy's output
+	/// meanwhile lets this one go once that is durable. An earlier output stays while a record depends on it.
 	fn placed(&mut self, file: FileId) {
 		let Some(output) = self.pipeline.jobs.get_mut(&file).and_then(|job| job.pending.take()) else {
 			return;
@@ -536,7 +567,9 @@ impl Owner {
 		}
 
 		if removed {
-			self.placed_after_removal(file, output);
+			if committing {
+				self.placed_after_removal(file, output);
+			}
 			return;
 		}
 
@@ -692,6 +725,29 @@ impl Owner {
 		self.raise_issue(file, job.attempt, &err);
 	}
 
+	/// The source's identity isn't the one recorded: another file took its place, and it is archived again. On some
+	/// filesystems a file's identity changes every time it is read; such a file would be archived forever, so after a
+	/// few times in a session it is an issue instead.
+	pub(super) fn identity_changed(&mut self, file: FileId, size: u64, mtime_ns: i64) {
+		let changes = self.pipeline.identity_changes.entry(file).or_default();
+		*changes += 1;
+		let unstable = *changes > IDENTITY_CHANGES;
+
+		self.source_changed(file, size, mtime_ns);
+		if unstable {
+			self.withdraw(file);
+			self.set_state(
+				file,
+				FileState::Issue {
+					kind: IssueKind::SourceUnreadable,
+					attempt: 0,
+					reason: IDENTITY_UNSTABLE.into(),
+					output: None,
+				},
+			);
+		}
+	}
+
 	/// Back to the front of the queue for the file's current role, which may have changed while its job ran.
 	fn requeue(&mut self, file: FileId) {
 		self.set_state(file, FileState::Queued);
@@ -775,6 +831,7 @@ impl Owner {
 	fn output_path(&mut self, file: FileId, made: &Made) -> RelPath {
 		let entry = self.tree.file(file);
 		let (folder, replaces) = (entry.folder, entry.record.replaces.clone());
+		let destination = self.destination_folder(folder);
 		let base = match made {
 			Made::Encoded { extension }
 			| Made::Moved {
@@ -785,12 +842,16 @@ impl Owner {
 				.tree
 				.folder(entry.folder)
 				.naming
-				.encoded_name(&entry.name, std::ffi::OsStr::new(extension)),
+				.encoded_name(&entry.name, OsStr::new(extension)),
 			Made::Copied(_) | Made::Moved { .. } => self.copied_output_name(file),
 			Made::Placeholder { .. } => placeholder_name(&entry.name),
 		};
+		let base = if destination.is_root() {
+			outside_the_work_area(base)
+		} else {
+			base
+		};
 
-		let destination = self.destination_folder(folder);
 		let mut candidate = base.clone();
 		for number in 2.. {
 			let key = (destination.clone(), collision_key(&candidate));
@@ -811,13 +872,22 @@ impl Owner {
 		destination.join(&candidate)
 	}
 
-	/// The mirrored folder: every name mapped to one the destination can hold.
+	/// The mirrored folder: every name mapped to one the destination can hold, and never into the project's own
+	/// folder.
 	pub(super) fn destination_folder(&self, folder: FolderId) -> RelPath {
 		self.tree
 			.folder(folder)
 			.key
 			.components()
-			.fold(RelPath::root(), |path, name| path.join(&destination_name(&name)))
+			.fold(RelPath::root(), |path, name| {
+				let name = destination_name(&name);
+				let name = if path.is_root() {
+					outside_the_work_area(name)
+				} else {
+					name
+				};
+				path.join(&name)
+			})
 	}
 
 	pub(super) fn claimed_by_other(&self, file: FileId, path: &RelPath) -> bool {
@@ -864,6 +934,18 @@ fn issue_kind(kind: &ErrorKind) -> IssueKind {
 	}
 }
 
+/// A name at the top of the destination that is the project's own folder, in any case, gets a name of its own: that
+/// folder is the project's work area, swept on every open.
+fn outside_the_work_area(name: OsString) -> OsString {
+	if collision_key(&name) != collision_key(OsStr::new(ARCHIVE_DIR)) {
+		return name;
+	}
+
+	let mut own = name;
+	own.push(" (source)");
+	own
+}
+
 fn numbered(name: &OsString, number: u32) -> OsString {
 	let path = Path::new(name);
 	let stem = path.file_stem().unwrap_or(name).to_string_lossy();
@@ -871,7 +953,7 @@ fn numbered(name: &OsString, number: u32) -> OsString {
 		Some(extension) => format!("{stem} ({number}).{}", extension.to_string_lossy()),
 		None => format!("{stem} ({number})"),
 	};
-	destination_name(std::ffi::OsStr::new(&numbered))
+	destination_name(OsStr::new(&numbered))
 }
 
 #[cfg(test)]
@@ -884,7 +966,7 @@ pub(super) mod tests {
 
 	use super::*;
 	use crate::project::scanning::tests::{key, list, owner};
-	use crate::record::Hash;
+	use crate::record::{Hash, Identity};
 	use crate::view::Update;
 
 	struct Fixture {
@@ -963,6 +1045,10 @@ pub(super) mod tests {
 		}
 
 		fn commit(&mut self, content: &[u8]) -> Option<Target> {
+			self.commit_as(content, SourceIdentity::default())
+		}
+
+		fn commit_as(&mut self, content: &[u8], identity: SourceIdentity) -> Option<Target> {
 			let (reply, answer) = oneshot::channel();
 			let staged = Staged {
 				path: PathBuf::from("staged"),
@@ -975,7 +1061,7 @@ pub(super) mod tests {
 				JobMessage::Commit {
 					staged,
 					made: Made::Copied(CopyReason::NotMedia),
-					identity: SourceIdentity::default(),
+					identity,
 					reply,
 				},
 			);
@@ -1034,6 +1120,29 @@ pub(super) mod tests {
 
 	fn failed(kind: ErrorKind) -> JobMessage {
 		JobMessage::Finished(Err(kind.into()))
+	}
+
+	#[test]
+	fn nothing_from_the_source_is_ever_mirrored_into_the_work_area() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		for folder in [".cryarchiver", ".cryarchiver2", "Photos/.cryarchiver"] {
+			fs::create_dir_all(source.join(folder)).unwrap();
+		}
+		fs::write(source.join(".cryarchive"), b"a file").unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		crate::project::scanning::tests::list_queued(&mut owner);
+
+		let mirrored = |folder: &str| {
+			let folder = owner.tree.folder_id(&key(folder)).unwrap();
+			owner.destination_folder(folder).display()
+		};
+		assert_eq!(mirrored(".cryarchiver"), ".cryarchiver (source)");
+		assert_eq!(mirrored(".cryarchiver2"), ".cryarchiver2");
+		assert_eq!(mirrored("Photos/.cryarchiver"), "Photos/.cryarchiver");
+		assert_eq!(outside_the_work_area(".CryArchiver".into()), ".CryArchiver (source)");
+		assert_eq!(outside_the_work_area(".cryarchive".into()), ".cryarchive");
 	}
 
 	#[test]
@@ -1179,6 +1288,48 @@ pub(super) mod tests {
 
 		assert!(matches!(fixture.record().state, FileState::Done(_)));
 		assert!(!fixture.owner.is_reference(fixture.file));
+	}
+
+	#[test]
+	fn a_source_whose_identity_changes_every_time_it_is_read_becomes_an_issue() {
+		let mut fixture = Fixture::new(b"first");
+		let changing = SourceIdentity {
+			at_start: Some(Identity { volume: 1, index: 1 }),
+			at_commit: Some(Identity { volume: 1, index: 2 }),
+		};
+
+		for _ in 0..IDENTITY_CHANGES {
+			fixture.running();
+			assert!(fixture.commit_as(b"first", changing).is_none());
+			assert_eq!(fixture.record().state, FileState::Discovered);
+			fixture.job(cancelled());
+			fixture.queue(None);
+		}
+
+		fixture.running();
+		assert!(fixture.commit_as(b"first", changing).is_none());
+		assert!(matches!(
+			&fixture.record().state,
+			FileState::Issue { kind: IssueKind::SourceUnreadable, reason, .. } if reason == IDENTITY_UNSTABLE
+		));
+		assert!(!fixture.owner.pipeline.observed.contains_key(&fixture.file));
+	}
+
+	#[test]
+	fn an_output_placed_after_its_source_changed_and_vanished_is_never_passed_off_as_the_new_content() {
+		let mut fixture = Fixture::new(b"first");
+		fixture.running();
+		let target = fixture.commit(b"first").unwrap();
+
+		fixture.change_source(b"second version");
+		fixture.remove_source();
+		place(&target, b"first");
+		fixture.job(JobMessage::Placed);
+		fixture.job(JobMessage::Finished(Ok(())));
+
+		assert!(fixture.owner.tree.file(fixture.file).removed);
+		assert_eq!(fixture.claims(), 0);
+		assert_eq!(fs::read(&target.path).unwrap(), b"first");
 	}
 
 	#[test]

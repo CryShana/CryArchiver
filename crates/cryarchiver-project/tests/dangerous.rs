@@ -1,10 +1,11 @@
 mod support;
 
 use std::fs;
+use std::time::{Duration, SystemTime};
 
 use cryarchiver_engine::outcome::ErrorKind;
 use cryarchiver_project::issues::{Problem, Verb};
-use cryarchiver_project::record::FileState;
+use cryarchiver_project::record::{FileRecord, FileState, mtime_ns};
 use cryarchiver_project::settings::{DELETE_CONFIRMATION, SettingsChange};
 use cryarchiver_project::store::Store;
 use cryarchiver_project::view::NoticeLevel;
@@ -13,13 +14,17 @@ use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
 
 const BIG: usize = 100_000;
 
-fn state(setup: &support::Setup, path: &str) -> FileState {
+fn record(setup: &support::Setup, path: &str) -> FileRecord {
 	let (_, _, loaded) = Store::open(&setup.project).unwrap();
 	loaded
 		.files
 		.into_iter()
 		.find(|(key, _)| key.display() == path)
-		.map_or_else(|| panic!("no record for {path}"), |(_, record)| record.state)
+		.map_or_else(|| panic!("no record for {path}"), |(_, record)| record)
+}
+
+fn state(setup: &support::Setup, path: &str) -> FileState {
+	record(setup, path).state
 }
 
 fn deleted(snapshot: &Snapshot) -> u64 {
@@ -349,4 +354,137 @@ fn an_archived_original_replaced_before_it_joins_a_size_group_is_archived_again_
 		2,
 		"the replacement was archived before its original was deleted"
 	);
+}
+
+/// In both modes: without deleting, the duplicate would silently point at content that isn't its own; deleting, its
+/// original would go with its content archived nowhere.
+#[test]
+fn a_canonical_copy_edited_in_place_before_its_encode_never_lets_its_duplicate_go_unarchived() {
+	for deleting in [false, true] {
+		let setup = setup(|settings| settings.delete_originals = deleting);
+		let canonical = write(&setup.source, "a.jpg", &jpeg(4, BIG));
+		let duplicate = write(&setup.source, "Copies/b.jpg", &jpeg(4, BIG));
+		let retagged = jpeg(5, BIG + 10);
+		let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234_567_891);
+		let encoder = FakeEncoder::new();
+		encoder.rule(
+			"a.jpg",
+			Rule::Rewrite {
+				path: canonical.clone(),
+				content: retagged.clone(),
+				modified,
+			},
+		);
+		let project = support::open_unwatched(&setup, &encoder);
+		let mut snapshot = Snapshot::default();
+
+		project.send(Command::Start {
+			delete_confirmed: deleting,
+		});
+		if deleting {
+			wait_for(&project, &mut snapshot, "both deleted", |s| deleted(s) == 2);
+		} else {
+			wait_for(&project, &mut snapshot, "the archive", |s| {
+				s.overall.as_ref().is_some_and(|overall| overall.parity.is_some())
+			});
+		}
+		drop(project);
+
+		let calls = encoder.calls();
+		assert!(
+			calls.iter().any(|call| call == "b.jpg"),
+			"archived from its own source: {calls:?}"
+		);
+		assert_eq!(duplicate.exists(), !deleting);
+		assert_eq!(
+			fs::read(setup.destination.join("Copies").join("b.avif")).unwrap(),
+			b"encoded b.jpg"
+		);
+		assert!(!setup.destination.join("Copies").join("placeholder_b.jpg.txt").exists());
+
+		let record = record(&setup, "a.jpg");
+		assert_eq!(
+			(record.size, record.mtime_ns),
+			(retagged.len() as u64, mtime_ns(modified)),
+			"the retagged content is what the record describes"
+		);
+		assert_eq!(
+			matches!(record.state, FileState::OriginalDeleted(_)),
+			deleting,
+			"{:?}",
+			record.state
+		);
+	}
+}
+
+fn run_until_done(project: &Project, snapshot: &mut Snapshot, deleting: bool, originals: u64) {
+	project.send(Command::Start {
+		delete_confirmed: deleting,
+	});
+	wait_for(project, snapshot, "the run", |s| {
+		s.overall.as_ref().is_some_and(|overall| overall.parity.is_some()) && (!deleting || deleted(s) == originals)
+	});
+}
+
+/// The source may hold another project's work area, left behind by a crash or still in use: it is archived like any
+/// folder, and never mistaken for this project's own.
+#[test]
+fn a_source_folder_named_like_the_work_area_is_archived_beside_it_and_survives_reopening() {
+	for deleting in [false, true] {
+		let setup = setup(|settings| settings.delete_originals = deleting);
+		let staged = write(&setup.source, ".cryarchiver/work/staged/a.txt", b"staged-looking");
+		let workspace = write(&setup.source, ".cryarchiver/work/x/b.txt", b"workspace-looking");
+		let encoder = FakeEncoder::new();
+		let project = support::open(&setup, &encoder);
+		let mut snapshot = Snapshot::default();
+		run_until_done(&project, &mut snapshot, deleting, 2);
+		drop(project);
+
+		assert_eq!(staged.exists(), !deleting);
+		assert_eq!(workspace.exists(), !deleting);
+		let outputs = [
+			(".cryarchiver/work/staged/a.txt", &b"staged-looking"[..]),
+			(".cryarchiver/work/x/b.txt", &b"workspace-looking"[..]),
+		]
+		.map(|(source, content)| {
+			let state = state(&setup, source);
+			let output = state.output().unwrap_or_else(|| panic!("{source}: {state:?}"));
+			(output.path.to_path(&setup.destination), content)
+		});
+		for (output, content) in &outputs {
+			assert_eq!(fs::read(output).unwrap(), *content, "deleting: {deleting}");
+		}
+		assert!(
+			setup
+				.destination
+				.join(".cryarchiver (source)")
+				.join("work")
+				.join("x")
+				.join("b.txt")
+				.exists()
+		);
+
+		let project = support::open(&setup, &encoder);
+		let mut snapshot = Snapshot::default();
+		run_until_done(&project, &mut snapshot, deleting, 2);
+		support::drain(&project, &mut snapshot);
+		drop(project);
+
+		for (output, content) in &outputs {
+			assert_eq!(
+				fs::read(output).ok().as_deref(),
+				Some(*content),
+				"reopened, deleting: {deleting}"
+			);
+		}
+		assert!(snapshot.issues.is_empty(), "{:?}", snapshot.issues);
+		let state = state(&setup, ".cryarchiver/work/x/b.txt");
+		assert!(
+			matches!(
+				(&state, deleting),
+				(FileState::OriginalDeleted(_), true) | (FileState::Done(_), false)
+			),
+			"{state:?}"
+		);
+	}
 }

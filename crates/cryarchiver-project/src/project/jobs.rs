@@ -64,6 +64,14 @@ pub(crate) enum JobMessage {
 	Kept(String),
 	/// A placeholder's source and its canonical copy's source are no longer the same file.
 	NotSameFile,
+	/// The job's source no longer has the size and time its record keeps: its size and time now, when they can be
+	/// read.
+	SourceChanged(Option<(u64, i64)>),
+	/// A same-file placeholder's canonical copy no longer has the size and time its record keeps.
+	CanonicalChanged {
+		canonical: RelPath,
+		now: Option<(u64, i64)>,
+	},
 	/// The delete checks passed: the project writes `DeletePending` durably, then answers whether to go on.
 	DeleteIntent {
 		reply: oneshot::Sender<bool>,
@@ -114,8 +122,8 @@ pub(crate) enum Task {
 		content: Vec<u8>,
 		made: Made,
 		/// For a placeholder matched by file identity alone: the canonical copy's source, which must still be the
-		/// same file.
-		same_file: Option<PathBuf>,
+		/// same file, as its record describes it.
+		same_file: Option<SameFile>,
 	},
 	Move {
 		from: PathBuf,
@@ -144,8 +152,17 @@ pub(crate) struct PlaceholderCheck {
 	pub(crate) output: PathBuf,
 	pub(crate) size: u64,
 	pub(crate) hash: Hash,
-	/// A placeholder matched by file identity alone: the canonical copy's source, which must still be the same file.
-	pub(crate) same_file: Option<PathBuf>,
+	/// A placeholder matched by file identity alone: the canonical copy's source, which must still be the same file,
+	/// as its record describes it.
+	pub(crate) same_file: Option<SameFile>,
+}
+
+/// A canonical copy's source and the size and time its record keeps: its archived output holds that content.
+#[derive(Debug, Clone)]
+pub(crate) struct SameFile {
+	pub(crate) path: PathBuf,
+	pub(crate) size: u64,
+	pub(crate) mtime_ns: i64,
 }
 
 #[derive(Clone)]
@@ -199,6 +216,14 @@ impl JobContext {
 				let staged = blocking(move || run::hash_staged(&output))
 					.await?
 					.map_err(|err| JobError::io(IoSide::Destination(&self.sink.staged_dir()), &err))?;
+
+				// The engine checks the source only against what it found itself; the record, with its dedup hashes,
+				// stands for what the project saw.
+				if !run::source_unchanged(&self.source, self.size, self.mtime_ns) {
+					discard(&staged);
+					return Err(self.source_changed().await);
+				}
+
 				self.commit(staged, Made::Encoded { extension }).await
 			}
 			JobOutcome::KeptOriginal { reason } => {
@@ -225,13 +250,13 @@ impl JobContext {
 
 		if !run::source_unchanged(&self.source, self.size, self.mtime_ns) {
 			discard(&staged);
-			return Err(ErrorKind::SourceChanged.into());
+			return Err(self.source_changed().await);
 		}
 
 		self.commit(staged, Made::Copied(reason)).await
 	}
 
-	async fn write(&self, content: Vec<u8>, made: Made, same_file: Option<PathBuf>) -> Result<(), JobError> {
+	async fn write(&self, content: Vec<u8>, made: Made, same_file: Option<SameFile>) -> Result<(), JobError> {
 		let (source, staged_path) = (self.source.clone(), self.sink.staged_path(""));
 		let staged = blocking(move || {
 			let times = fs::metadata(&source)
@@ -245,16 +270,30 @@ impl JobContext {
 		// The content stands for the source as the project last saw it: its hashes, or the text the ready check read.
 		if !run::source_unchanged(&self.source, self.size, self.mtime_ns) {
 			discard(&staged);
-			return Err(ErrorKind::SourceChanged.into());
+			return Err(self.source_changed().await);
 		}
 
 		if let Some(canonical) = same_file {
-			let source = self.source.clone();
-			let same =
-				blocking(move || matches!((file_id(&source), file_id(&canonical)), (Ok(a), Ok(b)) if a == b)).await?;
+			let (source, path) = (self.source.clone(), canonical.path.clone());
+			let same = blocking(move || matches!((file_id(&source), file_id(&path)), (Ok(a), Ok(b)) if a == b)).await?;
 			if !same {
 				discard(&staged);
 				self.send(JobMessage::NotSameFile);
+				return Err(ErrorKind::Cancelled.into());
+			}
+
+			// The same file now; the canonical copy's archived content is only this file's content while its record
+			// still describes it.
+			if !run::source_unchanged(&canonical.path, canonical.size, canonical.mtime_ns) {
+				discard(&staged);
+				let path = canonical.path;
+				let now = blocking(move || size_and_time(&path)).await?;
+				if let Made::Placeholder { canonical, .. } = &made {
+					self.send(JobMessage::CanonicalChanged {
+						canonical: canonical.clone(),
+						now,
+					});
+				}
 				return Err(ErrorKind::Cancelled.into());
 			}
 		}
@@ -264,7 +303,7 @@ impl JobContext {
 
 	async fn take_over(&self, from: PathBuf, made: Made) -> Result<(), JobError> {
 		if !run::source_unchanged(&self.source, self.size, self.mtime_ns) {
-			return Err(ErrorKind::SourceChanged.into());
+			return Err(self.source_changed().await);
 		}
 
 		let size = fs::metadata(&from)
@@ -283,9 +322,7 @@ impl JobContext {
 	async fn delete(&self, check: DeleteCheck) -> Result<(), JobError> {
 		let (source, size, mtime_ns) = (self.source.clone(), self.size, self.mtime_ns);
 		let verify = check.clone();
-		let verdict = blocking(move || verify_before_delete(&verify, &source, size, mtime_ns))
-			.await?
-			.map_err(|err| JobError::io(IoSide::Source(&self.source), &err))?;
+		let verdict = blocking(move || verify_before_delete(&verify, &source, size, mtime_ns)).await??;
 		if let Err(refusal) = verdict {
 			self.send(JobMessage::DeleteRefused(refusal));
 			return Ok(());
@@ -318,6 +355,15 @@ impl JobContext {
 		};
 		self.send(message);
 		Ok(())
+	}
+
+	/// The source no longer has the size and time its record keeps: the project archives it again as it is now.
+	async fn source_changed(&self) -> JobError {
+		let source = self.source.clone();
+		let now = blocking(move || size_and_time(&source)).await.ok().flatten();
+		self.send(JobMessage::SourceChanged(now));
+
+		ErrorKind::SourceChanged.into()
 	}
 
 	async fn source_identity(&self) -> Option<Identity> {
@@ -385,20 +431,22 @@ impl JobContext {
 }
 
 /// The read-back and source checks of spec §9, cheapest first. A source that can't be reached is an error: it proves
-/// neither a change nor that the original is gone.
+/// neither a change nor that the original is gone. So is an archived file that can't be read back: only its content
+/// can prove it damaged.
 fn verify_before_delete(
 	check: &DeleteCheck,
 	source: &Path,
 	size: u64,
 	mtime_ns: i64,
-) -> io::Result<Result<(), Refusal>> {
-	let matches = |path: &Path, size, hash| run::read_back(path, size, hash).unwrap_or(false);
+) -> Result<Result<(), Refusal>, JobError> {
+	let read_back = |path: &Path, size, hash| read_back(path, size, hash).map_err(|err| destination_error(path, &err));
 
-	if let Err(refusal) = source_as_archived(source, size, mtime_ns)? {
+	let archived = source_as_archived(source, size, mtime_ns).map_err(|err| JobError::io(IoSide::Source(source), &err));
+	if let Err(refusal) = archived? {
 		return Ok(Err(refusal));
 	}
 
-	if !matches(&check.output, check.size, check.hash) {
+	if !read_back(&check.output, check.size, check.hash)? {
 		return Ok(Err(Refusal::OutputDamaged));
 	}
 
@@ -406,30 +454,51 @@ fn verify_before_delete(
 		return Ok(Ok(()));
 	};
 
-	let names_link =
-		fs::read_to_string(&check.output).is_ok_and(|text| run::placeholder_links_to(&text, &placeholder.link));
-	if !names_link {
+	let text = match fs::read_to_string(&check.output) {
+		Ok(text) => Some(text),
+		Err(err) if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) => None,
+		Err(err) => return Err(destination_error(&check.output, &err)),
+	};
+	if !text.is_some_and(|text| run::placeholder_links_to(&text, &placeholder.link)) {
 		return Ok(Err(Refusal::Kept(
 			"the placeholder no longer names the archived copy".into(),
 		)));
 	}
 
-	if !matches(&placeholder.output, placeholder.size, placeholder.hash) {
+	if !read_back(&placeholder.output, placeholder.size, placeholder.hash)? {
 		return Ok(Err(Refusal::Kept(
 			"the archived copy it points to doesn't match its BLAKE3".into(),
 		)));
 	}
 
 	if let Some(canonical) = &placeholder.same_file {
-		let same = matches!((file_id(source), file_id(canonical)), (Ok(a), Ok(b)) if a == b);
+		let same = matches!((file_id(source), file_id(&canonical.path)), (Ok(a), Ok(b)) if a == b);
 		if !same {
 			return Ok(Err(Refusal::Kept(
 				"it is no longer the same file as the archived copy's source".into(),
 			)));
 		}
+
+		if !run::source_unchanged(&canonical.path, canonical.size, canonical.mtime_ns) {
+			return Ok(Err(Refusal::Kept(
+				"the archived copy's source changed since it was archived".into(),
+			)));
+		}
 	}
 
 	Ok(Ok(()))
+}
+
+/// A missing archived file is as good as a damaged one; any other error reading it proves nothing.
+fn read_back(path: &Path, size: u64, hash: Hash) -> io::Result<bool> {
+	match run::read_back(path, size, hash) {
+		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+		result => result,
+	}
+}
+
+fn destination_error(path: &Path, err: &io::Error) -> JobError {
+	JobError::io(IoSide::Destination(path), err)
 }
 
 /// The original has the size and time it was archived with, or it changed, or it is provably gone: its folder is
@@ -483,7 +552,7 @@ mod tests {
 	use std::path::Path;
 	use std::pin::Pin;
 
-	use cryarchiver_engine::commit::OutputSink;
+	use cryarchiver_engine::commit::{Artifact, OutputSink};
 	use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 	use super::*;
@@ -502,8 +571,54 @@ mod tests {
 		}
 	}
 
+	/// Rewrites the source in place, as a tagger would just before the encode reads it, then encodes what it holds.
+	struct RewritingEncoder(Vec<u8>);
+
+	impl Encode for RewritingEncoder {
+		fn encode<'a>(
+			&'a self,
+			job: &'a Job,
+			sink: &'a dyn OutputSink,
+			_on_event: &'a (dyn Fn(JobEvent) + Sync),
+			_cancel: &'a CancellationToken,
+		) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>> {
+			Box::pin(async move {
+				fs::write(&job.source, &self.0).unwrap();
+
+				let work_root = sink.work_root(&job.source);
+				fs::create_dir_all(&work_root).unwrap();
+				let work = work_root.join("encoded.avif");
+				fs::write(&work, fs::read(&job.source).unwrap()).unwrap();
+				let output = sink
+					.commit(&Artifact {
+						path: work,
+						source: job.source.clone(),
+						times: None,
+					})
+					.unwrap();
+
+				JobOutcome::Encoded {
+					out_bytes: fs::metadata(&output).unwrap().len(),
+					src_bytes: self.0.len() as u64,
+					output,
+					warnings: Vec::new(),
+				}
+			})
+		}
+	}
+
 	/// A job for `source` as the project last saw it, run to its end with every commit refused; returns what it sent.
 	fn run_job(source: &Path, destination: &Path, seen: &[u8], task: Task) -> Vec<JobMessage> {
+		run_job_with(Arc::new(NoEncoder), source, destination, seen, task)
+	}
+
+	fn run_job_with(
+		encoder: Arc<dyn Encode>,
+		source: &Path,
+		destination: &Path,
+		seen: &[u8],
+		task: Task,
+	) -> Vec<JobMessage> {
 		let meta = fs::metadata(source).unwrap();
 		let (messages, mut inbox): (_, UnboundedReceiver<Message>) = unbounded_channel();
 		let context = JobContext {
@@ -513,7 +628,7 @@ mod tests {
 			mtime_ns: mtime_ns(meta.modified().unwrap()),
 			identity: None,
 			sink: ArchivalSink::new(destination),
-			encoder: Arc::new(NoEncoder),
+			encoder,
 			messages,
 			cancel: CancellationToken::new(),
 		};
@@ -561,7 +676,32 @@ mod tests {
 		fs::read_dir(ArchivalSink::new(destination).staged_dir()).map_or(0, Iterator::count)
 	}
 
-	fn placeholder(same_file: Option<PathBuf>) -> Task {
+	fn committed(sent: &[JobMessage]) -> bool {
+		sent.iter().any(|message| matches!(message, JobMessage::Commit { .. }))
+	}
+
+	/// The file at `path` as a record would describe it now.
+	fn as_recorded(path: &Path) -> SameFile {
+		let meta = fs::metadata(path).unwrap();
+		SameFile {
+			path: path.to_path_buf(),
+			size: meta.len(),
+			mtime_ns: mtime_ns(meta.modified().unwrap()),
+		}
+	}
+
+	fn delete_check(output: &Path, content: &[u8]) -> DeleteCheck {
+		DeleteCheck {
+			output: output.to_path_buf(),
+			size: content.len() as u64,
+			hash: Hash(*blake3::hash(content).as_bytes()),
+			identity: Identity { volume: 0, index: 0 },
+			placeholder: None,
+			source_root: PathBuf::new(),
+		}
+	}
+
+	fn placeholder(same_file: Option<SameFile>) -> Task {
 		Task::Write {
 			content: b"placeholder".to_vec(),
 			made: Made::Placeholder {
@@ -636,11 +776,146 @@ mod tests {
 		fs::write(&other, b"seen").unwrap();
 		let destination = dir.path().join("archive");
 
-		let sent = run_job(&source, &destination, b"seen", placeholder(Some(other)));
+		let sent = run_job(&source, &destination, b"seen", placeholder(Some(as_recorded(&other))));
 
 		assert!(sent.iter().any(|message| matches!(message, JobMessage::NotSameFile)));
 		assert!(failed_with(&sent, &ErrorKind::Cancelled));
 		assert!(!sent.iter().any(|message| matches!(message, JobMessage::Commit { .. })));
 		assert_eq!(staged_files(&destination), 0);
+	}
+
+	#[test]
+	fn a_placeholder_of_the_same_file_is_written_only_while_the_canonical_copys_record_describes_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let canonical = dir.path().join("a.bin");
+		let source = dir.path().join("b.bin");
+		fs::write(&canonical, b"seen").unwrap();
+		fs::hard_link(&canonical, &source).unwrap();
+		let destination = dir.path().join("archive");
+
+		let recorded = as_recorded(&canonical);
+		let stale = SameFile {
+			mtime_ns: recorded.mtime_ns - 1,
+			..recorded.clone()
+		};
+		let sent = run_job(&source, &destination, b"seen", placeholder(Some(stale)));
+
+		let now = (recorded.size, recorded.mtime_ns);
+		assert!(sent.iter().any(|message| matches!(
+			message,
+			JobMessage::CanonicalChanged { canonical, now: Some(found) } if canonical.display() == "a.bin" && *found == now
+		)));
+		assert!(failed_with(&sent, &ErrorKind::Cancelled));
+		assert!(!committed(&sent));
+		assert_eq!(staged_files(&destination), 0);
+
+		let sent = run_job(&source, &destination, b"seen", placeholder(Some(recorded)));
+		assert!(committed(&sent));
+	}
+
+	#[test]
+	fn an_encode_of_a_source_that_changed_after_the_project_saw_it_is_never_committed() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("a.flac");
+		fs::write(&source, b"tags v1").unwrap();
+		let destination = dir.path().join("archive");
+		let encoder = Arc::new(RewritingEncoder(b"tags v2, longer".to_vec()));
+		let job = Job {
+			source: source.clone(),
+			speed: cryarchiver_engine::preset::Speed::Fast,
+			keep_metadata: true,
+			drop_aux: true,
+			min_savings: 0.0,
+		};
+
+		let sent = run_job_with(encoder, &source, &destination, b"tags v1", Task::Encode(job));
+
+		let now = (15, mtime_ns(fs::metadata(&source).unwrap().modified().unwrap()));
+		assert!(
+			sent.iter()
+				.any(|message| matches!(message, JobMessage::SourceChanged(Some(found)) if *found == now))
+		);
+		assert!(failed_with(&sent, &ErrorKind::SourceChanged));
+		assert!(!committed(&sent));
+		assert_eq!(staged_files(&destination), 0);
+	}
+
+	#[test]
+	fn an_archived_file_that_cant_be_read_back_is_an_error_never_damage() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("a.txt");
+		fs::write(&source, b"notes").unwrap();
+		let recorded = as_recorded(&source);
+		let output = dir.path().join("archived.txt");
+		fs::write(&output, b"notes").unwrap();
+		let verify = |check: &DeleteCheck| verify_before_delete(check, &source, recorded.size, recorded.mtime_ns);
+
+		assert!(matches!(verify(&delete_check(&output, b"notes")), Ok(Ok(()))));
+		assert!(matches!(
+			verify(&delete_check(&output, b"NOTES")),
+			Ok(Err(Refusal::OutputDamaged))
+		));
+		assert!(matches!(
+			verify(&delete_check(&dir.path().join("gone.txt"), b"notes")),
+			Ok(Err(Refusal::OutputDamaged))
+		));
+
+		#[cfg(windows)]
+		{
+			use std::os::windows::fs::OpenOptionsExt;
+
+			let exclusive = fs::File::options().read(true).share_mode(0).open(&output).unwrap();
+			assert!(verify(&delete_check(&output, b"notes")).is_err());
+			drop(exclusive);
+		}
+
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+
+			fs::set_permissions(&output, fs::Permissions::from_mode(0o000)).unwrap();
+			// SAFETY: geteuid only reads the process's credentials.
+			if unsafe { libc::geteuid() } != 0 {
+				assert!(verify(&delete_check(&output, b"notes")).is_err());
+			}
+			fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+		}
+	}
+
+	#[test]
+	fn a_same_file_placeholders_original_is_kept_once_its_canonical_copys_source_changed() {
+		let dir = tempfile::tempdir().unwrap();
+		let canonical = dir.path().join("a.bin");
+		let source = dir.path().join("b.bin");
+		fs::write(&canonical, b"content").unwrap();
+		fs::hard_link(&canonical, &source).unwrap();
+		let recorded = as_recorded(&source);
+		let text = run::placeholder_text("a.bin", "b.bin", recorded.size, None);
+		let placeholder = dir.path().join("placeholder_b.bin.txt");
+		fs::write(&placeholder, &text).unwrap();
+		let output = dir.path().join("a.bin.archived");
+		fs::write(&output, b"content").unwrap();
+		let check = |same_file: SameFile| DeleteCheck {
+			placeholder: Some(PlaceholderCheck {
+				link: "a.bin".into(),
+				output: output.clone(),
+				size: 7,
+				hash: Hash(*blake3::hash(b"content").as_bytes()),
+				same_file: Some(same_file),
+			}),
+			..delete_check(&placeholder, text.as_bytes())
+		};
+		let verify = |check: &DeleteCheck| verify_before_delete(check, &source, recorded.size, recorded.mtime_ns);
+
+		assert!(matches!(verify(&check(as_recorded(&canonical))), Ok(Ok(()))));
+
+		let stale = SameFile {
+			mtime_ns: recorded.mtime_ns - 1,
+			..as_recorded(&canonical)
+		};
+		assert!(matches!(
+			verify(&check(stale)),
+			Ok(Err(Refusal::Kept(reason))) if reason == "the archived copy's source changed since it was archived"
+		));
 	}
 }

@@ -319,6 +319,8 @@ mod tests {
 		let root: PathBuf = dir.path().to_path_buf();
 		fs::create_dir_all(root.join(".cryarchiver").join("work")).unwrap();
 		fs::write(root.join(".cryarchiver").join("work").join("x"), b"x").unwrap();
+		fs::create_dir_all(root.join(".cryarchiver (source)").join("work")).unwrap();
+		fs::write(root.join(".cryarchiver (source)").join("work").join("y"), b"123").unwrap();
 		fs::write(root.join("archive.cryarchive"), b"db").unwrap();
 		fs::create_dir(root.join("Photos")).unwrap();
 		fs::write(root.join("Photos").join("a.avif"), b"1234").unwrap();
@@ -327,7 +329,14 @@ mod tests {
 		let files = walk_destination(&root, OsStr::new("archive.cryarchive"));
 
 		let found: Vec<(String, u64)> = files.iter().map(|file| (file.path.display(), file.size)).collect();
-		assert_eq!(found, [("Photos/a.avif".to_owned(), 4), ("notes.txt".to_owned(), 2)]);
+		assert_eq!(
+			found,
+			[
+				(".cryarchiver (source)/work/y".to_owned(), 3),
+				("Photos/a.avif".to_owned(), 4),
+				("notes.txt".to_owned(), 2)
+			]
+		);
 	}
 
 	#[test]

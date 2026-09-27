@@ -17,6 +17,10 @@ const READ_BACK_BUFFER: usize = 4 << 20;
 
 const NOT_A_REGULAR_FILE: &str = "not a regular file";
 const OUTSIDE_THE_SOURCE: &str = "its real path is outside the source folder";
+const READ_ONLY: &str = "read-only";
+
+/// Only Windows reads back unbuffered; anywhere else a short read may come from the middle of a file (FUSE, CIFS).
+const SHORT_READ_IS_EOF: bool = cfg!(windows);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Staged {
@@ -108,7 +112,7 @@ pub fn read_back(path: &Path, size: u64, hash: Hash) -> io::Result<bool> {
 	let mut buffer = native::AlignedBuffer::new(READ_BACK_BUFFER);
 	#[cfg(not(windows))]
 	let mut buffer = vec![0; READ_BACK_BUFFER];
-	let (read, actual) = hash_through(&mut file, &mut buffer, true, |_| Ok(()))?;
+	let (read, actual) = hash_through(&mut file, &mut buffer, SHORT_READ_IS_EOF, |_| Ok(()))?;
 
 	Ok(read == size && actual == hash)
 }
@@ -283,11 +287,10 @@ mod native {
 	};
 	use windows::core::PCWSTR;
 
-	use super::{Deletion, Expected, NOT_A_REGULAR_FILE, OUTSIDE_THE_SOURCE};
+	use super::{Deletion, Expected, NOT_A_REGULAR_FILE, OUTSIDE_THE_SOURCE, READ_ONLY};
 	use crate::record::{Identity, mtime_ns};
 
 	const SECTOR_ALIGNMENT: usize = 4096;
-	const READ_ONLY: &str = "read-only";
 
 	pub fn delete_checked(path: &Path, root: &Path, expected: &Expected) -> io::Result<Deletion> {
 		const ERROR_FILE_NOT_FOUND: i32 = 2;
@@ -479,11 +482,15 @@ mod native {
 	use std::mem::MaybeUninit;
 	use std::os::unix::ffi::OsStrExt;
 	use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-	use std::os::unix::io::AsRawFd;
+	use std::os::unix::io::{AsRawFd, FromRawFd};
 	use std::path::Path;
 
-	use super::{Deletion, Expected, NOT_A_REGULAR_FILE, OUTSIDE_THE_SOURCE};
+	use super::{Deletion, Expected, NOT_A_REGULAR_FILE, OUTSIDE_THE_SOURCE, READ_ONLY};
 	use crate::record::Identity;
+
+	/// Linux's; the libc crate doesn't name it for every target.
+	#[cfg(target_os = "linux")]
+	const F_SETSIG: libc::c_int = 10;
 
 	pub fn delete_checked(path: &Path, root: &Path, expected: &Expected) -> io::Result<Deletion> {
 		let Some(name) = path.file_name() else {
@@ -515,9 +522,38 @@ mod native {
 			return Ok(Deletion::Refused(NOT_A_REGULAR_FILE));
 		}
 
-		let size = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
-		if !expected.matches(size, stat_mtime_ns(&stat), stat_identity(&stat)) {
+		let file = match open_entry(&folder, &name) {
+			Ok(file) => file,
+			Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Deletion::AlreadyGone),
+			Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(Deletion::Busy),
+			Err(err) if err.raw_os_error() == Some(libc::ELOOP) => return Ok(Deletion::Refused(NOT_A_REGULAR_FILE)),
+			Err(err) => return Err(err),
+		};
+		#[cfg(target_os = "linux")]
+		let Some(lease) = Lease::take(&file) else {
+			return Ok(Deletion::Busy);
+		};
+
+		let held = file.metadata()?;
+		let identity = Identity {
+			volume: held.dev(),
+			index: held.ino(),
+		};
+		if !held.is_file() || identity != stat_identity(&stat) {
 			return Ok(Deletion::Changed);
+		}
+
+		if !expected.matches(held.len(), held_mtime_ns(&held), identity) {
+			return Ok(Deletion::Changed);
+		}
+
+		if held.mode() & libc::S_IWUSR == 0 {
+			return Ok(Deletion::Refused(READ_ONLY));
+		}
+
+		#[cfg(target_os = "linux")]
+		if lease.broken() {
+			return Ok(Deletion::Busy);
 		}
 
 		// SAFETY: the folder descriptor is open and the name is NUL-terminated.
@@ -531,6 +567,55 @@ mod native {
 		}
 
 		Ok(Deletion::Deleted)
+	}
+
+	/// A write lease on the original, which the kernel grants only while no other descriptor has the file open, and
+	/// breaks when another program opens it meanwhile. Released when dropped.
+	#[cfg(target_os = "linux")]
+	struct Lease<'a> {
+		file: Option<&'a File>,
+	}
+
+	#[cfg(target_os = "linux")]
+	impl<'a> Lease<'a> {
+		/// `None` when another program has the file open.
+		fn take(file: &'a File) -> Option<Self> {
+			let fd = file.as_raw_fd();
+
+			// SAFETY: fcntl on an open descriptor, with integer arguments only. A broken lease is announced by a
+			// signal, SIGIO unless another is chosen, and SIGIO would end the process: SIGURG is ignored by default.
+			let taken = unsafe {
+				libc::fcntl(fd, F_SETSIG, libc::SIGURG) == 0 && libc::fcntl(fd, libc::F_SETLEASE, libc::F_WRLCK) == 0
+			};
+			if taken {
+				return Some(Self { file: Some(file) });
+			}
+
+			match io::Error::last_os_error().raw_os_error() {
+				Some(libc::EAGAIN) => None,
+				// A filesystem without leases (NFS, many FUSE ones) or a file the user doesn't own can't tell: the
+				// original is deleted without this check, so a program still writing to it there goes unnoticed.
+				_ => Some(Self { file: None }),
+			}
+		}
+
+		/// Another program opened the file since the lease was granted.
+		fn broken(&self) -> bool {
+			self.file.is_some_and(|file| {
+				// SAFETY: fcntl on an open descriptor, with no pointer arguments.
+				unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLEASE) != libc::F_WRLCK }
+			})
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	impl Drop for Lease<'_> {
+		fn drop(&mut self) {
+			if let Some(file) = self.file {
+				// SAFETY: fcntl on an open descriptor, with integer arguments only.
+				unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) };
+			}
+		}
 	}
 
 	pub fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
@@ -566,6 +651,24 @@ mod native {
 			.open(path)
 	}
 
+	/// Read-only, never through a link, and without waiting for a lease another program holds on it.
+	fn open_entry(folder: &File, name: &CString) -> io::Result<File> {
+		// SAFETY: the folder descriptor is open and the name is NUL-terminated.
+		let fd = unsafe {
+			libc::openat(
+				folder.as_raw_fd(),
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+			)
+		};
+		if fd < 0 {
+			return Err(io::Error::last_os_error());
+		}
+
+		// SAFETY: openat returned a new descriptor that nothing else owns.
+		Ok(unsafe { File::from_raw_fd(fd) })
+	}
+
 	fn stat_entry(folder: &File, name: &CString) -> io::Result<libc::stat> {
 		let mut stat = MaybeUninit::<libc::stat>::uninit();
 
@@ -587,8 +690,8 @@ mod native {
 	}
 
 	/// The same value `record::mtime_ns` gives for the `SystemTime` std builds from these fields.
-	fn stat_mtime_ns(stat: &libc::stat) -> i64 {
-		let nanos = i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtime_nsec);
+	fn held_mtime_ns(meta: &fs::Metadata) -> i64 {
+		let nanos = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
 		i64::try_from(nanos).unwrap_or(if nanos < 0 { i64::MIN } else { i64::MAX })
 	}
 
@@ -824,6 +927,30 @@ mod tests {
 		assert!(!read_back(&output, size, hash).unwrap());
 	}
 
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn read_back_reads_on_after_a_short_read() {
+		use std::os::unix::io::FromRawFd;
+
+		let mut fds = [0; 2];
+		// SAFETY: `fds` has room for the two descriptors pipe writes.
+		assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+		// SAFETY: pipe returned two new descriptors that nothing else owns.
+		let (mut reader, mut writer) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+		let slow_writer = std::thread::spawn(move || {
+			writer.write_all(b"first half, ").unwrap();
+			std::thread::sleep(Duration::from_millis(50));
+			writer.write_all(b"second half").unwrap();
+		});
+
+		let mut buffer = vec![0; 64];
+		let (size, hash) = hash_through(&mut reader, &mut buffer, SHORT_READ_IS_EOF, |_| Ok(())).unwrap();
+		slow_writer.join().unwrap();
+
+		assert_eq!(size, 23);
+		assert_eq!(hash, Hash(*blake3::hash(b"first half, second half").as_bytes()));
+	}
+
 	#[test]
 	fn originals_are_deleted_only_inside_the_source() {
 		let dir = tempfile::tempdir().unwrap();
@@ -902,7 +1029,7 @@ mod tests {
 		assert!(!original.exists());
 	}
 
-	#[cfg(windows)]
+	#[cfg(any(windows, target_os = "linux"))]
 	#[test]
 	fn an_original_another_program_has_open_is_busy() {
 		let dir = tempfile::tempdir().unwrap();
@@ -921,7 +1048,7 @@ mod tests {
 		assert!(!original.exists());
 	}
 
-	#[cfg(windows)]
+	#[cfg(any(windows, target_os = "linux"))]
 	#[test]
 	#[allow(clippy::permissions_set_readonly_false)]
 	fn a_read_only_original_is_refused() {

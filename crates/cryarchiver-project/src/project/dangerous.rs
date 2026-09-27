@@ -110,7 +110,8 @@ impl Owner {
 	}
 
 	/// For a placeholder that isn't lost: its canonical copy, while that holds a content output with a hash and the
-	/// same source content. A placeholder matched as the same file has no hash; its job checks the identities.
+	/// same source content. A placeholder matched as the same file has no hash: both records must describe the file
+	/// alike, and its job checks the identities and the canonical copy's source.
 	fn verified_canonical(&self, file: FileId) -> Option<(FileId, Output)> {
 		let record = &self.tree.file(file).record;
 		let Some(Output {
@@ -130,9 +131,10 @@ impl Owner {
 			.canonical_output(canonical)
 			.filter(|output| output.hash.is_some())?;
 
+		let theirs = &self.tree.file(canonical).record;
 		let same_content = match record.full_hash {
-			Some(ours) => self.tree.file(canonical).record.full_hash == Some(ours),
-			None => true,
+			Some(ours) => theirs.full_hash == Some(ours),
+			None => (record.size, record.mtime_ns) == (theirs.size, theirs.mtime_ns),
 		};
 		same_content.then(|| (canonical, output.clone()))
 	}
@@ -162,11 +164,7 @@ impl Owner {
 				output: self.destination_path(&canonical_output.path),
 				size: canonical_output.size,
 				hash: canonical_output.hash?,
-				same_file: entry
-					.record
-					.full_hash
-					.is_none()
-					.then(|| self.source_path(&self.tree.file(*canonical).key)),
+				same_file: entry.record.full_hash.is_none().then(|| self.same_file(*canonical)),
 			}),
 			None => None,
 		};
@@ -254,7 +252,8 @@ impl Owner {
 	/// Nothing was deleted. An archived file that no longer matches its hash is an issue; a source that changed is
 	/// archived again; anything else keeps its original until deleting starts again.
 	pub(super) fn delete_refused(&mut self, file: FileId, refusal: Refusal) {
-		let output = match self.tree.file(file).record.state.clone() {
+		let record = self.tree.file(file).record.clone();
+		let output = match record.state {
 			FileState::Done(output) => output,
 			FileState::DeletePending(output) => {
 				self.set_state(file, FileState::Done(output.clone()));
@@ -280,6 +279,9 @@ impl Owner {
 			Refusal::SourceChanged(now) => {
 				self.note(file, "original kept: the source changed since it was archived".into());
 				match now {
+					Some((size, mtime_ns)) if (size, mtime_ns) == (record.size, record.mtime_ns) => {
+						self.identity_changed(file, size, mtime_ns);
+					}
 					Some((size, mtime_ns)) => self.source_changed(file, size, mtime_ns),
 					None => {
 						self.danger.refused.insert(file);
@@ -494,6 +496,36 @@ mod tests {
 				hash: Some(hash(text.as_bytes())),
 			};
 			self.archived(name, content, output)
+		}
+
+		/// `name` is the same file as `canonical`, a hard link to it, archived as a placeholder matched by identity
+		/// alone: no hash.
+		fn same_file_placeholder(&mut self, name: &str, canonical: &str) -> FileId {
+			fs::hard_link(self.source(canonical), self.source(name)).unwrap();
+			let meta = fs::metadata(self.source(name)).unwrap();
+			let text = placeholder_text(canonical, name, meta.len(), None);
+			let path = key(&format!("placeholder_{name}.txt"));
+			fs::write(self.owner.destination_path(&path), &text).unwrap();
+			let output = Output {
+				how: How::Placeholder {
+					canonical: key(canonical),
+					lost: false,
+				},
+				path: path.clone(),
+				size: text.len() as u64,
+				hash: Some(hash(text.as_bytes())),
+			};
+
+			let record = FileRecord {
+				identity: file_id(&self.source(name)).ok().map(Identity::from),
+				class: MediaClass::Other,
+				state: FileState::Done(output),
+				..FileRecord::discovered(meta.len(), mtime_ns(meta.modified().unwrap()))
+			};
+			let file = self.owner.tree.add_file(FolderId::ROOT, OsStr::new(name), record);
+			self.owner.claim(file, &path);
+			self.owner.note_placeholder(file);
+			file
 		}
 
 		fn state(&self, file: FileId) -> FileState {
@@ -989,5 +1021,50 @@ mod tests {
 		fixture.owner.start_jobs(Instant::now());
 
 		assert!(fixture.owner.pipeline.jobs.contains_key(&notes));
+	}
+
+	#[test]
+	fn a_same_file_placeholder_is_deleted_only_while_both_records_describe_the_file_alike() {
+		let content = vec![7; 1000];
+		let mut fixture = Fixture::new();
+		let canonical = fixture.copy("a.bin", &content);
+		let duplicate = fixture.same_file_placeholder("b.bin", "a.bin");
+		fixture.owner.start(true);
+		assert!(fixture.owner.deletable(duplicate));
+
+		let seen_through_the_duplicate = FileRecord {
+			mtime_ns: fixture.owner.tree.file(canonical).record.mtime_ns + 1,
+			..fixture.owner.tree.file(duplicate).record.clone()
+		};
+		fixture.owner.tree.set_record(duplicate, seen_through_the_duplicate);
+		assert!(
+			!fixture.owner.deletable(duplicate),
+			"the canonical copy's archived content may be older than the file"
+		);
+		assert!(fixture.owner.delete_task(duplicate).is_none());
+	}
+
+	#[test]
+	fn a_same_file_placeholder_whose_canonical_copy_changed_has_it_archived_again() {
+		let content = vec![7; 1000];
+		let mut fixture = Fixture::new();
+		let canonical = fixture.copy("a.bin", &content);
+		fixture.same_file_placeholder("b.bin", "a.bin");
+		let record = fixture.owner.tree.file(canonical).record.clone();
+
+		fixture
+			.owner
+			.canonical_changed(&key("a.bin"), Some((record.size, record.mtime_ns)));
+		assert!(
+			matches!(fixture.state(canonical), FileState::Done(_)),
+			"nothing changed"
+		);
+
+		fixture
+			.owner
+			.canonical_changed(&key("a.bin"), Some((record.size, record.mtime_ns + 1)));
+		let now = &fixture.owner.tree.file(canonical).record;
+		assert_eq!(now.state, FileState::Discovered);
+		assert_eq!((now.size, now.mtime_ns), (record.size, record.mtime_ns + 1));
 	}
 }

@@ -5,6 +5,8 @@
 //! the process groups of running tools and starts new ones at low priority. It can't raise a priority back without
 //! privileges, and it has no live CPU cap: the project gives new jobs fewer threads instead.
 
+use std::io;
+use std::process::{Child, Command};
 use std::sync::{Mutex, PoisonError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -34,6 +36,13 @@ pub fn current() -> Limits {
 pub fn apply(limits: Limits) -> Applied {
 	*CURRENT.lock().unwrap_or_else(PoisonError::into_inner) = limits;
 	native::apply(limits)
+}
+
+/// Starts a program that isn't one of our tools, such as the file manager, outside the limit where the system
+/// allows that: on Windows, out of the process's job object, falling back to a plain start when a job the process
+/// was started in forbids leaving it.
+pub fn spawn_outside_limits(command: &mut Command) -> io::Result<Child> {
+	native::spawn_outside(command)
 }
 
 /// Keeps a running tool's process group known to [`apply`] until it is dropped.
@@ -71,21 +80,34 @@ impl Drop for Tracked {
 #[cfg(windows)]
 mod native {
 	use std::ffi::c_void;
+	use std::io;
+	use std::os::windows::process::CommandExt;
+	use std::process::{Child, Command};
 	use std::sync::OnceLock;
 
 	use windows::Win32::Foundation::{CloseHandle, HANDLE};
 	use windows::Win32::System::JobObjects::{
 		AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
-		JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_PRIORITY_CLASS, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-		JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0,
-		JobObjectBasicLimitInformation, JobObjectCpuRateControlInformation, SetInformationJobObject,
+		JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+		JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+		JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+		JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, SetInformationJobObject,
 	};
-	use windows::Win32::System::Threading::{GetCurrentProcess, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS};
+	use windows::Win32::System::Threading::{
+		CREATE_BREAKAWAY_FROM_JOB, GetCurrentProcess, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+	};
 	use windows::core::PCWSTR;
 
 	use super::{Applied, Limits};
 
 	static JOB: OnceLock<Option<usize>> = OnceLock::new();
+
+	pub fn spawn_outside(command: &mut Command) -> io::Result<Child> {
+		match command.creation_flags(CREATE_BREAKAWAY_FROM_JOB.0).spawn() {
+			Err(err) if err.kind() == io::ErrorKind::PermissionDenied => command.creation_flags(0).spawn(),
+			result => result,
+		}
+	}
 
 	pub fn apply(limits: Limits) -> Applied {
 		let Some(job) = job() else {
@@ -121,26 +143,31 @@ mod native {
 		u32::try_from(size_of::<T>()).expect("job information structs are small")
 	}
 
-	// Clearing the limit flag would leave running processes at the idle class, so lifting sets the normal class.
+	// Clearing the limit flag would leave running processes at the idle class, so lifting sets the normal class. The
+	// limits are set as a whole, so each call keeps leaving the job allowed: only for children started with
+	// CREATE_BREAKAWAY_FROM_JOB, which our tools never are.
 	fn set_priority(job: HANDLE, low: bool) -> windows::core::Result<()> {
 		let class = if low {
 			IDLE_PRIORITY_CLASS
 		} else {
 			NORMAL_PRIORITY_CLASS
 		};
-		let info = JOBOBJECT_BASIC_LIMIT_INFORMATION {
-			LimitFlags: JOB_OBJECT_LIMIT_PRIORITY_CLASS,
-			PriorityClass: class.0,
-			..JOBOBJECT_BASIC_LIMIT_INFORMATION::default()
+		let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+			BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+				LimitFlags: JOB_OBJECT_LIMIT_PRIORITY_CLASS | JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+				PriorityClass: class.0,
+				..JOBOBJECT_BASIC_LIMIT_INFORMATION::default()
+			},
+			..JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default()
 		};
 
 		// SAFETY: the pointer and size describe `info`, which outlives the call.
 		unsafe {
 			SetInformationJobObject(
 				job,
-				JobObjectBasicLimitInformation,
+				JobObjectExtendedLimitInformation,
 				(&raw const info).cast(),
-				byte_size::<JOBOBJECT_BASIC_LIMIT_INFORMATION>(),
+				byte_size::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(),
 			)
 		}
 	}
@@ -170,6 +197,8 @@ mod native {
 
 #[cfg(target_os = "linux")]
 mod native {
+	use std::io;
+	use std::process::{Child, Command};
 	use std::sync::{Mutex, PoisonError};
 
 	use super::{Applied, Limits};
@@ -183,6 +212,10 @@ mod native {
 
 	static GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
+	pub fn spawn_outside(command: &mut Command) -> io::Result<Child> {
+		command.spawn()
+	}
+
 	pub fn register(group: i32) {
 		GROUPS.lock().unwrap_or_else(PoisonError::into_inner).push(group);
 	}
@@ -194,11 +227,17 @@ mod native {
 		}
 	}
 
+	#[derive(Clone, Copy)]
+	enum Who {
+		Group(i32),
+		ThisProcess,
+	}
+
 	pub fn apply(limits: Limits) -> Applied {
 		let groups = GROUPS.lock().unwrap_or_else(PoisonError::into_inner);
 		let failed = groups
 			.iter()
-			.filter(|&&group| !set_priority(libc::PRIO_PGRP, IOPRIO_WHO_PGRP, group, limits.low_priority))
+			.filter(|&&group| !set_priority(Who::Group(group), limits.low_priority))
 			.count();
 		drop(groups);
 
@@ -210,21 +249,29 @@ mod native {
 
 	/// Runs in a freshly forked tool before `exec`: only async-signal-safe calls.
 	pub fn lower_this_process() {
-		set_priority(libc::PRIO_PROCESS, IOPRIO_WHO_PROCESS, 0, true);
+		set_priority(Who::ThisProcess, true);
 	}
 
-	fn set_priority(which: libc::__priority_which_t, who_kind: libc::c_int, who: i32, low: bool) -> bool {
+	fn set_priority(who: Who, low: bool) -> bool {
 		let (nice, class) = if low {
 			(LOW_NICE, IOPRIO_CLASS_IDLE)
 		} else {
 			(0, IOPRIO_CLASS_NONE)
 		};
-		let id = libc::id_t::try_from(who).unwrap_or(0);
+		let (who_kind, id) = match who {
+			Who::Group(group) => (IOPRIO_WHO_PGRP, group),
+			Who::ThisProcess => (IOPRIO_WHO_PROCESS, 0),
+		};
+		let unsigned_id = libc::id_t::try_from(id).unwrap_or(0);
 
 		// SAFETY: setpriority and ioprio_set only read their integer arguments.
 		unsafe {
-			let niced = libc::setpriority(which, id, nice) == 0;
-			let io = libc::syscall(libc::SYS_ioprio_set, who_kind, who, class << IOPRIO_CLASS_SHIFT) == 0;
+			// Each call names its `which` constant itself: glibc and musl give setpriority different types for it.
+			let niced = match who {
+				Who::Group(_) => libc::setpriority(libc::PRIO_PGRP, unsigned_id, nice),
+				Who::ThisProcess => libc::setpriority(libc::PRIO_PROCESS, unsigned_id, nice),
+			} == 0;
+			let io = libc::syscall(libc::SYS_ioprio_set, who_kind, id, class << IOPRIO_CLASS_SHIFT) == 0;
 			niced && io
 		}
 	}
@@ -235,7 +282,14 @@ pub(crate) use native::lower_this_process;
 
 #[cfg(not(any(windows, target_os = "linux")))]
 mod native {
+	use std::io;
+	use std::process::{Child, Command};
+
 	use super::{Applied, Limits};
+
+	pub fn spawn_outside(command: &mut Command) -> io::Result<Child> {
+		command.spawn()
+	}
 
 	pub fn apply(_limits: Limits) -> Applied {
 		Applied {

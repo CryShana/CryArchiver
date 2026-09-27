@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use cryarchiver_engine::commit::file_id;
 
-use super::jobs::{Made, Task};
+use super::jobs::{Made, SameFile, Task};
 use super::owner::{Message, Owner};
 use super::pipeline::RunningJob;
 use crate::dedup::{self, MIN_DEDUP_SIZE, Member};
@@ -307,7 +307,7 @@ impl Owner {
 						// can only confirm it, never replace it.
 						if recorded_output(&record.state).is_some() {
 							if identity.is_none() || identity != record.identity {
-								self.source_changed(file, request.size, request.mtime_ns);
+								self.identity_changed(file, request.size, request.mtime_ns);
 								return;
 							}
 						} else {
@@ -519,11 +519,7 @@ impl Owner {
 		let link = output.path.relative_from(&self.destination_folder(entry.folder));
 		let text = placeholder_text(&link, &entry.key.display(), entry.record.size, entry.record.full_hash);
 		let canonical_key = self.tree.file(canonical).key.clone();
-		let same_file = entry
-			.record
-			.full_hash
-			.is_none()
-			.then(|| self.source_path(&canonical_key));
+		let same_file = entry.record.full_hash.is_none().then(|| self.same_file(canonical));
 		Some(Task::Write {
 			content: text.into_bytes(),
 			made: Made::Placeholder {
@@ -532,6 +528,38 @@ impl Owner {
 			},
 			same_file,
 		})
+	}
+
+	/// What a same-file placeholder's job checks of its canonical copy: its source, as its record describes it.
+	pub(super) fn same_file(&self, canonical: FileId) -> SameFile {
+		let entry = self.tree.file(canonical);
+		SameFile {
+			path: self.source_path(&entry.key),
+			size: entry.record.size,
+			mtime_ns: entry.record.mtime_ns,
+		}
+	}
+
+	/// A same-file placeholder's job found its canonical copy's source changed since the record was made: the
+	/// canonical copy is archived again, and its duplicates are planned again.
+	pub(super) fn canonical_changed(&mut self, canonical: &RelPath, now: Option<(u64, i64)>) {
+		let Some(canonical) = self
+			.tree
+			.file_id(canonical)
+			.filter(|&file| !self.tree.file(file).removed)
+		else {
+			return;
+		};
+		let record = &self.tree.file(canonical).record;
+		let Some((size, mtime_ns)) = now.filter(|&now| now != (record.size, record.mtime_ns)) else {
+			return;
+		};
+
+		self.note(
+			canonical,
+			"the source changed since it was archived: archiving it again".into(),
+		);
+		self.source_changed(canonical, size, mtime_ns);
 	}
 
 	/// The duplicate and its canonical copy were matched as the same file, and no longer are: the duplicate goes

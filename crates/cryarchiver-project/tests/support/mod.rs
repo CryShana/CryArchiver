@@ -3,11 +3,12 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use cryarchiver_engine::commit::{Artifact, OutputSink, SourceTimes};
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate, Stage};
@@ -40,6 +41,13 @@ pub enum Rule {
 	Replace {
 		path: PathBuf,
 		content: Vec<u8>,
+	},
+	/// Writes `content` into the file at `path` in place, as a tagger does, gives it `modified`, then encodes. Only
+	/// once: later calls encode.
+	Rewrite {
+		path: PathBuf,
+		content: Vec<u8>,
+		modified: SystemTime,
 	},
 }
 
@@ -130,6 +138,19 @@ impl Encode for FakeEncoder {
 				}
 				Rule::Replace { path, content } => {
 					replace_keeping_the_time(&path, &content, &sink.work_root(&job.source));
+					self.rule(&name, Rule::Encode("avif"));
+					on_event(JobEvent::Stage(Stage::Encode));
+					stage(job, sink, "avif", &name)
+				}
+				Rule::Rewrite {
+					path,
+					content,
+					modified,
+				} => {
+					let mut file = fs::File::options().write(true).truncate(true).open(&path).unwrap();
+					file.write_all(&content).unwrap();
+					file.set_modified(modified).unwrap();
+					drop(file);
 					self.rule(&name, Rule::Encode("avif"));
 					on_event(JobEvent::Stage(Stage::Encode));
 					stage(job, sink, "avif", &name)
@@ -248,13 +269,26 @@ pub fn open(setup: &Setup, encoder: &Arc<FakeEncoder>) -> Project {
 }
 
 pub fn open_with(setup: &Setup, encoder: &Arc<FakeEncoder>, fault: Option<Fault>) -> Project {
+	open_tuned(setup, encoder, tuning(), fault)
+}
+
+/// Without watcher events: a change in the source is noticed only by what the project reads itself.
+pub fn open_unwatched(setup: &Setup, encoder: &Arc<FakeEncoder>) -> Project {
+	let tuning = Tuning {
+		watcher: false,
+		..tuning()
+	};
+	open_tuned(setup, encoder, tuning, None)
+}
+
+fn open_tuned(setup: &Setup, encoder: &Arc<FakeEncoder>, tuning: Tuning, fault: Option<Fault>) -> Project {
 	Project::open(
 		&setup.project,
 		ProjectOptions {
 			backend: Arc::new(FakeBackend {
 				encoder: encoder.clone(),
 			}),
-			tuning: tuning(),
+			tuning,
 			fault,
 		},
 	)

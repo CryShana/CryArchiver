@@ -31,25 +31,35 @@ mod windows_limits {
 		priority_class(HANDLE(child.as_raw_handle()))
 	}
 
+	fn sleeping() -> Command {
+		let mut command = Command::new("ping");
+		command.args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null());
+		command
+	}
+
 	fn sleeper() -> Child {
-		Command::new("ping")
-			.args(["-n", "30", "127.0.0.1"])
-			.stdout(Stdio::null())
-			.spawn()
-			.unwrap()
+		sleeping().spawn().unwrap()
 	}
 
 	#[test]
 	fn the_limit_reaches_running_processes_and_lifts_again() {
 		limits::apply(Limits::default());
 		let mut running = sleeper();
+		let mut outside = limits::spawn_outside_limits(&mut sleeping()).unwrap();
 
 		let applied = limits::apply(LIMITED);
 
 		assert!(applied.priority_live && applied.cpu_cap_live, "{applied:?}");
 		assert_eq!(own_priority_class(), IDLE_PRIORITY_CLASS.0);
 		assert_eq!(child_priority_class(&running), IDLE_PRIORITY_CLASS.0);
+		assert_eq!(
+			child_priority_class(&outside),
+			NORMAL_PRIORITY_CLASS.0,
+			"a program that isn't one of our tools stays out of the limit"
+		);
 		assert_eq!(limits::current(), LIMITED);
+		outside.kill().unwrap();
+		outside.wait().unwrap();
 
 		let lifted = limits::apply(Limits::default());
 

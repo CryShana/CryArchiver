@@ -6,8 +6,9 @@ use unicode_normalization::UnicodeNormalization;
 
 const CLI_MARKER: &str = "cry";
 const RESERVED_DEVICE_NAMES: &[&str] = &[
-	"con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2",
-	"lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+	"con", "prn", "aux", "nul", "conin$", "conout$", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+	"com9", "com¹", "com²", "com³", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "lpt¹",
+	"lpt²", "lpt³",
 ];
 const NAME_SUFFIX: char = '＿';
 
@@ -220,6 +221,15 @@ mod tests {
 		assert_eq!(destination_name(OsStr::new("CON.txt")), "CON\u{ff3f}.txt");
 		assert_eq!(destination_name(OsStr::new("com1")), "com1\u{ff3f}");
 		assert_eq!(destination_name(OsStr::new("CONSOLE.txt")), "CONSOLE.txt");
+		assert_eq!(destination_name(OsStr::new("CONIN$")), "CONIN$\u{ff3f}");
+		assert_eq!(destination_name(OsStr::new("conout$.log")), "conout$\u{ff3f}.log");
+		assert_eq!(destination_name(OsStr::new("COM\u{b9}.txt")), "COM\u{b9}\u{ff3f}.txt");
+		assert_eq!(destination_name(OsStr::new("com\u{b2}")), "com\u{b2}\u{ff3f}");
+		assert_eq!(
+			destination_name(OsStr::new("Lpt\u{b3}.tar.gz")),
+			"Lpt\u{b3}\u{ff3f}.tar.gz"
+		);
+		assert_eq!(destination_name(OsStr::new("LPT\u{b9}0.txt")), "LPT\u{b9}0.txt");
 		assert_eq!(placeholder_name(OsStr::new("a?.jpg")), "placeholder_a\u{ff1f}.jpg.txt");
 	}
 
