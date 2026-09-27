@@ -83,9 +83,17 @@ fn file_manager(folder: &Path) -> (&'static str, Command) {
 }
 
 /// Explorer reads switches from an unquoted argument and splits it at commas, so the folder is always quoted. A
-/// Windows name can't hold `"`; a trailing `\` is doubled so it doesn't escape the closing quote.
+/// Windows name can't hold `"`; a trailing `\` is doubled so it doesn't escape the closing quote. Explorer doesn't
+/// understand the `\\?\` form that canonical roots keep for UNC and long paths, so it gets the plain form.
 #[cfg(windows)]
 fn explorer_argument(folder: &Path) -> std::ffi::OsString {
+	let raw = folder.as_os_str().to_string_lossy();
+	let plain = match raw.strip_prefix(r"\\?\UNC\") {
+		Some(share) => format!(r"\\{share}"),
+		None => raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned(),
+	};
+	let folder = Path::new(&plain);
+
 	let mut argument = std::ffi::OsString::from("\"");
 	argument.push(folder.as_os_str());
 	if folder.as_os_str().as_encoded_bytes().ends_with(b"\\") {
@@ -131,5 +139,10 @@ mod tests {
 	fn explorer_gets_the_folder_as_one_quoted_argument() {
 		assert_eq!(explorer_argument(Path::new(r"C:\a,b\c d")), r#""C:\a,b\c d""#);
 		assert_eq!(explorer_argument(Path::new(r"C:\")), r#""C:\\""#);
+		assert_eq!(
+			explorer_argument(Path::new(r"\\?\UNC\nas\share\Photos")),
+			r#""\\nas\share\Photos""#
+		);
+		assert_eq!(explorer_argument(Path::new(r"\\?\C:\a")), r#""C:\a""#);
 	}
 }
