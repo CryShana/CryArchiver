@@ -251,3 +251,73 @@ fn a_sidecar_of_a_duplicate_video_keeps_its_own_name() {
 			.exists()
 	);
 }
+
+#[test]
+fn a_cue_sheet_whose_audio_is_deleted_before_it_is_archived_is_still_archived() {
+	let setup = setup(|_| {});
+	let audio = write(&setup.source, "Album/disc.flac", FLAC);
+	write(
+		&setup.source,
+		"Album/disc.cue",
+		b"FILE \"disc.flac\" WAVE
+",
+	);
+	let encoder = FakeEncoder::new();
+	encoder.rule(".flac", Rule::Hold);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "the audio's encode", |_| {
+		!encoder.calls().is_empty()
+	});
+	fs::remove_file(&audio).unwrap();
+	wait_for(&project, &mut snapshot, "the run to finish", finished);
+	drop(project);
+
+	assert_eq!(
+		fs::read(setup.destination.join("Album").join("disc.cue")).unwrap(),
+		b"FILE \"disc.flac\" WAVE
+"
+	);
+	assert!(snapshot.overall.unwrap().parity.is_some());
+	assert!(matches!(state(&setup, "Album/disc.cue"), FileState::Done(_)));
+}
+
+#[test]
+fn two_playlists_naming_each_other_are_both_archived() {
+	let setup = setup(|_| {});
+	write(
+		&setup.source,
+		"a.m3u",
+		b"#EXTM3U
+b.m3u
+",
+	);
+	write(
+		&setup.source,
+		"b.m3u",
+		b"#EXTM3U
+a.m3u
+",
+	);
+	let project = support::open(&setup, &FakeEncoder::new());
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "the run to finish", finished);
+	drop(project);
+
+	assert_eq!(
+		fs::read(setup.destination.join("a.m3u")).unwrap(),
+		b"#EXTM3U
+b.m3u
+"
+	);
+	assert_eq!(
+		fs::read(setup.destination.join("b.m3u")).unwrap(),
+		b"#EXTM3U
+a.m3u
+"
+	);
+}

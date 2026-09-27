@@ -1054,7 +1054,7 @@ mod tests {
 
 		fixture
 			.owner
-			.canonical_changed(&key("a.bin"), Some((record.size, record.mtime_ns)));
+			.archived_changed(&key("a.bin"), Some((record.size, record.mtime_ns)));
 		assert!(
 			matches!(fixture.state(canonical), FileState::Done(_)),
 			"nothing changed"
@@ -1062,7 +1062,7 @@ mod tests {
 
 		fixture
 			.owner
-			.canonical_changed(&key("a.bin"), Some((record.size, record.mtime_ns + 1)));
+			.archived_changed(&key("a.bin"), Some((record.size, record.mtime_ns + 1)));
 		let now = &fixture.owner.tree.file(canonical).record;
 		assert_eq!(now.state, FileState::Discovered);
 		assert_eq!((now.size, now.mtime_ns), (record.size, record.mtime_ns + 1));

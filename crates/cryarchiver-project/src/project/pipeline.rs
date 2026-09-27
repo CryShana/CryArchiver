@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::jobs::{JobContext, JobMessage, Made, SourceIdentity, Target, Task};
 use super::owner::{Message, Owner};
+use super::resolve::Deferred;
 use crate::keys::RelPath;
 use crate::memory::MemoryBudget;
 use crate::record::{CopyReason, FailureLog, FileRecord, FileState, How, IssueKind, MediaClass, Output};
@@ -46,6 +47,8 @@ pub(crate) struct RunningJob {
 	/// The job found that the duplicate it was writing a placeholder for is no longer the same file.
 	pub(super) not_same_file: bool,
 	pending: Option<Output>,
+	/// A take-over's holder and the output it held there, from the commit intent until the rename is confirmed.
+	moved_from: Option<(FileId, RelPath)>,
 }
 
 pub(crate) struct Pipeline {
@@ -85,6 +88,10 @@ impl RunningJob {
 
 	pub(super) fn pending_output_mut(&mut self) -> Option<&mut Output> {
 		self.pending.as_mut()
+	}
+
+	pub(super) fn moved_from(&self) -> Option<(FileId, &RelPath)> {
+		self.moved_from.as_ref().map(|(holder, path)| (*holder, path))
 	}
 }
 
@@ -169,7 +176,8 @@ impl Owner {
 
 		match check {
 			ReadyCheck::Changed { size, mtime_ns } => {
-				let mut record = entry.record.clone();
+				self.leave_dedup(file);
+				let mut record = self.tree.file(file).record.clone();
 				record.size = size;
 				record.mtime_ns = mtime_ns;
 				record.identity = None;
@@ -328,6 +336,7 @@ impl Owner {
 				requeue: false,
 				not_same_file: false,
 				pending: None,
+				moved_from: None,
 			},
 		);
 		self.pipeline.workers_dirty = true;
@@ -376,7 +385,7 @@ impl Owner {
 				}
 			}
 			JobMessage::SourceChanged(now) => self.job_source_changed(file, now),
-			JobMessage::CanonicalChanged { canonical, now } => self.canonical_changed(&canonical, now),
+			JobMessage::ArchivedChanged { file: archived, now } => self.archived_changed(&archived, now),
 			JobMessage::DeleteIntent { reply } => {
 				let go_on = self.delete_intent(file);
 				let _ = reply.send(go_on);
@@ -480,9 +489,11 @@ impl Owner {
 			return None;
 		}
 
-		if matches!(made, Made::Moved { .. }) && !self.take_over_holds(file, &staged.path) {
-			return None;
-		}
+		let moved_from = match made {
+			Made::Moved { .. } if !self.take_over_holds(file, &staged.path) => return None,
+			Made::Moved { .. } => self.dedup_holder(file),
+			_ => None,
+		};
 
 		self.keep_depended_output(file);
 		let path = self.output_path(file, made);
@@ -533,6 +544,7 @@ impl Owner {
 
 		if let Some(job) = self.pipeline.jobs.get_mut(&file) {
 			job.pending = Some(output);
+			job.moved_from = moved_from;
 		}
 		Some(Target {
 			path: self.destination_path(&path),
@@ -544,11 +556,17 @@ impl Owner {
 	/// change gave it, and its re-archive replaces this output; a file whose source vanished while still committing
 	/// keeps it as `SourceGone`, and one whose source changed first leaves it behind as a file the project doesn't
 	/// know, since its record describes the new content; a placeholder that adopted its canonical copy's output
-	/// meanwhile lets this one go once that is durable. An earlier output stays while a record depends on it.
+	/// meanwhile lets this one go once that is durable. A take-over whose source changed or vanished meanwhile gives the
+	/// moved output back to its holder. An earlier output stays while a record depends on it; one replaced by a file
+	/// no longer committing goes only once the record naming the new output is durable.
 	fn placed(&mut self, file: FileId) {
-		let Some(output) = self.pipeline.jobs.get_mut(&file).and_then(|job| job.pending.take()) else {
+		let Some(job) = self.pipeline.jobs.get_mut(&file) else {
 			return;
 		};
+		let Some(output) = job.pending.take() else {
+			return;
+		};
+		let moved_from = job.moved_from.take();
 		if self.crash_point(super::Fault::AfterPlaced) {
 			return;
 		}
@@ -558,12 +576,21 @@ impl Owner {
 			entry.removed,
 			matches!(entry.record.state, FileState::Committing { .. }),
 		);
-		let previous = entry.record.replaces.clone();
-		if let Some(previous) = previous.filter(|previous| {
+		if !committing && let Some((holder, from)) = moved_from {
+			self.give_back_moved_output(file, holder, &from, &output.path);
+			return;
+		}
+
+		let previous = entry.record.replaces.clone().filter(|previous| {
 			*previous != output.path && !self.claimed_by_other(file, previous) && !self.has_dependents(file)
-		}) {
+		});
+		if let Some(previous) = previous {
 			self.release_claim(file, &previous);
-			self.remove_replaced_output(&previous, &output.path);
+			if committing || removed {
+				self.remove_replaced_output(&previous, &output.path);
+			} else {
+				self.remove_once_durable(file, previous);
+			}
 		}
 
 		if removed {
@@ -574,15 +601,14 @@ impl Owner {
 		}
 
 		let mut record = self.tree.file(file).record.clone();
-		if !committing && record.state.output().is_some_and(|kept| kept.path != output.path) {
-			self.remove_once_durable(file, output.path);
-			return;
-		}
-
 		if !committing {
-			record.replaces = Some(output.path);
-			self.tree.set_record(file, record);
-			self.save_file(file);
+			if record.state.output().is_some_and(|kept| kept.path != output.path) {
+				self.remove_once_durable(file, output.path);
+			} else {
+				record.replaces = Some(output.path);
+				self.tree.set_record(file, record);
+				self.save_file(file);
+			}
 			return;
 		}
 
@@ -636,15 +662,9 @@ impl Owner {
 			return;
 		};
 
+		job.moved_from = None;
 		self.release_claim(file, &output.path);
 		self.pipeline.taken.insert(name_key(&output.path));
-
-		let mut record = self.tree.file(file).record.clone();
-		if record.replaces.as_ref() == Some(&output.path) {
-			record.replaces = None;
-			self.tree.set_record(file, record);
-			self.save_file(file);
-		}
 	}
 
 	fn job_finished(&mut self, file: FileId, result: Result<(), JobError>) {
@@ -729,6 +749,10 @@ impl Owner {
 	/// filesystems a file's identity changes every time it is read; such a file would be archived forever, so after a
 	/// few times in a session it is an issue instead.
 	pub(super) fn identity_changed(&mut self, file: FileId, size: u64, mtime_ns: i64) {
+		if self.verify_first(file, Deferred::IdentityChanged { size, mtime_ns }) {
+			return;
+		}
+
 		let changes = self.pipeline.identity_changes.entry(file).or_default();
 		*changes += 1;
 		let unstable = *changes > IDENTITY_CHANGES;
@@ -746,6 +770,11 @@ impl Owner {
 				},
 			);
 		}
+	}
+
+	/// The user asked for the file again: its identity may change a few more times.
+	pub(super) fn forget_identity_changes(&mut self, file: FileId) {
+		self.pipeline.identity_changes.remove(&file);
 	}
 
 	/// Back to the front of the queue for the file's current role, which may have changed while its job ran.
@@ -965,6 +994,7 @@ pub(super) mod tests {
 	use tokio::sync::oneshot;
 
 	use super::*;
+	use crate::issues::{IssueKey, Verb};
 	use crate::project::scanning::tests::{key, list, owner};
 	use crate::record::{Hash, Identity};
 	use crate::view::Update;
@@ -1098,6 +1128,7 @@ pub(super) mod tests {
 			requeue: false,
 			not_same_file: false,
 			pending: None,
+			moved_from: None,
 		}
 	}
 
@@ -1313,6 +1344,55 @@ pub(super) mod tests {
 			FileState::Issue { kind: IssueKind::SourceUnreadable, reason, .. } if reason == IDENTITY_UNSTABLE
 		));
 		assert!(!fixture.owner.pipeline.observed.contains_key(&fixture.file));
+	}
+
+	#[test]
+	fn a_retry_lets_a_source_whose_identity_kept_changing_be_archived_again() {
+		let mut fixture = Fixture::new(b"first");
+		let changing = SourceIdentity {
+			at_start: Some(Identity { volume: 1, index: 1 }),
+			at_commit: Some(Identity { volume: 1, index: 2 }),
+		};
+		for _ in 0..=IDENTITY_CHANGES {
+			fixture.running();
+			assert!(fixture.commit_as(b"first", changing).is_none());
+			fixture.job(cancelled());
+			fixture.queue(None);
+		}
+		assert!(matches!(fixture.record().state, FileState::Issue { .. }));
+
+		let issue = fixture.owner.issue_ids.id(&IssueKey::File(fixture.file));
+		fixture.owner.resolve(issue, Verb::Retry);
+		fixture.queue(None);
+		fixture.running();
+		assert!(fixture.commit_as(b"first", changing).is_none());
+
+		assert_eq!(fixture.record().state, FileState::Discovered);
+	}
+
+	#[test]
+	fn an_output_replaced_by_one_placed_after_a_source_change_goes_only_once_that_is_recorded() {
+		let mut fixture = Fixture::new(b"first");
+		let earlier = fixture.destination("notes old.txt");
+		fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+		fs::write(&earlier, b"earlier").unwrap();
+		fixture.running();
+		let target = fixture.commit(b"first").unwrap();
+		let mut record = fixture.record().clone();
+		record.replaces = Some(key("notes old.txt"));
+		fixture.owner.tree.set_record(fixture.file, record);
+
+		fixture.change_source(b"second version");
+		place(&target, b"first");
+		fixture.job(JobMessage::Placed);
+
+		assert_eq!(fixture.record().replaces, Some(key("notes.txt")));
+		assert!(earlier.exists());
+
+		fixture.owner.store.flush().unwrap();
+		fixture.owner.after_flush();
+		assert!(!earlier.exists());
+		assert_eq!(fs::read(&target.path).unwrap(), b"first");
 	}
 
 	#[test]

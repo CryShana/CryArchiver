@@ -19,12 +19,13 @@ use super::jobs::JobMessage;
 use super::live::LiveState;
 use super::pipeline::Pipeline;
 use super::publish::ViewState;
+use super::resolve::VerifyState;
 use super::scanning::ScanState;
 use super::watching::WatchState;
 use super::{Backend, Command, Fault, SystemSample, Tuning};
 use crate::issues::IssueIds;
 use crate::keys::RelPath;
-use crate::record::{FileState, Identity};
+use crate::record::{FileState, Identity, Output};
 use crate::references;
 use crate::scan::{DestinationFile, Listing};
 use crate::settings::Settings;
@@ -52,6 +53,7 @@ pub(crate) enum Message {
 	Hint(Hint),
 	FoldersChanged(Vec<RelPath>),
 	DestinationListed(Vec<DestinationFile>),
+	OutputVerified(FileId, Output, bool),
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -82,6 +84,7 @@ pub(crate) struct Owner {
 	pub(super) watching: WatchState,
 	pub(super) danger: DangerState,
 	pub(super) live: LiveState,
+	pub(super) verify: VerifyState,
 	pub(super) view: ViewState,
 	pub(super) issue_ids: IssueIds,
 	pub(super) issue_files: BTreeSet<FileId>,
@@ -205,7 +208,11 @@ impl Owner {
 		self.view.status_dirty = true;
 	}
 
+	/// A finished job or a ready check can make room for more work, which then starts at once rather than on the next
+	/// tick.
 	fn message(&mut self, message: Message) {
+		let checked = matches!(message, Message::ReadyChecked(..));
+		let frees = checked || matches!(message, Message::Job(..) | Message::Hashed(..));
 		match message {
 			Message::Listed(listing, recursive) => self.on_listed(&listing, recursive),
 			Message::ReadyChecked(file, check) => self.on_ready_checked(file, check),
@@ -216,7 +223,18 @@ impl Owner {
 			Message::Hint(hint) => self.on_hint(hint),
 			Message::FoldersChanged(folders) => self.on_folders_changed(folders),
 			Message::DestinationListed(files) => self.on_destination_listed(&files),
+			Message::OutputVerified(file, output, intact) => self.on_output_verified(file, output, intact),
 		}
+
+		if self.stopping || !frees {
+			return;
+		}
+
+		let now = Instant::now();
+		if checked {
+			self.check_discovered(now);
+		}
+		self.start_jobs(now);
 	}
 
 	fn tick(&mut self, now: Instant) {

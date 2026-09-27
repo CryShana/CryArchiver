@@ -67,9 +67,10 @@ pub(crate) enum JobMessage {
 	/// The job's source no longer has the size and time its record keeps: its size and time now, when they can be
 	/// read.
 	SourceChanged(Option<(u64, i64)>),
-	/// A same-file placeholder's canonical copy no longer has the size and time its record keeps.
-	CanonicalChanged {
-		canonical: RelPath,
+	/// An archived file whose content a job relies on by file identity alone, a same-file placeholder's canonical copy
+	/// or a hashless take-over's holder, no longer has the size and time its record keeps.
+	ArchivedChanged {
+		file: RelPath,
 		now: Option<(u64, i64)>,
 	},
 	/// The delete checks passed: the project writes `DeletePending` durably, then answers whether to go on.
@@ -128,6 +129,9 @@ pub(crate) enum Task {
 	Move {
 		from: PathBuf,
 		made: Made,
+		/// For a take-over matched by file identity alone: the holder, whose source must still be the file its record
+		/// describes.
+		holder: Option<(RelPath, SameFile)>,
 	},
 	Delete(DeleteCheck),
 }
@@ -198,7 +202,7 @@ impl JobContext {
 				made,
 				same_file,
 			} => self.write(content, made, same_file).await,
-			Task::Move { from, made } => self.take_over(from, made).await,
+			Task::Move { from, made, holder } => self.take_over(from, made, holder).await,
 			Task::Delete(check) => self.delete(check).await,
 		};
 
@@ -289,8 +293,8 @@ impl JobContext {
 				let path = canonical.path;
 				let now = blocking(move || size_and_time(&path)).await?;
 				if let Made::Placeholder { canonical, .. } = &made {
-					self.send(JobMessage::CanonicalChanged {
-						canonical: canonical.clone(),
+					self.send(JobMessage::ArchivedChanged {
+						file: canonical.clone(),
 						now,
 					});
 				}
@@ -301,9 +305,19 @@ impl JobContext {
 		self.commit(staged, made).await
 	}
 
-	async fn take_over(&self, from: PathBuf, made: Made) -> Result<(), JobError> {
+	async fn take_over(&self, from: PathBuf, made: Made, holder: Option<(RelPath, SameFile)>) -> Result<(), JobError> {
 		if !run::source_unchanged(&self.source, self.size, self.mtime_ns) {
 			return Err(self.source_changed().await);
+		}
+
+		// The holder's archived content is this file's only while the holder's record still describes their source.
+		if let Some((key, recorded)) = holder
+			&& !run::source_unchanged(&recorded.path, recorded.size, recorded.mtime_ns)
+		{
+			let path = recorded.path;
+			let now = blocking(move || size_and_time(&path)).await?;
+			self.send(JobMessage::ArchivedChanged { file: key, now });
+			return Err(ErrorKind::Cancelled.into());
 		}
 
 		let size = fs::metadata(&from)
@@ -758,6 +772,7 @@ mod tests {
 				hash: None,
 				extension: "bin".into(),
 			},
+			holder: None,
 		};
 
 		let sent = run_job(&source, &destination, b"seen, then more", task);
@@ -765,6 +780,48 @@ mod tests {
 		assert!(failed_with(&sent, &ErrorKind::SourceChanged));
 		assert!(!sent.iter().any(|message| matches!(message, JobMessage::Commit { .. })));
 		assert_eq!(fs::read(&held).unwrap(), b"archived");
+	}
+
+	#[test]
+	fn a_take_over_by_file_identity_needs_the_holders_source_as_its_record_describes_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let holder = dir.path().join("Deep").join("a.bin");
+		fs::create_dir_all(holder.parent().unwrap()).unwrap();
+		fs::write(&holder, b"seen").unwrap();
+		let source = dir.path().join("a.bin");
+		fs::hard_link(&holder, &source).unwrap();
+		let destination = dir.path().join("archive");
+		let held = destination.join("Deep").join("a.bin");
+		fs::create_dir_all(held.parent().unwrap()).unwrap();
+		fs::write(&held, b"archived").unwrap();
+		let take_over = |recorded: SameFile| Task::Move {
+			from: held.clone(),
+			made: Made::Moved {
+				how: How::Copied(CopyReason::NotMedia),
+				hash: None,
+				extension: "bin".into(),
+			},
+			holder: Some((RelPath::from_bytes(b"Deep/a.bin".to_vec()), recorded)),
+		};
+
+		let recorded = as_recorded(&holder);
+		let stale = SameFile {
+			mtime_ns: recorded.mtime_ns - 1,
+			..recorded.clone()
+		};
+		let sent = run_job(&source, &destination, b"seen", take_over(stale));
+
+		let now = (recorded.size, recorded.mtime_ns);
+		assert!(sent.iter().any(|message| matches!(
+			message,
+			JobMessage::ArchivedChanged { file, now: Some(found) } if file.display() == "Deep/a.bin" && *found == now
+		)));
+		assert!(failed_with(&sent, &ErrorKind::Cancelled));
+		assert!(!committed(&sent));
+		assert_eq!(fs::read(&held).unwrap(), b"archived");
+
+		let sent = run_job(&source, &destination, b"seen", take_over(recorded));
+		assert!(committed(&sent));
 	}
 
 	#[test]
@@ -803,7 +860,7 @@ mod tests {
 		let now = (recorded.size, recorded.mtime_ns);
 		assert!(sent.iter().any(|message| matches!(
 			message,
-			JobMessage::CanonicalChanged { canonical, now: Some(found) } if canonical.display() == "a.bin" && *found == now
+			JobMessage::ArchivedChanged { file, now: Some(found) } if file.display() == "a.bin" && *found == now
 		)));
 		assert!(failed_with(&sent, &ErrorKind::Cancelled));
 		assert!(!committed(&sent));

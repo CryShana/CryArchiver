@@ -1,13 +1,33 @@
 //! The user's resolutions of issues: Retry, Accept or Exclude, as each kind allows (project layer spec §10.1).
 
+use std::collections::HashMap;
 use std::fs;
+use std::io;
 
-use super::owner::Owner;
+use super::owner::{Message, Owner};
 use crate::dedup::full_hash;
 use crate::issues::{IssueId, IssueKey, Problem, Verb};
 use crate::record::{FileState, IssueKind, Output};
 use crate::tree::{FileId, FolderId};
 use crate::view::{LogKind, NoticeLevel};
+
+/// Output issues whose archived file is being hashed off the project task, and what waits for the answer.
+#[derive(Debug, Default)]
+pub(crate) struct VerifyState {
+	waiting: HashMap<FileId, Vec<Deferred>>,
+	/// The answer, while what waited for it runs: the file, the output as hashed, and whether it matched.
+	answer: Option<(FileId, Output, bool)>,
+}
+
+/// What an output issue's file waits to do until its archived file is verified.
+#[derive(Debug)]
+pub(crate) enum Deferred {
+	Changed { size: u64, mtime_ns: i64 },
+	IdentityChanged { size: u64, mtime_ns: i64 },
+	Missing,
+	Broken(String),
+	Resolve(Verb),
+}
 
 impl Owner {
 	pub(super) fn resolve(&mut self, issue: IssueId, verb: Verb) {
@@ -47,6 +67,10 @@ impl Owner {
 	}
 
 	fn resolve_file(&mut self, file: FileId, verb: Verb) {
+		if self.waits_for_verification(file, Deferred::Resolve(verb)) {
+			return;
+		}
+
 		let FileState::Issue { kind, output, .. } = self.tree.file(file).record.state.clone() else {
 			return;
 		};
@@ -56,6 +80,14 @@ impl Owner {
 				"that resolution doesn't apply to this issue".into(),
 			);
 			return;
+		}
+
+		if self.verify_first(file, Deferred::Resolve(verb)) {
+			return;
+		}
+
+		if verb == Verb::Retry {
+			self.forget_identity_changes(file);
 		}
 
 		let name = self.tree.file(file).key.display();
@@ -71,6 +103,7 @@ impl Owner {
 			}
 			(IssueKind::OutputMissing, Verb::Retry) => {
 				let adopted = self.give_up_output(file);
+				self.leave_dedup(file);
 				let mut record = self.tree.file(file).record.clone();
 				record.replaces = output.filter(|_| !adopted).map(|output| output.path);
 				self.tree.set_record(file, record);
@@ -96,7 +129,7 @@ impl Owner {
 	/// excluded.
 	fn accept_output(&mut self, file: FileId, output: Option<&Output>) {
 		if let Some(output) = output
-			&& self.output_intact(output)
+			&& self.output_intact(file, output)
 		{
 			self.set_state(file, FileState::Done(output.clone()));
 			self.file_settled(file);
@@ -112,7 +145,7 @@ impl Owner {
 				..output.clone()
 			})
 		});
-		self.transfer_dependents(file, output, false);
+		self.transfer_dependents(file, None);
 
 		if let Some(current) = current {
 			self.set_state(file, FileState::Done(current));
@@ -123,16 +156,105 @@ impl Owner {
 		self.file_settled(file);
 	}
 
-	/// Whether the recorded output is on disk as it was archived: only then may a placeholder adopt it. Blocking: reads
-	/// the file when its size matches.
-	pub(super) fn output_intact(&self, output: &Output) -> bool {
-		let path = self.destination_path(&output.path);
-		let sized = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() == output.size);
+	/// Whether the output an issue of `file` is about is on disk as it was archived: only then may a placeholder adopt
+	/// it, or Accept keep it as it was. Only an answer from `verify_first` says so.
+	pub(super) fn output_intact(&self, file: FileId, output: &Output) -> bool {
+		self.verify
+			.answer
+			.as_ref()
+			.is_some_and(|(verified, hashed, intact)| *verified == file && hashed == output && *intact)
+	}
 
-		sized
-			&& output
-				.hash
-				.is_some_and(|hash| full_hash(&path).is_ok_and(|found| found == hash))
+	/// Settling an output issue's dependents, or accepting its output as it was, needs the archived file hashed while
+	/// its size still matches. That runs off the project task, and `then` waits for the answer, after whatever already
+	/// waits for it. Returns whether it waits.
+	pub(super) fn verify_first(&mut self, file: FileId, then: Deferred) -> bool {
+		if self.verify.waiting.contains_key(&file) {
+			return self.waits_for_verification(file, then);
+		}
+
+		let Some(output) = self.output_to_verify(file, &then) else {
+			return false;
+		};
+		let (path, hash) = (self.destination_path(&output.path), output.hash);
+		let messages = self.messages.clone();
+		tokio::task::spawn_blocking(move || {
+			let intact = hash.is_some_and(|hash| full_hash(&path).is_ok_and(|found| found == hash));
+			let _ = messages.send(Message::OutputVerified(file, output, intact));
+		});
+		self.verify.waiting.insert(file, vec![then]);
+		true
+	}
+
+	/// Whatever comes for a file while its issue's output is being verified runs after what already waits, as it would
+	/// have. Returns whether it waits.
+	fn waits_for_verification(&mut self, file: FileId, then: Deferred) -> bool {
+		let Some(waiting) = self.verify.waiting.get_mut(&file) else {
+			return false;
+		};
+
+		waiting.push(then);
+		true
+	}
+
+	/// The issue's output, when `then` needs to know whether it is intact, no answer is at hand, and only its hash can
+	/// tell: a missing output, or one of another size, isn't intact.
+	fn output_to_verify(&self, file: FileId, then: &Deferred) -> Option<Output> {
+		let entry = self.tree.file(file);
+		let FileState::Issue {
+			output: Some(output), ..
+		} = &entry.record.state
+		else {
+			return None;
+		};
+
+		let needed = matches!(then, Deferred::Resolve(Verb::Accept)) || self.has_dependents(file);
+		let answered = self
+			.verify
+			.answer
+			.as_ref()
+			.is_some_and(|(verified, hashed, _)| *verified == file && hashed == output);
+		let sized = fs::symlink_metadata(self.destination_path(&output.path))
+			.is_ok_and(|meta| meta.is_file() && meta.len() == output.size);
+
+		(!entry.removed && needed && !answered && output.hash.is_some() && sized).then(|| output.clone())
+	}
+
+	/// The answer came back: what waited for it runs now, in order, with the answer at hand.
+	pub(super) fn on_output_verified(&mut self, file: FileId, output: Output, intact: bool) {
+		let Some(waiting) = self.verify.waiting.remove(&file) else {
+			return;
+		};
+
+		self.verify.answer = Some((file, output, intact));
+		for then in waiting {
+			self.run_deferred(file, then);
+		}
+		self.verify.answer = None;
+	}
+
+	fn run_deferred(&mut self, file: FileId, then: Deferred) {
+		let entry = self.tree.file(file);
+		let (folder, name) = (entry.folder, entry.name.clone());
+		match then {
+			Deferred::Changed { size, mtime_ns } => self.source_changed(file, size, mtime_ns),
+			Deferred::IdentityChanged { size, mtime_ns } => self.identity_changed(file, size, mtime_ns),
+			Deferred::Missing => {
+				let missing = fs::symlink_metadata(self.source_path(&entry.key))
+					.is_err_and(|err| err.kind() == io::ErrorKind::NotFound);
+				if missing {
+					self.source_missing(file);
+				} else {
+					self.queue_listing(self.tree.folder(folder).key.clone(), false);
+				}
+			}
+			Deferred::Broken(reason) => self.source_broken(folder, &name, &reason),
+			Deferred::Resolve(verb) => self.resolve_file(file, verb),
+		}
+	}
+
+	pub(super) fn verifying(&self) -> bool {
+		!self.verify.waiting.is_empty()
 	}
 
 	fn acknowledge_cycle(&mut self, folder: FolderId) {

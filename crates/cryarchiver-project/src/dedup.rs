@@ -46,6 +46,9 @@ pub fn full_hash(path: &Path) -> io::Result<Hash> {
 pub struct Member {
 	pub id: FileId,
 	pub path: RelPath,
+	/// The size and time the project recorded: the same file reached twice is recorded alike.
+	pub size: u64,
+	pub mtime_ns: i64,
 	pub identity: Option<Identity>,
 	pub window: Option<Hash>,
 	pub full: Option<Hash>,
@@ -64,12 +67,12 @@ pub struct GroupPlan {
 pub fn plan_group(members: &[Member]) -> GroupPlan {
 	let mut plan = GroupPlan::default();
 
-	let mut same_file: HashMap<Identity, Vec<&Member>> = HashMap::new();
+	let mut same_file: HashMap<SameFile, Vec<&Member>> = HashMap::new();
 	let mut representatives: Vec<&Member> = Vec::new();
 	for member in members {
-		match member.identity {
-			Some(identity) => {
-				let mates = same_file.entry(identity).or_default();
+		match same_file_key(member) {
+			Some(key) => {
+				let mates = same_file.entry(key).or_default();
 				if mates.is_empty() {
 					representatives.push(member);
 				}
@@ -144,10 +147,16 @@ pub fn plan_group(members: &[Member]) -> GroupPlan {
 	plan
 }
 
-fn with_mates<'m>(representative: &'m Member, same_file: &HashMap<Identity, Vec<&'m Member>>) -> Vec<&'m Member> {
-	representative
-		.identity
-		.and_then(|identity| same_file.get(&identity).cloned())
+/// Members are the same file only while their identities match and their records describe the file alike.
+type SameFile = (Identity, u64, i64);
+
+fn same_file_key(member: &Member) -> Option<SameFile> {
+	member.identity.map(|identity| (identity, member.size, member.mtime_ns))
+}
+
+fn with_mates<'m>(representative: &'m Member, same_file: &HashMap<SameFile, Vec<&'m Member>>) -> Vec<&'m Member> {
+	same_file_key(representative)
+		.and_then(|key| same_file.get(&key).cloned())
 		.unwrap_or_else(|| vec![representative])
 }
 
@@ -166,6 +175,8 @@ mod tests {
 		Member {
 			id: FileId(id),
 			path: RelPath::from_bytes(path.as_bytes().to_vec()),
+			size: 100_000,
+			mtime_ns: 1,
 			identity: None,
 			window: None,
 			full: None,
@@ -275,6 +286,25 @@ mod tests {
 
 		assert!(plan.window_needed.is_empty());
 		assert_eq!(plan.sets, [vec![FileId(2), FileId(1)]]);
+	}
+
+	#[test]
+	fn the_same_identity_recorded_with_another_size_or_time_is_not_the_same_file() {
+		let identity = Some(Identity { volume: 1, index: 9 });
+		let plan = plan_group(&[
+			Member {
+				identity,
+				..member(1, "a.jpg")
+			},
+			Member {
+				identity,
+				mtime_ns: 2,
+				..member(2, "sub/link.jpg")
+			},
+		]);
+
+		assert!(plan.sets.is_empty());
+		assert_eq!(plan.window_needed, [FileId(1), FileId(2)]);
 	}
 
 	#[test]

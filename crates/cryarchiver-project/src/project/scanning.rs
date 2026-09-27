@@ -8,6 +8,7 @@ use cryarchiver_engine::text::display_name;
 
 use super::duplicates::is_lost;
 use super::owner::{Message, Owner};
+use super::resolve::Deferred;
 use crate::keys::RelPath;
 use crate::record::{CycleRecord, FileRecord, FileState, FolderRecord, Identity, IssueKind, MediaClass};
 use crate::scan::{self, EntryKind, Listing};
@@ -223,6 +224,10 @@ impl Owner {
 	/// A file that appears where a gone source was is a new file: the old output stays, and the new one gets a name
 	/// of its own. So does a re-archive whose old output a placeholder adopted.
 	pub(super) fn source_changed(&mut self, file: FileId, size: u64, mtime_ns: i64) {
+		if self.verify_first(file, Deferred::Changed { size, mtime_ns }) {
+			return;
+		}
+
 		let adopted = self.give_up_output(file);
 		self.withdraw(file);
 
@@ -251,15 +256,23 @@ impl Owner {
 		self.observe(file);
 	}
 
-	/// The source file is gone. An archived file keeps its output; anything else leaves the project.
+	/// The source file is gone. An archived file keeps its output, and its size group decides again without it as a
+	/// source; anything else leaves the project.
 	pub(super) fn source_missing(&mut self, file: FileId) {
 		let state = self.tree.file(file).record.state.clone();
 		match state {
 			FileState::Done(output) => self.set_state(file, FileState::SourceGone(output)),
 			FileState::DeletePending(output) => self.set_state(file, FileState::OriginalDeleted(output)),
-			FileState::SourceGone(_) | FileState::OriginalDeleted(_) => {}
-			_ => self.forget_file(file),
+			FileState::SourceGone(_) | FileState::OriginalDeleted(_) => return,
+			_ => {
+				if !self.verify_first(file, Deferred::Missing) {
+					self.forget_file(file);
+				}
+				return;
+			}
 		}
+
+		self.member_changed(file);
 	}
 
 	/// An archived file listed again unchanged, after its source was gone or its original deleted, is Done as it was.
@@ -284,7 +297,8 @@ impl Owner {
 		self.queue_delete(file);
 	}
 
-	/// The file leaves the project; the placeholders that point at it adopt its verified output, or are released.
+	/// The file leaves the project; the placeholders that point at it adopt its verified output, or are released, and
+	/// whatever waited for it goes on without it.
 	pub(super) fn forget_file(&mut self, file: FileId) {
 		self.give_up_output(file);
 		self.withdraw(file);
@@ -297,6 +311,8 @@ impl Owner {
 		if self.view.watched.contains(&folder) {
 			self.send(Update::FileRemoved { folder, file });
 		}
+
+		self.file_settled(file);
 	}
 
 	/// An unreadable entry is an issue, unless the file is archived already: then its output stays and a warning says
@@ -314,6 +330,10 @@ impl Owner {
 		}
 
 		let file = if let Some(file) = known {
+			if self.verify_first(file, Deferred::Broken(reason.to_owned())) {
+				return;
+			}
+
 			self.give_up_output(file);
 			self.withdraw(file);
 			file

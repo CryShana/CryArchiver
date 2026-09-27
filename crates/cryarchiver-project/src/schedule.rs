@@ -213,6 +213,24 @@ impl Waits {
 		self.waiting_on.contains_key(&waiter)
 	}
 
+	/// Whether `waiter` waits for `dependency`, directly or through the files it waits for.
+	pub fn waits_for(&self, waiter: FileId, dependency: FileId) -> bool {
+		let mut seen = HashSet::new();
+		let mut next = vec![waiter];
+		while let Some(file) = next.pop() {
+			for &awaited in self.waiting_on.get(&file).into_iter().flatten() {
+				if awaited == dependency {
+					return true;
+				}
+
+				if seen.insert(awaited) {
+					next.push(awaited);
+				}
+			}
+		}
+		false
+	}
+
 	/// Marks `dependency` done and returns the waiters that no longer wait for anything.
 	pub fn settled(&mut self, dependency: FileId) -> Vec<FileId> {
 		let mut released = Vec::new();
@@ -400,6 +418,18 @@ mod tests {
 		waits.forget(FileId(1));
 
 		assert!(waits.settled(FileId(2)).is_empty());
+	}
+
+	#[test]
+	fn a_wait_is_followed_through_the_files_it_waits_for() {
+		let mut waits = Waits::default();
+		waits.wait(FileId(1), [FileId(2)]);
+		waits.wait(FileId(2), [FileId(3)]);
+		waits.wait(FileId(3), [FileId(2)]);
+
+		assert!(waits.waits_for(FileId(1), FileId(3)));
+		assert!(!waits.waits_for(FileId(3), FileId(1)));
+		assert!(!waits.waits_for(FileId(4), FileId(1)));
 	}
 
 	#[test]

@@ -19,6 +19,7 @@ use super::live::{self, LiveState};
 use super::owner::Owner;
 use super::pipeline::Pipeline;
 use super::publish::ViewState;
+use super::resolve::VerifyState;
 use super::scanning::ScanState;
 use super::watching::WatchState;
 use super::{ProjectError, ProjectOptions};
@@ -97,6 +98,7 @@ impl Owner {
 			watching,
 			danger: DangerState::default(),
 			live: LiveState::new(applied),
+			verify: VerifyState::default(),
 			view: ViewState::default(),
 			issue_ids: IssueIds::default(),
 			issue_files: BTreeSet::new(),

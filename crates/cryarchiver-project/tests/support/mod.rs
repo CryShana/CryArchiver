@@ -281,7 +281,7 @@ pub fn open_unwatched(setup: &Setup, encoder: &Arc<FakeEncoder>) -> Project {
 	open_tuned(setup, encoder, tuning, None)
 }
 
-fn open_tuned(setup: &Setup, encoder: &Arc<FakeEncoder>, tuning: Tuning, fault: Option<Fault>) -> Project {
+pub fn open_tuned(setup: &Setup, encoder: &Arc<FakeEncoder>, tuning: Tuning, fault: Option<Fault>) -> Project {
 	Project::open(
 		&setup.project,
 		ProjectOptions {

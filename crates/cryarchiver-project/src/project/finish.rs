@@ -102,17 +102,19 @@ impl Owner {
 		}
 	}
 
-	/// Nothing is running or waiting to run, and the scan is done.
+	/// Nothing is running or waiting to run, and the scan is done, with no listing or safety pass under way.
 	fn idle(&self) -> bool {
 		self.started
 			&& self.scan.complete
 			&& !self.scanning()
+			&& !self.watching.safety_pass_running
 			&& self.pipeline.jobs.is_empty()
 			&& self.pipeline.queues.values().all(crate::schedule::Queue::is_empty)
 			&& self.pipeline.observed.is_empty()
 			&& self.pipeline.retry_at.is_empty()
 			&& !self.delete_retries_pending()
 			&& !self.hashes_pending()
+			&& !self.verifying()
 			&& self.groups_planned()
 			&& self.watching.debouncer.is_empty()
 			&& !self.watching.destination_walk
@@ -231,6 +233,24 @@ mod tests {
 		assert!(!owner.idle());
 		owner.check_completion();
 		assert_eq!(owner.finish.completion, Completion::Pending);
+	}
+
+	#[test]
+	fn completion_waits_for_a_running_safety_pass() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		owner.started = true;
+		owner.finish.candidates.clear();
+		assert!(owner.idle());
+
+		owner.watching.safety_pass_running = true;
+		assert!(!owner.idle());
+
+		owner.on_folders_changed(Vec::new());
+		assert!(owner.idle());
 	}
 
 	#[test]

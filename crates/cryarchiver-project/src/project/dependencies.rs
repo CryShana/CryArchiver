@@ -25,7 +25,8 @@ impl Owner {
 		}
 	}
 
-	/// Returns whether the file is a reference file; it is then queued, or waits for the files it names.
+	/// Returns whether the file is a reference file; it is then queued, or waits for the files it names. A named file
+	/// that already waits for this one, such as a playlist naming it back, isn't waited for: the two would wait forever.
 	pub(super) fn gate_references(&mut self, file: FileId) -> bool {
 		let entry = self.tree.file(file);
 		let Some(kind) = references::kind_of(&entry.name) else {
@@ -73,6 +74,7 @@ impl Owner {
 		let pending: Vec<FileId> = targets
 			.into_iter()
 			.filter(|target| !self.tree.file(*target).record.state.is_settled())
+			.filter(|&target| !self.pipeline.waits.waits_for(target, file))
 			.collect();
 		self.set_state(file, FileState::Queued);
 		if pending.is_empty() {

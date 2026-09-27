@@ -2,7 +2,7 @@ mod support;
 
 use std::fs;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cryarchiver_engine::outcome::ErrorKind;
 use cryarchiver_project::issues::{Problem, Verb};
@@ -10,7 +10,7 @@ use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How, Output
 use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
 use cryarchiver_project::view::RowState;
-use cryarchiver_project::{Command, Fault};
+use cryarchiver_project::{Command, Fault, Tuning};
 use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
 
 fn records(setup: &support::Setup) -> Vec<(String, FileRecord)> {
@@ -439,4 +439,32 @@ fn outputs_competing_for_one_name_are_numbered_in_turn() {
 	}
 	names.sort();
 	assert_eq!(names, ["a (2).txt", "a (3).txt", "a.txt"]);
+}
+
+#[test]
+fn work_starts_as_soon_as_there_is_room_not_on_the_next_tick() {
+	const FILES: u32 = 200;
+
+	let setup = setup(|_| {});
+	for index in 0..FILES {
+		write(&setup.source, &format!("notes/{index}.txt"), b"notes");
+	}
+	let tick = Duration::from_millis(250);
+	let tuning = Tuning {
+		tick,
+		..support::tuning()
+	};
+	let project = support::open_tuned(&setup, &FakeEncoder::new(), tuning, None);
+	let mut snapshot = Snapshot::default();
+
+	let started = Instant::now();
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+
+	let one_start_per_disk_slot_and_tick = tick * FILES / 2;
+	assert!(
+		started.elapsed() < one_start_per_disk_slot_and_tick / 3,
+		"{:?}",
+		started.elapsed()
+	);
 }
