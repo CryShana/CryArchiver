@@ -107,7 +107,7 @@ pub async fn run(
 	}
 
 	let mut child = spawn(cmd, mode).map_err(RunError::Spawn)?;
-	let _tracked = limits::track(child.id());
+	let tracked = limits::track(child.id());
 	let mut stdout = child.stdout().take().expect("stdout is piped");
 	let stderr = tokio::spawn(collect_stderr(
 		child.stderr().take().expect("stderr is piped"),
@@ -156,6 +156,7 @@ pub async fn run(
 			}
 		}
 	};
+	drop(tracked);
 
 	// After a cancel the exit status proves nothing about the file: the same interruption may have ended the tool.
 	if cancel.is_cancelled() {

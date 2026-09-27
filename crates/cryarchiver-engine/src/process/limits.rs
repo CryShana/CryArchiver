@@ -59,9 +59,9 @@ pub fn track(pid: Option<u32>) -> Tracked {
 	}
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for Tracked {
 	fn drop(&mut self) {
+		#[cfg(target_os = "linux")]
 		if let Some(group) = self.group {
 			native::unregister(group);
 		}
@@ -73,7 +73,7 @@ mod native {
 	use std::ffi::c_void;
 	use std::sync::OnceLock;
 
-	use windows::Win32::Foundation::HANDLE;
+	use windows::Win32::Foundation::{CloseHandle, HANDLE};
 	use windows::Win32::System::JobObjects::{
 		AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
 		JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_PRIORITY_CLASS, JOBOBJECT_BASIC_LIMIT_INFORMATION,
@@ -106,7 +106,12 @@ mod native {
 			// SAFETY: no attributes and no name; the handle stays open for the life of the process.
 			let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.ok()?;
 			// SAFETY: both handles are valid; the pseudo handle of the current process needs no closing.
-			unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) }.ok()?;
+			if unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) }.is_err() {
+				// SAFETY: the job was created above and nothing else holds it.
+				let _ = unsafe { CloseHandle(job) };
+				return None;
+			}
+
 			Some(job.0.expose_provenance())
 		});
 		address.map(|address| HANDLE(std::ptr::with_exposed_provenance_mut::<c_void>(address)))
@@ -183,20 +188,22 @@ mod native {
 	}
 
 	pub fn unregister(group: i32) {
-		GROUPS
-			.lock()
-			.unwrap_or_else(PoisonError::into_inner)
-			.retain(|known| *known != group);
+		let mut groups = GROUPS.lock().unwrap_or_else(PoisonError::into_inner);
+		if let Some(index) = groups.iter().position(|known| *known == group) {
+			groups.swap_remove(index);
+		}
 	}
 
 	pub fn apply(limits: Limits) -> Applied {
-		let groups = GROUPS.lock().unwrap_or_else(PoisonError::into_inner).clone();
-		let priority_live = groups
-			.into_iter()
-			.all(|group| set_priority(libc::PRIO_PGRP, IOPRIO_WHO_PGRP, group, limits.low_priority));
+		let groups = GROUPS.lock().unwrap_or_else(PoisonError::into_inner);
+		let failed = groups
+			.iter()
+			.filter(|&&group| !set_priority(libc::PRIO_PGRP, IOPRIO_WHO_PGRP, group, limits.low_priority))
+			.count();
+		drop(groups);
 
 		Applied {
-			priority_live,
+			priority_live: failed == 0,
 			cpu_cap_live: limits.cpu_cap.is_none(),
 		}
 	}
