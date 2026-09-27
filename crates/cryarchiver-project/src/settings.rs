@@ -133,6 +133,68 @@ impl Settings {
 	}
 }
 
+/// Why a destination can't hold a source's archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootConflict {
+	Same,
+	DestinationInsideSource,
+	SourceInsideDestination,
+}
+
+impl RootConflict {
+	/// Compares paths as they are; both must be in the same form, canonical or planned.
+	pub fn between(source: &Path, destination: &Path) -> Option<Self> {
+		if source == destination {
+			Some(Self::Same)
+		} else if destination.starts_with(source) {
+			Some(Self::DestinationInsideSource)
+		} else if source.starts_with(destination) {
+			Some(Self::SourceInsideDestination)
+		} else {
+			None
+		}
+	}
+
+	pub const fn message(self) -> &'static str {
+		match self {
+			Self::Same => "the source and the destination are the same folder",
+			Self::DestinationInsideSource => "the destination is inside the source",
+			Self::SourceInsideDestination => "the source is inside the destination",
+		}
+	}
+}
+
+/// Where `path` will be once it exists: its nearest existing ancestor, canonical, followed by the missing names. A
+/// path with no existing ancestor at all is only made absolute.
+pub fn planned_path(path: &Path) -> io::Result<PathBuf> {
+	let mut existing = path;
+	let mut missing = Vec::new();
+	while !existing.exists() {
+		let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+			return std::path::absolute(path);
+		};
+		missing.push(name);
+		existing = if parent.as_os_str().is_empty() {
+			Path::new(".")
+		} else {
+			parent
+		};
+	}
+
+	let mut planned = std::fs::canonicalize(existing)
+		.map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", display_path(existing))))?;
+	planned.extend(missing.iter().rev());
+	Ok(planned)
+}
+
+/// Checks the roots before either needs to exist, on their planned paths.
+pub fn root_conflict(source: &Path, destination: &Path) -> io::Result<Option<RootConflict>> {
+	Ok(RootConflict::between(
+		&planned_path(source)?,
+		&planned_path(destination)?,
+	))
+}
+
 /// The roots must exist and differ, and neither may lie inside the other; checked on canonical paths.
 pub fn check_roots(source: &Path, destination: &Path) -> Result<(PathBuf, PathBuf), SettingsError> {
 	let canonical = |path: &Path| {
@@ -140,16 +202,8 @@ pub fn check_roots(source: &Path, destination: &Path) -> Result<(PathBuf, PathBu
 	};
 	let (source, destination) = (canonical(source)?, canonical(destination)?);
 
-	if source == destination {
-		return Err(SettingsError::Roots(
-			"the source and the destination are the same folder".into(),
-		));
-	}
-	if destination.starts_with(&source) {
-		return Err(SettingsError::Roots("the destination is inside the source".into()));
-	}
-	if source.starts_with(&destination) {
-		return Err(SettingsError::Roots("the source is inside the destination".into()));
+	if let Some(conflict) = RootConflict::between(&source, &destination) {
+		return Err(SettingsError::Roots(conflict.message().into()));
 	}
 	Ok((source, destination))
 }
@@ -277,5 +331,37 @@ mod tests {
 		let (canonical_source, canonical_destination) = check_roots(&source, &beside).unwrap();
 		assert!(canonical_source.ends_with("source"));
 		assert!(canonical_destination.ends_with("archive"));
+	}
+
+	#[test]
+	fn conflicts_are_found_before_the_folders_exist() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("new").join("photos");
+		let conflict = |destination: &Path| root_conflict(&source, destination).unwrap();
+
+		assert_eq!(conflict(&source), Some(RootConflict::Same));
+		assert_eq!(
+			conflict(&source.join("archive").join("deep")),
+			Some(RootConflict::DestinationInsideSource)
+		);
+		assert_eq!(
+			conflict(&dir.path().join("new")),
+			Some(RootConflict::SourceInsideDestination)
+		);
+		assert_eq!(conflict(&dir.path().join("archive")), None);
+		assert!(!dir.path().join("new").exists());
+	}
+
+	#[test]
+	fn a_planned_path_starts_at_the_canonical_nearest_ancestor() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::create_dir(dir.path().join("here")).unwrap();
+
+		let planned = planned_path(&dir.path().join("here").join("..").join("here").join("later")).unwrap();
+
+		assert_eq!(
+			planned,
+			fs::canonicalize(dir.path().join("here")).unwrap().join("later")
+		);
 	}
 }

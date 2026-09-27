@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -14,7 +15,9 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 
 use crate::app::{App, BURST_GAP};
+use crate::recent::RecentStore;
 use crate::source::ArchiveSource;
+use crate::start::StartMenu;
 use crate::theme::ColorDepth;
 
 const FRAME: Duration = Duration::from_millis(33);
@@ -31,6 +34,8 @@ pub enum RunError {
 	Io(#[from] io::Error),
 }
 
+type Events = Receiver<io::Result<(Event, Instant)>>;
+
 /// Runs the TUI until the user quits. The source is shut down while a "stopping" frame is on screen and is dropped
 /// only after the terminal has been restored, because stopping a real run can take seconds.
 pub fn run<S: ArchiveSource>(source: S) -> Result<(), RunError> {
@@ -39,22 +44,77 @@ pub fn run<S: ArchiveSource>(source: S) -> Result<(), RunError> {
 	}
 
 	let mut app = App::new(source, ColorDepth::detect());
-	let mut terminal = match ratatui::try_init() {
+	let mut terminal = match start_terminal() {
 		Ok(terminal) => terminal,
 		Err(err) => {
-			ratatui::restore();
 			app.shutdown();
-			return Err(err.into());
+			return Err(err);
+		}
+	};
+	app.set_mouse_capture(capture_mouse());
+
+	let input = Input::spawn();
+	let result = pump(&mut terminal, &mut app, &input.events);
+	input.stop();
+
+	finish(&mut terminal, app, result)
+}
+
+/// Runs the start menu until the user quits or a project opens, then that project until the user quits. `open`
+/// runs while the menu shows that the project is opening; its error goes back to the menu.
+pub fn run_start_menu<S, F>(store: RecentStore, mut open: F) -> Result<(), RunError>
+where
+	S: ArchiveSource,
+	F: FnMut(&Path) -> Result<S, String>,
+{
+	if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+		return Err(RunError::NotATerminal);
+	}
+
+	let depth = ColorDepth::detect();
+	let mut menu = StartMenu::new(store, depth);
+	let mut terminal = start_terminal()?;
+	menu.set_mouse_capture(capture_mouse());
+
+	let input = Input::spawn();
+	let source = match pump_menu(&mut terminal, &mut menu, &input.events, &mut open) {
+		Ok(Some(source)) => source,
+		ended => {
+			input.stop();
+			release_input_modes();
+			ratatui::restore();
+			return ended.map(|_| ());
 		}
 	};
 
+	// Keys pressed while the project was opening were meant for the menu, not for the dashboard.
+	while input.events.try_recv().is_ok() {}
+
+	let mut app = App::new(source, depth);
+	app.set_mouse_capture(menu.mouse_capture());
+	let result = pump(&mut terminal, &mut app, &input.events);
+	input.stop();
+
+	finish(&mut terminal, app, result)
+}
+
+fn start_terminal() -> Result<DefaultTerminal, RunError> {
+	let terminal = ratatui::try_init().inspect_err(|_| ratatui::restore())?;
+
 	release_input_modes_on_panic();
 	let _ = execute!(io::stdout(), EnableBracketedPaste);
-	let captured = execute!(io::stdout(), EnableMouseCapture).is_ok();
-	app.set_mouse_capture(captured);
+	Ok(terminal)
+}
 
-	let result = event_loop(&mut terminal, &mut app);
+fn capture_mouse() -> bool {
+	execute!(io::stdout(), EnableMouseCapture).is_ok()
+}
 
+fn finish<S: ArchiveSource>(
+	terminal: &mut DefaultTerminal,
+	mut app: App<S>,
+	result: Result<(), RunError>,
+) -> Result<(), RunError> {
 	app.begin_shutdown();
 	let _ = terminal.draw(|frame| app.draw(frame));
 	app.shutdown();
@@ -77,22 +137,85 @@ fn release_input_modes_on_panic() {
 	}));
 }
 
-fn event_loop<S: ArchiveSource>(terminal: &mut DefaultTerminal, app: &mut App<S>) -> Result<(), RunError> {
-	let stop = Arc::new(AtomicBool::new(false));
-	let (events, reader) = spawn_input(stop.clone());
-
-	let result = pump(terminal, app, &events);
-
-	stop.store(true, Ordering::Relaxed);
-	let _ = reader.join();
-	result
+/// Crossterm's blocking read runs on its own thread, so the UI thread only ever waits on the channel.
+struct Input {
+	events: Events,
+	stop: Arc<AtomicBool>,
+	reader: JoinHandle<()>,
 }
 
-fn pump<S: ArchiveSource>(
+impl Input {
+	fn spawn() -> Self {
+		let stop = Arc::new(AtomicBool::new(false));
+		let (events, reader) = spawn_input(stop.clone());
+		Self { events, stop, reader }
+	}
+
+	fn stop(self) {
+		self.stop.store(true, Ordering::Relaxed);
+		let _ = self.reader.join();
+	}
+}
+
+fn pump_menu<S, F>(
 	terminal: &mut DefaultTerminal,
-	app: &mut App<S>,
-	events: &Receiver<io::Result<(Event, Instant)>>,
-) -> Result<(), RunError> {
+	menu: &mut StartMenu,
+	events: &Events,
+	open: &mut F,
+) -> Result<Option<S>, RunError>
+where
+	F: FnMut(&Path) -> Result<S, String>,
+{
+	let mut dirty = true;
+	let mut captured = menu.mouse_capture();
+	let mut next_frame = Instant::now();
+
+	loop {
+		match events.recv_timeout(next_frame.saturating_duration_since(Instant::now())) {
+			Ok(first) => {
+				menu.handle_batch(&gather(first?, events)?);
+				dirty = true;
+			}
+			Err(RecvTimeoutError::Timeout) => {}
+			Err(RecvTimeoutError::Disconnected) => return Err(RunError::InputClosed),
+		}
+
+		if menu.should_quit() {
+			return Ok(None);
+		}
+
+		if menu.mouse_capture() != captured {
+			captured = apply_mouse_capture(menu.mouse_capture(), captured);
+			menu.set_mouse_capture(captured);
+		}
+
+		if let Some(project) = menu.take_request() {
+			terminal.draw(|frame| menu.draw(frame))?;
+			match open(&project) {
+				Ok(source) => {
+					menu.opened(&project);
+					return Ok(Some(source));
+				}
+				Err(message) => menu.open_failed(message),
+			}
+			dirty = true;
+		}
+
+		let now = Instant::now();
+		if now < next_frame {
+			continue;
+		}
+
+		dirty |= menu.tick();
+		if dirty {
+			terminal.draw(|frame| menu.draw(frame))?;
+			dirty = false;
+		}
+		next_frame = now + FRAME;
+	}
+}
+
+fn pump<S: ArchiveSource>(terminal: &mut DefaultTerminal, app: &mut App<S>, events: &Events) -> Result<(), RunError> {
 	let mut dirty = true;
 	let mut captured = app.mouse_capture();
 	let mut next_frame = Instant::now();
@@ -113,7 +236,8 @@ fn pump<S: ArchiveSource>(
 		}
 
 		if app.mouse_capture() != captured {
-			captured = apply_mouse_capture(app, captured);
+			captured = apply_mouse_capture(app.mouse_capture(), captured);
+			app.set_mouse_capture(captured);
 		}
 
 		let now = Instant::now();
@@ -153,10 +277,7 @@ fn copy_to_clipboard(text: &str) {
 
 /// Collects the events that follow the first one closely. A paste arrives as a quick run of key presses, and the app
 /// can only keep it out of the shortcuts when it sees the whole run at once.
-fn gather(
-	first: (Event, Instant),
-	events: &Receiver<io::Result<(Event, Instant)>>,
-) -> io::Result<Vec<(Event, Instant)>> {
+fn gather(first: (Event, Instant), events: &Events) -> io::Result<Vec<(Event, Instant)>> {
 	let mut batch = vec![first];
 	while let Ok(next) = events.recv_timeout(BURST_GAP) {
 		batch.push(next?);
@@ -164,25 +285,18 @@ fn gather(
 	Ok(batch)
 }
 
-/// A terminal that refuses the change keeps its current mode, and the app is told so.
-fn apply_mouse_capture<S: ArchiveSource>(app: &mut App<S>, captured: bool) -> bool {
-	let wanted = app.mouse_capture();
+/// Returns the mode in effect: a terminal that refuses the change keeps its current one.
+fn apply_mouse_capture(wanted: bool, captured: bool) -> bool {
 	let applied = if wanted {
 		execute!(io::stdout(), EnableMouseCapture)
 	} else {
 		execute!(io::stdout(), DisableMouseCapture)
 	};
 
-	if applied.is_ok() {
-		wanted
-	} else {
-		app.set_mouse_capture(captured);
-		captured
-	}
+	if applied.is_ok() { wanted } else { captured }
 }
 
-/// Crossterm's blocking read runs on its own thread, so the UI thread only ever waits on the channel.
-fn spawn_input(stop: Arc<AtomicBool>) -> (Receiver<io::Result<(Event, Instant)>>, JoinHandle<()>) {
+fn spawn_input(stop: Arc<AtomicBool>) -> (Events, JoinHandle<()>) {
 	let (sender, receiver) = mpsc::channel();
 	let reader = thread::spawn(move || {
 		while !stop.load(Ordering::Relaxed) {

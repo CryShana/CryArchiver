@@ -8,7 +8,7 @@ use super::{Outcome, Overlay, Ui, ViewMode};
 use crate::source::ArchiveSource;
 use crate::view::{FileId, NodeId};
 
-const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const WHEEL_ROWS: isize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,19 +27,25 @@ pub enum Hit {
 }
 
 /// Clickable regions of the frame that is on screen. Later regions sit on top of earlier ones.
-#[derive(Debug, Default)]
-pub struct HitMap(Vec<(Rect, Hit)>);
+#[derive(Debug)]
+pub struct HitMap<H = Hit>(Vec<(Rect, H)>);
 
-impl HitMap {
+impl<H> Default for HitMap<H> {
+	fn default() -> Self {
+		Self(Vec::new())
+	}
+}
+
+impl<H: Copy> HitMap<H> {
 	pub fn clear(&mut self) {
 		self.0.clear();
 	}
 
-	pub fn push(&mut self, area: Rect, hit: Hit) {
+	pub fn push(&mut self, area: Rect, hit: H) {
 		self.0.push((area, hit));
 	}
 
-	pub fn at(&self, position: Position) -> Option<Hit> {
+	pub fn at(&self, position: Position) -> Option<H> {
 		self.0
 			.iter()
 			.rev()

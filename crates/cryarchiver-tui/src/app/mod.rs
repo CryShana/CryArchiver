@@ -13,10 +13,10 @@ use ratatui::layout::Rect;
 use throbber_widgets_tui::ThrobberState;
 use tui_input::Input;
 
-pub(crate) use self::burst::BURST_GAP;
+pub(crate) use self::burst::{BURST_GAP, burst_flags};
 pub(crate) use self::menu::Menu;
 use self::mouse::Click;
-pub(crate) use self::mouse::{Hit, HitMap};
+pub(crate) use self::mouse::{DOUBLE_CLICK, Hit, HitMap};
 pub(crate) use self::settings::{SETTINGS_ROWS, SettingsRow};
 pub use self::tree::Selection;
 use self::tree::TreeState;

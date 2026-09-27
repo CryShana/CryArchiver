@@ -8,6 +8,7 @@ mod overlay;
 mod panels;
 mod settings;
 mod small;
+pub(crate) mod start;
 mod widgets;
 
 pub use self::issues::AttemptLog;

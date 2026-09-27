@@ -22,6 +22,7 @@ use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::toolchain::{Status, ToolConfig, Toolchain};
 use cryarchiver_engine::workspace::sweep;
+use cryarchiver_tui::recent::{RecentStore, now_unix_ms};
 use cryarchiver_tui::{MockSource, ProjectSource};
 use tokio::sync::Notify;
 use tokio::task::{JoinError, JoinSet};
@@ -39,6 +40,8 @@ use crate::report::{Report, Totals, outcome_line};
 struct Cli {
 	#[command(subcommand)]
 	command: Option<Command>,
+	#[arg(long, conflicts_with = "inputs", help = "Open the dashboard on demo data")]
+	demo: bool,
 	#[command(flatten)]
 	compress: CompressArgs,
 }
@@ -50,9 +53,11 @@ enum Command {
 		#[arg(long, value_name = "PATH", help = "ffmpeg binary or the folder containing it")]
 		ffmpeg: Option<PathBuf>,
 	},
-	#[command(about = "Open the archival TUI")]
+	#[command(about = "Open the archival TUI: a project, or the start menu without one")]
 	Tui {
 		project: Option<PathBuf>,
+		#[arg(long, conflicts_with = "project", help = "Show the dashboard on demo data")]
+		demo: bool,
 		#[arg(long, value_name = "PATH", help = "ffmpeg binary or the folder containing it")]
 		ffmpeg: Option<PathBuf>,
 	},
@@ -192,8 +197,25 @@ impl Drop for QueueSeat {
 	}
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TuiTarget {
+	Menu,
+	Demo,
+	Project(PathBuf),
+}
+
+impl TuiTarget {
+	fn new(project: Option<PathBuf>, demo: bool) -> Self {
+		match (project, demo) {
+			(Some(project), _) => Self::Project(project),
+			(None, true) => Self::Demo,
+			(None, false) => Self::Menu,
+		}
+	}
+}
+
 enum Launch {
-	Tui(Option<PathBuf>, Option<PathBuf>),
+	Tui(TuiTarget, Option<PathBuf>),
 	Doctor(Option<PathBuf>),
 	Compress(CompressArgs),
 	Run {
@@ -206,7 +228,7 @@ enum Launch {
 
 fn main() -> ExitCode {
 	let code = match launch() {
-		Launch::Tui(project, ffmpeg) => return ExitCode::from(open_tui(project.as_deref(), ffmpeg)),
+		Launch::Tui(target, ffmpeg) => return ExitCode::from(open_tui(target, ffmpeg)),
 		Launch::Doctor(ffmpeg) => block_on(doctor(ffmpeg)),
 		Launch::Compress(args) => block_on(compress(args)),
 		Launch::Run {
@@ -230,14 +252,18 @@ fn main() -> ExitCode {
 }
 
 fn launch() -> Launch {
-	if std::env::args_os().len() == 1 {
-		return Launch::Tui(None, None);
+	launch_from(std::env::args_os().collect())
+}
+
+fn launch_from(args: Vec<OsString>) -> Launch {
+	if args.len() == 1 {
+		return Launch::Tui(TuiTarget::Menu, None);
 	}
 
-	let cli = Cli::parse();
+	let cli = Cli::parse_from(args);
 	match cli.command {
 		Some(Command::Doctor { ffmpeg }) => Launch::Doctor(ffmpeg),
-		Some(Command::Tui { project, ffmpeg }) => Launch::Tui(project, ffmpeg),
+		Some(Command::Tui { project, demo, ffmpeg }) => Launch::Tui(TuiTarget::new(project, demo), ffmpeg),
 		Some(Command::Run {
 			project,
 			delete_originals,
@@ -248,9 +274,11 @@ fn launch() -> Launch {
 			ffmpeg,
 		},
 		Some(Command::Project(command)) => Launch::Project(command),
-		None if opens_project(&cli.compress.inputs) => {
-			Launch::Tui(cli.compress.inputs.into_iter().next(), cli.compress.ffmpeg)
-		}
+		None if cli.demo => Launch::Tui(TuiTarget::Demo, cli.compress.ffmpeg),
+		None if opens_project(&cli.compress.inputs) => Launch::Tui(
+			TuiTarget::new(cli.compress.inputs.into_iter().next(), false),
+			cli.compress.ffmpeg,
+		),
 		None => Launch::Compress(cli.compress),
 	}
 }
@@ -271,16 +299,20 @@ fn opens_project(inputs: &[PathBuf]) -> bool {
 		.is_some_and(|input| input.extension().is_some_and(|ext| ext == "cryarchive"))
 }
 
-fn open_tui(project: Option<&Path>, ffmpeg: Option<PathBuf>) -> u8 {
+fn open_tui(target: TuiTarget, ffmpeg: Option<PathBuf>) -> u8 {
 	use std::io::IsTerminal;
 
-	let result = match project {
-		None => cryarchiver_tui::run(MockSource::default()),
-		Some(_) if !io::stdin().is_terminal() || !io::stdout().is_terminal() => {
-			Err(cryarchiver_tui::RunError::NotATerminal)
-		}
-		Some(path) => match projects::open(path, ffmpeg) {
-			Ok(project) => cryarchiver_tui::run(ProjectSource::new(project)),
+	let result = match target {
+		_ if !io::stdin().is_terminal() || !io::stdout().is_terminal() => Err(cryarchiver_tui::RunError::NotATerminal),
+		TuiTarget::Demo => cryarchiver_tui::run(MockSource::default()),
+		TuiTarget::Menu => cryarchiver_tui::run_start_menu(RecentStore::locate(), |path| {
+			projects::open(path, ffmpeg.clone()).map(ProjectSource::new)
+		}),
+		TuiTarget::Project(path) => match projects::open(&path, ffmpeg) {
+			Ok(project) => {
+				let _ = RecentStore::locate().record(&path, now_unix_ms());
+				cryarchiver_tui::run(ProjectSource::new(project))
+			}
 			Err(message) => {
 				eprintln!("error: {message}");
 				pause_if_launched_from_explorer();
@@ -612,6 +644,46 @@ mod tests {
 
 		drop(second);
 		assert_eq!(videos.waiting(), 0);
+	}
+
+	fn args(args: &[&str]) -> Vec<OsString> {
+		std::iter::once("cryarchiver")
+			.chain(args.iter().copied())
+			.map(OsString::from)
+			.collect()
+	}
+
+	fn tui_target(args_given: &[&str]) -> Option<TuiTarget> {
+		match launch_from(args(args_given)) {
+			Launch::Tui(target, _) => Some(target),
+			_ => None,
+		}
+	}
+
+	#[test]
+	fn launching_without_a_project_opens_the_start_menu() {
+		assert_eq!(tui_target(&[]), Some(TuiTarget::Menu));
+		assert_eq!(tui_target(&["tui"]), Some(TuiTarget::Menu));
+	}
+
+	#[test]
+	fn demo_is_a_flag_on_tui_and_on_the_bare_launch() {
+		assert_eq!(tui_target(&["--demo"]), Some(TuiTarget::Demo));
+		assert_eq!(tui_target(&["tui", "--demo"]), Some(TuiTarget::Demo));
+		assert!(Cli::try_parse_from(args(&["tui", "family.cryarchive", "--demo"])).is_err());
+		assert!(Cli::try_parse_from(args(&["--demo", "song.flac"])).is_err());
+	}
+
+	#[test]
+	fn a_project_opens_directly() {
+		let project = PathBuf::from("family.cryarchive");
+
+		assert_eq!(
+			tui_target(&["tui", "family.cryarchive"]),
+			Some(TuiTarget::Project(project.clone()))
+		);
+		assert_eq!(tui_target(&["family.cryarchive"]), Some(TuiTarget::Project(project)));
+		assert_eq!(tui_target(&["song.flac"]), None);
 	}
 
 	#[tokio::test]

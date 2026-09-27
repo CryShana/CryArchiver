@@ -8,18 +8,18 @@ use tui_input::Input;
 
 use super::log::toast_color;
 use super::widgets::{VERB_KEYS, bold, fg, put, to_u16};
-use crate::app::{Hit, Overlay, Ui, ViewMode};
+use crate::app::{Hit, HitMap, Overlay, Ui, ViewMode};
 use crate::format::{fit, width};
 use crate::theme::Theme;
 use crate::view::{ArchiveView, Duplicates, FileDetails, IssueVerbs, Notification, RunState};
 
-struct Chip {
+pub struct Chip {
 	key: Cow<'static, str>,
 	label: Cow<'static, str>,
 	code: Option<KeyCode>,
 }
 
-fn chip(key: &'static str, label: &'static str, code: Option<KeyCode>) -> Chip {
+pub fn chip(key: &'static str, label: &'static str, code: Option<KeyCode>) -> Chip {
 	Chip {
 		key: Cow::Borrowed(key),
 		label: Cow::Borrowed(label),
@@ -47,27 +47,40 @@ pub fn render(
 		Some(toast) => render_toast(buf, area, toast, &ui.theme),
 		None => area.right(),
 	};
+	let chips = chips(view, details, ui);
+	draw_chips(buf, area, right, chips, &ui.theme, &mut ui.hits, Hit::Footer);
+}
+
+/// Draws chips from the left until one doesn't fit before `right`. Each chip with a key is clickable.
+pub fn draw_chips<H: Copy>(
+	buf: &mut Buffer,
+	area: Rect,
+	right: u16,
+	chips: Vec<Chip>,
+	theme: &Theme,
+	hits: &mut HitMap<H>,
+	hit: impl Fn(KeyCode) -> H,
+) {
 	let mut x = area.x + 1;
-	for chip in chips(view, details, ui) {
+	for chip in chips {
 		let needed = to_u16(width(&chip.key) + width(&chip.label) + 4);
 		if x + needed > right {
 			break;
 		}
 
 		let start = x;
-		let key_style = bold(ui.theme.accent).bg(ui.theme.selection);
+		let key_style = bold(theme.accent).bg(theme.selection);
 		x = put(buf, x, area.y, &format!(" {} ", chip.key), key_style, right);
-		x = put(buf, x + 1, area.y, &chip.label, fg(ui.theme.dim), right) + 2;
+		x = put(buf, x + 1, area.y, &chip.label, fg(theme.dim), right) + 2;
 
 		if let Some(code) = chip.code {
-			ui.hits
-				.push(Rect::new(start, area.y, x - start - 1, 1), Hit::Footer(code));
+			hits.push(Rect::new(start, area.y, x - start - 1, 1), hit(code));
 		}
 	}
 }
 
 /// Draws the toast right-aligned and returns where the chips must stop.
-fn render_toast(buf: &mut Buffer, area: Rect, toast: &Notification, theme: &Theme) -> u16 {
+pub fn render_toast(buf: &mut Buffer, area: Rect, toast: &Notification, theme: &Theme) -> u16 {
 	let text = fit(&format!("◆ {} ", toast.text), usize::from(area.width / 2));
 	let text = text.trim_end();
 	let x = area.right().saturating_sub(to_u16(width(text)) + 1);

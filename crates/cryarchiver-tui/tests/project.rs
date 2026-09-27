@@ -10,9 +10,10 @@ use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate};
 use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome};
 use cryarchiver_engine::text::display_path;
 use cryarchiver_project::{Backend, Project, ProjectOptions, SystemSample, Tuning};
+use cryarchiver_tui::recent::{FILE_NAME, RecentStore};
 use cryarchiver_tui::source::Target;
 use cryarchiver_tui::view::{FileState, NoticeLevel, RunState};
-use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, OverlayKind, ProjectSource};
+use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, OverlayKind, ProjectSource, StartMenu};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -315,6 +316,42 @@ fn a_deleting_project_archives_but_deletes_nothing_until_delete_is_typed_this_se
 	let shown = screen(&mut app);
 	assert!(!shown.contains("deleting paused"));
 	assert!(shown.contains("⊗ 1 original deleted"), "{shown}");
+}
+
+#[test]
+fn the_delete_typed_when_creating_in_the_start_menu_does_not_confirm_the_session() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+	fs::write(source.join("notes.txt"), b"notes").unwrap();
+	let store = RecentStore::at(dir.path().join(FILE_NAME));
+	let mut menu = StartMenu::new(store, ColorDepth::TrueColor);
+	let key = |menu: &mut StartMenu, code: KeyCode| {
+		menu.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), Instant::now());
+	};
+
+	menu.handle_event(&Event::Paste(display_path(&source)), Instant::now());
+	key(&mut menu, KeyCode::Tab);
+	menu.handle_event(&Event::Paste(display_path(&dir.path().join("archive"))), Instant::now());
+	for _ in 0..3 {
+		key(&mut menu, KeyCode::Tab);
+	}
+	key(&mut menu, KeyCode::Enter);
+	menu.handle_event(&Event::Paste("DELETE".into()), Instant::now());
+	key(&mut menu, KeyCode::Enter);
+	key(&mut menu, KeyCode::Tab);
+	key(&mut menu, KeyCode::Enter);
+	let project = menu.take_request().expect("the form created the project");
+	assert!(cryarchiver_project::peek(&project).unwrap().delete_originals);
+
+	let mut source_view = open(&project);
+	refresh_until(&mut source_view, "the run to start", |s| {
+		s.view().header.run_state != RunState::Paused
+	});
+
+	assert!(source_view.view().header.deleting_originals);
+	assert!(source_view.view().header.deleting_paused);
+	assert!(source.join("notes.txt").exists());
 }
 
 #[test]

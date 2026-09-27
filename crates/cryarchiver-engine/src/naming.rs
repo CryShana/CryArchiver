@@ -94,15 +94,20 @@ pub fn destination_name(name: &OsStr) -> OsString {
 		})
 		.collect();
 
-	let stem_end = mapped.find('.').unwrap_or(mapped.len());
-	if RESERVED_DEVICE_NAMES.contains(&mapped[..stem_end].to_ascii_lowercase().as_str()) {
-		mapped.insert(stem_end, NAME_SUFFIX);
+	if is_reserved_device_name(&mapped) {
+		mapped.insert(mapped.find('.').unwrap_or(mapped.len()), NAME_SUFFIX);
 	}
 
 	if mapped.ends_with(['.', ' ']) {
 		mapped.push(NAME_SUFFIX);
 	}
 	OsString::from(mapped)
+}
+
+/// Whether Windows reserves the name for a device, whatever its extension (`CON`, `nul.txt`, `COM1.tar.gz`).
+pub fn is_reserved_device_name(name: &str) -> bool {
+	let stem = &name[..name.find('.').unwrap_or(name.len())];
+	RESERVED_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str())
 }
 
 fn media_stem_key(name: &OsStr) -> Option<String> {

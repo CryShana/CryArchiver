@@ -92,6 +92,7 @@ On Linux, the check that an original is still open in another program is best ef
 |---|---|
 | `project create SOURCE DESTINATION [--name N] [--speed S] [--watch] [--limit PERCENT]` | Create a project; neither folder may be inside the other |
 | `tui PROJECT`, or `PROJECT.cryarchive` alone | Open a project in the dashboard |
+| `tui`, or no arguments | Open the start menu: recent projects and a new project form |
 | `run PROJECT [--delete-originals]` | Run a project without the dashboard |
 | `project dump PROJECT` | Print the project's tables, for debugging |
 
@@ -99,4 +100,6 @@ On Linux, the check that an original is still open in another program is best ef
 
 `run` prints a progress line every few seconds and the log as it happens, then a summary that lists the open issues. It exits with `0` once everything is archived without open issues, `1` with open issues (unacknowledged unknown files in the destination included) or when stopped with Ctrl+C before the end (a watch-mode run stopped with Ctrl+C exits with `0` when it has no open issues), and `2` when the project can't be opened or the delete confirmation doesn't agree. A second Ctrl+C exits at once; the next run resumes the jobs that were running.
 
-`cryarchiver` with no arguments, or `cryarchiver tui`, opens the dashboard on demo data. The dashboard needs a terminal of at least 100×30; press `?` for keys and `q` to quit. Quitting stops running jobs, and the project resumes them on the next open.
+`cryarchiver` with no arguments, or `cryarchiver tui`, opens the start menu: the last 10 projects you opened, and a form that creates a new project and checks every field as you type. `cryarchiver --demo` or `cryarchiver tui --demo` shows the dashboard on demo data instead. The list of recent projects is kept in `recent.bin`, next to the executable when that folder is writable, otherwise in `%APPDATA%\CryArchiver` or `~/.config/cryarchiver` (`$XDG_CONFIG_HOME/cryarchiver`); it only changes when you open or create a project, or remove projects from it in the menu.
+
+The dashboard needs a terminal of at least 100×30; press `?` for keys and `q` to quit. Quitting stops running jobs, and the project resumes them on the next open.

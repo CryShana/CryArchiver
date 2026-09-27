@@ -65,12 +65,22 @@ pub fn confirm_delete(
 	theme: &Theme,
 	hits: &mut HitMap,
 ) {
+	let ask = if view.settings.delete_originals {
+		"Type DELETE to allow it for this session:"
+	} else {
+		"Type DELETE to turn it on:"
+	};
+	let area = delete_prompt(buf, screen, ask, input, theme);
+	hits.push(area, Hit::Modal);
+}
+
+/// The dangerous-mode warning with the `DELETE` field; returns the modal's area.
+pub fn delete_prompt(buf: &mut Buffer, screen: Rect, ask: &str, input: &Input, theme: &Theme) -> Rect {
 	let area = screen.centered(
 		Constraint::Length(screen.width.saturating_sub(10).min(72)),
 		Constraint::Length(10),
 	);
 	let inner = modal(buf, area, screen, theme, "Delete originals?");
-	hits.push(area, Hit::Modal);
 	let right = inner.right();
 	let cells = usize::from(inner.width.saturating_sub(4));
 
@@ -90,11 +100,6 @@ pub fn confirm_delete(
 		put(buf, inner.x + 2, y, &fit(line, cells), fg(theme.text), right);
 	}
 
-	let ask = if view.settings.delete_originals {
-		"Type DELETE to allow it for this session:"
-	} else {
-		"Type DELETE to turn it on:"
-	};
 	put(buf, inner.x + 2, inner.y + 5, ask, fg(theme.dim), right);
 	let field = Rect::new(inner.x + 2, inner.y + 6, inner.width.saturating_sub(4).min(24), 1);
 	buf.set_style(field, Style::new().bg(theme.selection));
@@ -107,6 +112,7 @@ pub fn confirm_delete(
 		bold(theme.bright).bg(theme.selection),
 		field.right(),
 	);
+	area
 }
 
 pub fn confirm_restart(buf: &mut Buffer, screen: Rect, view: &ArchiveView, theme: &Theme, hits: &mut HitMap) {

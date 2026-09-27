@@ -41,6 +41,8 @@ pub enum StoreError {
 	UpgradeRequired(u8),
 	#[error("the project file is damaged: {0}")]
 	Damaged(String),
+	#[error("the project wasn't closed cleanly; opening it recovers it")]
+	NeedsRecovery,
 	#[error(transparent)]
 	Io(#[from] io::Error),
 	#[error("project file error: {0}")]
@@ -398,6 +400,20 @@ fn read_meta(db: &impl ReadableDatabase) -> Result<Meta, StoreError> {
 	})
 }
 
+/// Reads the meta table of a closed project. The read-only handle takes a shared lock only while it lives, so it
+/// never keeps an open from taking the project.
+pub fn peek(path: &Path) -> Result<Meta, StoreError> {
+	if !path.is_file() {
+		return Err(io::Error::new(io::ErrorKind::NotFound, "no project file at this path").into());
+	}
+
+	let db = match ReadOnlyDatabase::open(path) {
+		Err(redb::DatabaseError::RepairAborted) => return Err(StoreError::NeedsRecovery),
+		opened => opened?,
+	};
+	read_meta(&db)
+}
+
 /// Prints every table as readable text, for debugging (`cryarchiver project dump`).
 pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 	let db = ReadOnlyDatabase::open(path)?;
@@ -594,6 +610,31 @@ mod tests {
 			Store::open(&project(dir.path())),
 			Err(StoreError::TooNew(format)) if format == FORMAT_VERSION + 1
 		));
+	}
+
+	#[test]
+	fn peek_reads_the_settings_and_leaves_the_project_openable() {
+		let dir = tempfile::tempdir().unwrap();
+		let settings = Settings::new(Path::new("src"), Path::new("dst"));
+		drop(Store::create(&project(dir.path()), &settings).unwrap());
+
+		assert_eq!(peek(&project(dir.path())).unwrap().settings, settings);
+		let opened = Store::open(&project(dir.path())).unwrap();
+
+		assert!(matches!(peek(&project(dir.path())), Err(StoreError::AlreadyOpen)));
+		drop(opened);
+		assert!(matches!(
+			peek(&dir.path().join("missing.cryarchive")),
+			Err(StoreError::Io(err)) if err.kind() == io::ErrorKind::NotFound
+		));
+	}
+
+	#[test]
+	fn peek_refuses_a_file_that_is_not_a_project() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(project(dir.path()), b"not a database").unwrap();
+
+		assert!(peek(&project(dir.path())).is_err());
 	}
 
 	#[test]

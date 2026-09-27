@@ -20,6 +20,6 @@ pub mod view;
 pub mod watch;
 
 pub use project::{
-	Backend, Command, Fault, PROJECT_EXTENSION, Project, ProjectError, ProjectOptions, SystemSample, Target, Tuning,
-	create,
+	Backend, Command, Fault, PROJECT_EXTENSION, Project, ProjectError, ProjectOptions, Summary, SystemSample, Target,
+	Tuning, create, peek,
 };

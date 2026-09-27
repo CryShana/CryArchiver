@@ -42,6 +42,8 @@ fn tui_without_a_terminal_explains_and_exits_with_2() {
 	for args in [
 		&[][..],
 		&["tui"][..],
+		&["--demo"][..],
+		&["tui", "--demo"][..],
 		&["family.cryarchive"][..],
 		&["tui", "family.cryarchive"][..],
 	] {
