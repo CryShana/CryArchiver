@@ -8,7 +8,7 @@ use std::ffi::{OsStr, OsString};
 use cryarchiver_engine::naming::ArchivalFolder;
 
 use crate::keys::RelPath;
-use crate::record::{FileRecord, FileState, FolderRecord, Identity};
+use crate::record::{CopyReason, FileRecord, FileState, FolderRecord, How, Identity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FolderId(pub u32);
@@ -40,6 +40,11 @@ pub struct Totals {
 	pub bytes_out: u64,
 	pub issues: u32,
 	pub unscanned: u32,
+	/// Source bytes of every counted file, finished or not.
+	pub size: u64,
+	pub kept: u64,
+	pub duplicates: u64,
+	pub originals_deleted: u64,
 }
 
 /// What a folder row shows: the subtree's counts, progress and sizes.
@@ -55,6 +60,7 @@ pub struct FolderStats {
 	pub complete: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct Share {
 	settled: bool,
@@ -63,6 +69,10 @@ struct Share {
 	bytes_out: u64,
 	issue: bool,
 	counted: bool,
+	size: u64,
+	kept: bool,
+	duplicate: bool,
+	deleted: bool,
 }
 
 #[derive(Debug)]
@@ -141,6 +151,14 @@ impl Tree {
 		&self.files[id.index()]
 	}
 
+	pub fn has_folder(&self, id: FolderId) -> bool {
+		id.index() < self.folders.len()
+	}
+
+	pub fn has_file(&self, id: FileId) -> bool {
+		usize::try_from(id.0).is_ok_and(|index| index < self.files.len())
+	}
+
 	pub fn folder_id(&self, key: &RelPath) -> Option<FolderId> {
 		self.folder_keys.get(key).copied()
 	}
@@ -157,11 +175,11 @@ impl Tree {
 		self.files.len()
 	}
 
-	pub fn file_ids(&self) -> impl Iterator<Item = FileId> + use<> {
+	pub fn file_ids(&self) -> impl DoubleEndedIterator<Item = FileId> + use<> {
 		(0..self.files.len() as u64).map(FileId)
 	}
 
-	pub fn folder_ids(&self) -> impl Iterator<Item = FolderId> + use<> {
+	pub fn folder_ids(&self) -> impl DoubleEndedIterator<Item = FolderId> + use<> {
 		(0..u32::try_from(self.folders.len()).expect("fewer than 2^32 folders")).map(FolderId)
 	}
 
@@ -320,6 +338,10 @@ impl Tree {
 				bytes_out: output.map_or(0, |output| output.size),
 				issue: matches!(file.record.state, FileState::Issue { .. }),
 				counted: true,
+				size: file.record.size,
+				kept: output.is_some_and(|output| output.how == How::Copied(CopyReason::KeptOriginal)),
+				duplicate: output.is_some_and(|output| matches!(output.how, How::Placeholder { .. })),
+				deleted: matches!(file.record.state, FileState::OriginalDeleted(_)),
 			}
 		};
 
@@ -338,6 +360,10 @@ impl Tree {
 			totals.bytes_in = totals.bytes_in + share.bytes_in - old.bytes_in;
 			totals.bytes_out = totals.bytes_out + share.bytes_out - old.bytes_out;
 			totals.issues = totals.issues + u32::from(share.issue) - u32::from(old.issue);
+			totals.size = totals.size + share.size - old.size;
+			totals.kept = totals.kept + u64::from(share.kept) - u64::from(old.kept);
+			totals.duplicates = totals.duplicates + u64::from(share.duplicate) - u64::from(old.duplicate);
+			totals.originals_deleted = totals.originals_deleted + u64::from(share.deleted) - u64::from(old.deleted);
 		}
 	}
 
@@ -457,6 +483,30 @@ mod tests {
 
 		let stats = tree.stats(photos);
 		assert_eq!((stats.bytes_in, stats.bytes_out), (100, 40));
+	}
+
+	#[test]
+	fn kept_originals_and_duplicates_are_counted() {
+		let (mut tree, _, a, b, c) = tree_with_two_levels();
+		let output = |how| Output {
+			how,
+			path: RelPath::root(),
+			size: 1,
+			hash: None,
+		};
+
+		tree.set_state(a, FileState::Done(output(How::Copied(CopyReason::KeptOriginal))));
+		tree.set_state(
+			b,
+			FileState::Done(output(How::Placeholder {
+				canonical: RelPath::root(),
+			})),
+		);
+		tree.set_state(c, FileState::OriginalDeleted(output(How::Encoded)));
+
+		let totals = tree.totals(FolderId::ROOT);
+		assert_eq!((totals.kept, totals.duplicates, totals.originals_deleted), (1, 1, 1));
+		assert_eq!(totals.size, 210);
 	}
 
 	#[test]

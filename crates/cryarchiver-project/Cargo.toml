@@ -17,6 +17,8 @@ redb.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -26,3 +28,4 @@ windows.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+ulid.workspace = true

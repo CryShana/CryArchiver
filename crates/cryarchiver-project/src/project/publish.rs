@@ -1,0 +1,514 @@
+//! Keeping front ends up to date (project layer spec §11.3): changes mark folders and files dirty, and a publish
+//! step sends what changed at most every view interval. File rows go out only for watched folders and the filter
+//! result, so the stream scales with what a front end shows.
+
+use std::collections::{HashSet, VecDeque};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use cryarchiver_engine::text::display_name;
+
+use super::owner::Owner;
+use crate::issues::{IssueKey, Problem, Verbs};
+use crate::record::{CopyReason, FileState, How, IssueKind};
+use crate::tree::{FileId, FolderId};
+use crate::view::{
+	Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, LogEntry, LogKind, Notice,
+	NoticeLevel, Overall, RowState, RunState, Status, Update,
+};
+
+const THROUGHPUT_WINDOW: Duration = Duration::from_mins(5);
+
+#[derive(Debug)]
+pub(crate) struct ViewState {
+	pub(super) watched: HashSet<FolderId>,
+	pub(super) filter: Option<(String, HashSet<FileId>)>,
+	dirty_folders: HashSet<FolderId>,
+	dirty_files: HashSet<FileId>,
+	pub(super) status_dirty: bool,
+	pub(super) issues_dirty: bool,
+	last_status: Option<Status>,
+	last_overall: Option<Overall>,
+	last_publish: Option<Instant>,
+	throughput: VecDeque<(Instant, u64)>,
+}
+
+impl Default for ViewState {
+	fn default() -> Self {
+		Self {
+			watched: HashSet::new(),
+			filter: None,
+			dirty_folders: HashSet::new(),
+			dirty_files: HashSet::new(),
+			status_dirty: true,
+			issues_dirty: true,
+			last_status: None,
+			last_overall: None,
+			last_publish: None,
+			throughput: VecDeque::new(),
+		}
+	}
+}
+
+impl Owner {
+	pub(super) fn send(&self, update: Update) {
+		let _ = self.updates.send(update);
+	}
+
+	pub(super) fn notice(&self, level: NoticeLevel, text: String) {
+		self.send(Update::Notice(Notice { level, text }));
+	}
+
+	pub(super) fn log(&self, kind: LogKind, message: String) {
+		let since_midnight = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map_or(0, |since| since.as_secs() % 86_400);
+		self.send(Update::Log(LogEntry {
+			time: u32::try_from(since_midnight).unwrap_or(0),
+			kind,
+			message,
+		}));
+	}
+
+	pub(super) fn touch_file(&mut self, file: FileId) {
+		self.view.dirty_files.insert(file);
+		self.touch_folder(self.tree.file(file).folder);
+	}
+
+	pub(super) fn touch_folder(&mut self, folder: FolderId) {
+		let ancestors: Vec<FolderId> = self.tree.ancestors(folder).collect();
+		self.view.dirty_folders.extend(ancestors);
+	}
+
+	pub(super) fn file_added(&mut self, file: FileId) {
+		let folder = self.tree.file(file).folder;
+		if self.view.watched.contains(&folder) {
+			self.send(Update::FileAdded {
+				folder,
+				row: self.row(file),
+			});
+		}
+	}
+
+	pub(super) fn publish_if_due(&mut self, now: Instant) {
+		let due = self
+			.view
+			.last_publish
+			.is_none_or(|last| now.saturating_duration_since(last) >= self.tuning.view_interval);
+		if due {
+			self.publish();
+		}
+	}
+
+	pub(super) fn publish(&mut self) {
+		let now = Instant::now();
+		self.view.last_publish = Some(now);
+
+		let mut folders: Vec<FolderId> = self.view.dirty_folders.drain().collect();
+		folders.sort();
+		for folder in folders {
+			self.send(Update::Folder(folder, self.tree.stats(folder)));
+		}
+
+		let mut files: Vec<FileId> = self.view.dirty_files.drain().collect();
+		files.sort();
+		for file in files {
+			let entry = self.tree.file(file);
+			let shown = self.view.watched.contains(&entry.folder)
+				|| self.view.filter.as_ref().is_some_and(|(_, hits)| hits.contains(&file));
+			if shown && !entry.removed {
+				self.send(Update::FileStatus {
+					folder: entry.folder,
+					file,
+					status: self.file_status(file),
+				});
+			}
+		}
+
+		let status = self.status();
+		if self.view.status_dirty || self.view.last_status.as_ref() != Some(&status) {
+			self.view.status_dirty = false;
+			self.view.last_status = Some(status.clone());
+			self.send(Update::Status(status));
+		}
+
+		self.record_throughput(now);
+		let overall = self.overall();
+		if self.view.last_overall.as_ref() != Some(&overall) {
+			self.view.last_overall = Some(overall.clone());
+			self.send(Update::Overall(overall));
+		}
+
+		if self.view.issues_dirty {
+			self.view.issues_dirty = false;
+			let issues = self.issues_view();
+			self.send(Update::Issues(issues));
+		}
+	}
+
+	pub(super) fn status(&self) -> Status {
+		let run_state = if !self.started || self.paused {
+			RunState::Paused
+		} else {
+			RunState::Running
+		};
+
+		Status {
+			run_state,
+			limit_pending: false,
+			scan_complete: self.scan.complete,
+			deleting_originals: self.settings.delete_originals,
+		}
+	}
+
+	pub(super) fn overall(&self) -> Overall {
+		let root = self.tree.totals(FolderId::ROOT);
+		let stats = self.tree.stats(FolderId::ROOT);
+		let saved = root.bytes_in.saturating_sub(root.bytes_out);
+
+		#[allow(clippy::cast_precision_loss)]
+		let saved_fraction = if root.bytes_in == 0 {
+			0.0
+		} else {
+			saved as f64 / root.bytes_in as f64
+		};
+
+		Overall {
+			files_done: root.settled,
+			files_active: 0,
+			files_queued: root.files.saturating_sub(root.settled + u64::from(root.issues)),
+			files_total: root.files,
+			scan_complete: self.scan.complete,
+			progress: stats.progress,
+			kept: root.kept,
+			duplicates: root.duplicates,
+			open_issues: u64::try_from(self.issue_files.len()).unwrap_or(u64::MAX),
+			saved_bytes: saved,
+			saved_fraction,
+			eta: self.eta(root.size.saturating_sub(root.bytes_in)),
+			parity: None,
+			originals_deleted: root.originals_deleted,
+		}
+	}
+
+	fn record_throughput(&mut self, now: Instant) {
+		let done = self.tree.totals(FolderId::ROOT).bytes_in;
+		let samples = &mut self.view.throughput;
+		if samples
+			.back()
+			.is_none_or(|(at, _)| now.saturating_duration_since(*at) >= Duration::from_secs(1))
+		{
+			samples.push_back((now, done));
+		}
+		while samples
+			.front()
+			.is_some_and(|(at, _)| now.saturating_duration_since(*at) > THROUGHPUT_WINDOW)
+		{
+			samples.pop_front();
+		}
+	}
+
+	#[allow(
+		clippy::cast_precision_loss,
+		clippy::cast_possible_truncation,
+		clippy::cast_sign_loss
+	)]
+	fn eta(&self, remaining: u64) -> Option<Duration> {
+		let (first, last) = (self.view.throughput.front()?, self.view.throughput.back()?);
+		let seconds = last.0.saturating_duration_since(first.0).as_secs_f64();
+		let bytes = last.1.saturating_sub(first.1);
+		if seconds < 5.0 || bytes == 0 {
+			return None;
+		}
+
+		Some(Duration::from_secs_f64(remaining as f64 / (bytes as f64 / seconds)))
+	}
+
+	pub(super) fn row_state(&self, file: FileId) -> RowState {
+		match &self.tree.file(file).record.state {
+			FileState::Discovered | FileState::Ready | FileState::Queued => RowState::Queued,
+			FileState::InProgress { .. } => RowState::Encoding,
+			FileState::Committing { .. } => RowState::Verifying,
+			FileState::Done(output) => match &output.how {
+				How::Encoded => RowState::Done,
+				How::Copied(CopyReason::KeptOriginal) => RowState::KeptOriginal,
+				How::Copied(_) => RowState::Copied,
+				How::Placeholder { .. } => RowState::Duplicate,
+			},
+			FileState::Issue { kind, .. } => match kind {
+				IssueKind::Unrecoverable { damaged: true } => RowState::SourceDamaged,
+				IssueKind::Unrecoverable { damaged: false } | IssueKind::SourceUnreadable => RowState::Failed,
+				IssueKind::OutputMissing => RowState::Warning,
+			},
+			FileState::Excluded => RowState::Excluded,
+			FileState::SourceGone(_) => RowState::SourceGone,
+			FileState::DeletePending(_) => RowState::DeletePending,
+			FileState::OriginalDeleted(_) => RowState::OriginalDeleted,
+		}
+	}
+
+	pub(super) fn file_status(&self, file: FileId) -> FileStatus {
+		let record = &self.tree.file(file).record;
+		let output = record.state.output();
+
+		FileStatus {
+			state: self.row_state(file),
+			progress: None,
+			codec: output.map(|output| codec_label(&output.how, &output.path.name())),
+			bytes_in: record.size,
+			bytes_out: output.map(|output| output.size),
+		}
+	}
+
+	pub(super) fn row(&self, file: FileId) -> FileRow {
+		FileRow {
+			id: file,
+			name: display_name(&self.tree.file(file).name),
+			status: self.file_status(file),
+		}
+	}
+
+	pub(super) fn watch_folder(&mut self, folder: FolderId, watched: bool) {
+		if !self.tree.has_folder(folder) {
+			return;
+		}
+
+		if !watched {
+			self.view.watched.remove(&folder);
+			return;
+		}
+
+		self.view.watched.insert(folder);
+		let rows = self
+			.tree
+			.folder(folder)
+			.files
+			.iter()
+			.filter(|&&file| !self.tree.file(file).removed)
+			.map(|&file| self.row(file))
+			.collect();
+		self.send(Update::Files { folder, rows });
+	}
+
+	/// Matches and their ancestors, in display order: a folder, its subfolders, then its matching files.
+	pub(super) fn set_filter(&mut self, query: String) {
+		if query.is_empty() {
+			self.view.filter = None;
+			self.send(Update::Filter(None));
+			return;
+		}
+
+		let needle = query.to_lowercase();
+		let matches = |name: &std::ffi::OsStr| display_name(name).to_lowercase().contains(&needle);
+		let mut hits: HashSet<FileId> = HashSet::new();
+		let mut kept = vec![false; self.tree.folder_count()];
+		for folder in self.tree.folder_ids().rev() {
+			let entry = self.tree.folder(folder);
+			for &file in &entry.files {
+				if !self.tree.file(file).removed && matches(&self.tree.file(file).name) {
+					hits.insert(file);
+					kept[folder.0 as usize] = true;
+				}
+			}
+
+			kept[folder.0 as usize] |= folder != FolderId::ROOT && matches(&entry.name);
+			if kept[folder.0 as usize]
+				&& let Some(parent) = entry.parent
+			{
+				kept[parent.0 as usize] = true;
+			}
+		}
+
+		let mut rows = Vec::new();
+		self.filter_rows(FolderId::ROOT, 0, &kept, &hits, &mut rows);
+		let view = FilterView {
+			query,
+			matching_files: hits.len(),
+			rows,
+		};
+		self.view.filter = Some((needle, hits));
+		self.send(Update::Filter(Some(view)));
+	}
+
+	fn filter_rows(
+		&self,
+		folder: FolderId,
+		depth: u16,
+		kept: &[bool],
+		hits: &HashSet<FileId>,
+		rows: &mut Vec<(u16, FilterEntry)>,
+	) {
+		if !kept[folder.0 as usize] {
+			return;
+		}
+
+		rows.push((depth, FilterEntry::Folder(folder)));
+
+		for &child in &self.tree.folder(folder).children {
+			self.filter_rows(child, depth + 1, kept, hits, rows);
+		}
+
+		for &file in &self.tree.folder(folder).files {
+			if hits.contains(&file) {
+				rows.push((
+					depth + 1,
+					FilterEntry::File {
+						folder,
+						row: self.row(file),
+					},
+				));
+			}
+		}
+	}
+
+	pub(super) fn send_details(&mut self, file: FileId) {
+		if !self.tree.has_file(file) {
+			return;
+		}
+
+		let details = self.details(file);
+		self.send(Update::Details(file, Box::new(details)));
+	}
+
+	pub(super) fn details(&mut self, file: FileId) -> Details {
+		let issue = self.issue_files.contains(&file).then(|| self.file_issue_view(file));
+		let entry = self.tree.file(file);
+		let record = &entry.record;
+		let output = record.state.output();
+		let status = self.file_status(file);
+
+		let mut plan = vec![(
+			"Kind".to_owned(),
+			match record.class {
+				crate::record::MediaClass::Media => "media",
+				crate::record::MediaClass::Other => "other file, copied as it is",
+				crate::record::MediaClass::Unknown => "not read yet",
+			}
+			.to_owned(),
+		)];
+		if let Some(codec) = &status.codec {
+			plan.push(("Output".to_owned(), codec.clone()));
+		}
+
+		Details {
+			source_path: self.source_path(&entry.key).display().to_string(),
+			destination_path: output.map_or_else(String::new, |output| {
+				self.destination_path(&output.path).display().to_string()
+			}),
+			source_info: format!("{} bytes", record.size),
+			state: status.state,
+			stage: None,
+			fraction: status.progress,
+			bytes_in: record.size,
+			bytes_out: status.bytes_out,
+			plan,
+			log_tail: Vec::new(),
+			duplicates: Duplicates::None,
+			issue,
+		}
+	}
+
+	pub(super) fn send_issue_log(&mut self, issue: crate::issues::IssueId, attempt: u32) {
+		let Some(IssueKey::File(file)) = self.issue_ids.key(issue).cloned() else {
+			return;
+		};
+
+		let key = self.tree.file(file).key.clone();
+		match self.store.read_log(&key, attempt) {
+			Ok(Some(log)) => {
+				let mut lines = vec![log.error];
+				lines.extend(log.log_tail);
+				self.send(Update::IssueLog { issue, attempt, lines });
+			}
+			Ok(None) => self.send(Update::IssueLog {
+				issue,
+				attempt,
+				lines: Vec::new(),
+			}),
+			Err(err) => self.fail(err),
+		}
+	}
+
+	pub(super) fn issues_view(&mut self) -> Vec<IssueView> {
+		let mut issues: Vec<IssueView> = self
+			.issue_files
+			.clone()
+			.into_iter()
+			.map(|file| self.file_issue_view(file))
+			.collect();
+
+		for folder in self.tree.folder_ids() {
+			let cycle = self.tree.folder(folder).record.cycle;
+			if cycle.is_some_and(|cycle| !cycle.acknowledged) {
+				let id = self.issue_ids.id(&IssueKey::Cycle(folder));
+				let entry = self.tree.folder(folder);
+				issues.push(IssueView {
+					id,
+					problem: Problem::DirectoryCycle,
+					file: None,
+					folder: Some(folder),
+					name: display_name(&entry.name),
+					location: entry.key.display(),
+					reason: "this folder link leads back into its own tree, so it isn't followed".into(),
+					resolution: resolution(Problem::DirectoryCycle.verbs()),
+					verbs: Problem::DirectoryCycle.verbs(),
+					attempts: 0,
+				});
+			}
+		}
+		issues
+	}
+
+	pub(super) fn file_issue_view(&mut self, file: FileId) -> IssueView {
+		let id = self.issue_ids.id(&IssueKey::File(file));
+		let entry = self.tree.file(file);
+		let (problem, reason) = match &entry.record.state {
+			FileState::Issue { kind, reason, .. } => (Problem::of(*kind), reason.clone()),
+			_ => (Problem::EncodeFailed, String::new()),
+		};
+
+		IssueView {
+			id,
+			problem,
+			file: Some(file),
+			folder: Some(entry.folder),
+			name: display_name(&entry.name),
+			location: entry.key.display(),
+			reason,
+			resolution: resolution(problem.verbs()),
+			verbs: problem.verbs(),
+			attempts: self.last_attempts.get(&entry.key).copied().unwrap_or(0),
+		}
+	}
+}
+
+fn resolution(verbs: Verbs) -> String {
+	let mut choices: Vec<String> = [verbs.retry, verbs.accept]
+		.into_iter()
+		.flatten()
+		.map(str::to_lowercase)
+		.collect();
+	if verbs.exclude {
+		choices.push("exclude".into());
+	}
+	format!("waiting for you: {}", choices.join(", "))
+}
+
+pub(super) fn codec_label(how: &How, output_name: &std::ffi::OsStr) -> String {
+	match how {
+		How::Copied(_) => "copy".into(),
+		How::Placeholder { .. } => "dup".into(),
+		How::Encoded => {
+			let extension = std::path::Path::new(output_name)
+				.extension()
+				.map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+				.unwrap_or_default();
+			match extension.as_str() {
+				"avif" => "AVIF".into(),
+				"jxl" => "JXL".into(),
+				"opus" | "mka" => "Opus".into(),
+				"mkv" | "webm" => "AV1".into(),
+				other => other.to_uppercase(),
+			}
+		}
+	}
+}
