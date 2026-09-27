@@ -1,5 +1,6 @@
 pub mod avif;
 pub mod decode;
+pub mod jxl;
 pub mod plan;
 pub mod props;
 pub mod structure;
