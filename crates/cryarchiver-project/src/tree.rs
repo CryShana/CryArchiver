@@ -85,6 +85,8 @@ pub struct Folder {
 	pub record: FolderRecord,
 	pub naming: ArchivalFolder,
 	pub identity: Option<Identity>,
+	/// Missing from its parent's last listing. When it shows up again, it is listed again with everything below it.
+	pub vanished: bool,
 	totals: Totals,
 }
 
@@ -125,6 +127,7 @@ impl Tree {
 			record: FolderRecord::default(),
 			naming: ArchivalFolder::default(),
 			identity: None,
+			vanished: false,
 			totals: Totals {
 				unscanned: 1,
 				..Totals::default()
@@ -210,6 +213,7 @@ impl Tree {
 			record,
 			naming: ArchivalFolder::default(),
 			identity: None,
+			vanished: false,
 			totals: Totals::default(),
 		});
 		self.folders[parent.index()].children.push(id);

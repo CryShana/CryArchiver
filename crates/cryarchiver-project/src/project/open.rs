@@ -13,8 +13,10 @@ use super::owner::Owner;
 use super::publish::ViewState;
 use super::scanning::ScanState;
 use super::{ProjectError, ProjectOptions};
+use crate::dedup::full_hash;
 use crate::issues::IssueIds;
-use crate::record::{FileState, Identity};
+use crate::keys::RelPath;
+use crate::record::{FileState, Identity, Output};
 use crate::settings::Settings;
 use crate::store::{Loaded, Store};
 use crate::tree::{FileId, FolderId, Tree};
@@ -92,23 +94,43 @@ impl Owner {
 	fn recover(&mut self) {
 		let files: Vec<FileId> = self.tree.file_ids().collect();
 		for file in files {
-			let recovered = match &self.tree.file(file).record.state {
-				FileState::InProgress { .. } => Some(FileState::Queued),
+			let record = &self.tree.file(file).record;
+			match &record.state {
+				FileState::InProgress { .. } => self.set_state(file, FileState::Queued),
 				FileState::Committing { output, .. } => {
-					let target = self.destination_path(&output.path);
-					let placed = fs::metadata(target).is_ok_and(|meta| meta.len() == output.size);
-					Some(if placed {
-						FileState::Done(output.clone())
-					} else {
-						FileState::Queued
-					})
+					let (output, replaces) = (output.clone(), record.replaces.clone());
+					self.recover_commit(file, output, replaces.as_ref());
 				}
-				_ => None,
-			};
-
-			if let Some(state) = recovered {
-				self.set_state(file, state);
+				_ => {}
 			}
 		}
+	}
+
+	/// A re-archive into its own earlier output's place can find the old output there, with the same size, so only
+	/// the new content's hash proves the rename happened.
+	fn recover_commit(&mut self, file: FileId, output: Output, replaces: Option<&RelPath>) {
+		let target = self.destination_path(&output.path);
+		let hash_matches = |hash| full_hash(&target).is_ok_and(|found| found == hash);
+		let placed = match replaces {
+			Some(previous) if *previous == output.path => output.hash.is_some_and(hash_matches),
+			Some(_) => {
+				fs::metadata(&target).is_ok_and(|meta| meta.len() == output.size)
+					&& output.hash.is_none_or(hash_matches)
+			}
+			None => fs::metadata(&target).is_ok_and(|meta| meta.len() == output.size),
+		};
+		if !placed {
+			self.set_state(file, FileState::Queued);
+			return;
+		}
+
+		if let Some(previous) = replaces {
+			self.remove_replaced_output(previous, &output.path);
+		}
+
+		let mut record = self.tree.file(file).record.clone();
+		record.replaces = None;
+		self.tree.set_record(file, record);
+		self.set_state(file, FileState::Done(output));
 	}
 }

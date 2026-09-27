@@ -11,7 +11,7 @@ use crate::keys::RelPath;
 use crate::record::{CycleRecord, FileRecord, FileState, FolderRecord, Identity, IssueKind, MediaClass};
 use crate::scan::{self, EntryKind, Listing};
 use crate::tree::{FileId, FolderId};
-use crate::view::{LogKind, Update};
+use crate::view::{LogKind, NoticeLevel, Update};
 
 #[derive(Debug, Default)]
 pub(crate) struct ScanState {
@@ -59,7 +59,7 @@ impl Owner {
 
 		if let Some(error) = &listing.error {
 			self.notice(
-				crate::view::NoticeLevel::Warning,
+				NoticeLevel::Warning,
 				format!("{} can't be read: {error}", self.folder_label(folder)),
 			);
 		} else if self.leads_back(folder, listing.identity) {
@@ -108,6 +108,15 @@ impl Owner {
 			}
 		}
 
+		for &index in &diff.unchanged_files {
+			if let Some(file) = self
+				.tree
+				.file_id(&self.tree.folder(folder).key.join(&listing.entries[index].name))
+			{
+				self.source_returned(file);
+			}
+		}
+
 		for &index in &diff.broken {
 			if let EntryKind::Broken(reason) = &listing.entries[index].kind {
 				self.source_broken(folder, &listing.entries[index].name, reason);
@@ -125,7 +134,8 @@ impl Owner {
 			let name = &listing.entries[index].name;
 			present.insert(name.clone());
 			let (child, new) = self.add_folder(folder, name);
-			if recursive || new || !self.tree.folder(child).record.scanned {
+			let returned = std::mem::take(&mut self.tree.folder_mut(child).vanished);
+			if recursive || new || returned || !self.tree.folder(child).record.scanned {
 				self.scan.queue.push_back((self.tree.folder(child).key.clone(), true));
 			}
 		}
@@ -136,7 +146,7 @@ impl Owner {
 			.children
 			.iter()
 			.copied()
-			.filter(|child| !present.contains(&self.tree.folder(*child).name))
+			.filter(|child| !self.tree.folder(*child).vanished && !present.contains(&self.tree.folder(*child).name))
 			.collect();
 		for child in vanished {
 			self.subtree_missing(child);
@@ -220,6 +230,14 @@ impl Owner {
 		}
 	}
 
+	/// An archived file listed again unchanged, after its source was gone or its original deleted, is Done as it was.
+	fn source_returned(&mut self, file: FileId) {
+		if let FileState::SourceGone(output) | FileState::OriginalDeleted(output) = &self.tree.file(file).record.state {
+			let output = output.clone();
+			self.set_state(file, FileState::Done(output));
+		}
+	}
+
 	pub(super) fn forget_file(&mut self, file: FileId) {
 		let folder = self.tree.file(file).folder;
 		self.tree.remove_file(file);
@@ -231,15 +249,25 @@ impl Owner {
 		}
 	}
 
+	/// An unreadable entry is an issue, unless the file is archived already: then its output stays and a warning says
+	/// what happened.
 	fn source_broken(&mut self, folder: FolderId, name: &OsStr, reason: &str) {
 		let key = self.tree.folder(folder).key.join(name);
-		let file = match self.tree.file_id(&key) {
-			Some(file) if !self.tree.file(file).removed => file,
-			_ => {
-				let file = self.tree.add_file(folder, name, FileRecord::default());
-				self.file_added(file);
-				file
-			}
+		let known = self.tree.file_id(&key).filter(|&file| !self.tree.file(file).removed);
+		if known.is_some_and(|file| self.tree.file(file).record.state.output().is_some()) {
+			self.notice(
+				NoticeLevel::Warning,
+				format!("{} can't be read: {reason}", key.display()),
+			);
+			return;
+		}
+
+		let file = if let Some(file) = known {
+			file
+		} else {
+			let file = self.tree.add_file(folder, name, FileRecord::default());
+			self.file_added(file);
+			file
 		};
 
 		self.set_state(
@@ -254,6 +282,7 @@ impl Owner {
 
 	/// The folder is gone, with everything below it, including any cycle it was.
 	fn subtree_missing(&mut self, folder: FolderId) {
+		self.tree.folder_mut(folder).vanished = true;
 		if self.tree.folder_mut(folder).record.cycle.take().is_some() {
 			self.view.issues_dirty = true;
 		}
@@ -318,5 +347,96 @@ impl Owner {
 		} else {
 			key.display()
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::fs;
+	use std::path::Path;
+	use std::sync::Arc;
+	use std::sync::mpsc::{Receiver, channel};
+
+	use cryarchiver_engine::engine::{Encode, MemoryGate};
+
+	use super::*;
+	use crate::project::{Backend, ProjectOptions, SystemSample, Tuning, create};
+	use crate::store::Store;
+
+	struct NoBackend;
+
+	impl Backend for NoBackend {
+		fn encoder(&self, _image_threads: usize, _memory: Arc<dyn MemoryGate>) -> Arc<dyn Encode> {
+			unreachable!("scanning never encodes")
+		}
+
+		fn toolchain(&self) -> String {
+			String::new()
+		}
+
+		fn sample(&self) -> SystemSample {
+			SystemSample::default()
+		}
+	}
+
+	/// An owner whose listings run only when the test lists a folder: nothing is spawned.
+	fn owner(source: &Path, destination: &Path) -> (Owner, Receiver<Update>) {
+		let project = create(source, destination, OsStr::new("archive"), |_| {}).unwrap();
+		let (store, meta, loaded) = Store::open(&project).unwrap();
+		let (updates, received) = channel();
+		let options = ProjectOptions {
+			backend: Arc::new(NoBackend),
+			tuning: Tuning {
+				listings: 0,
+				..Tuning::default()
+			},
+		};
+
+		(
+			Owner::open(store, meta.settings, loaded, options, updates).unwrap(),
+			received,
+		)
+	}
+
+	fn list(owner: &mut Owner, folder: &RelPath, recursive: bool) {
+		let listing = scan::list_folder(&owner.settings.source, folder);
+		owner.scan.active += 1;
+		owner.on_listed(&listing, recursive);
+	}
+
+	fn list_queued(owner: &mut Owner) {
+		while let Some((folder, recursive)) = owner.scan.queue.pop_front() {
+			list(owner, &folder, recursive);
+		}
+	}
+
+	fn key(path: &str) -> RelPath {
+		RelPath::from_bytes(path.as_bytes().to_vec())
+	}
+
+	#[test]
+	fn a_folder_that_comes_back_is_listed_again_in_full() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(source.join("A").join("B")).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		list_queued(&mut owner);
+
+		fs::rename(source.join("A"), dir.path().join("moved")).unwrap();
+		list(&mut owner, &RelPath::root(), false);
+		let a = owner.tree.folder_id(&key("A")).unwrap();
+		assert!(owner.tree.folder(a).vanished);
+		assert_eq!(owner.tree.totals(FolderId::ROOT).unscanned, 0);
+		assert!(owner.tree.is_complete(FolderId::ROOT));
+
+		fs::rename(dir.path().join("moved"), source.join("A")).unwrap();
+		list(&mut owner, &RelPath::root(), false);
+		assert!(!owner.tree.folder(a).vanished);
+		assert_eq!(Vec::from(owner.scan.queue.clone()), [(key("A"), true)]);
+
+		list_queued(&mut owner);
+		let b = owner.tree.folder_id(&key("A/B")).unwrap();
+		assert!(!owner.tree.folder(b).vanished);
 	}
 }

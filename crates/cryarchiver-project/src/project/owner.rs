@@ -1,11 +1,13 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::commit::free_space;
-
+use cryarchiver_engine::text::display_name;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 
@@ -16,7 +18,7 @@ use crate::issues::IssueIds;
 use crate::keys::RelPath;
 use crate::record::{FileState, Identity};
 use crate::scan::Listing;
-use crate::settings::Settings;
+use crate::settings::{Settings, SettingsChange};
 use crate::store::{Store, StoreError};
 use crate::tree::{FileId, FolderId, Tree};
 use crate::view::{NoticeLevel, SystemView, Update};
@@ -91,7 +93,7 @@ impl Owner {
 			self.send(Update::FolderAdded {
 				id,
 				parent: folder.parent.unwrap_or(FolderId::ROOT),
-				name: cryarchiver_engine::text::display_name(&folder.name),
+				name: display_name(&folder.name),
 			});
 		}
 
@@ -184,7 +186,7 @@ impl Owner {
 		self.delete_confirmed = delete_confirmed;
 	}
 
-	fn change_settings(&mut self, change: crate::settings::SettingsChange) {
+	fn change_settings(&mut self, change: SettingsChange) {
 		match self.settings.apply(change) {
 			Ok(()) => {
 				if let Err(err) = self.store.set_settings(&self.settings) {
@@ -244,6 +246,26 @@ impl Owner {
 
 	pub(super) fn destination_path(&self, key: &RelPath) -> PathBuf {
 		key.to_path(&self.settings.destination)
+	}
+
+	/// Once a re-archive's new output is placed, removes the earlier output it replaces: only that exact recorded
+	/// path inside the destination, never the new output itself. Blocking: one file removal.
+	pub(super) fn remove_replaced_output(&self, previous: &RelPath, placed: &RelPath) {
+		let plain = previous.components().all(|name| {
+			let mut parts = Path::new(&name).components();
+			matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None))
+		});
+		if previous == placed || previous.is_root() || !plain {
+			return;
+		}
+
+		match fs::remove_file(self.destination_path(previous)) {
+			Err(err) if err.kind() != io::ErrorKind::NotFound => self.notice(
+				NoticeLevel::Warning,
+				format!("{} can't be removed: {err}", previous.display()),
+			),
+			_ => {}
+		}
 	}
 }
 

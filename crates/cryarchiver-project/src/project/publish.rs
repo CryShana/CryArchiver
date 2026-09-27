@@ -3,13 +3,14 @@
 //! result, so the stream scales with what a front end shows.
 
 use std::collections::{HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cryarchiver_engine::text::display_name;
 
 use super::owner::Owner;
-use crate::issues::{IssueKey, Problem, Verbs};
-use crate::record::{CopyReason, FileState, How, IssueKind};
+use crate::issues::{IssueId, IssueKey, Problem, Verbs};
+use crate::record::{CopyReason, FileState, How, IssueKind, MediaClass};
 use crate::tree::{FileId, FolderId};
 use crate::view::{
 	Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, LogEntry, LogKind, Notice,
@@ -298,7 +299,7 @@ impl Owner {
 		}
 
 		let needle = query.to_lowercase();
-		let matches = |name: &std::ffi::OsStr| display_name(name).to_lowercase().contains(&needle);
+		let matches = |name: &OsStr| display_name(name).to_lowercase().contains(&needle);
 		let mut hits: HashSet<FileId> = HashSet::new();
 		let mut kept = vec![false; self.tree.folder_count()];
 		for folder in self.tree.folder_ids().rev() {
@@ -379,9 +380,9 @@ impl Owner {
 		let mut plan = vec![(
 			"Kind".to_owned(),
 			match record.class {
-				crate::record::MediaClass::Media => "media",
-				crate::record::MediaClass::Other => "other file, copied as it is",
-				crate::record::MediaClass::Unknown => "not read yet",
+				MediaClass::Media => "media",
+				MediaClass::Other => "other file, copied as it is",
+				MediaClass::Unknown => "not read yet",
 			}
 			.to_owned(),
 		)];
@@ -407,7 +408,7 @@ impl Owner {
 		}
 	}
 
-	pub(super) fn send_issue_log(&mut self, issue: crate::issues::IssueId, attempt: u32) {
+	pub(super) fn send_issue_log(&mut self, issue: IssueId, attempt: u32) {
 		let Some(IssueKey::File(file)) = self.issue_ids.key(issue).cloned() else {
 			return;
 		};
@@ -493,7 +494,7 @@ fn resolution(verbs: Verbs) -> String {
 	format!("waiting for you: {}", choices.join(", "))
 }
 
-pub(super) fn codec_label(how: &How, output_name: &std::ffi::OsStr) -> String {
+pub(super) fn codec_label(how: &How, output_name: &OsStr) -> String {
 	match how {
 		How::Copied(_) => "copy".into(),
 		How::Placeholder { .. } => "dup".into(),
