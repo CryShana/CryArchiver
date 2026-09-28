@@ -274,7 +274,7 @@ fn keep(reason: String) -> Gate {
 }
 
 pub fn image_target(speed: Speed, overrides: &Overrides) -> f64 {
-	overrides.image.unwrap_or(ssim_target(speed))
+	overrides.normalized().image.unwrap_or(ssim_target(speed))
 }
 
 pub fn plan_still(
@@ -513,6 +513,19 @@ mod tests {
 				(60.0, ssim_target(speed))
 			);
 		}
+	}
+
+	#[test]
+	fn the_image_target_reads_the_normalized_override() {
+		let image = |target: f64| Overrides {
+			image: Some(target),
+			..Overrides::default()
+		};
+
+		assert!((image_target(Speed::Fast, &image(200.0)) - 95.0).abs() < 1e-9);
+		assert!((image_target(Speed::Fast, &image(10.0)) - 50.0).abs() < 1e-9);
+		assert!((image_target(Speed::Moderate, &image(80.04)) - 80.0).abs() < 1e-9);
+		assert!((image_target(Speed::Slow, &image(f64::NAN)) - ssim_target(Speed::Slow)).abs() < 1e-9);
 	}
 
 	#[test]

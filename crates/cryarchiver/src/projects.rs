@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cryarchiver_engine::preset::Speed;
+use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::process::limits::{self, Limits};
 use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::toolchain::{ToolConfig, Toolchain};
@@ -79,6 +79,7 @@ pub fn create(
 	destination: &Path,
 	name: Option<&str>,
 	speed: Speed,
+	overrides: Overrides,
 	watch: bool,
 	limit: Option<u8>,
 ) -> u8 {
@@ -92,6 +93,7 @@ pub fn create(
 			Speed::Moderate => ProjectSpeed::Moderate,
 			Speed::Fast => ProjectSpeed::Fast,
 		};
+		settings.overrides = overrides.normalized();
 		settings.watch = watch;
 		settings.performance_limit = limit;
 	});

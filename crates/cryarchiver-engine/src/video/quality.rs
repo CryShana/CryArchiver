@@ -78,7 +78,7 @@ pub struct Scorer<'a> {
 }
 
 pub fn target(speed: Speed, film_grain: bool, overrides: &Overrides) -> Target {
-	let custom = overrides.video.map(|video| Target {
+	let custom = overrides.normalized().video.map(|video| Target {
 		mean: video.mean,
 		floor: video.floor,
 	});
@@ -436,6 +436,28 @@ mod tests {
 		assert_eq!(
 			target(Speed::Fast, false, &custom),
 			target(Speed::Fast, false, &Overrides::default())
+		);
+	}
+
+	#[test]
+	fn the_target_reads_the_normalized_override() {
+		assert_eq!(
+			target(Speed::Moderate, false, &overridden(120.0, 60.0)),
+			Target {
+				mean: 99.0,
+				floor: 70.0
+			}
+		);
+		assert_eq!(
+			target(Speed::Slow, false, &overridden(90.04, 85.06)),
+			Target {
+				mean: 90.0,
+				floor: 85.1
+			}
+		);
+		assert_eq!(
+			target(Speed::Moderate, false, &overridden(f64::NAN, 85.0)),
+			target(Speed::Moderate, false, &Overrides::default())
 		);
 	}
 

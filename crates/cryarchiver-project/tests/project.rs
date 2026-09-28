@@ -5,9 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use cryarchiver_engine::preset::{Overrides, VmafOverride};
 use cryarchiver_project::issues::Verb;
 use cryarchiver_project::keys::RelPath;
 use cryarchiver_project::record::{CopyReason, FileRecord, FileState, Hash, How, IssueKind, Output, mtime_ns};
+use cryarchiver_project::settings::{SettingsChange, Speed};
 use cryarchiver_project::store::{Store, StoreError};
 use cryarchiver_project::tree::FolderId;
 use cryarchiver_project::view::{FilterEntry, NoticeLevel, RowState, RunState};
@@ -1187,4 +1189,88 @@ fn quality_learned_in_one_run_is_there_the_next_time() {
 	let quality = encoder.quality.lock().unwrap().clone().unwrap();
 
 	assert_eq!(quality.lookup(&key).map(|stats| stats.setting), Some(90.5));
+}
+
+#[test]
+fn a_project_file_from_before_quality_overrides_opens_without_them() {
+	#[derive(serde::Serialize)]
+	struct Previous {
+		#[serde(with = "cryarchiver_project::keys::path_bytes")]
+		source: PathBuf,
+		#[serde(with = "cryarchiver_project::keys::path_bytes")]
+		destination: PathBuf,
+		speed: Speed,
+		min_savings: u8,
+		watch: bool,
+		performance_limit: Option<u8>,
+		stability_window: std::time::Duration,
+		keep_auxiliary_images: bool,
+		delete_originals: bool,
+	}
+
+	let setup = setup(|settings| settings.speed = Speed::Slow);
+	let (_, meta, _) = Store::open(&setup.project).unwrap();
+	let current = meta.settings;
+	let previous = Previous {
+		source: current.source.clone(),
+		destination: current.destination.clone(),
+		speed: current.speed,
+		min_savings: current.min_savings,
+		watch: current.watch,
+		performance_limit: current.performance_limit,
+		stability_window: current.stability_window,
+		keep_auxiliary_images: current.keep_auxiliary_images,
+		delete_originals: current.delete_originals,
+	};
+	{
+		let db = redb::Database::open(&setup.project).unwrap();
+		let txn = db.begin_write().unwrap();
+		{
+			let mut table = txn
+				.open_table(redb::TableDefinition::<&str, &[u8]>::new("meta"))
+				.unwrap();
+			table
+				.insert("settings", rmp_serde::to_vec_named(&previous).unwrap().as_slice())
+				.unwrap();
+		}
+		txn.commit().unwrap();
+	}
+
+	let project = support::open(&setup, &FakeEncoder::new());
+
+	assert!(project.settings().overrides.is_empty());
+	assert_eq!(project.settings(), &current);
+	assert_eq!(project.settings().speed, Speed::Slow);
+}
+
+#[test]
+fn an_overrides_change_is_stored_and_read_back_on_reopen() {
+	let setup = setup(|_| {});
+	let encoder = FakeEncoder::new();
+	let custom = Overrides {
+		video: Some(VmafOverride {
+			mean: 90.0,
+			floor: 85.0,
+		}),
+		image: Some(80.0),
+		audio_stereo_kbps: None,
+	};
+	{
+		let project = support::open(&setup, &encoder);
+		let mut snapshot = Snapshot::default();
+		project.send(Command::ChangeSettings(SettingsChange::Overrides(Overrides {
+			video: Some(VmafOverride {
+				mean: 90.04,
+				floor: 85.0,
+			}),
+			..custom
+		})));
+		wait_for(&project, &mut snapshot, "the new overrides", |s| {
+			s.settings.as_ref().is_some_and(|settings| settings.overrides == custom)
+		});
+	}
+
+	let project = support::open(&setup, &encoder);
+
+	assert_eq!(project.settings().overrides, custom);
 }

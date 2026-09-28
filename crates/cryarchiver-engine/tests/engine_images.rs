@@ -451,6 +451,38 @@ async fn an_animated_png_keeps_its_frames_timing_and_loop_count() {
 }
 
 #[tokio::test]
+async fn an_animation_is_checked_against_the_image_override() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("anim.apng");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:d=1:r=10",
+		"-f",
+		"apng",
+		source.to_str().unwrap(),
+	]);
+	let with_target = |target: f64| Job {
+		min_savings: 0.0,
+		overrides: Overrides {
+			image: Some(target),
+			..Overrides::default()
+		},
+		..job(&source)
+	};
+
+	let strict = run(&with_target(95.0), &dir.path().join("strict")).await;
+	let lenient = run(&with_target(50.0), &dir.path().join("lenient")).await;
+
+	assert!(
+		matches!(&strict, JobOutcome::KeptOriginal { reason: KeepReason::QualityUnreachable(reason) } if reason.contains("target 95)")),
+		"{strict:?}"
+	);
+	assert!(matches!(lenient, JobOutcome::Encoded { .. }), "{lenient:?}");
+}
+
+#[tokio::test]
 async fn a_single_frame_gif_becomes_a_still_avif() {
 	let dir = tempfile::tempdir().unwrap();
 	let png = support::smooth_png(dir.path(), "frame.png", 160, 120);

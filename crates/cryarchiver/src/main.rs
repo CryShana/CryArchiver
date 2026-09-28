@@ -17,7 +17,7 @@ use cryarchiver_engine::commit::{OutputSink, check_space};
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::cli_output_path;
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
-use cryarchiver_engine::preset::{Overrides, Speed};
+use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::quality::memory;
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::text::display_path;
@@ -92,6 +92,8 @@ enum ProjectCommand {
 		name: Option<String>,
 		#[arg(short, long, value_enum, default_value_t, help = "Speed preset")]
 		speed: Speed,
+		#[command(flatten)]
+		quality: QualityArgs,
 		#[arg(long, help = "Keep running and archive new files as they appear")]
 		watch: bool,
 		#[arg(
@@ -123,6 +125,8 @@ struct CompressArgs {
 	output: Option<PathBuf>,
 	#[arg(short, long, value_enum, default_value_t, help = "Speed preset")]
 	speed: Speed,
+	#[command(flatten)]
+	quality: QualityArgs,
 	#[arg(long, help = "Keep personal metadata and the source's file timestamps")]
 	keep_metadata: bool,
 	#[arg(long, help = "Convert photos that have gain or depth maps, dropping the extras")]
@@ -143,6 +147,111 @@ struct CompressArgs {
 	ffmpeg: Option<PathBuf>,
 	#[arg(short, long, help = "Only print failures and the summary")]
 	quiet: bool,
+}
+
+#[derive(Args, Clone, Copy)]
+struct QualityArgs {
+	#[arg(
+		long,
+		value_name = "MEAN/FLOOR",
+		value_parser = parse_video_vmaf,
+		help = "Video VMAF mean and 5th-percentile floor instead of the preset's, e.g. 93/89 (moderate and slow)"
+	)]
+	video_vmaf: Option<VmafOverride>,
+	#[arg(
+		long,
+		value_name = "N",
+		value_parser = parse_image_target,
+		help = "Image SSIMULACRA2 target instead of the preset's, 50 to 95"
+	)]
+	image_target: Option<f64>,
+	#[arg(
+		long,
+		value_name = "N",
+		value_parser = parse_audio_kbps,
+		help = "Stereo Opus bitrate in kbps instead of the preset's, 64 to 320 in steps of 8; other layouts scale with it"
+	)]
+	audio_kbps: Option<u32>,
+}
+
+impl QualityArgs {
+	fn overrides(self) -> Overrides {
+		Overrides {
+			video: self.video_vmaf,
+			image: self.image_target,
+			audio_stereo_kbps: self.audio_kbps,
+		}
+	}
+}
+
+fn checked(overrides: Overrides) -> Result<Overrides, String> {
+	overrides.validate()?;
+	Ok(overrides.normalized())
+}
+
+fn number<T: std::str::FromStr>(text: &str) -> Result<T, String> {
+	text.trim().parse().map_err(|_| format!("\"{text}\" is not a number"))
+}
+
+fn parse_video_vmaf(text: &str) -> Result<VmafOverride, String> {
+	let (mean, floor) = text
+		.split_once('/')
+		.ok_or_else(|| "expected MEAN/FLOOR, such as 93/89".to_owned())?;
+	let video = VmafOverride {
+		mean: number(mean)?,
+		floor: number(floor)?,
+	};
+
+	let overrides = checked(Overrides {
+		video: Some(video),
+		..Overrides::default()
+	})?;
+	Ok(overrides.video.unwrap_or(video))
+}
+
+fn parse_image_target(text: &str) -> Result<f64, String> {
+	let target = number(text)?;
+
+	let overrides = checked(Overrides {
+		image: Some(target),
+		..Overrides::default()
+	})?;
+	Ok(overrides.image.unwrap_or(target))
+}
+
+fn parse_audio_kbps(text: &str) -> Result<u32, String> {
+	let kbps = number(text)?;
+
+	let overrides = checked(Overrides {
+		audio_stereo_kbps: Some(kbps),
+		..Overrides::default()
+	})?;
+	Ok(overrides.audio_stereo_kbps.unwrap_or(kbps))
+}
+
+/// `MODERATE · custom: video VMAF 90/85, image 80, audio 160 kbps`, or `None` without overrides.
+fn quality_label(speed: Speed, overrides: &Overrides) -> Option<String> {
+	if overrides.is_empty() {
+		return None;
+	}
+
+	let preset = match speed {
+		Speed::Slow => "SLOW",
+		Speed::Moderate => "MODERATE",
+		Speed::Fast => "FAST",
+	};
+	let values: Vec<String> = [
+		overrides
+			.video
+			.map(|video| format!("video VMAF {}/{}", video.mean, video.floor)),
+		overrides.image.map(|image| format!("image {image}")),
+		overrides.audio_stereo_kbps.map(|kbps| format!("audio {kbps} kbps")),
+	]
+	.into_iter()
+	.flatten()
+	.collect();
+
+	Some(format!("{preset} · custom: {}", values.join(", ")))
 }
 
 #[derive(Default)]
@@ -244,9 +353,18 @@ fn main() -> ExitCode {
 			destination,
 			name,
 			speed,
+			quality,
 			watch,
 			limit,
-		}) => projects::create(&source, &destination, name.as_deref(), speed, watch, limit),
+		}) => projects::create(
+			&source,
+			&destination,
+			name.as_deref(),
+			speed,
+			quality.overrides(),
+			watch,
+			limit,
+		),
 		Launch::Project(ProjectCommand::Dump { project }) => projects::dump(&project),
 	};
 
@@ -309,7 +427,21 @@ fn parse(args: Vec<OsString>) -> Result<Cli, clap::Error> {
 		));
 	}
 
-	Cli::try_parse_from(args)
+	let cli = Cli::try_parse_from(args)?;
+
+	let (speed, quality) = match &cli.command {
+		Some(Command::Project(ProjectCommand::Create { speed, quality, .. })) => (*speed, quality),
+		Some(_) => return Ok(cli),
+		None => (cli.compress.speed, &cli.compress.quality),
+	};
+	if speed == Speed::Fast && quality.video_vmaf.is_some() {
+		return Err(command.error(
+			clap::error::ErrorKind::ArgumentConflict,
+			"--video-vmaf can't be used with --speed fast: FAST never measures video quality; use moderate or slow",
+		));
+	}
+
+	Ok(cli)
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -461,6 +593,13 @@ async fn compress(args: CompressArgs) -> u8 {
 	prepare_work_roots(&files, sink.as_ref());
 	cancel_on_ctrl_c(&cancel);
 
+	let overrides = args.quality.overrides();
+	if let Some(label) = quality_label(args.speed, &overrides)
+		&& !args.quiet
+	{
+		let _ = writeln!(io::stdout(), "{label}");
+	}
+
 	let min_savings = f64::from(args.min_savings) / 100.0;
 	let jobs = files
 		.into_iter()
@@ -470,7 +609,7 @@ async fn compress(args: CompressArgs) -> u8 {
 			keep_metadata: args.keep_metadata,
 			drop_aux: args.drop_aux,
 			min_savings,
-			overrides: Overrides::default(),
+			overrides,
 		})
 		.collect();
 	let parallel = args.jobs.unwrap_or_else(default_jobs).max(1);
@@ -749,6 +888,157 @@ mod tests {
 		);
 		assert_eq!(tui_target(&["family.cryarchive"]), Some(TuiTarget::Project(project)));
 		assert_eq!(tui_target(&["song.flac"]), None);
+	}
+
+	fn compress_overrides(given: &[&str]) -> Overrides {
+		match launch_from(args(given)) {
+			Launch::Compress(compress) => compress.quality.overrides(),
+			_ => panic!("{given:?} is not a compress run"),
+		}
+	}
+
+	fn refusal(given: &[&str]) -> clap::Error {
+		parse(args(given))
+			.err()
+			.unwrap_or_else(|| panic!("{given:?} was accepted"))
+	}
+
+	#[test]
+	fn quality_flags_become_normalized_overrides() {
+		assert_eq!(compress_overrides(&["a.flac"]), Overrides::default());
+		assert_eq!(
+			compress_overrides(&[
+				"a.flac",
+				"--video-vmaf",
+				"90/85",
+				"--image-target",
+				"80",
+				"--audio-kbps",
+				"160"
+			]),
+			Overrides {
+				video: Some(VmafOverride {
+					mean: 90.0,
+					floor: 85.0
+				}),
+				image: Some(80.0),
+				audio_stereo_kbps: Some(160),
+			}
+		);
+		assert_eq!(
+			compress_overrides(&["a.flac", "--video-vmaf", "90.04/85.06", "--image-target", "62.46"]),
+			Overrides {
+				video: Some(VmafOverride {
+					mean: 90.0,
+					floor: 85.1
+				}),
+				image: Some(62.5),
+				audio_stereo_kbps: None,
+			}
+		);
+
+		let Launch::Project(ProjectCommand::Create { quality, .. }) =
+			launch_from(args(&["project", "create", "src", "dst", "--image-target", "80"]))
+		else {
+			panic!("project create was not parsed");
+		};
+		assert_eq!(quality.overrides().image, Some(80.0));
+	}
+
+	#[test]
+	fn quality_flags_out_of_range_exit_with_2_and_name_the_range() {
+		for (given, range) in [
+			(&["a.flac", "--video-vmaf", "79.9/70"][..], "between 80 and 99"),
+			(&["a.flac", "--video-vmaf", "99.1/90"][..], "between 80 and 99"),
+			(&["a.flac", "--video-vmaf", "90/69"][..], "between 70 and the mean (90)"),
+			(&["a.flac", "--video-vmaf", "90/91"][..], "between 70 and the mean (90)"),
+			(&["a.flac", "--video-vmaf", "nan/80"][..], "between 80 and 99"),
+			(&["a.flac", "--video-vmaf", "90"][..], "MEAN/FLOOR"),
+			(&["a.flac", "--image-target", "49"][..], "between 50 and 95"),
+			(&["a.flac", "--image-target", "96"][..], "between 50 and 95"),
+			(&["a.flac", "--image-target", "high"][..], "not a number"),
+			(
+				&["a.flac", "--audio-kbps", "56"][..],
+				"between 64 and 320 kbps, in steps of 8",
+			),
+			(
+				&["a.flac", "--audio-kbps", "328"][..],
+				"between 64 and 320 kbps, in steps of 8",
+			),
+			(
+				&["a.flac", "--audio-kbps", "100"][..],
+				"between 64 and 320 kbps, in steps of 8",
+			),
+			(
+				&["project", "create", "src", "dst", "--audio-kbps", "400"][..],
+				"between 64 and 320 kbps",
+			),
+		] {
+			let err = refusal(given);
+
+			assert_eq!(err.exit_code(), 2, "{given:?}");
+			assert!(err.to_string().contains(range), "{given:?}: {err}");
+		}
+	}
+
+	#[test]
+	fn a_video_target_at_fast_is_refused() {
+		for given in [
+			&["a.mp4", "--speed", "fast", "--video-vmaf", "93/89"][..],
+			&["project", "create", "src", "dst", "-s", "fast", "--video-vmaf", "93/89"][..],
+		] {
+			let err = refusal(given);
+
+			assert_eq!(err.exit_code(), 2, "{given:?}");
+			assert!(
+				err.to_string()
+					.contains("FAST never measures video quality; use moderate or slow"),
+				"{given:?}: {err}"
+			);
+		}
+
+		assert!(
+			parse(args(&[
+				"a.mp4",
+				"--speed",
+				"fast",
+				"--image-target",
+				"80",
+				"--audio-kbps",
+				"96"
+			]))
+			.is_ok()
+		);
+		assert!(parse(args(&["a.mp4", "--speed", "slow", "--video-vmaf", "93/89"])).is_ok());
+	}
+
+	#[test]
+	fn a_custom_profile_is_labelled_with_its_preset_and_values() {
+		let custom = Overrides {
+			video: Some(VmafOverride {
+				mean: 90.0,
+				floor: 85.0,
+			}),
+			image: Some(80.0),
+			audio_stereo_kbps: Some(160),
+		};
+
+		assert_eq!(quality_label(Speed::Moderate, &Overrides::default()), None);
+		assert_eq!(
+			quality_label(Speed::Moderate, &custom).as_deref(),
+			Some("MODERATE · custom: video VMAF 90/85, image 80, audio 160 kbps")
+		);
+		assert_eq!(
+			quality_label(
+				Speed::Slow,
+				&Overrides {
+					image: Some(62.5),
+					..Overrides::default()
+				}
+			)
+			.as_deref(),
+			Some("SLOW · custom: image 62.5")
+		);
 	}
 
 	#[tokio::test]

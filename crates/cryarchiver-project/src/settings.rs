@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use cryarchiver_engine::commit::{FileIdentity, file_id};
-use cryarchiver_engine::preset::Speed as EngineSpeed;
+use cryarchiver_engine::preset::{Overrides, Speed as EngineSpeed};
 use cryarchiver_engine::text::display_path;
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +32,7 @@ impl From<Speed> for EngineSpeed {
 }
 
 /// The project settings of the project layer spec §4, stored in the `meta` table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
 	#[serde(with = "crate::keys::path_bytes")]
@@ -40,6 +40,8 @@ pub struct Settings {
 	#[serde(with = "crate::keys::path_bytes")]
 	pub destination: PathBuf,
 	pub speed: Speed,
+	#[serde(default)]
+	pub overrides: Overrides,
 	/// Percent.
 	pub min_savings: u8,
 	pub watch: bool,
@@ -56,6 +58,7 @@ impl Default for Settings {
 			source: PathBuf::new(),
 			destination: PathBuf::new(),
 			speed: Speed::Moderate,
+			overrides: Overrides::default(),
 			min_savings: 10,
 			watch: false,
 			performance_limit: None,
@@ -66,9 +69,11 @@ impl Default for Settings {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SettingsChange {
 	Speed(Speed),
+	/// Replaces every override; `Overrides::default()` returns to the preset.
+	Overrides(Overrides),
 	MinSavings(u8),
 	Watch(bool),
 	PerformanceLimit(Option<u8>),
@@ -92,6 +97,8 @@ pub enum SettingsError {
 	#[error("the stability window must be at most an hour")]
 	StabilityWindow,
 	#[error("{0}")]
+	Overrides(String),
+	#[error("{0}")]
 	Roots(String),
 }
 
@@ -108,6 +115,10 @@ impl Settings {
 	pub fn apply(&mut self, change: SettingsChange) -> Result<(), SettingsError> {
 		match change {
 			SettingsChange::Speed(speed) => self.speed = speed,
+			SettingsChange::Overrides(overrides) => {
+				overrides.validate().map_err(SettingsError::Overrides)?;
+				self.overrides = overrides.normalized();
+			}
 			SettingsChange::MinSavings(percent) if percent <= MAX_MIN_SAVINGS => self.min_savings = percent,
 			SettingsChange::MinSavings(_) => return Err(SettingsError::MinSavings),
 			SettingsChange::Watch(watch) => self.watch = watch,
@@ -330,6 +341,8 @@ pub fn plain_path(path: PathBuf) -> PathBuf {
 mod tests {
 	use std::fs;
 
+	use cryarchiver_engine::preset::VmafOverride;
+
 	use super::*;
 
 	#[test]
@@ -415,6 +428,62 @@ mod tests {
 		assert_eq!(settings.speed, Speed::Fast);
 		assert!(settings.watch);
 		assert_eq!(settings.min_savings, 10);
+		assert!(settings.overrides.is_empty());
+	}
+
+	#[test]
+	fn overrides_are_validated_and_stored_normalized() {
+		let mut settings = Settings::default();
+
+		assert!(settings.overrides.is_empty());
+		assert!(matches!(
+			settings.apply(SettingsChange::Overrides(Overrides {
+				image: Some(40.0),
+				..Overrides::default()
+			})),
+			Err(SettingsError::Overrides(reason)) if reason.contains("between 50 and 95")
+		));
+		assert!(settings.overrides.is_empty());
+
+		settings
+			.apply(SettingsChange::Overrides(Overrides {
+				video: Some(VmafOverride {
+					mean: 90.04,
+					floor: 85.06,
+				}),
+				image: None,
+				audio_stereo_kbps: Some(160),
+			}))
+			.unwrap();
+		assert_eq!(
+			settings.overrides,
+			Overrides {
+				video: Some(VmafOverride {
+					mean: 90.0,
+					floor: 85.1
+				}),
+				image: None,
+				audio_stereo_kbps: Some(160),
+			}
+		);
+
+		settings.apply(SettingsChange::Overrides(Overrides::default())).unwrap();
+		assert!(settings.overrides.is_empty());
+	}
+
+	#[test]
+	fn overrides_round_trip_through_the_stored_form() {
+		let settings = Settings {
+			overrides: Overrides {
+				image: Some(80.0),
+				..Overrides::default()
+			},
+			..Settings::default()
+		};
+
+		let read: Settings = rmp_serde::from_slice(&rmp_serde::to_vec_named(&settings).unwrap()).unwrap();
+
+		assert_eq!(read, settings);
 	}
 
 	#[test]

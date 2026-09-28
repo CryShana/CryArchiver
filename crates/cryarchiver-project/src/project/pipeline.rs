@@ -12,7 +12,6 @@ use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::{collision_key, destination_name, placeholder_name};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError};
-use cryarchiver_engine::preset::Overrides;
 use cryarchiver_engine::quality::memory::SharedMemory;
 use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::workspace::ARCHIVE_DIR;
@@ -390,7 +389,7 @@ impl Owner {
 				keep_metadata: true,
 				drop_aux: !self.settings.keep_auxiliary_images,
 				min_savings: self.settings.min_savings_fraction(),
-				overrides: Overrides::default(),
+				overrides: self.settings.overrides,
 			})),
 			Work::Copy if self.pipeline.chosen_copies.contains(&file) => Some(Task::Copy(CopyReason::Chosen)),
 			Work::Copy => Some(self.reference_task(file).unwrap_or(Task::Copy(CopyReason::NotMedia))),
@@ -1049,6 +1048,7 @@ pub(super) mod tests {
 	use std::sync::mpsc::Receiver;
 	use std::time::Duration;
 
+	use cryarchiver_engine::preset::Overrides;
 	use tokio::sync::mpsc::UnboundedReceiver;
 	use tokio::sync::oneshot;
 	use tokio::time::MissedTickBehavior;
@@ -1246,6 +1246,30 @@ pub(super) mod tests {
 
 	fn failed(kind: ErrorKind) -> JobMessage {
 		JobMessage::Finished(Err(kind.into()))
+	}
+
+	#[test]
+	fn a_job_built_after_an_overrides_change_carries_the_new_overrides() {
+		let mut fixture = Fixture::named("song.flac", b"fLaC");
+		let overrides_of = |owner: &mut Owner, file: FileId| match owner.task_for(file, Work::Encode) {
+			Some(Task::Encode(job)) => job.overrides,
+			_ => panic!("an encode task was expected"),
+		};
+		let custom = Overrides {
+			image: Some(80.0),
+			audio_stereo_kbps: Some(160),
+			..Overrides::default()
+		};
+
+		let before = overrides_of(&mut fixture.owner, fixture.file);
+		fixture
+			.owner
+			.change_settings(&crate::settings::SettingsChange::Overrides(custom));
+		let after = overrides_of(&mut fixture.owner, fixture.file);
+
+		assert_eq!(before, Overrides::default());
+		assert_eq!(after, custom);
+		assert_eq!(fixture.owner.settings.overrides, custom);
 	}
 
 	#[test]

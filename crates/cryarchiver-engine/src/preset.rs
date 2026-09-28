@@ -36,6 +36,36 @@ impl Overrides {
 		*self == Self::default()
 	}
 
+	/// Every value clamped into its range and rounded to the quality cache key's resolution (0.1, or the 8 kbps
+	/// step). A value that is not a finite number is dropped.
+	#[must_use]
+	pub fn normalized(&self) -> Self {
+		let video = self
+			.video
+			.filter(|video| video.mean.is_finite() && video.floor.is_finite())
+			.map(|video| {
+				let mean = tenths(video.mean.clamp(*VIDEO_MEAN_RANGE.start(), *VIDEO_MEAN_RANGE.end()));
+				VmafOverride {
+					mean,
+					floor: tenths(video.floor.clamp(VIDEO_FLOOR_MIN, mean)),
+				}
+			});
+		let image = self
+			.image
+			.filter(|image| image.is_finite())
+			.map(|image| tenths(image.clamp(*IMAGE_RANGE.start(), *IMAGE_RANGE.end())));
+		let audio_stereo_kbps = self.audio_stereo_kbps.map(|kbps| {
+			let stepped = kbps.saturating_add(AUDIO_STEP_KBPS / 2) / AUDIO_STEP_KBPS * AUDIO_STEP_KBPS;
+			stepped.clamp(*AUDIO_STEREO_RANGE.start(), *AUDIO_STEREO_RANGE.end())
+		});
+
+		Self {
+			video,
+			image,
+			audio_stereo_kbps,
+		}
+	}
+
 	pub fn validate(&self) -> Result<(), String> {
 		if let Some(video) = self.video {
 			if !VIDEO_MEAN_RANGE.contains(&video.mean) {
@@ -76,6 +106,10 @@ impl Overrides {
 
 		Ok(())
 	}
+}
+
+fn tenths(value: f64) -> f64 {
+	(value * 10.0).round() / 10.0
 }
 
 #[cfg(test)]
@@ -148,6 +182,43 @@ mod tests {
 				"{invalid}"
 			);
 		}
+	}
+
+	#[test]
+	fn normalizing_clamps_into_the_ranges_and_rounds_to_the_key_resolution() {
+		assert_eq!(video(120.0, 60.0).normalized(), video(99.0, 70.0));
+		assert_eq!(video(50.0, 90.0).normalized(), video(80.0, 80.0));
+		assert_eq!(video(90.04, 85.06).normalized(), video(90.0, 85.1));
+		assert_eq!(video(90.0, 95.0).normalized(), video(90.0, 90.0));
+		assert_eq!(image(200.0).normalized(), image(95.0));
+		assert_eq!(image(10.0).normalized(), image(50.0));
+		assert_eq!(image(80.04).normalized(), image(80.0));
+		assert_eq!(image(62.46).normalized(), image(62.5));
+		assert_eq!(audio(1000).normalized(), audio(320));
+		assert_eq!(audio(0).normalized(), audio(64));
+		assert_eq!(audio(99).normalized(), audio(96));
+		assert_eq!(audio(100).normalized(), audio(104));
+		assert_eq!(audio(u32::MAX).normalized(), audio(320));
+	}
+
+	#[test]
+	fn normalizing_keeps_valid_values_and_drops_values_that_are_not_numbers() {
+		for valid in [
+			video(93.0, 89.0),
+			video(92.5, 87.5),
+			image(62.5),
+			audio(160),
+			Overrides::default(),
+		] {
+			assert_eq!(valid.normalized(), valid);
+		}
+
+		assert_eq!(video(f64::NAN, 80.0).normalized(), Overrides::default());
+		assert_eq!(video(90.0, f64::NAN).normalized(), Overrides::default());
+		assert_eq!(image(f64::NAN).normalized(), Overrides::default());
+		assert_eq!(video(f64::INFINITY, 80.0).normalized(), Overrides::default());
+		assert_eq!(video(95.0, 91.0).normalized().validate(), Ok(()));
+		assert_eq!(video(120.0, 10.0).normalized().validate(), Ok(()));
 	}
 
 	#[test]

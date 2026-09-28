@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::text::display_path;
+use cryarchiver_project::settings::Settings;
 use cryarchiver_project::view::{IssueView, Overall, RunState, Update};
 use cryarchiver_project::{Command, Project};
 use indicatif::{DecimalBytes, HumanDuration};
@@ -18,6 +19,7 @@ const LISTED_ISSUES: usize = 20;
 
 #[derive(Debug, Default)]
 struct Summary {
+	quality: Option<String>,
 	/// The last state before the run began to stop.
 	run_state: Option<RunState>,
 	overall: Overall,
@@ -101,7 +103,7 @@ impl Summary {
 	}
 
 	fn final_lines(&self, deleting: bool) -> Vec<String> {
-		let mut lines = Vec::new();
+		let mut lines: Vec<String> = self.quality.iter().cloned().collect();
 		match self.overall.parity {
 			Some(parity) if parity.excluded > 0 => lines.push(format!(
 				"{} source files → {} archived + {} excluded",
@@ -171,7 +173,10 @@ pub fn run(project: &mut Project, delete_originals: bool, interrupted: &Arc<Atom
 		delete_confirmed: delete_originals,
 	});
 
-	let mut summary = Summary::default();
+	let mut summary = Summary {
+		quality: quality_of(project.settings()),
+		..Summary::default()
+	};
 	let mut last_progress = Instant::now();
 	let stopped_by_user = loop {
 		if interrupted.load(Ordering::SeqCst) {
@@ -203,6 +208,10 @@ pub fn run(project: &mut Project, delete_originals: bool, interrupted: &Arc<Atom
 	summary.exit_code(stopped_by_user)
 }
 
+fn quality_of(settings: &Settings) -> Option<String> {
+	crate::quality_label(settings.speed.into(), &settings.overrides)
+}
+
 fn clock(seconds: u32) -> String {
 	format!(
 		"{:02}:{:02}:{:02}",
@@ -214,7 +223,9 @@ fn clock(seconds: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+	use cryarchiver_engine::preset::{Overrides, VmafOverride};
 	use cryarchiver_project::issues::{IssueId, Problem};
+	use cryarchiver_project::settings::Speed;
 	use cryarchiver_project::view::Parity;
 
 	use super::*;
@@ -269,6 +280,43 @@ mod tests {
 				"3 originals deleted",
 			]
 		);
+	}
+
+	#[test]
+	fn the_summary_names_a_custom_profile_first() {
+		let settings = Settings {
+			speed: Speed::Moderate,
+			overrides: Overrides {
+				video: Some(VmafOverride {
+					mean: 90.0,
+					floor: 85.0,
+				}),
+				image: Some(80.0),
+				audio_stereo_kbps: Some(160),
+			},
+			..Settings::default()
+		};
+		let summary = Summary {
+			quality: quality_of(&settings),
+			overall: Overall {
+				parity: Some(Parity {
+					source_files: 2,
+					archive_files: 2,
+					excluded: 0,
+				}),
+				..Overall::default()
+			},
+			..Summary::default()
+		};
+
+		assert_eq!(
+			summary.final_lines(false),
+			[
+				"MODERATE · custom: video VMAF 90/85, image 80, audio 160 kbps",
+				"2 source files → 2 archived"
+			]
+		);
+		assert_eq!(quality_of(&Settings::default()), None);
 	}
 
 	#[test]

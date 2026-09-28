@@ -97,7 +97,7 @@ impl From<rmp_serde::decode::Error> for StoreError {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Meta {
 	pub format: u32,
 	pub app_version: String,
@@ -459,7 +459,7 @@ fn parent_folder(path: &Path) -> &Path {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Peeked {
 	pub meta: Meta,
 	/// The project wasn't closed cleanly; opening it recovers it.

@@ -92,6 +92,87 @@ fn project_create_writes_a_project_that_dump_prints() {
 }
 
 #[test]
+fn project_create_stores_quality_overrides_that_a_reopen_reads_back() {
+	let dir = tempfile::tempdir().unwrap();
+	fs::create_dir_all(dir.path().join("Photos")).unwrap();
+
+	let out = cryarchiver(
+		dir.path(),
+		&["project", "create", "Photos", "Archive", "--image-target", "80"],
+	);
+
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	let project = dir.path().join("Archive").join("Photos.cryarchive");
+	let (_, meta, _) = cryarchiver_project::store::Store::open(&project).unwrap();
+	assert_eq!(
+		meta.settings.overrides,
+		cryarchiver_engine::preset::Overrides {
+			image: Some(80.0),
+			..Default::default()
+		}
+	);
+
+	let dump = cryarchiver(dir.path(), &["project", "dump", project.to_str().unwrap()]);
+	assert_eq!(dump.status.code(), Some(0), "{}", stderr(&dump));
+	assert!(
+		stdout(&dump).contains("overrides: Overrides { video: None, image: Some(80.0), audio_stereo_kbps: None }"),
+		"{}",
+		stdout(&dump)
+	);
+}
+
+#[test]
+fn quality_flags_out_of_range_exit_with_2_and_the_range() {
+	let dir = tempfile::tempdir().unwrap();
+	fs::create_dir_all(dir.path().join("Photos")).unwrap();
+
+	let compress = cryarchiver(dir.path(), &["a.flac", "--image-target", "40"]);
+	let create = cryarchiver(
+		dir.path(),
+		&["project", "create", "Photos", "Archive", "--video-vmaf", "95/60"],
+	);
+	let fast = cryarchiver(dir.path(), &["a.mp4", "-s", "fast", "--video-vmaf", "93/89"]);
+
+	assert_eq!(compress.status.code(), Some(2));
+	assert!(stderr(&compress).contains("between 50 and 95"), "{}", stderr(&compress));
+	assert_eq!(create.status.code(), Some(2));
+	assert!(
+		stderr(&create).contains("between 70 and the mean (95)"),
+		"{}",
+		stderr(&create)
+	);
+	assert!(!dir.path().join("Archive").exists());
+	assert_eq!(fast.status.code(), Some(2));
+	assert!(
+		stderr(&fast).contains("FAST never measures video quality; use moderate or slow"),
+		"{}",
+		stderr(&fast)
+	);
+}
+
+#[test]
+fn run_of_a_project_with_overrides_names_the_custom_profile() {
+	let dir = tempfile::tempdir().unwrap();
+	fs::create_dir_all(dir.path().join("source")).unwrap();
+	let project = cryarchiver_project::create(
+		&dir.path().join("source"),
+		&dir.path().join("archive"),
+		std::ffi::OsStr::new("archive"),
+		|settings| settings.overrides.image = Some(80.0),
+	)
+	.unwrap();
+
+	let out = cryarchiver(dir.path(), &["run", project.to_str().unwrap()]);
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	assert!(
+		stdout(&out).contains("MODERATE · custom: image 80\n"),
+		"{}",
+		stdout(&out)
+	);
+}
+
+#[test]
 fn project_create_refuses_a_destination_inside_the_source() {
 	let dir = tempfile::tempdir().unwrap();
 	fs::create_dir_all(dir.path().join("Photos")).unwrap();
@@ -504,6 +585,59 @@ fn moderate_runs_teach_the_quality_cache() {
 		serde_json::from_slice(&fs::read(cache.path().join("quality-cache.json")).unwrap()).unwrap();
 	let keys: Vec<&String> = saved["entries"].as_object().unwrap().keys().collect();
 	assert!(keys.iter().any(|key| key.starts_with("video/mpeg4/")), "{keys:?}");
+}
+
+#[test]
+fn a_video_override_keys_what_the_quality_cache_learns() {
+	let dir = tempfile::tempdir().unwrap();
+	let cache = tempfile::tempdir().unwrap();
+	support::mpeg4(dir.path(), "clip.mp4", 3);
+
+	let out = Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
+		.current_dir(dir.path())
+		.env("CRYARCHIVER_CACHE_DIR", cache.path())
+		.args(["clip.mp4", "--video-vmaf", "90.04/85"])
+		.output()
+		.unwrap();
+
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	assert!(
+		stdout(&out).contains("MODERATE · custom: video VMAF 90/85\n"),
+		"{}",
+		stdout(&out)
+	);
+	let saved: serde_json::Value =
+		serde_json::from_slice(&fs::read(cache.path().join("quality-cache.json")).unwrap()).unwrap();
+	let keys: Vec<&String> = saved["entries"].as_object().unwrap().keys().collect();
+	assert!(
+		keys.iter()
+			.any(|key| key.starts_with("video/mpeg4/") && key.ends_with("|t90.0/85.0")),
+		"{keys:?}"
+	);
+}
+
+#[test]
+fn an_audio_override_sets_the_opus_bitrate() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "a.flac", 5);
+
+	let custom = cryarchiver(dir.path(), &["a.flac", "-o", "custom", "--audio-kbps", "64"]);
+	let preset = cryarchiver(dir.path(), &["a.flac", "-o", "preset"]);
+
+	assert_eq!(custom.status.code(), Some(0), "{}{}", stdout(&custom), stderr(&custom));
+	assert!(
+		stdout(&custom).contains("MODERATE · custom: audio 64 kbps\n"),
+		"{}",
+		stdout(&custom)
+	);
+	assert!(!stdout(&preset).contains("custom"), "{}", stdout(&preset));
+	let size = |folder: &str| fs::metadata(dir.path().join(folder).join("a.cry.opus")).unwrap().len();
+	assert!(
+		size("custom") * 4 < size("preset") * 3,
+		"{} vs {}",
+		size("custom"),
+		size("preset")
+	);
 }
 
 #[test]

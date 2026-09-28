@@ -165,7 +165,8 @@ fn table_rate(channels: u32, speed: Speed, overrides: &Overrides) -> u32 {
 		8 => seven_one,
 		other => other * stereo / 2,
 	};
-	let Some(custom) = overrides.audio_stereo_kbps else {
+
+	let Some(custom) = overrides.normalized().audio_stereo_kbps else {
 		return rate;
 	};
 
@@ -297,9 +298,40 @@ mod tests {
 			[48, 96, 144, 192, 272]
 		);
 		assert_eq!(
+			table_rate(
+				1,
+				Speed::Fast,
+				&Overrides {
+					audio_stereo_kbps: Some(72),
+					..Overrides::default()
+				}
+			),
+			40,
+			"48 · 72 / 96 = 36 is a tie between 32 and 40, and rounds up"
+		);
+		assert_eq!(
 			plan_track(&stream("flac", 6, Some("5.1"), None), None, Speed::Moderate, &custom),
 			encode(320, 6, LayoutFix::Keep("5.1"))
 		);
+	}
+
+	#[test]
+	fn the_table_reads_the_normalized_override() {
+		let stereo = |kbps: u32| {
+			table_rate(
+				2,
+				Speed::Moderate,
+				&Overrides {
+					audio_stereo_kbps: Some(kbps),
+					..Overrides::default()
+				},
+			)
+		};
+
+		assert_eq!(stereo(1000), 320);
+		assert_eq!(stereo(8), 64);
+		assert_eq!(stereo(100), 104);
+		assert_eq!(stereo(u32::MAX), 320);
 	}
 
 	#[test]

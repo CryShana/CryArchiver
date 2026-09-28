@@ -120,7 +120,7 @@ pub enum Fault {
 	AfterDeleteIntent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
 	/// `delete_confirmed` is the front end's confirmation for a project that deletes originals (spec §9). Without it
 	/// such a project archives but deletes nothing, until a later start or `ChangeSettings` with the typed `DELETE`

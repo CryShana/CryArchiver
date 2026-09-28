@@ -85,7 +85,10 @@ impl Owner {
 				self.cancel_deletes();
 			}
 			SettingsChange::StabilityWindow(_) | SettingsChange::Watch(_) => self.view.status_dirty = true,
-			SettingsChange::Speed(_) | SettingsChange::MinSavings(_) | SettingsChange::KeepAuxiliaryImages(_) => {}
+			SettingsChange::Speed(_)
+			| SettingsChange::Overrides(_)
+			| SettingsChange::MinSavings(_)
+			| SettingsChange::KeepAuxiliaryImages(_) => {}
 		}
 	}
 
