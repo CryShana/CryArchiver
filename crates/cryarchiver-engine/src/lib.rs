@@ -11,6 +11,7 @@ pub mod outcome;
 pub mod preset;
 pub mod probe;
 pub mod process;
+pub mod quality;
 pub mod sink;
 pub mod text;
 pub mod toolchain;
