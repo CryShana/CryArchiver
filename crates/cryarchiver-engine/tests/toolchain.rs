@@ -26,6 +26,7 @@ async fn detects_the_installed_toolchain_and_caches_it() {
 	);
 	assert!(tools.svt_settings && tools.colour_tags && tools.vp9_alpha, "{tools:?}");
 	assert!(tools.has_av1_decoder());
+	assert!(tools.has_vmaf(), "{tools:?}");
 	assert!(cache.path().join("toolchain.json").is_file());
 	assert_eq!(Toolchain::detect(&config, &cancel).await.unwrap(), tools);
 }

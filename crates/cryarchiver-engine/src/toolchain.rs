@@ -9,11 +9,14 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::process::{self, StdoutMode, ToolCommand, ToolOutput};
+use crate::quality::vmaf;
 use crate::text::display_path;
 
 const MIN_FFMPEG: Version = Version { major: 8, minor: 1 };
 const MIN_SVT_AV1: Version = Version { major: 4, minor: 0 };
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const CACHE_FORMAT: u32 = 2;
+const VMAF_PROBE_INPUT: &str = "testsrc2=s=64x64:d=0.2";
 const FULL_BUILD_HINT: &str = "install a full ffmpeg build (Windows: gyan.dev \"full\" or BtbN GPL builds; Linux: BtbN static builds or a distro ffmpeg with libsvtav1)";
 const SOXR_PROBE: &[&str] = &[
 	"-hide_banner",
@@ -190,6 +193,8 @@ pub struct Toolchain {
 	pub vp9_alpha: bool,
 	pub soxr: bool,
 	pub opus_surround: bool,
+	#[serde(default)]
+	pub vmaf: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,7 +246,7 @@ impl Toolchain {
 	}
 
 	async fn probe(ffmpeg: PathBuf, ffprobe: PathBuf, cancel: &CancellationToken) -> Result<Self, ToolchainError> {
-		let (version, encoders, decoders, filters, soxr, opus_surround, svt_av1, video) = tokio::join!(
+		let (version, encoders, decoders, filters, soxr, opus_surround, svt_av1, video, vmaf) = tokio::join!(
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-version"], cancel),
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-encoders"], cancel),
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-decoders"], cancel),
@@ -250,6 +255,7 @@ impl Toolchain {
 			succeeds(&ffmpeg, OPUS_SURROUND_PROBE, cancel),
 			svt_version(&ffmpeg, cancel),
 			video_probes(&ffmpeg, &ffprobe, cancel),
+			vmaf_models(&ffmpeg, cancel),
 		);
 
 		let first_line = stdout_text(&version?).lines().next().unwrap_or_default().to_owned();
@@ -269,6 +275,8 @@ impl Toolchain {
 			vp9_alpha,
 		} = video?;
 		let vp9_alpha = vp9_alpha && ALPHA_FILTERS.iter().all(|name| filters.contains(*name));
+		let vmaf = vmaf? && filters.contains(vmaf::FILTER);
+
 		Ok(Self {
 			ffmpeg,
 			ffprobe,
@@ -282,6 +290,7 @@ impl Toolchain {
 			vp9_alpha,
 			soxr,
 			opus_surround,
+			vmaf,
 		})
 	}
 
@@ -303,6 +312,10 @@ impl Toolchain {
 
 	pub fn has_libjxl(&self) -> bool {
 		self.encoders.contains(LIBJXL)
+	}
+
+	pub fn has_vmaf(&self) -> bool {
+		self.vmaf
 	}
 
 	fn missing(&self, selected: impl Fn(&ReportLine) -> bool) -> Vec<String> {
@@ -439,10 +452,10 @@ impl Toolchain {
 			),
 			check(
 				"libvmaf",
-				self.filters.contains("libvmaf"),
+				self.vmaf,
 				Status::Warn,
 				OPTIONAL,
-				"video quality checks",
+				"video quality search and checks at MODERATE and SLOW",
 			),
 		]
 	}
@@ -579,7 +592,7 @@ fn fingerprint(ffmpeg: &Path) -> Option<String> {
 	let meta = fs::metadata(ffmpeg).ok()?;
 	let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
 	Some(format!(
-		"{}|{}|{}|{modified}",
+		"{CACHE_FORMAT}|{}|{}|{}|{modified}",
 		crate::VERSION,
 		ffmpeg.display(),
 		meta.len()
@@ -627,6 +640,34 @@ async fn succeeds(ffmpeg: &Path, args: &[&str], cancel: &CancellationToken) -> R
 async fn svt_version(ffmpeg: &Path, cancel: &CancellationToken) -> Result<Option<Version>, ToolchainError> {
 	let out = run_ffmpeg(ffmpeg, SVT_PROBE, cancel).await?;
 	Ok(out.stderr_tail.iter().find_map(|line| parse_svt_version(line)))
+}
+
+async fn vmaf_models(ffmpeg: &Path, cancel: &CancellationToken) -> Result<bool, ToolchainError> {
+	for model in vmaf::MODELS {
+		let graph = format!("[0:v][1:v]{}=model=version={model}", vmaf::FILTER);
+		let args = [
+			"-hide_banner",
+			"-nostdin",
+			"-f",
+			"lavfi",
+			"-i",
+			VMAF_PROBE_INPUT,
+			"-f",
+			"lavfi",
+			"-i",
+			VMAF_PROBE_INPUT,
+			"-lavfi",
+			graph.as_str(),
+			"-f",
+			"null",
+			"-",
+		];
+		let out = run_ffmpeg(ffmpeg, &args, cancel).await?;
+		if !out.status.success() || !out.stderr_tail.iter().any(|line| line.contains("VMAF score:")) {
+			return Ok(false);
+		}
+	}
+	Ok(true)
 }
 
 fn stdout_text(out: &ToolOutput) -> String {
@@ -818,6 +859,7 @@ mod tests {
 			vp9_alpha: true,
 			soxr: true,
 			opus_surround: true,
+			vmaf: true,
 		}
 	}
 
@@ -985,5 +1027,29 @@ mod tests {
 		let result = Toolchain::detect(&config, &CancellationToken::new()).await;
 
 		assert!(result.is_err(), "{result:?}");
+	}
+
+	#[test]
+	fn a_missing_vmaf_model_only_warns() {
+		let tools = Toolchain {
+			vmaf: false,
+			..complete_toolchain()
+		};
+
+		let line = tools.report().into_iter().find(|line| line.label == "libvmaf").unwrap();
+
+		assert_eq!(line.status, Status::Warn);
+		assert!(line.detail.contains("not available"), "{}", line.detail);
+		assert!(tools.problems(MediaKind::Video).is_empty());
+		assert!(!tools.has_vmaf());
+	}
+
+	#[test]
+	fn fingerprints_name_the_cache_format() {
+		let dir = tempfile::tempdir().unwrap();
+		let ffmpeg = dir.path().join("ffmpeg");
+		fs::write(&ffmpeg, b"").unwrap();
+
+		assert!(fingerprint(&ffmpeg).unwrap().starts_with("2|"));
 	}
 }
