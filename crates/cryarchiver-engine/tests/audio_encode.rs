@@ -5,7 +5,7 @@ use std::path::Path;
 use cryarchiver_engine::audio::encode;
 use cryarchiver_engine::audio::plan::{AudioPlan, plan_file};
 use cryarchiver_engine::audio::verify::Levels;
-use cryarchiver_engine::preset::Speed;
+use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe::{MediaInfo, probe};
 use tokio_util::sync::CancellationToken;
 
@@ -13,7 +13,7 @@ async fn encode_file(source: &Path, output: &Path) -> (Vec<Levels>, MediaInfo) {
 	let tools = support::toolchain().await;
 	let cancel = CancellationToken::new();
 	let info = probe(&tools, source, &cancel).await.unwrap();
-	let AudioPlan::Encode(plan) = plan_file(&info, Speed::Moderate) else {
+	let AudioPlan::Encode(plan) = plan_file(&info, Speed::Moderate, &Overrides::default()) else {
 		panic!("expected an encode plan")
 	};
 

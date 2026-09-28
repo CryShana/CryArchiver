@@ -16,7 +16,7 @@ use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput,
 use crate::integrity;
 use crate::metadata::MetadataMode;
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
-use crate::preset::Speed;
+use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::quality::keys::{CacheKey, Group, VideoGroup};
 use crate::quality::memory::{GroupStats, Observation, QualityMemory, SharedMemory};
@@ -45,6 +45,7 @@ pub struct Job {
 	pub keep_metadata: bool,
 	pub drop_aux: bool,
 	pub min_savings: f64,
+	pub overrides: Overrides,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,7 +260,7 @@ impl Engine {
 			MediaClass::Audio(info) => {
 				self.require(MediaKind::Audio)?;
 				on_event(JobEvent::Stage(Stage::Plan));
-				match plan_file(&info, job.speed) {
+				match plan_file(&info, job.speed, &job.overrides) {
 					AudioPlan::Encode(plan) => Planned::Audio {
 						info: Box::new(info),
 						plan,
@@ -276,8 +277,8 @@ impl Engine {
 				}
 
 				on_event(JobEvent::Stage(Stage::Plan));
-				let planned =
-					precheck(&info, &self.video_caps()).and_then(|_| plan_streams(&info, job.speed, job.keep_metadata));
+				let planned = precheck(&info, &self.video_caps())
+					.and_then(|_| plan_streams(&info, job.speed, &job.overrides, job.keep_metadata));
 				if let Err(reason) = planned {
 					return Ok(JobOutcome::KeptOriginal { reason });
 				}
@@ -383,6 +384,7 @@ impl Engine {
 			source: &cx.job.source,
 			source_bytes: cx.source_bytes,
 			speed: cx.job.speed,
+			overrides: cx.job.overrides,
 			min_savings: cx.job.min_savings,
 			mode: metadata_mode(cx.job),
 			threads: self.image_threads,
@@ -461,8 +463,9 @@ impl Engine {
 		let (info, probe_json) = probe::probe_video(&self.tools, source, cx.source_bytes, cx.cancel)
 			.await
 			.map_err(video_probe_error)?;
-		let planned = precheck(&info, &self.video_caps())
-			.and_then(|main| plan_streams(&info, cx.job.speed, cx.job.keep_metadata).map(|streams| (main, streams)));
+		let planned = precheck(&info, &self.video_caps()).and_then(|main| {
+			plan_streams(&info, cx.job.speed, &cx.job.overrides, cx.job.keep_metadata).map(|streams| (main, streams))
+		});
 		let (main, streams) = match planned {
 			Ok(planned) => planned,
 			Err(reason) => return Ok(Produced::Kept(reason)),
@@ -492,7 +495,7 @@ impl Engine {
 		))
 		.await?;
 		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
-		let mut quality = self.video_quality(cx.job.speed, main, &analysis, &video);
+		let mut quality = self.video_quality(cx.job, main, &analysis, &video);
 		if cx.job.speed != Speed::Fast && !self.tools.has_vmaf() {
 			video
 				.warnings
@@ -542,8 +545,8 @@ impl Engine {
 		Ok(produced)
 	}
 
-	fn video_quality(&self, speed: Speed, main: &Stream, analysis: &Analysis, video: &VideoPlan) -> VideoQuality {
-		let target = video_quality::target(speed, video.encoder.film_grain());
+	fn video_quality(&self, job: &Job, main: &Stream, analysis: &Analysis, video: &VideoPlan) -> VideoQuality {
+		let target = video_quality::target(job.speed, video.encoder.film_grain(), &job.overrides);
 		let key = CacheKey {
 			group: Group::Video(VideoGroup::of(main, analysis, video)),
 			encoder: self.encoder_id(&video.encoder),
@@ -554,7 +557,7 @@ impl Engine {
 		let stats = self.quality.lookup(&key);
 
 		VideoQuality {
-			strategy: video_quality::strategy(speed, stats.as_ref(), video.encoder.crf(), self.tools.has_vmaf()),
+			strategy: video_quality::strategy(job.speed, stats.as_ref(), video.encoder.crf(), self.tools.has_vmaf()),
 			slope: stats.and_then(|stats| stats.slope).unwrap_or(DEFAULT_SLOPE),
 			key,
 			stats,

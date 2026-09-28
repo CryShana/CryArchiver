@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::images::plan::worst_case_memory;
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
-use cryarchiver_engine::preset::Speed;
+use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe::{Stream, probe};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
@@ -23,6 +23,7 @@ fn job(source: &Path) -> Job {
 		keep_metadata: false,
 		drop_aux: false,
 		min_savings: 0.10,
+		overrides: Overrides::default(),
 	}
 }
 
@@ -144,6 +145,30 @@ async fn image_jobs_wait_for_memory_and_release_it() {
 	assert_eq!(gate.requested.load(Ordering::SeqCst), worst_case_memory(64, 48));
 	assert_eq!(gate.refusals.load(Ordering::SeqCst), 0);
 	assert_eq!(gate.reserved.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_image_override_is_the_target_the_still_is_encoded_against() {
+	let dir = tempfile::tempdir().unwrap();
+	let png = support::photo_png(dir.path(), "a.png", 320, 240);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let custom = Job {
+		overrides: Overrides {
+			image: Some(60.0),
+			..Overrides::default()
+		},
+		..fast(&png)
+	};
+
+	let outcome = engine
+		.run(&custom, &sink(dir.path()), &|_| {}, &CancellationToken::new())
+		.await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	let entries = memory.entries();
+	assert_eq!(entries.len(), 1, "{entries:?}");
+	assert_eq!(entries[0].0, "image/png/photo/opaque/8bit/mp1|ravif-0.13|p9|t60.0");
 }
 
 #[tokio::test]

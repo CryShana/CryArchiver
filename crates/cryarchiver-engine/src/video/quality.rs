@@ -4,7 +4,7 @@ use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 use crate::outcome::{ErrorKind, JobError, KeepReason};
-use crate::preset::Speed;
+use crate::preset::{Overrides, Speed};
 use crate::quality::memory::GroupStats;
 use crate::quality::search::{self as crf_search, Bounds, Choice, Next, Probe, Target};
 use crate::quality::vmaf::{self, FrameWindow, Reference, Score, Scoring};
@@ -77,11 +77,16 @@ pub struct Scorer<'a> {
 	pub cancel: &'a CancellationToken,
 }
 
-pub fn target(speed: Speed, film_grain: bool) -> Target {
-	let base = match speed {
-		Speed::Slow => TARGETS[0],
-		Speed::Moderate => TARGETS[1],
-		Speed::Fast => TARGETS[2],
+pub fn target(speed: Speed, film_grain: bool, overrides: &Overrides) -> Target {
+	let custom = overrides.video.map(|video| Target {
+		mean: video.mean,
+		floor: video.floor,
+	});
+	let base = match (speed, custom) {
+		(Speed::Fast, _) => TARGETS[2],
+		(Speed::Slow | Speed::Moderate, Some(custom)) => custom,
+		(Speed::Slow, None) => TARGETS[0],
+		(Speed::Moderate, None) => TARGETS[1],
 	};
 	if !film_grain {
 		return base;
@@ -341,7 +346,10 @@ fn pooled(scores: &[f64]) -> Result<Score, JobError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::preset::VmafOverride;
+	use crate::quality::keys::{CacheKey, CodecFamily, DynamicRange, FpsBucket, Group, VideoGroup};
 	use crate::video::analyze::{NoiseClass, ScanType, segments};
+	use crate::video::plan::Resolution;
 
 	fn detail(start_s: f64, si: f64, usable: bool) -> Detail {
 		Detail {
@@ -354,41 +362,112 @@ mod tests {
 
 	#[test]
 	fn targets_follow_the_speed_and_allow_for_film_grain() {
+		let preset = Overrides::default();
+
 		assert_eq!(
-			target(Speed::Slow, false),
+			target(Speed::Slow, false, &preset),
 			Target {
 				mean: 95.0,
 				floor: 91.0
 			}
 		);
 		assert_eq!(
-			target(Speed::Slow, true),
+			target(Speed::Slow, true, &preset),
 			Target {
 				mean: 93.0,
 				floor: 88.5
 			}
 		);
 		assert_eq!(
-			target(Speed::Moderate, false),
+			target(Speed::Moderate, false, &preset),
 			Target {
 				mean: 93.0,
 				floor: 89.0
 			}
 		);
 		assert_eq!(
-			target(Speed::Moderate, true),
+			target(Speed::Moderate, true, &preset),
 			Target {
 				mean: 91.0,
 				floor: 86.5
 			}
 		);
 		assert_eq!(
-			target(Speed::Fast, false),
+			target(Speed::Fast, false, &preset),
 			Target {
 				mean: 93.0,
 				floor: 88.0
 			}
 		);
+	}
+
+	fn overridden(mean: f64, floor: f64) -> Overrides {
+		Overrides {
+			video: Some(VmafOverride { mean, floor }),
+			..Overrides::default()
+		}
+	}
+
+	#[test]
+	fn a_video_override_replaces_the_speed_targets_but_not_the_grain_allowance() {
+		let custom = overridden(90.0, 85.0);
+
+		assert_eq!(
+			target(Speed::Moderate, false, &custom),
+			Target {
+				mean: 90.0,
+				floor: 85.0
+			}
+		);
+		assert_eq!(
+			target(Speed::Moderate, true, &custom),
+			Target {
+				mean: 88.0,
+				floor: 82.5
+			}
+		);
+		assert_eq!(
+			target(Speed::Slow, false, &custom),
+			Target {
+				mean: 90.0,
+				floor: 85.0
+			}
+		);
+		assert_eq!(
+			target(Speed::Fast, false, &custom),
+			target(Speed::Fast, false, &Overrides::default())
+		);
+	}
+
+	#[test]
+	fn overridden_targets_never_share_learned_values_with_the_preset() {
+		let group = VideoGroup {
+			codec: CodecFamily::H264,
+			resolution: Resolution::Hd1080,
+			fps: FpsBucket::UpTo31,
+			range: DynamicRange::Sdr8,
+			scan: ScanType::Progressive,
+			grain: None,
+			alpha: false,
+		};
+		let key = |overrides: &Overrides| {
+			let target = target(Speed::Moderate, false, overrides);
+			CacheKey {
+				group: Group::Video(group),
+				encoder: "svt-av1-4.2".to_owned(),
+				preset: 5,
+				target: target.mean,
+				floor: Some(target.floor),
+			}
+			.to_string()
+		};
+
+		let preset = key(&Overrides::default());
+
+		assert!(preset.ends_with("|t93.0/89.0"), "{preset}");
+		assert_ne!(key(&overridden(90.0, 85.0)), preset);
+		assert_ne!(key(&overridden(93.0, 85.0)), preset);
+		assert_eq!(key(&overridden(93.0, 89.0)), preset);
 	}
 
 	#[test]

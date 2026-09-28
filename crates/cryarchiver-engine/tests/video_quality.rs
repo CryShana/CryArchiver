@@ -2,7 +2,7 @@ mod support;
 
 use std::fs;
 
-use cryarchiver_engine::preset::Speed;
+use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::quality::search::DEFAULT_SLOPE;
 use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, analyze};
@@ -37,7 +37,7 @@ async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
 	.unwrap();
 	let mut plan = plan_video(&info, main, &[], &analysis, Speed::Moderate);
 	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
-	let goal = target(Speed::Moderate, plan.encoder.film_grain());
+	let goal = target(Speed::Moderate, plan.encoder.film_grain(), &Overrides::default());
 	let samples = search_samples(&analysis, info.format.duration, Speed::Moderate);
 
 	let searched = {

@@ -1,6 +1,6 @@
 use crate::audio::plan::{TrackJob, TrackPlan, plan_track};
 use crate::outcome::KeepReason;
-use crate::preset::Speed;
+use crate::preset::{Overrides, Speed};
 use crate::probe::{MediaInfo, Stream};
 
 const MKV_SUBTITLES: &[&str] = &[
@@ -70,7 +70,12 @@ impl StreamPlan {
 	}
 }
 
-pub fn plan_streams(info: &MediaInfo, speed: Speed, keep_metadata: bool) -> Result<StreamPlan, KeepReason> {
+pub fn plan_streams(
+	info: &MediaInfo,
+	speed: Speed,
+	overrides: &Overrides,
+	keep_metadata: bool,
+) -> Result<StreamPlan, KeepReason> {
 	let mut plan = StreamPlan::default();
 	let mut audio_tracks = 0;
 	let mut dropped_data = 0;
@@ -84,7 +89,7 @@ pub fn plan_streams(info: &MediaInfo, speed: Speed, keep_metadata: bool) -> Resu
 						.push(format!("audio track {audio_tracks} has no audio data and was dropped"));
 				} else {
 					plan.audio
-						.push(audio_track(stream, audio_tracks, speed, &mut plan.warnings));
+						.push(audio_track(stream, audio_tracks, speed, overrides, &mut plan.warnings));
 				}
 			}
 			"subtitle" => plan.subtitles.push(subtitle_track(stream)?),
@@ -134,7 +139,13 @@ fn subtitle_track(stream: &Stream) -> Result<SubtitleTrack, KeepReason> {
 	})
 }
 
-fn audio_track(stream: &Stream, track: usize, speed: Speed, warnings: &mut Vec<String>) -> TrackJob {
+fn audio_track(
+	stream: &Stream,
+	track: usize,
+	speed: Speed,
+	overrides: &Overrides,
+	warnings: &mut Vec<String>,
+) -> TrackJob {
 	let copy = |warnings: &mut Vec<String>, reason: &str| {
 		warnings.push(format!("audio track {track} copied as-is: {reason}"));
 		TrackJob {
@@ -147,7 +158,7 @@ fn audio_track(stream: &Stream, track: usize, speed: Speed, warnings: &mut Vec<S
 	let Some(sample_rate) = stream.sample_rate.filter(|&rate| rate > 0) else {
 		return copy(warnings, "unknown sample rate");
 	};
-	match plan_track(stream, None, speed) {
+	match plan_track(stream, None, speed, overrides) {
 		Ok(plan) => TrackJob {
 			stream_index: stream.index,
 			sample_rate,
@@ -196,6 +207,12 @@ mod tests {
 	use super::*;
 	use crate::audio::plan::{EncodePlan, LayoutFix};
 
+	const PRESET: &Overrides = &Overrides {
+		video: None,
+		image: None,
+		audio_stereo_kbps: None,
+	};
+
 	fn info(json: &str) -> MediaInfo {
 		MediaInfo::parse(json.as_bytes()).unwrap()
 	}
@@ -208,7 +225,7 @@ mod tests {
 
 	#[test]
 	fn audio_is_planned_per_track() {
-		let plan = plan_streams(&info(IPHONE), Speed::Moderate, false).unwrap();
+		let plan = plan_streams(&info(IPHONE), Speed::Moderate, PRESET, false).unwrap();
 
 		assert_eq!(
 			plan.audio,
@@ -227,8 +244,8 @@ mod tests {
 
 	#[test]
 	fn data_streams_are_attached_only_when_keeping_metadata() {
-		let kept = plan_streams(&info(IPHONE), Speed::Moderate, true).unwrap();
-		let clean = plan_streams(&info(IPHONE), Speed::Moderate, false).unwrap();
+		let kept = plan_streams(&info(IPHONE), Speed::Moderate, PRESET, true).unwrap();
+		let clean = plan_streams(&info(IPHONE), Speed::Moderate, PRESET, false).unwrap();
 
 		assert_eq!(
 			kept.extracted,
@@ -263,6 +280,7 @@ mod tests {
 				{"index":3,"codec_type":"audio","codec_name":"opus","sample_rate":"48000","channels":2,"channel_layout":"stereo"}]}"#,
 			),
 			Speed::Moderate,
+			PRESET,
 			true,
 		)
 		.unwrap();
@@ -291,14 +309,14 @@ mod tests {
 		);
 
 		assert_eq!(
-			plan_streams(&mp4, Speed::Moderate, false).unwrap().extracted,
+			plan_streams(&mp4, Speed::Moderate, PRESET, false).unwrap().extracted,
 			vec![Extracted {
 				stream_index: 2,
 				file_name: "cover.jpg".into(),
 				mime_type: "image/jpeg".into(),
 			}]
 		);
-		let kept = plan_streams(&mkv, Speed::Moderate, true).unwrap();
+		let kept = plan_streams(&mkv, Speed::Moderate, PRESET, true).unwrap();
 		assert_eq!(kept.extracted[0].file_name, "small_cover.png");
 		assert_eq!(kept.extracted[0].work_file(), "stream-4.bin");
 	}
@@ -314,6 +332,7 @@ mod tests {
 				{"index":4,"codec_type":"attachment","codec_name":"ttf","tags":{"filename":"a.ttf"}}]}"#,
 			),
 			Speed::Moderate,
+			PRESET,
 			false,
 		)
 		.unwrap();
@@ -347,6 +366,7 @@ mod tests {
 				"chapters":[{"id":1},{"id":2}]}"#,
 			),
 			Speed::Moderate,
+			PRESET,
 			true,
 		)
 		.unwrap();
@@ -364,6 +384,7 @@ mod tests {
 				{"index":2,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo"}]}"#,
 			),
 			Speed::Moderate,
+			PRESET,
 			false,
 		)
 		.unwrap();
@@ -386,6 +407,7 @@ mod tests {
 				{"index":4,"codec_type":"subtitle","codec_name":"microdvd"}]}"#,
 			),
 			Speed::Moderate,
+			PRESET,
 			false,
 		)
 		.unwrap();
@@ -404,7 +426,7 @@ mod tests {
 		);
 
 		assert_eq!(
-			plan_streams(&teletext, Speed::Moderate, false),
+			plan_streams(&teletext, Speed::Moderate, PRESET, false),
 			Err(KeepReason::Unsupported(
 				"subtitle codec dvb_teletext can't be stored in MKV".into()
 			))

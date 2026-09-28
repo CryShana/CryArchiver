@@ -3,7 +3,7 @@ mod support;
 use std::fs;
 use std::path::Path;
 
-use cryarchiver_engine::preset::Speed;
+use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::video::analyze::{Analysis, NoiseClass, ScanType};
 use cryarchiver_engine::video::mux::{Attachment, MuxInputs, MuxPlan, command, mux};
@@ -91,7 +91,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 	let cancel = CancellationToken::new();
 
 	let info = probe(&tools, &source, &cancel).await.unwrap();
-	let streams = plan_streams(&info, Speed::Fast, false).unwrap();
+	let streams = plan_streams(&info, Speed::Fast, &Overrides::default(), false).unwrap();
 	let analysis = Analysis {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,

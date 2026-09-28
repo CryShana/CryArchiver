@@ -17,7 +17,7 @@ use crate::images::{blocking, structure};
 use crate::metadata::icc::{self, Cicp};
 use crate::metadata::{self, ImageFormat, MetadataMode, OutputMetadata, SourceMetadata, exif, sniff};
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
-use crate::preset::Speed;
+use crate::preset::{Overrides, Speed};
 use crate::probe::MediaInfo;
 use crate::quality::keys::{CacheKey, Group, ImageGroup};
 use crate::quality::memory::{Observation, QualityMemory};
@@ -46,6 +46,7 @@ pub struct ImageContext<'a> {
 	pub source: &'a Path,
 	pub source_bytes: u64,
 	pub speed: Speed,
+	pub overrides: Overrides,
 	pub min_savings: f64,
 	pub mode: MetadataMode,
 	pub threads: usize,
@@ -238,7 +239,7 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		graphic,
 		grey_icc: grey_profile(icc.as_deref()),
 	};
-	let plan = match plan::plan_still(&facts, cx.speed, cx.caps.libjxl) {
+	let plan = match plan::plan_still(&facts, cx.speed, &cx.overrides, cx.caps.libjxl) {
 		Ok(plan) => plan,
 		Err(reason) => return Ok(Err(reason)),
 	};
@@ -662,7 +663,7 @@ async fn produce_animation(
 
 	(cx.on_event)(JobEvent::Stage(Stage::Verify));
 	let score = animated::verify_animation(cx.tools, cx.source, &output, &animation, cx.cancel).await?;
-	let target = plan::ssim_target(cx.speed);
+	let target = plan::image_target(cx.speed, &cx.overrides);
 	if score < target {
 		return Ok(Some(ImageOutcome::Kept(KeepReason::QualityUnreachable(format!(
 			"quality target not reached at a smaller size (SSIMULACRA2 {score:.1}, target {target:.0})"

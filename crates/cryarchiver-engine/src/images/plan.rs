@@ -2,7 +2,7 @@ use crate::images::props::Effective;
 use crate::images::structure::Structure;
 use crate::metadata::{MetadataMode, SourceMetadata, exif, icc};
 use crate::outcome::KeepReason;
-use crate::preset::Speed;
+use crate::preset::{Overrides, Speed};
 
 pub const MAX_AVIF_SIDE: u32 = 16_384;
 pub const MAX_AVIF_PIXELS: u64 = 64_000_000;
@@ -273,7 +273,16 @@ fn keep(reason: String) -> Gate {
 	Gate::Keep(KeepReason::Unsupported(reason))
 }
 
-pub fn plan_still(facts: &StillFacts, speed: Speed, libjxl: bool) -> Result<StillPlan, KeepReason> {
+pub fn image_target(speed: Speed, overrides: &Overrides) -> f64 {
+	overrides.image.unwrap_or(ssim_target(speed))
+}
+
+pub fn plan_still(
+	facts: &StillFacts,
+	speed: Speed,
+	overrides: &Overrides,
+	libjxl: bool,
+) -> Result<StillPlan, KeepReason> {
 	let pixels = u64::from(facts.width) * u64::from(facts.height);
 	let fits_avif = facts.width <= MAX_AVIF_SIDE
 		&& facts.height <= MAX_AVIF_SIDE
@@ -297,7 +306,7 @@ pub fn plan_still(facts: &StillFacts, speed: Speed, libjxl: bool) -> Result<Stil
 	Ok(StillPlan {
 		memory_bytes: memory_estimate(facts.width, facts.height, &candidates),
 		candidates,
-		target: ssim_target(speed),
+		target: image_target(speed, overrides),
 	})
 }
 
@@ -372,19 +381,25 @@ mod tests {
 		};
 
 		assert_eq!(
-			kinds(&plan_still(&facts(6000, 4000), Speed::Moderate, true).unwrap()),
+			kinds(&plan_still(&facts(6000, 4000), Speed::Moderate, &Overrides::default(), true).unwrap()),
 			["ravif"]
 		);
 		assert_eq!(
-			kinds(&plan_still(&facts(1293, 48277), Speed::Moderate, true).unwrap()),
+			kinds(&plan_still(&facts(1293, 48277), Speed::Moderate, &Overrides::default(), true).unwrap()),
 			["jxl lossy"]
 		);
 		assert_eq!(
-			kinds(&plan_still(&facts(20000, 800), Speed::Moderate, true).unwrap()),
+			kinds(&plan_still(&facts(20000, 800), Speed::Moderate, &Overrides::default(), true).unwrap()),
 			["jxl lossy"]
 		);
-		assert_eq!(kinds(&plan_still(&deep, Speed::Moderate, true).unwrap()), ["jxl lossy"]);
-		assert_eq!(kinds(&plan_still(&grey, Speed::Moderate, true).unwrap()), ["jxl lossy"]);
+		assert_eq!(
+			kinds(&plan_still(&deep, Speed::Moderate, &Overrides::default(), true).unwrap()),
+			["jxl lossy"]
+		);
+		assert_eq!(
+			kinds(&plan_still(&grey, Speed::Moderate, &Overrides::default(), true).unwrap()),
+			["jxl lossy"]
+		);
 	}
 
 	#[test]
@@ -395,12 +410,15 @@ mod tests {
 		};
 
 		assert_eq!(
-			kinds(&plan_still(&graphic, Speed::Fast, true).unwrap()),
+			kinds(&plan_still(&graphic, Speed::Fast, &Overrides::default(), true).unwrap()),
 			["ravif", "jxl lossless"]
 		);
-		assert_eq!(kinds(&plan_still(&graphic, Speed::Fast, false).unwrap()), ["ravif"]);
+		assert_eq!(
+			kinds(&plan_still(&graphic, Speed::Fast, &Overrides::default(), false).unwrap()),
+			["ravif"]
+		);
 		assert!(matches!(
-			plan_still(&facts(1293, 48277), Speed::Fast, false),
+			plan_still(&facts(1293, 48277), Speed::Fast, &Overrides::default(), false),
 			Err(KeepReason::Unsupported(reason)) if reason.contains("libjxl")
 		));
 	}
@@ -478,6 +496,23 @@ mod tests {
 			),
 			(80.0, 85.0, 90.0)
 		);
+	}
+
+	#[test]
+	fn an_image_override_replaces_the_target_at_every_speed() {
+		let custom = Overrides {
+			image: Some(60.0),
+			..Overrides::default()
+		};
+
+		for speed in [Speed::Fast, Speed::Moderate, Speed::Slow] {
+			let target = |overrides: &Overrides| plan_still(&facts(64, 48), speed, overrides, true).unwrap().target;
+
+			assert_eq!(
+				(target(&custom), target(&Overrides::default())),
+				(60.0, ssim_target(speed))
+			);
+		}
 	}
 
 	#[test]

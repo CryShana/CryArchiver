@@ -1,6 +1,6 @@
 use crate::container::{Container, MATROSKA_AUDIO, OGG_OPUS};
 use crate::outcome::KeepReason;
-use crate::preset::Speed;
+use crate::preset::{AUDIO_STEP_KBPS, Overrides, Speed};
 use crate::probe::{MediaInfo, Stream};
 
 pub const OPUS_RATE: u32 = 48_000;
@@ -71,7 +71,7 @@ pub enum AudioPlan {
 	Encode(FilePlan),
 }
 
-pub fn plan_file(info: &MediaInfo, speed: Speed) -> AudioPlan {
+pub fn plan_file(info: &MediaInfo, speed: Speed, overrides: &Overrides) -> AudioPlan {
 	let streams: Vec<&Stream> = info.audio_streams().collect();
 	if streams.is_empty() {
 		return AudioPlan::Keep(KeepReason::Unsupported("no audio streams".into()));
@@ -89,7 +89,7 @@ pub fn plan_file(info: &MediaInfo, speed: Speed) -> AudioPlan {
 			return AudioPlan::Keep(KeepReason::Unsupported("unknown sample rate".into()));
 		};
 
-		match plan_track(stream, container_bitrate, speed) {
+		match plan_track(stream, container_bitrate, speed, overrides) {
 			Ok(plan) => tracks.push(TrackJob {
 				stream_index: stream.index,
 				sample_rate,
@@ -109,7 +109,12 @@ pub fn plan_file(info: &MediaInfo, speed: Speed) -> AudioPlan {
 	AudioPlan::Encode(FilePlan { container, tracks })
 }
 
-pub fn plan_track(stream: &Stream, container_bitrate: Option<u64>, speed: Speed) -> Result<TrackPlan, String> {
+pub fn plan_track(
+	stream: &Stream,
+	container_bitrate: Option<u64>,
+	speed: Speed,
+	overrides: &Overrides,
+) -> Result<TrackPlan, String> {
 	let Some(channels) = stream.channels.filter(|&count| count > 0) else {
 		return Err("unknown channel count".into());
 	};
@@ -120,7 +125,7 @@ pub fn plan_track(stream: &Stream, container_bitrate: Option<u64>, speed: Speed)
 		));
 	}
 
-	let target = table_rate(channels, speed);
+	let target = table_rate(channels, speed, overrides);
 	let source_kbps = stream
 		.bit_rate
 		.or(container_bitrate)
@@ -134,7 +139,8 @@ pub fn plan_track(stream: &Stream, container_bitrate: Option<u64>, speed: Speed)
 	let bitrate_kbps = if is_lossless(stream) {
 		target
 	} else {
-		target.min(source_kbps.unwrap_or(target).max(table_rate(channels, Speed::Fast)))
+		let fast_floor = table_rate(channels, Speed::Fast, &Overrides::default());
+		target.min(source_kbps.unwrap_or(target).max(fast_floor))
 	};
 
 	let layout = layout_fix(stream.channel_layout.as_deref(), channels);
@@ -145,20 +151,27 @@ pub fn plan_track(stream: &Stream, container_bitrate: Option<u64>, speed: Speed)
 	}))
 }
 
-fn table_rate(channels: u32, speed: Speed) -> u32 {
+fn table_rate(channels: u32, speed: Speed, overrides: &Overrides) -> u32 {
 	let (mono, stereo, five_one, seven_one) = match speed {
 		Speed::Fast => (48, 96, 192, 288),
 		Speed::Moderate => (64, 128, 256, 384),
 		Speed::Slow => (80, 160, 320, 448),
 	};
 
-	match channels {
+	let rate = match channels {
 		1 => mono,
 		2 => stereo,
 		6 => five_one,
 		8 => seven_one,
 		other => other * stereo / 2,
-	}
+	};
+	let Some(custom) = overrides.audio_stereo_kbps else {
+		return rate;
+	};
+
+	let step = u64::from(stereo * AUDIO_STEP_KBPS);
+	let steps = (u64::from(rate) * u64::from(custom) + step / 2) / step;
+	u32::try_from(steps * u64::from(AUDIO_STEP_KBPS)).unwrap_or(u32::MAX)
 }
 
 fn is_lossless(stream: &Stream) -> bool {
@@ -205,6 +218,12 @@ mod tests {
 	use super::*;
 	use crate::probe::Format;
 
+	const PRESET: &Overrides = &Overrides {
+		video: None,
+		image: None,
+		audio_stereo_kbps: None,
+	};
+
 	fn stream(codec: &str, channels: u32, layout: Option<&str>, kbps: Option<u64>) -> Stream {
 		Stream {
 			codec_type: "audio".into(),
@@ -240,16 +259,77 @@ mod tests {
 	#[test]
 	fn lossless_sources_use_the_table_rate() {
 		assert_eq!(
-			plan_track(&stream("flac", 2, Some("stereo"), None), None, Speed::Moderate),
+			plan_track(&stream("flac", 2, Some("stereo"), None), None, Speed::Moderate, PRESET),
 			encode(128, 2, LayoutFix::Keep("stereo"))
 		);
 		assert_eq!(
-			plan_track(&stream("flac", 2, Some("stereo"), None), None, Speed::Slow),
+			plan_track(&stream("flac", 2, Some("stereo"), None), None, Speed::Slow, PRESET),
 			encode(160, 2, LayoutFix::Keep("stereo"))
 		);
 		assert_eq!(
-			plan_track(&stream("pcm_s24le", 8, Some("7.1"), None), None, Speed::Fast),
+			plan_track(&stream("pcm_s24le", 8, Some("7.1"), None), None, Speed::Fast, PRESET),
 			encode(288, 8, LayoutFix::Keep("7.1"))
+		);
+	}
+
+	#[test]
+	fn a_stereo_override_scales_every_layout_in_steps_of_eight() {
+		let custom = Overrides {
+			audio_stereo_kbps: Some(160),
+			..Overrides::default()
+		};
+		let rates = |speed: Speed, overrides: &Overrides| {
+			[1, 2, 3, 6, 8].map(|channels| table_rate(channels, speed, overrides))
+		};
+
+		assert_eq!(rates(Speed::Moderate, &custom), [80, 160, 240, 320, 480]);
+		assert_eq!(rates(Speed::Moderate, PRESET), [64, 128, 192, 256, 384]);
+		assert_eq!(rates(Speed::Fast, PRESET), [48, 96, 144, 192, 288]);
+		assert_eq!(rates(Speed::Slow, PRESET), [80, 160, 240, 320, 448]);
+		assert_eq!(
+			rates(
+				Speed::Slow,
+				&Overrides {
+					audio_stereo_kbps: Some(96),
+					..Overrides::default()
+				}
+			),
+			[48, 96, 144, 192, 272]
+		);
+		assert_eq!(
+			plan_track(&stream("flac", 6, Some("5.1"), None), None, Speed::Moderate, &custom),
+			encode(320, 6, LayoutFix::Keep("5.1"))
+		);
+	}
+
+	#[test]
+	fn an_override_keeps_the_source_cap_and_the_fast_floor() {
+		let custom = Overrides {
+			audio_stereo_kbps: Some(192),
+			..Overrides::default()
+		};
+
+		assert_eq!(
+			plan_track(
+				&stream("mp3", 2, Some("stereo"), Some(128)),
+				None,
+				Speed::Moderate,
+				&custom
+			),
+			encode(128, 2, LayoutFix::Keep("stereo"))
+		);
+		assert_eq!(
+			plan_track(&stream("mp3", 2, Some("stereo"), Some(64)), None, Speed::Fast, &custom),
+			encode(96, 2, LayoutFix::Keep("stereo"))
+		);
+		assert_eq!(
+			plan_track(
+				&stream("mp3", 2, Some("stereo"), Some(320)),
+				None,
+				Speed::Moderate,
+				&custom
+			),
+			encode(192, 2, LayoutFix::Keep("stereo"))
 		);
 	}
 
@@ -259,7 +339,7 @@ mod tests {
 		dts.profile = Some("DTS-HD MA".into());
 
 		assert_eq!(
-			plan_track(&dts, None, Speed::Moderate),
+			plan_track(&dts, None, Speed::Moderate, PRESET),
 			encode(256, 6, LayoutFix::Relabel("5.1"))
 		);
 	}
@@ -267,19 +347,39 @@ mod tests {
 	#[test]
 	fn lossy_sources_are_capped_between_the_fast_row_and_the_table() {
 		assert_eq!(
-			plan_track(&stream("ac3", 6, Some("5.1(side)"), Some(448)), None, Speed::Moderate),
+			plan_track(
+				&stream("ac3", 6, Some("5.1(side)"), Some(448)),
+				None,
+				Speed::Moderate,
+				PRESET
+			),
 			encode(256, 6, LayoutFix::Relabel("5.1"))
 		);
 		assert_eq!(
-			plan_track(&stream("mp3", 2, Some("stereo"), Some(112)), None, Speed::Moderate),
+			plan_track(
+				&stream("mp3", 2, Some("stereo"), Some(112)),
+				None,
+				Speed::Moderate,
+				PRESET
+			),
 			encode(112, 2, LayoutFix::Keep("stereo"))
 		);
 		assert_eq!(
-			plan_track(&stream("mp3", 2, Some("stereo"), Some(64)), None, Speed::Moderate),
+			plan_track(
+				&stream("mp3", 2, Some("stereo"), Some(64)),
+				None,
+				Speed::Moderate,
+				PRESET
+			),
 			encode(96, 2, LayoutFix::Keep("stereo"))
 		);
 		assert_eq!(
-			plan_track(&stream("aac", 2, Some("stereo"), None), Some(256_000), Speed::Moderate),
+			plan_track(
+				&stream("aac", 2, Some("stereo"), None),
+				Some(256_000),
+				Speed::Moderate,
+				PRESET
+			),
 			encode(128, 2, LayoutFix::Keep("stereo"))
 		);
 	}
@@ -287,11 +387,21 @@ mod tests {
 	#[test]
 	fn efficient_sources_are_copied_unless_oversized() {
 		assert_eq!(
-			plan_track(&stream("opus", 1, Some("mono"), None), Some(32_000), Speed::Moderate),
+			plan_track(
+				&stream("opus", 1, Some("mono"), None),
+				Some(32_000),
+				Speed::Moderate,
+				PRESET
+			),
 			Ok(TrackPlan::Copy)
 		);
 		assert_eq!(
-			plan_track(&stream("vorbis", 2, Some("stereo"), Some(160)), None, Speed::Moderate),
+			plan_track(
+				&stream("vorbis", 2, Some("stereo"), Some(160)),
+				None,
+				Speed::Moderate,
+				PRESET
+			),
 			encode(128, 2, LayoutFix::Keep("stereo"))
 		);
 	}
@@ -299,7 +409,7 @@ mod tests {
 	#[test]
 	fn efficient_sources_with_unknown_bitrate_are_left_alone() {
 		assert_eq!(
-			plan_track(&stream("opus", 2, Some("stereo"), None), None, Speed::Moderate),
+			plan_track(&stream("opus", 2, Some("stereo"), None), None, Speed::Moderate, PRESET),
 			Ok(TrackPlan::Copy)
 		);
 	}
@@ -307,26 +417,49 @@ mod tests {
 	#[test]
 	fn layouts_are_relabelled_remixed_or_rejected() {
 		assert_eq!(
-			plan_track(&stream("flac", 6, Some("hexagonal"), None), None, Speed::Moderate),
+			plan_track(
+				&stream("flac", 6, Some("hexagonal"), None),
+				None,
+				Speed::Moderate,
+				PRESET
+			),
 			encode(256, 6, LayoutFix::Remix("5.1"))
 		);
 		assert_eq!(
-			plan_track(&stream("flac", 8, Some("7.1(wide)"), None), None, Speed::Moderate),
+			plan_track(
+				&stream("flac", 8, Some("7.1(wide)"), None),
+				None,
+				Speed::Moderate,
+				PRESET
+			),
 			encode(384, 8, LayoutFix::Remix("7.1"))
 		);
 		assert_eq!(
-			plan_track(&stream("flac", 3, Some("2.1"), None), None, Speed::Moderate),
+			plan_track(&stream("flac", 3, Some("2.1"), None), None, Speed::Moderate, PRESET),
 			encode(192, 3, LayoutFix::Remix("3.0"))
 		);
 		assert_eq!(
-			plan_track(&stream("pcm_s16le", 2, None, None), None, Speed::Moderate),
+			plan_track(&stream("pcm_s16le", 2, None, None), None, Speed::Moderate, PRESET),
 			encode(128, 2, LayoutFix::Relabel("stereo"))
 		);
 		assert_eq!(
-			plan_track(&stream("pcm_s16le", 6, Some("6 channels"), None), None, Speed::Moderate),
+			plan_track(
+				&stream("pcm_s16le", 6, Some("6 channels"), None),
+				None,
+				Speed::Moderate,
+				PRESET
+			),
 			encode(256, 6, LayoutFix::Relabel("5.1"))
 		);
-		assert!(plan_track(&stream("pcm_s16le", 10, Some("5.1.4"), None), None, Speed::Moderate).is_err());
+		assert!(
+			plan_track(
+				&stream("pcm_s16le", 10, Some("5.1.4"), None),
+				None,
+				Speed::Moderate,
+				PRESET
+			)
+			.is_err()
+		);
 	}
 
 	#[test]
@@ -337,10 +470,10 @@ mod tests {
 			..flac.clone()
 		};
 
-		let AudioPlan::Encode(single) = plan_file(&info(vec![flac.clone()], None), Speed::Moderate) else {
+		let AudioPlan::Encode(single) = plan_file(&info(vec![flac.clone()], None), Speed::Moderate, PRESET) else {
 			panic!("one track encodes")
 		};
-		let AudioPlan::Encode(double) = plan_file(&info(vec![flac, second], None), Speed::Moderate) else {
+		let AudioPlan::Encode(double) = plan_file(&info(vec![flac, second], None), Speed::Moderate, PRESET) else {
 			panic!("two tracks encode")
 		};
 
@@ -363,15 +496,15 @@ mod tests {
 		};
 
 		assert!(matches!(
-			plan_file(&info(vec![opus], Some(32_000)), Speed::Moderate),
+			plan_file(&info(vec![opus], Some(32_000)), Speed::Moderate, PRESET),
 			AudioPlan::Keep(KeepReason::AlreadyEfficient(_))
 		));
 		assert!(matches!(
-			plan_file(&info(vec![wide], None), Speed::Moderate),
+			plan_file(&info(vec![wide], None), Speed::Moderate, PRESET),
 			AudioPlan::Keep(KeepReason::Unsupported(_))
 		));
 		assert!(matches!(
-			plan_file(&info(vec![no_rate], None), Speed::Moderate),
+			plan_file(&info(vec![no_rate], None), Speed::Moderate, PRESET),
 			AudioPlan::Keep(KeepReason::Unsupported(_))
 		));
 	}
@@ -388,7 +521,7 @@ mod tests {
 		};
 
 		assert!(matches!(
-			plan_file(&info(vec![opus, cover], Some(400_000)), Speed::Moderate),
+			plan_file(&info(vec![opus, cover], Some(400_000)), Speed::Moderate, PRESET),
 			AudioPlan::Keep(KeepReason::AlreadyEfficient(_))
 		));
 	}
@@ -396,7 +529,7 @@ mod tests {
 	#[test]
 	fn files_without_audio_are_unsupported() {
 		assert!(matches!(
-			plan_file(&info(Vec::new(), None), Speed::Moderate),
+			plan_file(&info(Vec::new(), None), Speed::Moderate, PRESET),
 			AudioPlan::Keep(KeepReason::Unsupported(_))
 		));
 	}

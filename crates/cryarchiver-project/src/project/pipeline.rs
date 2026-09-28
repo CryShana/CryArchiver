@@ -12,6 +12,7 @@ use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::{collision_key, destination_name, placeholder_name};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError};
+use cryarchiver_engine::preset::Overrides;
 use cryarchiver_engine::quality::memory::SharedMemory;
 use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::workspace::ARCHIVE_DIR;
@@ -389,6 +390,7 @@ impl Owner {
 				keep_metadata: true,
 				drop_aux: !self.settings.keep_auxiliary_images,
 				min_savings: self.settings.min_savings_fraction(),
+				overrides: Overrides::default(),
 			})),
 			Work::Copy if self.pipeline.chosen_copies.contains(&file) => Some(Task::Copy(CopyReason::Chosen)),
 			Work::Copy => Some(self.reference_task(file).unwrap_or(Task::Copy(CopyReason::NotMedia))),

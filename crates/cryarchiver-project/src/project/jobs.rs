@@ -883,6 +883,7 @@ mod tests {
 			keep_metadata: true,
 			drop_aux: true,
 			min_savings: 0.0,
+			overrides: cryarchiver_engine::preset::Overrides::default(),
 		};
 
 		let sent = run_job_with(encoder, &source, &destination, b"tags v1", Task::Encode(job));
