@@ -207,3 +207,58 @@ pub fn photo_png(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
 	]);
 	path
 }
+
+pub fn clip_with_extras(dir: &Path) -> PathBuf {
+	let cues = dir.join("cues.srt");
+	std::fs::write(
+		&cues,
+		"1\n00:00:01,000 --> 00:00:02,000\none\n\n2\n00:00:05,000 --> 00:00:06,000\nfive\n\n3\n00:00:08,000 --> 00:00:09,000\neight\n",
+	)
+	.unwrap();
+	let chapters = dir.join("chapters.txt");
+	std::fs::write(
+		&chapters,
+		";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=4000\ntitle=A\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=4000\nEND=7000\ntitle=B\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=7000\nEND=10000\ntitle=C\n",
+	)
+	.unwrap();
+	let font = dir.join("font.ttf");
+	std::fs::write(&font, b"not a real font").unwrap();
+
+	let clip = dir.join("extras.mkv");
+	ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=10",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=10",
+		"-i",
+		cues.to_str().unwrap(),
+		"-i",
+		chapters.to_str().unwrap(),
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-map",
+		"2",
+		"-map_chapters",
+		"3",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		"-c:a",
+		"aac",
+		"-c:s",
+		"srt",
+		"-attach",
+		font.to_str().unwrap(),
+		"-metadata:s:t",
+		"mimetype=application/x-truetype-font",
+		clip.to_str().unwrap(),
+	]);
+	clip
+}

@@ -561,11 +561,11 @@ mod tests {
 			subtitles: vec![
 				SubtitleTrack {
 					stream_index: 3,
-					to_srt: false,
+					codec: None,
 				},
 				SubtitleTrack {
 					stream_index: 4,
-					to_srt: false,
+					codec: None,
 				},
 			],
 			..StreamPlan::default()

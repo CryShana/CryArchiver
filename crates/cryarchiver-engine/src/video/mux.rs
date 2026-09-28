@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::plan::TrackPlan;
+use crate::container::{Container, MP4_VIDEO};
 use crate::outcome::JobError;
 use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, ToolCommand};
@@ -43,6 +44,7 @@ pub struct MuxPlan<'a> {
 	pub video: &'a VideoPlan,
 	pub streams: &'a StreamPlan,
 	pub keep_metadata: bool,
+	pub container: Container,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,14 +118,14 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 	let outputs = output_streams(plan.video, plan.streams);
 	push_maps(&mut cmd, &outputs, &plan.streams.attachments, source);
 	cmd.args(["-c", "copy"]);
-	for (ordinal, _) in plan
+	for (ordinal, codec) in plan
 		.streams
 		.subtitles
 		.iter()
 		.enumerate()
-		.filter(|(_, subtitle)| subtitle.to_srt)
+		.filter_map(|(ordinal, subtitle)| Some((ordinal, subtitle.codec?)))
 	{
-		cmd.arg(format!("-c:s:{ordinal}")).arg("srt");
+		cmd.arg(format!("-c:s:{ordinal}")).arg(codec);
 	}
 
 	for (offset, attachment) in inputs.attachments.iter().enumerate() {
@@ -147,8 +149,12 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 	}
 
 	cmd.arg("-map_chapters").arg(source.to_string());
-	cmd.args(["-cues_to_front", "1", "-f", "matroska"])
-		.arg(process::tool_path(output));
+	if plan.container.muxer == MP4_VIDEO.muxer {
+		cmd.args(["-movflags", "+faststart"]);
+	} else {
+		cmd.args(["-cues_to_front", "1"]);
+	}
+	cmd.arg("-f").arg(plan.container.muxer).arg(process::tool_path(output));
 	cmd
 }
 
@@ -253,6 +259,7 @@ fn timecode(info: &MediaInfo) -> Option<&str> {
 mod tests {
 	use super::*;
 	use crate::audio::plan::{EncodePlan, LayoutFix, TrackJob};
+	use crate::container::{MATROSKA_VIDEO, MP4_VIDEO, WEBM_VIDEO};
 	use crate::video::joined;
 	use crate::video::plan::test_plan;
 	use crate::video::streams::SubtitleTrack;
@@ -278,11 +285,11 @@ mod tests {
 			subtitles: vec![
 				SubtitleTrack {
 					stream_index: 3,
-					to_srt: false,
+					codec: None,
 				},
 				SubtitleTrack {
 					stream_index: 4,
-					to_srt: true,
+					codec: Some("srt"),
 				},
 			],
 			attachments: vec![5],
@@ -319,6 +326,7 @@ mod tests {
 			video: &video,
 			streams: &streams,
 			keep_metadata,
+			container: MATROSKA_VIDEO,
 		};
 		joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")))
 	}
@@ -481,11 +489,53 @@ mod tests {
 			video: &video,
 			streams: &streams,
 			keep_metadata: true,
+			container: MATROSKA_VIDEO,
 		};
 
 		let args = joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")));
 
 		assert!(args.contains("-map 0:v:0 -map 1:2 -c copy"), "{args}");
 		assert!(args.contains("-map_metadata 1"), "{args}");
+	}
+
+	#[test]
+	fn webm_and_mp4_mux_with_their_own_options() {
+		let (info, video) = (info(), test_plan());
+		let streams = StreamPlan {
+			subtitles: vec![SubtitleTrack {
+				stream_index: 3,
+				codec: Some("webvtt"),
+			}],
+			..StreamPlan::default()
+		};
+		let inputs = MuxInputs {
+			video: Path::new("video.a1.mkv"),
+			audio: None,
+			source: Path::new("source.mkv"),
+			source_bytes: 0,
+			attachments: &[],
+		};
+		let muxed = |container| {
+			joined(&command(
+				Path::new("ffmpeg"),
+				&inputs,
+				&MuxPlan {
+					info: &info,
+					video: &video,
+					streams: &streams,
+					keep_metadata: true,
+					container,
+				},
+				Path::new("mux.out"),
+			))
+		};
+
+		let webm = muxed(WEBM_VIDEO);
+		let mp4 = muxed(MP4_VIDEO);
+
+		assert!(webm.contains("-c copy -c:s:0 webvtt"), "{webm}");
+		assert!(webm.contains("-cues_to_front 1 -f webm"), "{webm}");
+		assert!(mp4.contains("-movflags +faststart -f mp4"), "{mp4}");
+		assert!(!mp4.contains("cues_to_front"), "{mp4}");
 	}
 }

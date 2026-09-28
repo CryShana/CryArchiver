@@ -337,7 +337,7 @@ fn too_large_for_svt(width: u32, height: u32) -> bool {
 	width > SVT_MAX_WIDTH || height > SVT_MAX_HEIGHT
 }
 
-fn has_alpha(stream: &Stream) -> bool {
+pub fn has_alpha(stream: &Stream) -> bool {
 	stream.tag("alpha_mode") == Some("1")
 		|| stream
 			.pix_fmt

@@ -1,5 +1,6 @@
 use crate::audio::plan::{TrackJob, TrackPlan, plan_track};
-use crate::outcome::KeepReason;
+use crate::container::{Container, MATROSKA_VIDEO};
+use crate::outcome::{KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{MediaInfo, Stream};
 
@@ -31,11 +32,70 @@ const TEXT_SUBTITLES: &[&str] = &[
 	"eia_608",
 ];
 const DATA_MIME: &str = "application/octet-stream";
+const MKV_TEXT: &[&str] = &["subrip", "srt", "ass", "ssa", "webvtt"];
+const WEBM_AUDIO: &[&str] = &["opus", "vorbis"];
+const MP4_AUDIO: &[&str] = &["aac", "ac3", "eac3", "mp3", "opus", "flac", "alac"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleTrack {
 	pub stream_index: u32,
-	pub to_srt: bool,
+	pub codec: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StreamRules {
+	pub speed: Speed,
+	pub overrides: Overrides,
+	pub keep_metadata: bool,
+	pub container: Container,
+}
+
+impl StreamRules {
+	pub fn new(speed: Speed, keep_metadata: bool) -> Self {
+		Self {
+			speed,
+			overrides: Overrides::default(),
+			keep_metadata,
+			container: MATROSKA_VIDEO,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+	Matroska,
+	Webm,
+	Mp4,
+}
+
+impl Target {
+	fn of(container: Container) -> Self {
+		match container.muxer {
+			"webm" => Self::Webm,
+			"mp4" => Self::Mp4,
+			_ => Self::Matroska,
+		}
+	}
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::Matroska => "MKV",
+			Self::Webm => "WebM",
+			Self::Mp4 => "MP4",
+		}
+	}
+
+	fn holds_files(self) -> bool {
+		self == Self::Matroska
+	}
+
+	fn copies(self, codec: &str) -> bool {
+		match self {
+			Self::Matroska => true,
+			Self::Webm => WEBM_AUDIO.contains(&codec),
+			Self::Mp4 => MP4_AUDIO.contains(&codec),
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,15 +130,12 @@ impl StreamPlan {
 	}
 }
 
-pub fn plan_streams(
-	info: &MediaInfo,
-	speed: Speed,
-	overrides: &Overrides,
-	keep_metadata: bool,
-) -> Result<StreamPlan, KeepReason> {
+pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan, Refusal> {
+	let target = Target::of(rules.container);
 	let mut plan = StreamPlan::default();
 	let mut audio_tracks = 0;
 	let mut dropped_data = 0;
+	let mut dropped_files = 0;
 
 	for stream in &info.streams {
 		match stream.codec_type.as_str() {
@@ -87,13 +144,31 @@ pub fn plan_streams(
 				if stream.channels.unwrap_or(0) == 0 {
 					plan.warnings
 						.push(format!("audio track {audio_tracks} has no audio data and was dropped"));
-				} else {
-					plan.audio
-						.push(audio_track(stream, audio_tracks, speed, overrides, &mut plan.warnings));
+					continue;
 				}
+
+				let track = audio_track(stream, audio_tracks, rules.speed, &rules.overrides, &mut plan.warnings);
+				if track.plan == TrackPlan::Copy && !target.copies(&stream.codec_name) {
+					return Err(Refusal::Impossible(format!(
+						"audio track {audio_tracks} ({}) can't be stored in {} as it is",
+						stream.codec_name,
+						target.name()
+					)));
+				}
+				plan.audio.push(track);
 			}
-			"subtitle" => plan.subtitles.push(subtitle_track(stream)?),
-			"attachment" => plan.attachments.push(stream.index),
+			"subtitle" => match subtitle_track(stream, target)? {
+				Some(track) => plan.subtitles.push(track),
+				None => plan.warnings.push(format!(
+					"subtitle stream {} ({}) dropped: {} holds only text subtitles; --burn-subs can draw it into the picture",
+					stream.index,
+					stream.codec_name,
+					target.name()
+				)),
+			},
+			"attachment" if target.holds_files() => plan.attachments.push(stream.index),
+			"attachment" => dropped_files += 1,
+			"video" if stream.is_attached_pic() && !target.holds_files() => dropped_files += 1,
 			"video" if stream.is_attached_pic() => match cover(stream) {
 				Some(cover) => plan.extracted.push(cover),
 				None => plan.warnings.push(format!(
@@ -102,7 +177,7 @@ pub fn plan_streams(
 				)),
 			},
 			"data" if is_chapter_track(stream, info) => {}
-			"data" if keep_metadata => plan.extracted.push(Extracted {
+			"data" if rules.keep_metadata && target.holds_files() => plan.extracted.push(Extracted {
 				stream_index: stream.index,
 				file_name: format!("stream-{}-{}.bin", stream.index, data_codec(stream)),
 				mime_type: DATA_MIME.into(),
@@ -112,31 +187,50 @@ pub fn plan_streams(
 		}
 	}
 
+	let plural = |count: usize| if count == 1 { "" } else { "s" };
 	if dropped_data > 0 {
+		let why = if target.holds_files() {
+			" (use --keep-metadata to keep them)".to_owned()
+		} else {
+			format!(": {} can't hold them", target.name())
+		};
 		plan.warnings.push(format!(
-			"{dropped_data} data stream{} dropped (use --keep-metadata to keep them)",
-			if dropped_data == 1 { "" } else { "s" }
+			"{dropped_data} data stream{} dropped{why}",
+			plural(dropped_data)
+		));
+	}
+
+	if dropped_files > 0 {
+		plan.warnings.push(format!(
+			"{dropped_files} attachment{} or cover{} dropped: {} can't hold them",
+			plural(dropped_files),
+			plural(dropped_files),
+			target.name()
 		));
 	}
 	Ok(plan)
 }
 
-fn subtitle_track(stream: &Stream) -> Result<SubtitleTrack, KeepReason> {
+fn subtitle_track(stream: &Stream, target: Target) -> Result<Option<SubtitleTrack>, Refusal> {
 	let codec = stream.codec_name.as_str();
-	let to_srt = if MKV_SUBTITLES.contains(&codec) {
-		false
-	} else if TEXT_SUBTITLES.contains(&codec) {
-		true
-	} else {
-		return Err(KeepReason::Unsupported(format!(
-			"subtitle codec {codec} can't be stored in MKV"
-		)));
+	let text = MKV_TEXT.contains(&codec) || TEXT_SUBTITLES.contains(&codec);
+	let track = |converted: Option<&'static str>| {
+		Ok(Some(SubtitleTrack {
+			stream_index: stream.index,
+			codec: converted,
+		}))
 	};
 
-	Ok(SubtitleTrack {
-		stream_index: stream.index,
-		to_srt,
-	})
+	match target {
+		Target::Matroska if MKV_SUBTITLES.contains(&codec) => track(None),
+		Target::Matroska if TEXT_SUBTITLES.contains(&codec) => track(Some("srt")),
+		Target::Matroska => Err(Refusal::Keep(KeepReason::Unsupported(format!(
+			"subtitle codec {codec} can't be stored in MKV"
+		)))),
+		Target::Webm if text => track((codec != "webvtt").then_some("webvtt")),
+		Target::Mp4 if text => track((codec != "mov_text").then_some("mov_text")),
+		Target::Webm | Target::Mp4 => Ok(None),
+	}
 }
 
 fn audio_track(
@@ -206,15 +300,21 @@ fn data_codec(stream: &Stream) -> String {
 mod tests {
 	use super::*;
 	use crate::audio::plan::{EncodePlan, LayoutFix};
-
-	const PRESET: &Overrides = &Overrides {
-		video: None,
-		image: None,
-		audio_stereo_kbps: None,
-	};
+	use crate::container::{MATROSKA_VIDEO, MP4_VIDEO, WEBM_VIDEO};
 
 	fn info(json: &str) -> MediaInfo {
 		MediaInfo::parse(json.as_bytes()).unwrap()
+	}
+
+	fn rules(speed: Speed, keep_metadata: bool) -> StreamRules {
+		StreamRules::new(speed, keep_metadata)
+	}
+
+	fn into(container: Container) -> StreamRules {
+		StreamRules {
+			container,
+			..StreamRules::new(Speed::Moderate, true)
+		}
 	}
 
 	const IPHONE: &str = r#"{"streams":[
@@ -225,7 +325,7 @@ mod tests {
 
 	#[test]
 	fn audio_is_planned_per_track() {
-		let plan = plan_streams(&info(IPHONE), Speed::Moderate, PRESET, false).unwrap();
+		let plan = plan_streams(&info(IPHONE), &rules(Speed::Moderate, false)).unwrap();
 
 		assert_eq!(
 			plan.audio,
@@ -244,8 +344,8 @@ mod tests {
 
 	#[test]
 	fn data_streams_are_attached_only_when_keeping_metadata() {
-		let kept = plan_streams(&info(IPHONE), Speed::Moderate, PRESET, true).unwrap();
-		let clean = plan_streams(&info(IPHONE), Speed::Moderate, PRESET, false).unwrap();
+		let kept = plan_streams(&info(IPHONE), &rules(Speed::Moderate, true)).unwrap();
+		let clean = plan_streams(&info(IPHONE), &rules(Speed::Moderate, false)).unwrap();
 
 		assert_eq!(
 			kept.extracted,
@@ -279,9 +379,7 @@ mod tests {
 				{"index":2,"codec_type":"audio","codec_name":"aac","channels":2},
 				{"index":3,"codec_type":"audio","codec_name":"opus","sample_rate":"48000","channels":2,"channel_layout":"stereo"}]}"#,
 			),
-			Speed::Moderate,
-			PRESET,
-			true,
+			&rules(Speed::Moderate, true),
 		)
 		.unwrap();
 
@@ -309,14 +407,14 @@ mod tests {
 		);
 
 		assert_eq!(
-			plan_streams(&mp4, Speed::Moderate, PRESET, false).unwrap().extracted,
+			plan_streams(&mp4, &rules(Speed::Moderate, false)).unwrap().extracted,
 			vec![Extracted {
 				stream_index: 2,
 				file_name: "cover.jpg".into(),
 				mime_type: "image/jpeg".into(),
 			}]
 		);
-		let kept = plan_streams(&mkv, Speed::Moderate, PRESET, true).unwrap();
+		let kept = plan_streams(&mkv, &rules(Speed::Moderate, true)).unwrap();
 		assert_eq!(kept.extracted[0].file_name, "small_cover.png");
 		assert_eq!(kept.extracted[0].work_file(), "stream-4.bin");
 	}
@@ -331,9 +429,7 @@ mod tests {
 				{"index":3,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle"},
 				{"index":4,"codec_type":"attachment","codec_name":"ttf","tags":{"filename":"a.ttf"}}]}"#,
 			),
-			Speed::Moderate,
-			PRESET,
-			false,
+			&rules(Speed::Moderate, false),
 		)
 		.unwrap();
 
@@ -342,15 +438,15 @@ mod tests {
 			vec![
 				SubtitleTrack {
 					stream_index: 1,
-					to_srt: false
+					codec: None
 				},
 				SubtitleTrack {
 					stream_index: 2,
-					to_srt: true
+					codec: Some("srt")
 				},
 				SubtitleTrack {
 					stream_index: 3,
-					to_srt: false
+					codec: None
 				},
 			]
 		);
@@ -365,9 +461,7 @@ mod tests {
 				{"index":3,"codec_type":"data","codec_name":"bin_data","codec_tag_string":"text"}],
 				"chapters":[{"id":1},{"id":2}]}"#,
 			),
-			Speed::Moderate,
-			PRESET,
-			true,
+			&rules(Speed::Moderate, true),
 		)
 		.unwrap();
 
@@ -383,9 +477,7 @@ mod tests {
 				{"index":1,"codec_type":"audio","codec_name":"mp2","sample_rate":"48000","channels":0},
 				{"index":2,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo"}]}"#,
 			),
-			Speed::Moderate,
-			PRESET,
-			false,
+			&rules(Speed::Moderate, false),
 		)
 		.unwrap();
 
@@ -406,15 +498,13 @@ mod tests {
 				{"index":3,"codec_type":"subtitle","codec_name":"dvb_subtitle"},
 				{"index":4,"codec_type":"subtitle","codec_name":"microdvd"}]}"#,
 			),
-			Speed::Moderate,
-			PRESET,
-			false,
+			&rules(Speed::Moderate, false),
 		)
 		.unwrap();
 
 		assert_eq!(
-			plan.subtitles.iter().map(|track| track.to_srt).collect::<Vec<_>>(),
-			[false, true, false, true]
+			plan.subtitles.iter().map(|track| track.codec).collect::<Vec<_>>(),
+			[None, Some("srt"), None, Some("srt")]
 		);
 	}
 
@@ -426,10 +516,65 @@ mod tests {
 		);
 
 		assert_eq!(
-			plan_streams(&teletext, Speed::Moderate, PRESET, false),
-			Err(KeepReason::Unsupported(
+			plan_streams(&teletext, &rules(Speed::Moderate, false)),
+			Err(Refusal::Keep(KeepReason::Unsupported(
 				"subtitle codec dvb_teletext can't be stored in MKV".into()
-			))
+			)))
 		);
+	}
+
+	#[test]
+	fn webm_and_mp4_convert_text_subtitles_and_drop_what_they_can_not_hold() {
+		let extras = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"subtitle","codec_name":"subrip"},
+			{"index":2,"codec_type":"subtitle","codec_name":"webvtt"},
+			{"index":3,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle"},
+			{"index":4,"codec_type":"attachment","codec_name":"ttf","tags":{"filename":"a.ttf"}},
+			{"index":5,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}},
+			{"index":6,"codec_type":"data","codec_tag_string":"mebx"}]}"#,
+		);
+		let codecs = |plan: &StreamPlan| {
+			plan.subtitles
+				.iter()
+				.map(|track| (track.stream_index, track.codec))
+				.collect::<Vec<_>>()
+		};
+
+		let webm = plan_streams(&extras, &into(WEBM_VIDEO)).unwrap();
+		let mp4 = plan_streams(&extras, &into(MP4_VIDEO)).unwrap();
+		let mkv = plan_streams(&extras, &into(MATROSKA_VIDEO)).unwrap();
+
+		assert_eq!(codecs(&webm), [(1, Some("webvtt")), (2, None)]);
+		assert_eq!(codecs(&mp4), [(1, Some("mov_text")), (2, Some("mov_text"))]);
+		assert!(webm.attachments.is_empty() && webm.extracted.is_empty());
+		assert_eq!(webm.warnings.len(), 3, "{:?}", webm.warnings);
+		assert!(webm.warnings.iter().any(|warning| warning.contains("--burn-subs")));
+		assert_eq!(mkv.attachments, [4]);
+		assert_eq!(mkv.extracted.len(), 2);
+	}
+
+	#[test]
+	fn copied_audio_must_fit_the_container() {
+		let pcm = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"audio","codec_name":"pcm_s16le","sample_rate":"48000","channels":10,"channel_layout":"5.1.4"}]}"#,
+		);
+		let opus = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"audio","codec_name":"opus","sample_rate":"48000","channels":2,"channel_layout":"stereo"}]}"#,
+		);
+
+		assert!(matches!(
+			plan_streams(&pcm, &into(WEBM_VIDEO)),
+			Err(Refusal::Impossible(reason)) if reason.contains("WebM")
+		));
+		assert!(matches!(
+			plan_streams(&pcm, &into(MP4_VIDEO)),
+			Err(Refusal::Impossible(reason)) if reason.contains("MP4")
+		));
+		assert!(plan_streams(&pcm, &into(MATROSKA_VIDEO)).is_ok());
+		assert!(plan_streams(&opus, &into(WEBM_VIDEO)).is_ok());
+		assert!(plan_streams(&opus, &into(MP4_VIDEO)).is_ok());
 	}
 }

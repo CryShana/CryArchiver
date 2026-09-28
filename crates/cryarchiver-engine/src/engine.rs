@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::audio::plan::{AudioPlan, AudioRules, FilePlan, plan_file_with, retarget};
 use crate::audio::{cover, encode, verify};
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
-use crate::container::{Container, Cover};
+use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
 use crate::detect::{self, Detection, MediaClass};
 use crate::format::{OutputFormat, check_kind};
 use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
@@ -18,7 +18,7 @@ use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
 use crate::options::{JobOptions, kept_as_requested};
-use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
+use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::quality::keys::{CacheKey, Group, VideoGroup};
@@ -31,7 +31,7 @@ use crate::video::encode::{EncodedVideo, Sample};
 use crate::video::mux::{self, Attachment, MuxInputs, MuxPlan};
 use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, usable_main};
 use crate::video::quality::{self as video_quality, MAX_RETRIES, Scorer, Searched, Strategy};
-use crate::video::streams::{Extracted, StreamPlan, plan_streams};
+use crate::video::streams::{Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
 };
@@ -310,22 +310,19 @@ impl Engine {
 			}
 			MediaClass::Video(info) => {
 				self.require(MediaKind::Video)?;
-				if matches!(job.options.format, Some(OutputFormat::Webm | OutputFormat::Mp4)) {
-					return Err(
-						ErrorKind::EncodeFailed("WebM and MP4 video output is not available yet".into()).into(),
-					);
-				}
-
 				check_damage(&job.source)?;
 
 				on_event(JobEvent::Stage(Stage::Plan));
+				let rules = stream_rules(job);
 				let planned = self
 					.video_main(&info, job.options.forced())
-					.and_then(|_| plan_streams(&info, job.speed, &job.overrides, job.keep_metadata));
-				if let Err(reason) = planned {
-					return Ok(JobOutcome::KeptOriginal { reason });
+					.map_err(Refusal::from)
+					.and_then(|_| plan_streams(&info, &rules));
+				match planned {
+					Ok(_) => Planned::Video,
+					Err(Refusal::Keep(reason)) => return Ok(JobOutcome::KeptOriginal { reason }),
+					Err(Refusal::Impossible(reason)) => return Err(ErrorKind::EncodeFailed(reason).into()),
 				}
-				Planned::Video
 			}
 			MediaClass::StillImage(info) | MediaClass::AnimatedImage(info) => {
 				self.require(MediaKind::Image)?;
@@ -542,6 +539,7 @@ impl Engine {
 		}))
 	}
 
+	#[allow(clippy::too_many_lines)]
 	async fn produce_video(&self, cx: &Context<'_>, workspace: &Workspace) -> Result<Produced, JobError> {
 		let source = cx.job.source.as_path();
 
@@ -549,13 +547,23 @@ impl Engine {
 		let (info, probe_json) = probe::probe_video(&self.tools, source, cx.source_bytes, cx.cancel)
 			.await
 			.map_err(video_probe_error)?;
-		let planned = self.video_main(&info, cx.job.options.forced()).and_then(|main| {
-			plan_streams(&info, cx.job.speed, &cx.job.overrides, cx.job.keep_metadata).map(|streams| (main, streams))
-		});
+		let rules = stream_rules(cx.job);
+		let planned = self
+			.video_main(&info, cx.job.options.forced())
+			.map_err(Refusal::from)
+			.and_then(|main| plan_streams(&info, &rules).map(|streams| (main, streams)));
 		let (main, streams) = match planned {
 			Ok(planned) => planned,
-			Err(reason) => return Ok(Produced::Kept(reason)),
+			Err(Refusal::Keep(reason)) => return Ok(Produced::Kept(reason)),
+			Err(Refusal::Impossible(reason)) => return Err(ErrorKind::EncodeFailed(reason).into()),
 		};
+
+		if rules.container == MP4_VIDEO && video_plan::has_alpha(main) {
+			return Err(
+				ErrorKind::EncodeFailed("transparent video can't be stored in MP4; use MKV or WebM".into()).into(),
+			);
+		}
+
 		let frames = probe::first_frames(&self.tools, source, main.index, 5, cx.cancel)
 			.await
 			.map_err(video_probe_error)?;
@@ -963,10 +971,19 @@ impl Engine {
 		warnings.extend(temps.warnings);
 
 		(cx.on_event)(JobEvent::Stage(Stage::Mux));
-		let metadata = cx.job.keep_metadata.then_some((job.probe_json, job.first_frame));
+		let container = video_container(cx.job);
+		let keeps_files = container == MATROSKA_VIDEO;
+		if cx.job.keep_metadata && !keeps_files {
+			warnings.push(format!(
+				"the source metadata attachment was left out: .{} can't hold attachments",
+				container.extension
+			));
+		}
+
+		let metadata = (cx.job.keep_metadata && keeps_files).then_some((job.probe_json, job.first_frame));
 		let attachments = collect_attachments(workspace, &job.streams.extracted, metadata, &mut warnings)?;
 
-		let output = workspace.file("mux.mkv");
+		let output = workspace.file(&format!("mux.{}", container.extension));
 		let cmd = mux::command(
 			&self.tools.ffmpeg,
 			&MuxInputs {
@@ -981,6 +998,7 @@ impl Engine {
 				video: job.video,
 				streams: job.streams,
 				keep_metadata: cx.job.keep_metadata,
+				container,
 			},
 			&output,
 		);
@@ -1138,6 +1156,21 @@ fn media_kind(class: &MediaClass) -> Option<MediaKind> {
 		MediaClass::Video(_) => Some(MediaKind::Video),
 		MediaClass::StillImage(_) | MediaClass::AnimatedImage(_) => Some(MediaKind::Image),
 		MediaClass::Kept(_) | MediaClass::Damaged(_) | MediaClass::Other(_) => None,
+	}
+}
+
+fn video_container(job: &Job) -> Container {
+	job.options
+		.format
+		.and_then(OutputFormat::video_container)
+		.unwrap_or(MATROSKA_VIDEO)
+}
+
+fn stream_rules(job: &Job) -> StreamRules {
+	StreamRules {
+		container: video_container(job),
+		overrides: job.overrides,
+		..StreamRules::new(job.speed, job.keep_metadata)
 	}
 }
 

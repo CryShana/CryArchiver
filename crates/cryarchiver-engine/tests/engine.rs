@@ -2155,3 +2155,83 @@ async fn a_learned_crf_whose_requested_output_misses_its_check_and_its_retry_is_
 	);
 	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
 }
+
+fn position(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+	bytes.windows(needle.len()).position(|window| window == needle)
+}
+
+#[tokio::test]
+async fn webm_output_converts_subtitles_to_webvtt_and_drops_attachments() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::clip_with_extras(dir.path());
+
+	let outcome = run(&requested(&clip, OutputFormat::Webm), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output, dir.path().join("extras.cry.webm"));
+	assert!(
+		warnings.iter().any(|warning| warning.contains("can't hold them")),
+		"{warnings:?}"
+	);
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let codecs: Vec<&str> = info.streams.iter().map(|stream| stream.codec_name.as_str()).collect();
+	assert_eq!(codecs, ["av1", "opus", "webvtt"]);
+	assert_eq!(info.chapters.len(), 3);
+}
+
+#[tokio::test]
+async fn mp4_output_has_mov_text_chapters_and_its_index_in_front() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::clip_with_extras(dir.path());
+
+	let outcome = run(&requested(&clip, OutputFormat::Mp4), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let codecs: Vec<&str> = info
+		.streams
+		.iter()
+		.filter(|stream| stream.codec_type != "data")
+		.map(|stream| stream.codec_name.as_str())
+		.collect();
+	assert_eq!(codecs, ["av1", "opus", "mov_text"]);
+	assert_eq!(info.chapters.len(), 3);
+	let bytes = fs::read(&output).unwrap();
+	assert!(
+		position(&bytes, b"moov") < position(&bytes, b"mdat"),
+		"faststart puts the index first"
+	);
+}
+
+#[tokio::test]
+async fn transparent_video_can_not_be_written_as_mp4() {
+	let dir = tempfile::tempdir().unwrap();
+	let alpha = dir.path().join("alpha.webm");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:d=1,format=yuva420p",
+		"-c:v",
+		"libvpx-vp9",
+		"-pix_fmt",
+		"yuva420p",
+		alpha.to_str().unwrap(),
+	]);
+
+	let outcome = run(&requested(&alpha, OutputFormat::Mp4), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.to_string().contains("can't be stored in MP4")),
+		"{outcome:?}"
+	);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}

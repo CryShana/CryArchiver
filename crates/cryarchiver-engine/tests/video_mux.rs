@@ -3,12 +3,13 @@ mod support;
 use std::fs;
 use std::path::Path;
 
-use cryarchiver_engine::preset::{Overrides, Speed};
+use cryarchiver_engine::container::MATROSKA_VIDEO;
+use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::video::analyze::{Analysis, NoiseClass, ScanType};
 use cryarchiver_engine::video::mux::{Attachment, MuxInputs, MuxPlan, command, mux};
 use cryarchiver_engine::video::plan::{VideoCaps, plan_video, precheck};
-use cryarchiver_engine::video::streams::plan_streams;
+use cryarchiver_engine::video::streams::{StreamRules, plan_streams};
 use tokio_util::sync::CancellationToken;
 
 fn source_with_everything(dir: &Path) -> std::path::PathBuf {
@@ -91,7 +92,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 	let cancel = CancellationToken::new();
 
 	let info = probe(&tools, &source, &cancel).await.unwrap();
-	let streams = plan_streams(&info, Speed::Fast, &Overrides::default(), false).unwrap();
+	let streams = plan_streams(&info, &StreamRules::new(Speed::Fast, false)).unwrap();
 	let analysis = Analysis {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,
@@ -143,6 +144,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 			video: &video,
 			streams: &streams,
 			keep_metadata: false,
+			container: MATROSKA_VIDEO,
 		},
 		&output,
 	);
