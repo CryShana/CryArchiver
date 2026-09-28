@@ -296,11 +296,7 @@ impl Engine {
 					.is_some_and(|format| format.kind() == MediaKind::Audio) =>
 			{
 				self.require(MediaKind::Audio)?;
-				let damage = integrity::find_damage(&job.source)
-					.map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
-				if let Some(reason) = damage {
-					return Err(ErrorKind::SourceDamaged(reason).into());
-				}
+				check_damage(&job.source)?;
 
 				on_event(JobEvent::Stage(Stage::Plan));
 				match plan_file_with(&info, job.speed, &job.overrides, AudioRules { forced: true }) {
@@ -320,11 +316,7 @@ impl Engine {
 					);
 				}
 
-				let damage = integrity::find_damage(&job.source)
-					.map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
-				if let Some(reason) = damage {
-					return Err(ErrorKind::SourceDamaged(reason).into());
-				}
+				check_damage(&job.source)?;
 
 				on_event(JobEvent::Stage(Stage::Plan));
 				let planned = self
@@ -783,10 +775,8 @@ impl Engine {
 			Searched::Unreachable { crf, score } if cx.job.options.forced() => {
 				video.encoder = video.encoder.with_crf(crf);
 				video.warnings.push(format!(
-					"{}; encoded at CRF {crf} without a full check because it was requested (best predicted VMAF {:.1} / {:.1})",
-					video_quality::unreachable_text(crf, score, quality.target),
-					score.mean,
-					score.p5
+					"{}; encoded at CRF {crf} without a full check because it was requested",
+					video_quality::short_text(crf, score, quality.target)
 				));
 				return Ok(Tuning::Encode { verify: false });
 			}
@@ -851,15 +841,19 @@ impl Engine {
 				None
 			};
 			let Some(lower) = lower else {
-				let reason = video_quality::unreachable_text(crf, score, quality.target);
 				if cx.job.options.forced() {
-					temps
-						.warnings
-						.push(format!("{reason}; it was written because it was requested"));
+					temps.warnings.push(format!(
+						"{}; it was written because it was requested",
+						video_quality::short_text(crf, score, quality.target)
+					));
 					return Ok(Checked::Short);
 				}
 
-				return Ok(Checked::Missed(KeepReason::QualityUnreachable(reason)));
+				return Ok(Checked::Missed(video_quality::unreachable_reason(
+					crf,
+					score,
+					quality.target,
+				)));
 			};
 
 			temps.warnings.push(format!(
@@ -1127,6 +1121,14 @@ fn metadata_mode(job: &Job) -> MetadataMode {
 		MetadataMode::Full
 	} else {
 		MetadataMode::IccOnly
+	}
+}
+
+fn check_damage(source: &Path) -> Result<(), JobError> {
+	let damage = integrity::find_damage(source).map_err(|err| JobError::io(IoSide::Source(source), &err))?;
+	match damage {
+		Some(reason) => Err(ErrorKind::SourceDamaged(reason).into()),
+		None => Ok(()),
 	}
 }
 

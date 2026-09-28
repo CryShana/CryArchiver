@@ -944,6 +944,124 @@ async fn an_animation_asked_for_as_jpeg_xl_fails_instead_of_becoming_avif() {
 }
 
 #[tokio::test]
+async fn an_animated_avif_asked_for_in_any_format_fails_instead_of_being_kept() {
+	let dir = tempfile::tempdir().unwrap();
+	let avif = dir.path().join("moving.avif");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=64x48:r=10",
+		"-frames:v",
+		"5",
+		"-c:v",
+		"libaom-av1",
+		"-cpu-used",
+		"8",
+		avif.to_str().unwrap(),
+	]);
+
+	let as_jxl = run(&requested(&avif, OutputFormat::Jxl), dir.path()).await;
+	let as_avif = run(&requested(&avif, OutputFormat::Avif), dir.path()).await;
+	let unrequested = run(&job(&avif), dir.path()).await;
+
+	assert!(
+		matches!(&as_jxl, JobOutcome::Failed(err) if err.to_string() == "encode failed: animated JPEG XL output isn't supported; use -f avif"),
+		"{as_jxl:?}"
+	);
+	assert!(
+		matches!(&as_avif, JobOutcome::Failed(err) if err.to_string() == "encode failed: animated AVIF/HEIF/JPEG XL files can't be re-encoded"),
+		"{as_avif:?}"
+	);
+	assert!(
+		matches!(&unrequested, JobOutcome::KeptOriginal { reason: KeepReason::Unsupported(reason) } if reason.contains("kept as they are")),
+		"{unrequested:?}"
+	);
+}
+
+#[tokio::test]
+async fn a_requested_still_below_its_target_is_written_and_learns_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	// Even raised to quality 100, ravif scores this 16×16 frame just under 95.
+	let photo = dir.path().join("photo.png");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=16x16",
+		"-frames:v",
+		"1",
+		photo.to_str().unwrap(),
+	]);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await)
+		.with_image_threads(4)
+		.with_quality_memory(memory.clone());
+	let strict = Job {
+		overrides: Overrides {
+			image: Some(95.0),
+			..Overrides::default()
+		},
+		..requested(&photo, OutputFormat::Avif)
+	};
+
+	let outcome = engine
+		.run(&strict, &sink(dir.path()), &|_| {}, &CancellationToken::new())
+		.await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output, dir.path().join("photo.cry.avif"));
+	assert!(
+		warnings.iter().any(
+			|warning| warning.starts_with("quality target not reached (SSIMULACRA2 ")
+				&& warning.ends_with(", target 95); it was written because it was requested")
+		),
+		"{warnings:?}"
+	);
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn a_requested_animation_below_its_target_is_written_with_a_warning() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("anim.apng");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:d=1:r=10",
+		"-f",
+		"apng",
+		source.to_str().unwrap(),
+	]);
+	let strict = Job {
+		overrides: Overrides {
+			image: Some(95.0),
+			..Overrides::default()
+		},
+		..requested(&source, OutputFormat::Avif)
+	};
+
+	let outcome = run(&strict, dir.path()).await;
+
+	let JobOutcome::Encoded { warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let quality: Vec<&String> = warnings
+		.iter()
+		.filter(|warning| warning.contains("quality target not reached"))
+		.collect();
+	assert_eq!(quality.len(), 1, "{warnings:?}");
+	assert!(
+		quality[0].starts_with("quality target not reached (SSIMULACRA2 ")
+			&& quality[0].ends_with(", target 95); it was written because it was requested"),
+		"{warnings:?}"
+	);
+}
+
+#[tokio::test]
 async fn a_tiny_image_asked_for_as_avif_is_written_even_when_larger() {
 	let dir = tempfile::tempdir().unwrap();
 	let tiny = dir.path().join("tiny.png");

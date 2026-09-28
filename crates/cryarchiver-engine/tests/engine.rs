@@ -2083,9 +2083,31 @@ async fn a_requested_video_that_misses_its_target_is_written_and_learns_nothing(
 		matches!(&outcome, JobOutcome::Encoded { output, .. } if *output == dir.path().join("faint-noise.cry.mkv")),
 		"{outcome:?}"
 	);
-	assert!(warned(&outcome, "quality target not reached"), "{outcome:?}");
-	assert!(warned(&outcome, "best predicted VMAF"), "{outcome:?}");
+	let warning = quality_warning(&outcome);
+	assert!(
+		warning.starts_with("quality target not reached (VMAF ")
+			&& warning.ends_with(" without a full check because it was requested"),
+		"{warning}"
+	);
+	assert_eq!(
+		(warning.matches("VMAF").count(), warning.matches("CRF").count()),
+		(1, 2),
+		"{warning}"
+	);
 	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+fn quality_warning(outcome: &JobOutcome) -> String {
+	let JobOutcome::Encoded { warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let found: Vec<&String> = warnings
+		.iter()
+		.filter(|warning| warning.contains("quality target not reached"))
+		.collect();
+	assert_eq!(found.len(), 1, "{warnings:?}");
+	assert!(!found[0].contains("at a smaller size"), "{warnings:?}");
+	found[0].clone()
 }
 
 #[tokio::test]
@@ -2110,9 +2132,16 @@ async fn a_learned_crf_whose_requested_output_misses_its_check_and_its_retry_is_
 
 	let (outcome, events) = run_recording(&engine, &strict, dir.path()).await;
 
+	let warning = quality_warning(&outcome);
 	assert!(
-		warned(&outcome, "it was written because it was requested"),
-		"{outcome:?}"
+		warning.starts_with("quality target not reached (VMAF ")
+			&& warning.ends_with("); it was written because it was requested"),
+		"{warning}"
+	);
+	assert_eq!(
+		(warning.matches("VMAF").count(), warning.matches("CRF").count()),
+		(1, 1),
+		"{warning}"
 	);
 	assert_eq!(
 		stages(&events, Stage::Sample),

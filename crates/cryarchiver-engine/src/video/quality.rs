@@ -222,7 +222,19 @@ pub fn verify_windows(frames: u64, decoded_s: f64, speed: Speed) -> Vec<FrameWin
 
 pub fn unreachable_text(crf: f64, score: Score, target: Target) -> String {
 	format!(
-		"quality target not reached at a smaller size (VMAF {:.1} / {:.1} at CRF {crf}, target {:.1} / {:.1})",
+		"quality target not reached at a smaller size ({})",
+		measured(crf, score, target)
+	)
+}
+
+/// The same measurement for an output written below its target because it was requested.
+pub fn short_text(crf: f64, score: Score, target: Target) -> String {
+	format!("quality target not reached ({})", measured(crf, score, target))
+}
+
+fn measured(crf: f64, score: Score, target: Target) -> String {
+	format!(
+		"VMAF {:.1} / {:.1} at CRF {crf}, target {:.1} / {:.1}",
 		score.mean, score.p5, target.mean, target.floor
 	)
 }

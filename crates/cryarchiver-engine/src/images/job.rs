@@ -26,6 +26,8 @@ use crate::toolchain::Toolchain;
 use crate::video::run_ffmpeg;
 use crate::workspace::Workspace;
 
+const ANIMATED_JXL: &str = "animated JPEG XL output isn't supported; use -f avif";
+
 #[derive(Debug, Clone)]
 pub struct ImageInput {
 	pub bytes: Arc<Vec<u8>>,
@@ -163,11 +165,7 @@ impl Choice {
 	}
 
 	fn short_note(&self, target: f64) -> Option<String> {
-		self.best_short.map(|score| {
-			format!(
-				"quality target not reached (SSIMULACRA2 {score:.1}, target {target:.0}); it was written because it was requested"
-			)
-		})
+		self.best_short.map(|score| short_warning(score, target))
 	}
 }
 
@@ -662,6 +660,13 @@ async fn produce_animation(
 		sniff(&input.bytes),
 		ImageFormat::Avif | ImageFormat::Heif | ImageFormat::Jxl
 	) {
+		if let Some(route) = cx.route {
+			return Err(animation_refusal(
+				route,
+				"animated AVIF/HEIF/JPEG XL files can't be re-encoded",
+			));
+		}
+
 		return Ok(Some(keep("animated AVIF/HEIF/JPEG XL files are kept as they are")));
 	}
 
@@ -669,12 +674,19 @@ async fn produce_animation(
 	let timeline = match blocking(cx.cancel, move || animated::scan(&bytes)).await? {
 		Ok(Some(timeline)) if timeline.frames > 1 => timeline,
 		Ok(_) => return Ok(None),
-		Err(ScanError::TooManyFrames) => return Ok(Some(keep("the animation has too many frames to verify"))),
+		Err(ScanError::TooManyFrames) => {
+			let reason = "the animation has too many frames to verify";
+			if let Some(route) = cx.route {
+				return Err(animation_refusal(route, reason));
+			}
+
+			return Ok(Some(keep(reason)));
+		}
 		Err(ScanError::Unreadable(reason)) => return Err(ErrorKind::SourceDamaged(reason).into()),
 	};
 
 	if matches!(cx.route, Some(ImageRoute::Jxl | ImageRoute::JxlLossless)) {
-		return Err(ErrorKind::EncodeFailed("animated JPEG XL output isn't supported; use -f avif".into()).into());
+		return Err(ErrorKind::EncodeFailed(ANIMATED_JXL.into()).into());
 	}
 
 	let animation = Animation {
@@ -729,13 +741,13 @@ async fn produce_animation(
 	let score = animated::verify_animation(cx.tools, cx.source, &output, &animation, cx.cancel).await?;
 	let target = plan::image_target(cx.speed, &cx.overrides);
 	if score < target {
-		let reason =
-			format!("quality target not reached at a smaller size (SSIMULACRA2 {score:.1}, target {target:.0})");
 		if !cx.forced {
-			return Ok(Some(ImageOutcome::Kept(KeepReason::QualityUnreachable(reason))));
+			return Ok(Some(ImageOutcome::Kept(KeepReason::QualityUnreachable(format!(
+				"quality target not reached at a smaller size (SSIMULACRA2 {score:.1}, target {target:.0})"
+			)))));
 		}
 
-		warnings.push(format!("{reason}; it was written because it was requested"));
+		warnings.push(short_warning(score, target));
 	}
 
 	for warning in &warnings {
@@ -747,6 +759,20 @@ async fn produce_animation(
 		warnings,
 		learned: Vec::new(),
 	}))
+}
+
+fn animation_refusal(route: ImageRoute, avif_reason: &str) -> JobError {
+	let reason = match route {
+		ImageRoute::Jxl | ImageRoute::JxlLossless => ANIMATED_JXL,
+		ImageRoute::Avif => avif_reason,
+	};
+	ErrorKind::EncodeFailed(reason.to_owned()).into()
+}
+
+fn short_warning(score: f64, target: f64) -> String {
+	format!(
+		"quality target not reached (SSIMULACRA2 {score:.1}, target {target:.0}); it was written because it was requested"
+	)
 }
 
 fn keep(reason: &str) -> ImageOutcome {
