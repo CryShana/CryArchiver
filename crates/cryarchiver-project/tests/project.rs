@@ -496,7 +496,9 @@ fn a_project_that_deletes_originals_archives_but_deletes_nothing_until_the_sessi
 		s.overall.as_ref().is_some_and(|overall| overall.originals_deleted == 1)
 	});
 	assert!(!original.exists());
-	assert!(!snapshot.status.as_ref().unwrap().deleting_paused);
+	wait_for(&project, &mut snapshot, "deleting to resume", |s| {
+		s.status.as_ref().is_some_and(|status| !status.deleting_paused)
+	});
 }
 
 #[test]

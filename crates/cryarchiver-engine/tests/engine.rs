@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::images::plan::worst_case_memory;
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
-use cryarchiver_engine::preset::{Overrides, Speed};
+use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{Stream, probe};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
@@ -1727,6 +1727,55 @@ async fn a_learned_crf_whose_output_is_not_smaller_is_forgotten() {
 
 	assert_eq!(stages(&events, Stage::Sample), 1, "the next clip searches: {events:?}");
 	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn a_learned_crf_that_misses_its_check_and_its_retry_is_forgotten() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let next = support::mpeg4(dir.path(), "next.mp4", 3);
+	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
+	assert!(key.ends_with("|t93.0/89.0"), "{key}");
+	let strict_key = key.replace("|t93.0/89.0", "|t99.0/98.0");
+	let memory = Arc::new(SharedMemory::with_entries([(strict_key, stats)]));
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let strict = |source: &Path| Job {
+		overrides: Overrides {
+			video: Some(VmafOverride {
+				mean: 99.0,
+				floor: 98.0,
+			}),
+			..Overrides::default()
+		},
+		..job(source)
+	};
+
+	let (outcome, events) = run_recording(&engine, &strict(&clip), dir.path()).await;
+
+	assert!(
+		matches!(
+			outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::QualityUnreachable(_)
+			}
+		),
+		"{outcome:?}"
+	);
+	assert_eq!(
+		stages(&events, Stage::Sample),
+		0,
+		"the learned CRF was used: {events:?}"
+	);
+	assert_eq!(
+		stages(&events, Stage::Encode),
+		2,
+		"encoded, then encoded again: {events:?}"
+	);
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+
+	let (_, events) = run_recording(&engine, &strict(&next), dir.path()).await;
+
+	assert_eq!(stages(&events, Stage::Sample), 1, "the next clip searches: {events:?}");
 }
 
 #[tokio::test]

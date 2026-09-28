@@ -59,7 +59,7 @@ cryarchiver album/ --speed slow        # slower, higher quality
 **Custom quality.** Three flags replace a speed preset's quality targets and keep the rest of the preset. The run then names the preset as custom, for example `MODERATE · custom: video VMAF 90/85, image 80`.
 - `--video-vmaf MEAN/FLOOR` is the VMAF mean and 5th-percentile floor each video must reach: mean 80–99, floor from 70 up to the mean. The presets use 93/89 at moderate and 95/91 at slow. Noisy sources encoded with film grain still get 2 off the mean and 2.5 off the floor. `fast` never measures video quality, so it refuses this flag.
 - `--image-target N` is the SSIMULACRA2 score each image must reach, 50–95. The presets use 80, 85 and 90 at fast, moderate and slow.
-- `--audio-kbps N` is the stereo Opus bitrate, 64–320 in steps of 8. Other channel layouts scale with it (mono gets half), and it applies to the audio tracks inside videos too. A lossy source with a lower bitrate is encoded at its own bitrate instead, but never below the fast preset's rate for its layout (96 kbps for stereo), so a 64 kbps MP3 becomes 96 kbps Opus.
+- `--audio-kbps N` is the stereo Opus bitrate, 64–320 in steps of 8. Other channel layouts scale with it (mono gets half), and it applies to the audio tracks inside videos too. A lossy source with a lower bitrate is encoded at its own bitrate instead, raised to the fast preset's rate for its layout (96 kbps for stereo) but never above N.
 - Video and image values are rounded to 0.1. What is learned about each kind of file is kept per target, so a custom run never reuses what a preset run learned.
 
 | Option | Meaning | Default |

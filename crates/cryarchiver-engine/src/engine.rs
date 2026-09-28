@@ -544,7 +544,10 @@ impl Engine {
 		let learned = if verify {
 			match Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await? {
 				Checked::Passed(observation) => Some(observation),
-				Checked::Missed(reason) => return Ok(Produced::Kept(reason)),
+				Checked::Missed(reason) => {
+					self.forget_learned(&quality);
+					return Ok(Produced::Kept(reason));
+				}
 			}
 		} else {
 			None
@@ -570,13 +573,19 @@ impl Engine {
 		})
 	}
 
-	/// A group whose learned setting led to an output that wasn't smaller forgets it, so that its next file searches
-	/// afresh instead of repeating the same encode.
 	fn kept_video(&self, quality: &VideoQuality, reason: KeepReason) -> Produced {
-		if quality.stats.is_some() && matches!(reason, KeepReason::NotSmaller { .. }) {
-			self.quality.forget(&quality.key);
+		if matches!(reason, KeepReason::NotSmaller { .. }) {
+			self.forget_learned(quality);
 		}
 		Produced::Kept(reason)
+	}
+
+	/// A group whose learned setting led to an output that wasn't smaller, or that missed its check and its retry,
+	/// forgets it, so that its next file searches afresh instead of repeating the same encodes.
+	fn forget_learned(&self, quality: &VideoQuality) {
+		if quality.stats.is_some() {
+			self.quality.forget(&quality.key);
+		}
 	}
 
 	fn video_quality(&self, job: &Job, main: &Stream, analysis: &Analysis, video: &VideoPlan) -> VideoQuality {
