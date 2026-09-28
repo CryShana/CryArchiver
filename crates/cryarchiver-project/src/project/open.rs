@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use cryarchiver_engine::commit::file_id;
+use cryarchiver_engine::quality::memory::SharedMemory;
 use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::workspace::sweep;
@@ -58,7 +59,7 @@ impl Owner {
 		project_file: &Path,
 		store: Store,
 		settings: Settings,
-		loaded: Loaded,
+		mut loaded: Loaded,
 		options: ProjectOptions,
 		updates: Sender<Update>,
 	) -> Result<Self, ProjectError> {
@@ -72,6 +73,7 @@ impl Owner {
 			.collect();
 		let watching = WatchState::new(Debouncer::new(options.tuning.debounce), unknown);
 		let memory = Arc::new(MemoryBudget::default());
+		let quality = Arc::new(SharedMemory::with_entries(std::mem::take(&mut loaded.quality)));
 		let applied = live::apply_limit(settings.performance_limit);
 		let image_threads = live::image_threads(settings.performance_limit, applied);
 		let mut pipeline = Pipeline::new(
@@ -80,9 +82,10 @@ impl Owner {
 				ramp: options.tuning.ramp,
 				max_encodes: options.tuning.max_encodes,
 			},
-			options.backend.encoder(image_threads, memory.clone()),
+			options.backend.encoder(image_threads, memory.clone(), quality.clone()),
 			image_threads,
 			memory,
+			quality,
 		);
 		pipeline.governor.set_limit(settings.performance_limit.is_some());
 

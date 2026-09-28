@@ -14,6 +14,7 @@ use cryarchiver_engine::commit::{Artifact, OutputSink, SourceTimes};
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::naming::is_media_name;
 use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome, KeepReason};
+use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_project::issues::IssueId;
 use cryarchiver_project::settings::Settings;
 use cryarchiver_project::tree::{FileId, FolderId, FolderStats};
@@ -57,6 +58,7 @@ pub struct FakeEncoder {
 	pub calls: Mutex<Vec<String>>,
 	running: AtomicUsize,
 	pub peak: AtomicUsize,
+	pub quality: Mutex<Option<Arc<dyn QualityMemory>>>,
 }
 
 impl FakeEncoder {
@@ -204,7 +206,13 @@ pub struct FakeBackend {
 }
 
 impl Backend for FakeBackend {
-	fn encoder(&self, _image_threads: usize, _memory: Arc<dyn MemoryGate>) -> Arc<dyn Encode> {
+	fn encoder(
+		&self,
+		_image_threads: usize,
+		_memory: Arc<dyn MemoryGate>,
+		quality: Arc<dyn QualityMemory>,
+	) -> Arc<dyn Encode> {
+		*self.encoder.quality.lock().unwrap() = Some(quality);
 		self.encoder.clone()
 	}
 

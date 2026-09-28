@@ -580,6 +580,7 @@ pub(super) mod tests {
 	use cryarchiver_engine::commit::OutputSink;
 	use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate};
 	use cryarchiver_engine::outcome::JobOutcome;
+	use cryarchiver_engine::quality::memory::QualityMemory;
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
@@ -606,7 +607,12 @@ pub(super) mod tests {
 	}
 
 	impl Backend for NoBackend {
-		fn encoder(&self, _image_threads: usize, _memory: Arc<dyn MemoryGate>) -> Arc<dyn Encode> {
+		fn encoder(
+			&self,
+			_image_threads: usize,
+			_memory: Arc<dyn MemoryGate>,
+			_quality: Arc<dyn QualityMemory>,
+		) -> Arc<dyn Encode> {
 			Arc::new(NoEncoder)
 		}
 

@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use cryarchiver_engine::engine::{Encode, Engine, MemoryGate};
+use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::toolchain::{FfmpegBuild, Toolchain};
 use sysinfo::System;
 
@@ -27,11 +28,17 @@ impl EngineBackend {
 }
 
 impl Backend for EngineBackend {
-	fn encoder(&self, image_threads: usize, memory: Arc<dyn MemoryGate>) -> Arc<dyn Encode> {
+	fn encoder(
+		&self,
+		image_threads: usize,
+		memory: Arc<dyn MemoryGate>,
+		quality: Arc<dyn QualityMemory>,
+	) -> Arc<dyn Encode> {
 		Arc::new(
 			Engine::new(self.tools.clone())
 				.with_image_threads(image_threads)
-				.with_memory_gate(memory),
+				.with_memory_gate(memory)
+				.with_quality_memory(quality),
 		)
 	}
 

@@ -904,3 +904,44 @@ fn a_pending_delete_finishes_only_when_the_source_is_gone() {
 		FileState::OriginalDeleted(copied("gone.txt", 4))
 	);
 }
+
+#[test]
+fn quality_learned_in_one_run_is_there_the_next_time() {
+	use cryarchiver_engine::metadata::ImageFormat;
+	use cryarchiver_engine::quality::keys::{CacheKey, Group, ImageGroup};
+	use cryarchiver_engine::quality::memory::Observation;
+
+	let setup = setup(|_| {});
+	let encoder = FakeEncoder::new();
+	let key = CacheKey {
+		group: Group::Image(ImageGroup::new(ImageFormat::Jpeg, false, false, false, 4000, 3000)),
+		encoder: "ravif-0.13".into(),
+		preset: 6,
+		target: 85.0,
+		floor: None,
+	};
+	{
+		let project = support::open(&setup, &encoder);
+		let quality = encoder
+			.quality
+			.lock()
+			.unwrap()
+			.clone()
+			.expect("the encoder gets the project's memory");
+		quality.record(
+			&key,
+			Observation {
+				setting: 90.5,
+				slope: None,
+				bpp: None,
+			},
+		);
+		let mut snapshot = Snapshot::default();
+		wait_for(&project, &mut snapshot, "the scan", Snapshot::scan_complete);
+	}
+
+	let _project = support::open(&setup, &encoder);
+	let quality = encoder.quality.lock().unwrap().clone().unwrap();
+
+	assert_eq!(quality.lookup(&key).map(|stats| stats.setting), Some(90.5));
+}

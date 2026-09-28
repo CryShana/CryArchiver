@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use cryarchiver_engine::commit::OutputSink;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate};
 use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome};
+use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_project::{Backend, Project, ProjectOptions, SystemSample, Tuning};
 use cryarchiver_tui::recent::{FILE_NAME, RecentStore};
@@ -50,7 +51,12 @@ impl Encode for CopyEverything {
 struct TestBackendOptions;
 
 impl Backend for TestBackendOptions {
-	fn encoder(&self, _image_threads: usize, _memory: Arc<dyn MemoryGate>) -> Arc<dyn Encode> {
+	fn encoder(
+		&self,
+		_image_threads: usize,
+		_memory: Arc<dyn MemoryGate>,
+		_quality: Arc<dyn QualityMemory>,
+	) -> Arc<dyn Encode> {
 		Arc::new(CopyEverything)
 	}
 

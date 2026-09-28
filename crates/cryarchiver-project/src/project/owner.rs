@@ -281,11 +281,21 @@ impl Owner {
 	}
 
 	fn settle(&mut self, now: Instant) {
+		self.save_quality();
 		match self.store.flush_if_due(now) {
 			Ok(_) => self.after_flush(),
 			Err(err) => self.fail(err),
 		}
 		self.publish_if_due(now);
+	}
+
+	fn save_quality(&mut self) {
+		for (key, stats) in self.pipeline.quality.take_changed() {
+			if let Err(err) = self.store.set_quality(&key, &stats) {
+				self.fail(err);
+				return;
+			}
+		}
 	}
 
 	/// Stop now: running jobs are cancelled and requeued, then everything is written down. After a simulated crash
@@ -309,6 +319,7 @@ impl Owner {
 			}
 		}
 
+		self.save_quality();
 		match self.store.flush() {
 			Ok(()) => self.after_flush(),
 			Err(err) => self.fail(err),

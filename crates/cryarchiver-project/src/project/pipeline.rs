@@ -12,6 +12,7 @@ use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::{collision_key, destination_name, placeholder_name};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError};
+use cryarchiver_engine::quality::memory::SharedMemory;
 use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::workspace::ARCHIVE_DIR;
 use tokio_util::sync::CancellationToken;
@@ -75,6 +76,7 @@ pub(crate) struct Pipeline {
 	pub(super) encoder: Arc<dyn Encode>,
 	pub(super) image_threads: usize,
 	pub(super) memory: Arc<MemoryBudget>,
+	pub(super) quality: Arc<SharedMemory>,
 	pub(super) sink: ArchivalSink,
 	pub(super) disk: DiskGuard,
 	last_disk_check: Option<Instant>,
@@ -109,6 +111,7 @@ impl Pipeline {
 		encoder: Arc<dyn Encode>,
 		image_threads: usize,
 		memory: Arc<MemoryBudget>,
+		quality: Arc<SharedMemory>,
 	) -> Self {
 		Self {
 			observed: HashMap::new(),
@@ -126,6 +129,7 @@ impl Pipeline {
 			encoder,
 			image_threads,
 			memory,
+			quality,
 			sink: ArchivalSink::new(destination),
 			disk: DiskGuard::default(),
 			last_disk_check: None,

@@ -25,6 +25,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use cryarchiver_engine::engine::{Encode, MemoryGate};
+use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::text::display_path;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -83,7 +84,12 @@ pub struct SystemSample {
 /// What the project needs from the outside world: the encoder, and the machine's load.
 pub trait Backend: Send + Sync {
 	/// Builds the encoder for the jobs that start from now on.
-	fn encoder(&self, image_threads: usize, memory: Arc<dyn MemoryGate>) -> Arc<dyn Encode>;
+	fn encoder(
+		&self,
+		image_threads: usize,
+		memory: Arc<dyn MemoryGate>,
+		quality: Arc<dyn QualityMemory>,
+	) -> Arc<dyn Encode>;
 
 	fn toolchain(&self) -> String;
 

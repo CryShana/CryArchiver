@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cryarchiver_engine::quality::memory::GroupStats;
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -28,6 +29,7 @@ const FORMAT_KEY: &str = "format";
 const APP_VERSION_KEY: &str = "app_version";
 const CREATED_KEY: &str = "created";
 const SETTINGS_KEY: &str = "settings";
+const QUALITY_PREFIX: &str = "quality/";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -106,6 +108,7 @@ pub struct Loaded {
 	pub unknown: Vec<(RelPath, UnknownRecord)>,
 	/// The highest attempt with a failure log, per file.
 	pub last_attempts: HashMap<RelPath, u32>,
+	pub quality: Vec<(String, GroupStats)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +232,13 @@ impl Store {
 				.or_default();
 			*last = (*last).max(attempt);
 		}
+
+		for entry in txn.open_table(META)?.iter()? {
+			let (key, value) = entry?;
+			if let Some(quality_key) = key.value().strip_prefix(QUALITY_PREFIX) {
+				loaded.quality.push((quality_key.to_owned(), decode(value.value())?));
+			}
+		}
 		Ok(loaded)
 	}
 
@@ -258,6 +268,10 @@ impl Store {
 
 	pub fn set_settings(&mut self, settings: &Settings) -> Result<(), StoreError> {
 		self.put(Table::Meta, SETTINGS_KEY.as_bytes().to_vec(), settings)
+	}
+
+	pub fn set_quality(&mut self, key: &str, stats: &GroupStats) -> Result<(), StoreError> {
+		self.put(Table::Meta, format!("{QUALITY_PREFIX}{key}").into_bytes(), stats)
 	}
 
 	/// A write-ahead intent: commits it together with everything batched so far, durably, before returning.
@@ -461,6 +475,15 @@ pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 		let record: UnknownRecord = decode(value.value())?;
 		writeln!(out, "{:?} = {record:?}", RelPath::from_bytes(key.value().to_vec()))?;
 	}
+
+	writeln!(out, "\n[quality]")?;
+	for entry in txn.open_table(META)?.iter()? {
+		let (key, value) = entry?;
+		if let Some(quality_key) = key.value().strip_prefix(QUALITY_PREFIX) {
+			let stats: GroupStats = decode(value.value())?;
+			writeln!(out, "{quality_key} = {stats:?}")?;
+		}
+	}
 	Ok(())
 }
 
@@ -654,5 +677,35 @@ mod tests {
 		assert!(text.contains("\"a.txt\" = FileRecord"), "{text}");
 		assert!(text.contains("Committing"), "{text}");
 		assert!(text.contains("[folders]\n\"\" = FolderRecord"), "{text}");
+	}
+
+	#[test]
+	fn learned_quality_is_kept_in_the_meta_table_and_dumped() {
+		let dir = tempfile::tempdir().unwrap();
+		let key = "video/h264/1080/fps31/sdr8/progressive/clean/opaque|svt-av1-4.2|p5|t95.0/90.0";
+		let stats = GroupStats {
+			setting: 29.5,
+			slope: Some(0.4),
+			bpp: Some(0.03),
+			observations: 2,
+		};
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		store.set_quality(key, &stats).unwrap();
+		store.flush().unwrap();
+		drop(store);
+
+		let (store, meta, loaded) = Store::open(&project(dir.path())).unwrap();
+		drop(store);
+		let mut out = Vec::new();
+		dump(&project(dir.path()), &mut out).unwrap();
+
+		assert_eq!(loaded.quality, vec![(key.to_owned(), stats)]);
+		assert_eq!(meta.settings, Settings::default());
+		assert!(
+			String::from_utf8(out)
+				.unwrap()
+				.contains(&format!("[quality]\n{key} = GroupStats")),
+			"the dump lists learned quality"
+		);
 	}
 }

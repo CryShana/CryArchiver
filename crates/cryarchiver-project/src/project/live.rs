@@ -96,7 +96,9 @@ impl Owner {
 		let threads = image_threads(cap, self.live.applied);
 		if threads != self.pipeline.image_threads {
 			self.pipeline.image_threads = threads;
-			self.pipeline.encoder = self.backend.encoder(threads, self.pipeline.memory.clone());
+			self.pipeline.encoder =
+				self.backend
+					.encoder(threads, self.pipeline.memory.clone(), self.pipeline.quality.clone());
 			self.live.stale = self.image_jobs();
 		}
 
