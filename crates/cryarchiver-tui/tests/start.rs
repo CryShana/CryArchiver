@@ -153,6 +153,34 @@ fn the_list_shows_at_once_and_fills_in_as_projects_are_read() {
 }
 
 #[test]
+fn opening_a_project_stops_the_checks_for_the_whole_session() {
+	let setup = Setup::new();
+	for index in 0..6 {
+		let project = setup.project(&format!("P{index}"));
+		setup.store.record(&project, index).unwrap();
+	}
+	let mut menu = StartMenu::new(setup.store.clone(), ColorDepth::TrueColor);
+
+	press(&mut menu, KeyCode::Enter);
+	let project = menu.take_request().unwrap();
+	menu.stop_checks();
+
+	assert!(!menu.checks_running());
+	let states: Vec<EntryState> = menu.entries().iter().map(|entry| entry.state.clone()).collect();
+	let opened = cryarchiver_project::store::Store::open(&project);
+	assert!(opened.is_ok(), "the menu still holds the project");
+	drop(opened);
+
+	menu.opened(&project);
+	std::thread::sleep(Duration::from_millis(50));
+	menu.tick();
+	assert!(!menu.checks_running());
+	assert!(menu.wait_for_checks(Duration::ZERO));
+	let after: Vec<EntryState> = menu.entries().iter().map(|entry| entry.state.clone()).collect();
+	assert_eq!(after, states);
+}
+
+#[test]
 fn a_project_out_of_reach_is_unavailable_and_kept_by_clear_missing() {
 	let setup = Setup::new();
 	let offline = setup.path("unplugged/archive/Old.cryarchive");

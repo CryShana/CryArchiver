@@ -32,7 +32,9 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use crate::issues::{IssueId, Verb};
-use crate::settings::{RootConflict, Settings, SettingsChange, SettingsError, check_roots, plain_path, planned_path};
+use crate::settings::{
+	RootConflict, Settings, SettingsChange, SettingsError, check_roots, identity_conflict, plain_path, planned_path,
+};
 use crate::store::{Store, StoreError};
 use crate::tree::{FileId, FolderId};
 use crate::view::Update;
@@ -174,9 +176,9 @@ pub fn create(
 	name: &OsStr,
 	configure: impl FnOnce(&mut Settings),
 ) -> Result<PathBuf, ProjectError> {
-	refuse_overlapping_roots(source, destination)?;
-	fs::create_dir_all(destination).map_err(|err| naming(destination, &err))?;
-	let (source, destination) = check_roots(source, destination)?;
+	let planned = approved_destination(source, destination)?;
+	fs::create_dir_all(&planned).map_err(|err| naming(destination, &err))?;
+	let (source, destination) = check_roots(source, &planned)?;
 
 	let path = project_file(&destination, name)?;
 	let mut settings = Settings::new(&source, &destination);
@@ -193,19 +195,22 @@ pub fn project_file(destination: &Path, name: &OsStr) -> io::Result<PathBuf> {
 	Ok(plain_path(planned_path(destination)?).join(file_name))
 }
 
-/// Runs before anything is created. The source must already be a folder: creating a destination against a missing
-/// source could create the source's own folders, and the destination may not exist yet, so it is compared on its
-/// planned path.
-fn refuse_overlapping_roots(source: &Path, destination: &Path) -> Result<(), ProjectError> {
+/// Runs before anything is created, and returns the only path that may be created: the destination's planned path,
+/// with no `.` or `..` left. `create_dir_all` walks the typed text literally, so `<source>/new/../../archive` would
+/// create `<source>/new` on the way. The source must already be a folder: creating a destination against a missing
+/// source could create the source's own folders.
+fn approved_destination(source: &Path, destination: &Path) -> Result<PathBuf, ProjectError> {
 	let meta = fs::metadata(source).map_err(|err| naming(source, &err))?;
 	if !meta.is_dir() {
 		return Err(SettingsError::Roots(format!("{}: the source is not a folder", display_path(source))).into());
 	}
 
 	let source = fs::canonicalize(source).map_err(|err| naming(source, &err))?;
-	match RootConflict::between(&source, &planned_path(destination)?) {
+	let planned = planned_path(destination)?;
+	let conflict = RootConflict::between(&source, &planned).or_else(|| identity_conflict(&source, &planned));
+	match conflict {
 		Some(conflict) => Err(SettingsError::Roots(conflict.message().into()).into()),
-		None => Ok(()),
+		None => Ok(planned),
 	}
 }
 

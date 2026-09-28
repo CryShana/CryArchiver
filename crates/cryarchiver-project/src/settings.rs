@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use cryarchiver_engine::commit::{FileIdentity, file_id};
 use cryarchiver_engine::preset::Speed as EngineSpeed;
 use cryarchiver_engine::text::display_path;
 use serde::{Deserialize, Serialize};
@@ -214,22 +215,68 @@ pub fn planned_path(path: &Path) -> io::Result<PathBuf> {
 	Ok(planned)
 }
 
-/// Checks the roots before either needs to exist, on their planned paths.
+/// Checks the roots before either needs to exist, on their planned paths, by text and by folder identity.
 pub fn root_conflict(source: &Path, destination: &Path) -> io::Result<Option<RootConflict>> {
-	Ok(RootConflict::between(
-		&planned_path(source)?,
-		&planned_path(destination)?,
-	))
+	let (source, destination) = (planned_path(source)?, planned_path(destination)?);
+	Ok(RootConflict::between(&source, &destination).or_else(|| identity_conflict(&source, &destination)))
 }
 
-/// The roots must exist and differ, and neither may lie inside the other; checked on canonical paths.
+/// Compares folder identities, which catch what the text can't: on Linux, a bind mount, or a case-insensitive volume
+/// where the path keeps the typed case, can name the source with other text. `source` is canonical and `destination`
+/// planned; a source that doesn't exist has no identity, and gives no conflict here.
+pub fn identity_conflict(source: &Path, destination: &Path) -> Option<RootConflict> {
+	let source_id = file_id(source).ok()?;
+	let existing = destination.ancestors().find(|dir| dir.exists())?;
+	let existing_id = file_id(existing).ok()?;
+	let complete = existing == destination;
+	let is = |id: FileIdentity| move |dir: &Path| file_id(dir).is_ok_and(|found| found == id);
+
+	if existing_id == source_id {
+		return Some(if complete {
+			RootConflict::Same
+		} else {
+			RootConflict::DestinationInsideSource
+		});
+	}
+
+	if existing.ancestors().skip(1).any(is(source_id)) {
+		return Some(RootConflict::DestinationInsideSource);
+	}
+
+	if complete && source.ancestors().skip(1).any(is(existing_id)) {
+		return Some(RootConflict::SourceInsideDestination);
+	}
+	None
+}
+
+/// Whether the current user may create entries in `folder`, asked without writing anything.
+#[cfg(unix)]
+pub fn may_create_in(folder: &Path) -> bool {
+	use std::os::unix::ffi::OsStrExt;
+
+	let Ok(path) = std::ffi::CString::new(folder.as_os_str().as_bytes()) else {
+		return false;
+	};
+	// SAFETY: `path` is a valid NUL-terminated string that outlives the call.
+	unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// Windows can't be asked without trying; the probe when the project is created decides.
+#[cfg(not(unix))]
+pub fn may_create_in(_: &Path) -> bool {
+	true
+}
+
+/// The roots must exist and differ, and neither may lie inside the other; checked on canonical paths and on folder
+/// identities.
 pub fn check_roots(source: &Path, destination: &Path) -> Result<(PathBuf, PathBuf), SettingsError> {
 	let canonical = |path: &Path| {
 		dunce_canonicalize(path).map_err(|err| SettingsError::Roots(format!("{}: {err}", display_path(path))))
 	};
 	let (source, destination) = (canonical(source)?, canonical(destination)?);
 
-	if let Some(conflict) = RootConflict::between(&source, &destination) {
+	let conflict = RootConflict::between(&source, &destination).or_else(|| identity_conflict(&source, &destination));
+	if let Some(conflict) = conflict {
 		return Err(SettingsError::Roots(conflict.message().into()));
 	}
 	Ok((source, destination))
@@ -424,6 +471,57 @@ mod tests {
 		assert_eq!(conflict(&dir.path().join("new").join("..").join("archive")), None);
 		assert!(!source.join("new").exists());
 		assert!(!dir.path().join("missing").exists());
+	}
+
+	/// A second name for `target`: a junction on Windows, a symbolic link elsewhere. `None` when one can't be made.
+	fn alias(target: &Path, alias: &Path) -> Option<PathBuf> {
+		#[cfg(windows)]
+		let made = std::process::Command::new("cmd")
+			.args(["/C", "mklink", "/J"])
+			.arg(alias)
+			.arg(target)
+			.stdout(std::process::Stdio::null())
+			.status()
+			.is_ok_and(|status| status.success());
+		#[cfg(unix)]
+		let made = std::os::unix::fs::symlink(target, alias).is_ok();
+
+		made.then(|| alias.to_path_buf())
+	}
+
+	#[test]
+	fn folder_identity_finds_the_source_behind_another_name() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(source.join("inner")).unwrap();
+		let Some(alias) = alias(&source, &dir.path().join("alias")) else {
+			eprintln!("skipped: no junction or link can be made here");
+			return;
+		};
+		let canonical = fs::canonicalize(&source).unwrap();
+
+		assert_eq!(identity_conflict(&canonical, &alias), Some(RootConflict::Same));
+		assert_eq!(
+			identity_conflict(&canonical, &alias.join("new").join("archive")),
+			Some(RootConflict::DestinationInsideSource)
+		);
+		assert_eq!(
+			identity_conflict(&canonical, &alias.join("inner")),
+			Some(RootConflict::DestinationInsideSource)
+		);
+		assert_eq!(
+			identity_conflict(&canonical.join("inner"), &alias),
+			Some(RootConflict::SourceInsideDestination)
+		);
+		assert_eq!(identity_conflict(&canonical, &dir.path().join("archive")), None);
+		assert_eq!(identity_conflict(&dir.path().join("missing"), &alias), None);
+		assert_eq!(
+			root_conflict(&source, &alias.join("archive")).unwrap(),
+			Some(RootConflict::DestinationInsideSource)
+		);
+		assert!(check_roots(&source, &alias).is_err());
+		assert!(!source.join("new").exists());
+		fs::remove_dir(&alias).or_else(|_| fs::remove_file(&alias)).unwrap();
 	}
 
 	#[cfg(windows)]

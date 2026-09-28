@@ -5,7 +5,10 @@ pub mod validate;
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::text::display_path;
@@ -79,7 +82,19 @@ pub enum Dialog {
 	Discard,
 }
 
-type Peeks = Receiver<(u64, usize, EntryState)>;
+/// The worker that reads the recent projects, one after another.
+struct Checks {
+	results: Receiver<(u64, usize, EntryState)>,
+	stop: Arc<AtomicBool>,
+	worker: JoinHandle<()>,
+}
+
+impl Checks {
+	fn halt(self) -> JoinHandle<()> {
+		self.stop.store(true, Ordering::Relaxed);
+		self.worker
+	}
+}
 
 pub struct StartMenu {
 	store: RecentStore,
@@ -97,7 +112,9 @@ pub struct StartMenu {
 	last_click: Option<(Position, Instant)>,
 	last_key: Option<Instant>,
 	generation: u64,
-	peeks: Option<Peeks>,
+	checks: Option<Checks>,
+	/// Workers told to stop that may still be finishing their current project.
+	halted: Vec<JoinHandle<()>>,
 }
 
 impl StartMenu {
@@ -120,7 +137,8 @@ impl StartMenu {
 			last_click: None,
 			last_key: None,
 			generation: 0,
-			peeks: None,
+			checks: None,
+			halted: Vec::new(),
 		};
 
 		menu.set_entries(loaded.entries);
@@ -188,11 +206,11 @@ impl StartMenu {
 	/// Takes in the entries read since the last tick and drops an expired notice; returns whether a redraw is due.
 	pub fn tick(&mut self) -> bool {
 		let mut changed = false;
-		while let Some(peeks) = &self.peeks {
-			match peeks.try_recv() {
+		while let Some(checks) = &self.checks {
+			match checks.results.try_recv() {
 				Ok(result) => changed |= self.apply_peek(result),
 				Err(mpsc::TryRecvError::Empty) => break,
-				Err(mpsc::TryRecvError::Disconnected) => self.peeks = None,
+				Err(mpsc::TryRecvError::Disconnected) => self.checks = None,
 			}
 		}
 
@@ -209,16 +227,37 @@ impl StartMenu {
 	/// Waits until every entry has been read, or `timeout` passes; returns whether all were read.
 	pub fn wait_for_checks(&mut self, timeout: Duration) -> bool {
 		let deadline = Instant::now() + timeout;
-		while let Some(peeks) = &self.peeks {
-			match peeks.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+		while let Some(checks) = &self.checks {
+			match checks
+				.results
+				.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+			{
 				Ok(result) => {
 					self.apply_peek(result);
 				}
-				Err(RecvTimeoutError::Disconnected) => self.peeks = None,
+				Err(RecvTimeoutError::Disconnected) => self.checks = None,
 				Err(RecvTimeoutError::Timeout) => return false,
 			}
 		}
 		true
+	}
+
+	/// Stops reading the recent projects and waits for the project being read, so none is left locked by this menu:
+	/// called before a project opens, which then keeps the worker stopped for the whole session.
+	pub fn stop_checks(&mut self) {
+		if let Some(checks) = self.checks.take() {
+			self.halted.push(checks.halt());
+		}
+
+		for worker in self.halted.drain(..) {
+			let _ = worker.join();
+		}
+	}
+
+	/// Whether a worker reading the recent projects may still hold one of them.
+	pub fn checks_running(&self) -> bool {
+		self.checks.as_ref().is_some_and(|checks| !checks.worker.is_finished())
+			|| self.halted.iter().any(|worker| !worker.is_finished())
 	}
 
 	fn apply_peek(&mut self, (generation, index, state): (u64, usize, EntryState)) -> bool {
@@ -421,11 +460,16 @@ impl StartMenu {
 			}
 			return;
 		};
+		let warning = form.take_warning();
 
 		match self.store.record(&path, now_unix_ms()) {
 			Ok(recents) => self.set_entries(recents),
 			Err(err) => self.notify(NoticeLevel::Warning, not_saved(&err)),
 		}
+		if let Some(warning) = warning {
+			self.notify(NoticeLevel::Warning, warning);
+		}
+
 		self.selected = 0;
 		self.form = None;
 		self.request_open(path);
@@ -519,7 +563,12 @@ impl StartMenu {
 		self.request_open(path);
 	}
 
+	/// The worker is told to stop at once; [`Self::stop_checks`] waits for it before the open.
 	fn request_open(&mut self, path: PathBuf) {
+		if let Some(checks) = self.checks.take() {
+			self.halted.push(checks.halt());
+		}
+
 		self.opening = Some(project_name(&path));
 		self.request = Some(path);
 	}
@@ -571,8 +620,13 @@ impl StartMenu {
 			.collect();
 		self.selected = self.selected.min(self.entries.len().saturating_sub(1));
 
+		if let Some(checks) = self.checks.take() {
+			self.halted.push(checks.halt());
+		}
+		self.halted.retain(|worker| !worker.is_finished());
+
 		self.generation += 1;
-		self.peeks = (!paths.is_empty()).then(|| spawn_peeks(self.generation, paths));
+		self.checks = (!paths.is_empty()).then(|| spawn_checks(self.generation, paths));
 	}
 
 	fn notify(&mut self, level: NoticeLevel, text: String) {
@@ -580,16 +634,19 @@ impl StartMenu {
 	}
 }
 
-fn spawn_peeks(generation: u64, paths: Vec<PathBuf>) -> Peeks {
-	let (sender, receiver) = mpsc::channel();
-	std::thread::spawn(move || {
+fn spawn_checks(generation: u64, paths: Vec<PathBuf>) -> Checks {
+	let (sender, results) = mpsc::channel();
+	let stop = Arc::new(AtomicBool::new(false));
+	let stopped = stop.clone();
+	let worker = std::thread::spawn(move || {
 		for (index, path) in paths.iter().enumerate() {
-			if sender.send((generation, index, peek(path))).is_err() {
+			if stopped.load(Ordering::Relaxed) || sender.send((generation, index, peek(path))).is_err() {
 				return;
 			}
 		}
 	});
-	receiver
+
+	Checks { results, stop, worker }
 }
 
 fn peek(path: &Path) -> EntryState {

@@ -2,7 +2,7 @@ mod support;
 
 use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cryarchiver_project::issues::Verb;
@@ -635,6 +635,93 @@ fn dot_dot_in_a_destination_cannot_reach_into_the_source() {
 	}
 	assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
 	assert!(!dir.path().join("missing").exists());
+}
+
+/// Only the checked path is created: `create_dir_all` on the typed text would create `<source>/new` on the way.
+fn assert_only_the_planned_folder_is_created(destination: &Path, source: &Path, archive: &Path) {
+	let created = cryarchiver_project::create(source, destination, OsStr::new("a"), |_| {});
+
+	assert!(created.is_ok(), "{}: {created:?}", destination.display());
+	assert_eq!(fs::read_dir(source).unwrap().count(), 0, "{}", destination.display());
+	assert!(archive.join("a.cryarchive").is_file());
+}
+
+#[test]
+fn a_destination_that_climbs_out_of_the_source_creates_nothing_in_it() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+	let destination = source.join("new").join("..").join("..").join("archive");
+
+	assert_only_the_planned_folder_is_created(&destination, &source, &dir.path().join("archive"));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_verbatim_destination_that_climbs_out_of_the_source_creates_nothing_in_it() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+	let verbatim = fs::canonicalize(&source).unwrap();
+	assert!(verbatim.to_string_lossy().starts_with(r"\\?\"));
+	let destination = PathBuf::from(format!(r"{}\new\..\..\archive", verbatim.display()));
+
+	assert_only_the_planned_folder_is_created(&destination, &source, &dir.path().join("archive"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_typed_unix_destination_that_climbs_out_of_the_source_creates_nothing_in_it() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+	let destination = PathBuf::from(format!("{}/source/new/deeper/../../../archive", dir.path().display()));
+
+	assert_only_the_planned_folder_is_created(&destination, &source, &dir.path().join("archive"));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_destination_through_a_junction_into_the_source_is_refused() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+	let alias = dir.path().join("alias");
+	let made = std::process::Command::new("cmd")
+		.args(["/C", "mklink", "/J"])
+		.arg(&alias)
+		.arg(&source)
+		.stdout(std::process::Stdio::null())
+		.status();
+	if !made.is_ok_and(|status| status.success()) {
+		eprintln!("skipped: a junction can't be created here");
+		return;
+	}
+
+	for destination in [alias.join("archive"), alias.clone()] {
+		let created = cryarchiver_project::create(&source, &destination, OsStr::new("a"), |_| {});
+
+		assert!(matches!(created, Err(ProjectError::Settings(_))), "{created:?}");
+	}
+	assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+	fs::remove_dir(&alias).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_destination_through_a_link_into_the_source_is_refused() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+	let alias = dir.path().join("alias");
+	std::os::unix::fs::symlink(&source, &alias).unwrap();
+
+	for destination in [alias.join("archive"), alias.clone()] {
+		let created = cryarchiver_project::create(&source, &destination, OsStr::new("a"), |_| {});
+
+		assert!(matches!(created, Err(ProjectError::Settings(_))), "{created:?}");
+	}
+	assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
 }
 
 #[test]

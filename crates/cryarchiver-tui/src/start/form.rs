@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use cryarchiver_project::settings::{DELETE_CONFIRMATION, SettingsChange, Speed};
 use tui_input::Input;
 
-use super::validate::{Probes, Validation, validate};
+use super::validate::{Probe, Validation, probe_destination, validate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormField {
@@ -48,16 +48,16 @@ pub struct NewProjectForm {
 	confirming: Option<Input>,
 	focus: FormField,
 	validation: Validation,
-	probes: Probes,
 	/// Anything was changed since the form opened.
 	edited: bool,
 	/// Why the last Create failed.
 	error: Option<String>,
+	/// A warning from the last Create that still succeeded.
+	warning: Option<String>,
 }
 
 impl NewProjectForm {
 	pub fn new() -> Self {
-		let mut probes = Probes::default();
 		Self {
 			source: Input::default(),
 			destination: Input::default(),
@@ -67,10 +67,10 @@ impl NewProjectForm {
 			delete_confirmation: None,
 			confirming: None,
 			focus: FormField::Source,
-			validation: validate("", "", "", &mut probes),
-			probes,
+			validation: validate("", "", ""),
 			edited: false,
 			error: None,
+			warning: None,
 		}
 	}
 
@@ -78,8 +78,8 @@ impl NewProjectForm {
 		self.edited
 	}
 
-	pub fn probes_made(&self) -> usize {
-		self.probes.made()
+	pub fn take_warning(&mut self) -> Option<String> {
+		self.warning.take()
 	}
 
 	pub fn value(&self, field: FormField) -> &str {
@@ -126,12 +126,7 @@ impl NewProjectForm {
 
 	fn revalidate(&mut self) {
 		self.error = None;
-		self.validation = validate(
-			self.source.value(),
-			self.destination.value(),
-			self.name.value(),
-			&mut self.probes,
-		);
+		self.validation = validate(self.source.value(), self.destination.value(), self.name.value());
 	}
 
 	pub fn focus(&self) -> FormField {
@@ -205,32 +200,38 @@ impl NewProjectForm {
 		self.error.as_deref()
 	}
 
-	/// Creates the project through the project layer, which checks everything again. Deleting originals goes through
-	/// the settings' own `DELETE` gate; it enables the setting only, and the session that opens the project still
-	/// asks for `DELETE` before anything is deleted.
+	/// Checks everything again on the final values, then probes the destination, the one check that writes, and
+	/// creates the project through the project layer, which checks the roots once more. Deleting originals goes
+	/// through the settings' own `DELETE` gate; it enables the setting only, and the session that opens the project
+	/// still asks for `DELETE` before anything is deleted.
 	pub fn create(&mut self) -> Option<PathBuf> {
 		self.revalidate();
 		if !self.can_create() {
 			return None;
 		}
 
+		let (source, destination) = (Path::new(self.source.value()), Path::new(self.destination.value()));
+		match probe_destination(source, destination) {
+			Probe::Writable => {}
+			Probe::Leftover(warning) => self.warning = Some(warning),
+			Probe::Failed(reason) => {
+				self.error = Some(format!("the destination can't be written: {reason}"));
+				return None;
+			}
+		}
+
 		let (speed, confirmation) = (self.speed, self.delete_confirmation.clone());
-		let created = cryarchiver_project::create(
-			Path::new(self.source.value()),
-			Path::new(self.destination.value()),
-			OsStr::new(self.name.value()),
-			|settings| {
-				settings.speed = speed;
-				if let Some(confirmation) = confirmation {
-					settings
-						.apply(SettingsChange::DeleteOriginals {
-							enabled: true,
-							confirmation,
-						})
-						.expect("the form keeps only a confirmation that reads DELETE");
-				}
-			},
-		);
+		let created = cryarchiver_project::create(source, destination, OsStr::new(self.name.value()), |settings| {
+			settings.speed = speed;
+			if let Some(confirmation) = confirmation {
+				settings
+					.apply(SettingsChange::DeleteOriginals {
+						enabled: true,
+						confirmation,
+					})
+					.expect("the form keeps only a confirmation that reads DELETE");
+			}
+		});
 
 		match created {
 			Ok(path) => Some(path),
@@ -390,18 +391,28 @@ mod tests {
 	}
 
 	#[test]
-	fn typing_the_name_or_changing_the_speed_does_not_probe_again() {
+	fn filling_the_form_writes_nothing_until_create() {
 		let setup = setup();
-		let mut form = filled(&setup);
-		assert_eq!(form.probes_made(), 1);
+		let folder = |dir: &Path| {
+			let mut names: Vec<_> = fs::read_dir(dir)
+				.unwrap()
+				.map(|entry| entry.unwrap().file_name())
+				.collect();
+			names.sort();
+			(names, fs::metadata(dir).unwrap().modified().unwrap())
+		};
+		let before = folder(setup.dir.path());
 
+		let mut form = filled(&setup);
 		typed(&mut form, FormField::Name, " 2026");
 		form.set_speed(Speed::Slow);
-		form.toggle_delete();
-		form.cancel_delete();
-
-		assert_eq!(form.probes_made(), 1);
 		assert!(form.can_create());
+		assert_eq!(folder(setup.dir.path()), before);
+
+		let path = form.create().unwrap();
+		assert!(form.take_warning().is_none());
+		assert_eq!(folder(setup.dir.path()).0, ["Holiday", "archive"]);
+		assert_eq!(folder(path.parent().unwrap()).0, ["Holiday 2026.cryarchive"]);
 	}
 
 	#[test]

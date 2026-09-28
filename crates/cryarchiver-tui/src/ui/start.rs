@@ -445,7 +445,6 @@ impl FormLayout<'_> {
 		let (text, style) = match check {
 			Check::Valid => ("✓".to_owned(), fg(theme.done)),
 			Check::Warning(reason) => (format!("⚠ {reason}"), fg(theme.warn)),
-			Check::Pending(reason) => (format!("… {reason}"), fg(theme.dim)),
 			Check::Invalid(reason) if empty => (reason.clone(), fg(theme.dim)),
 			Check::Invalid(reason) => (format!("✗ {reason}"), fg(theme.error)),
 		};

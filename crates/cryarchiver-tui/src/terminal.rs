@@ -191,6 +191,7 @@ where
 
 		if let Some(project) = menu.take_request() {
 			terminal.draw(|frame| menu.draw(frame))?;
+			menu.stop_checks();
 			match open(&project) {
 				Ok(source) => {
 					menu.opened(&project);

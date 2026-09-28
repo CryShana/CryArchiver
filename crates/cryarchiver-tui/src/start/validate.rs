@@ -1,6 +1,5 @@
-//! The checks of the new project form, run again on every change. Each one only looks at the file system, except the
-//! destination probe: once the source checks out, it creates and removes one entry outside the source, once for each
-//! source and destination.
+//! The checks of the new project form, run again on every change. They only look at the file system and never write
+//! to it; the one check that writes, [`probe_destination`], runs once, when Create is pressed.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -11,26 +10,25 @@ use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::naming::is_reserved_device_name;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_project::project_file;
-use cryarchiver_project::settings::{planned_path, root_conflict};
+use cryarchiver_project::settings::{RootConflict, identity_conflict, may_create_in, planned_path, root_conflict};
 
 pub const MAX_NAME_CHARS: usize = 100;
 const INVALID_CHARS: &str = "<>:\"/\\|?*";
 pub const NOT_EMPTY: &str = "files already there will be listed as unknown and never touched";
-pub const NOT_CHECKED: &str = "checked once the source is valid";
+#[cfg(windows)]
+pub const MARKED_READ_ONLY: &str = "marked read-only; Create checks that it can be written";
 const PROBE_PREFIX: &str = ".cryarchiver-probe-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
 	Valid,
 	Warning(String),
-	/// Not checked yet: it depends on another field that doesn't pass.
-	Pending(String),
 	Invalid(String),
 }
 
 impl Check {
 	pub fn is_valid(&self) -> bool {
-		matches!(self, Self::Valid | Self::Warning(_))
+		!matches!(self, Self::Invalid(_))
 	}
 }
 
@@ -51,42 +49,17 @@ impl Validation {
 	}
 }
 
-/// The last destination probe, kept so that edits to other fields don't write again.
-#[derive(Debug, Default)]
-pub struct Probes {
-	last: Option<(PathBuf, PathBuf, Probe)>,
-	made: usize,
-}
-
-impl Probes {
-	pub fn made(&self) -> usize {
-		self.made
-	}
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Probe {
-	Writable,
-	/// Writing worked, but the probe entry couldn't be removed again.
-	Leftover {
-		path: PathBuf,
-		reason: String,
-	},
-	Failed(String),
-}
-
-pub fn validate(source: &str, destination: &str, name: &str, probes: &mut Probes) -> Validation {
+pub fn validate(source: &str, destination: &str, name: &str) -> Validation {
 	let project_file = (!destination.is_empty() && !name.is_empty())
 		.then(|| project_file(Path::new(destination), OsStr::new(name)).ok())
 		.flatten();
 	let free_space = (!destination.is_empty())
 		.then(|| free_space(Path::new(destination)).ok())
 		.flatten();
-	let source_check = check_source(source);
 
 	Validation {
-		destination: check_destination(source, source_check.is_valid(), destination, probes),
-		source: source_check,
+		source: check_source(source),
+		destination: check_destination(source, destination),
 		name: check_name(name, project_file.as_deref()),
 		project_file,
 		free_space,
@@ -112,8 +85,7 @@ fn check_source(source: &str) -> Check {
 	}
 }
 
-/// The probe runs only for a source that checks out, so it never writes while the source is half typed.
-fn check_destination(source: &str, source_valid: bool, destination: &str, probes: &mut Probes) -> Check {
+fn check_destination(source: &str, destination: &str) -> Check {
 	if destination.is_empty() {
 		return Check::Invalid("enter the folder the archive goes to".into());
 	}
@@ -127,45 +99,62 @@ fn check_destination(source: &str, source_valid: bool, destination: &str, probes
 		}
 	}
 
-	let exists = match fs::metadata(path) {
+	let (exists, verb) = match fs::metadata(path) {
 		Ok(meta) if !meta.is_dir() => return Check::Invalid("is a file, not a folder".into()),
-		Ok(_) => true,
-		Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+		Ok(_) => (true, "written"),
+		Err(err) if err.kind() == io::ErrorKind::NotFound => (false, "created"),
 		Err(err) => return Check::Invalid(format!("can't be read: {err}")),
 	};
 
-	if !source_valid {
-		return Check::Pending(NOT_CHECKED.into());
+	let folder = match nearest_folder(path) {
+		Ok(folder) => folder,
+		Err(reason) => return Check::Invalid(format!("can't be created: {reason}")),
+	};
+	let Ok(meta) = fs::metadata(&folder) else {
+		return Check::Invalid(format!("can't be {verb}: {} can't be read", display_path(&folder)));
+	};
+
+	if !may_create_in(&folder) {
+		return Check::Invalid(format!(
+			"can't be {verb}: no permission to write in {}",
+			display_path(&folder)
+		));
 	}
 
-	let (Ok(source), Ok(planned)) = (fs::canonicalize(source), planned_path(path)) else {
-		return Check::Pending(NOT_CHECKED.into());
-	};
-	let probe = match &probes.last {
-		Some((last_source, last_destination, probe)) if *last_source == source && *last_destination == planned => {
-			probe.clone()
-		}
-		_ => {
-			let probe = probe(&planned, exists, &source, &remove_entry);
-			probes.made += 1;
-			probes.last = Some((source, planned, probe.clone()));
-			probe
-		}
-	};
-	destination_check(&probe, exists, path)
+	if meta.permissions().readonly() {
+		return read_only(verb, &folder);
+	}
+
+	if exists && has_entries(path) {
+		return Check::Warning(NOT_EMPTY.into());
+	}
+	Check::Valid
 }
 
-fn destination_check(probe: &Probe, exists: bool, destination: &Path) -> Check {
-	match probe {
-		Probe::Failed(reason) if exists => Check::Invalid(format!("can't be written: {reason}")),
-		Probe::Failed(reason) => Check::Invalid(format!("can't be created: {reason}")),
-		Probe::Leftover { path, reason } => Check::Warning(format!(
-			"writable, but the test entry {} couldn't be removed ({reason}); please delete it",
-			display_path(path)
-		)),
-		Probe::Writable if exists && has_entries(destination) => Check::Warning(NOT_EMPTY.into()),
-		Probe::Writable => Check::Valid,
+/// A Unix folder without write permission can't take new entries. On Windows the read-only mark on a folder doesn't
+/// stop new entries, and Explorer sets it on folders such as Pictures; it is only a warning, and Create probes.
+#[cfg(windows)]
+fn read_only(_: &str, _: &Path) -> Check {
+	Check::Warning(MARKED_READ_ONLY.into())
+}
+
+#[cfg(not(windows))]
+fn read_only(verb: &str, folder: &Path) -> Check {
+	Check::Invalid(format!("can't be {verb}: {} is read-only", display_path(folder)))
+}
+
+/// The destination itself when it exists, otherwise its nearest existing ancestor, on its planned path; it must be a
+/// folder.
+fn nearest_folder(destination: &Path) -> Result<PathBuf, String> {
+	let planned = planned_path(destination).map_err(|err| err.to_string())?;
+	let Some(folder) = planned.ancestors().find(|dir| dir.exists()) else {
+		return Err("no part of the path exists".into());
+	};
+
+	if !folder.is_dir() {
+		return Err(format!("{} is a file, not a folder", display_path(folder)));
 	}
+	Ok(folder.to_path_buf())
 }
 
 fn check_name(name: &str, project_file: Option<&Path>) -> Check {
@@ -207,38 +196,37 @@ fn has_entries(folder: &Path) -> bool {
 	fs::read_dir(folder).is_ok_and(|mut entries| entries.next().is_some())
 }
 
-/// Tries a new file in the destination when it exists. A missing destination is created later with all its missing
-/// parents, so a folder and a file inside it are tried in its nearest existing ancestor instead: some folders allow new
-/// subfolders but not new files. `planned` is the destination's planned path and `source` is canonical.
-fn probe(planned: &Path, exists: bool, source: &Path, remove: &dyn Fn(&Path) -> io::Result<()>) -> Probe {
-	let folder = if exists {
-		Some(planned)
-	} else {
-		planned.ancestors().skip(1).find(|dir| dir.exists())
-	};
-	let Some(folder) = folder else {
-		return Probe::Failed("no part of the path exists".into());
+/// What the probe at Create found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+	Writable,
+	/// Writing worked, but the probe folder couldn't be removed again; the text names it.
+	Leftover(String),
+	Failed(String),
+}
+
+/// The one check that writes, run when Create is pressed and every other check has passed: a probe folder with a
+/// file inside, in the planned destination's nearest existing folder, then both removed. Some folders allow new
+/// subfolders but not new files. Nothing is tried inside the source, which must exist.
+pub fn probe_destination(source: &Path, destination: &Path) -> Probe {
+	probe_with(source, destination, &remove_entry)
+}
+
+fn probe_with(source: &Path, destination: &Path, remove: &dyn Fn(&Path) -> io::Result<()>) -> Probe {
+	let (Ok(source), Ok(folder)) = (fs::canonicalize(source), nearest_folder(destination)) else {
+		return Probe::Failed("the folders changed; check them again".into());
 	};
 
-	if !folder.is_dir() {
-		return Probe::Failed(format!("{} is a file, not a folder", display_path(folder)));
-	}
-
-	if fs::canonicalize(folder).is_ok_and(|folder| folder.starts_with(source)) {
+	let inside_source = fs::canonicalize(&folder).is_ok_and(|folder| folder.starts_with(&source))
+		|| matches!(
+			identity_conflict(&source, &folder),
+			Some(RootConflict::Same | RootConflict::DestinationInsideSource)
+		);
+	if inside_source {
 		return Probe::Failed("its nearest existing folder is inside the source".into());
 	}
 
 	let entry = folder.join(probe_name());
-	if exists {
-		if let Err(err) = create_file(&entry) {
-			return Probe::Failed(err.to_string());
-		}
-		return match remove(&entry) {
-			Ok(()) => Probe::Writable,
-			Err(err) => leftover(entry, &err),
-		};
-	}
-
 	if let Err(err) = fs::create_dir(&entry) {
 		return Probe::Failed(err.to_string());
 	}
@@ -247,7 +235,10 @@ fn probe(planned: &Path, exists: bool, source: &Path, remove: &dyn Fn(&Path) -> 
 	match create_file(&inside) {
 		Ok(()) => match remove(&inside).and_then(|()| remove(&entry)) {
 			Ok(()) => Probe::Writable,
-			Err(err) => leftover(entry, &err),
+			Err(err) => Probe::Leftover(format!(
+				"the destination is writable, but the test folder {} couldn't be removed ({err}); please delete it",
+				display_path(&entry)
+			)),
 		},
 		Err(err) => match remove(&entry) {
 			Ok(()) => Probe::Failed(err.to_string()),
@@ -256,13 +247,6 @@ fn probe(planned: &Path, exists: bool, source: &Path, remove: &dyn Fn(&Path) -> 
 				display_path(&entry)
 			)),
 		},
-	}
-}
-
-fn leftover(path: PathBuf, err: &io::Error) -> Probe {
-	Probe::Leftover {
-		path,
-		reason: err.to_string(),
 	}
 }
 
@@ -292,6 +276,7 @@ fn probe_name() -> String {
 #[cfg(test)]
 mod tests {
 	use std::fs;
+	use std::time::SystemTime;
 
 	use cryarchiver_project::settings::plain_path;
 
@@ -299,7 +284,6 @@ mod tests {
 
 	struct Folders {
 		dir: tempfile::TempDir,
-		probes: std::cell::RefCell<Probes>,
 	}
 
 	impl Folders {
@@ -307,10 +291,7 @@ mod tests {
 			let dir = tempfile::tempdir().unwrap();
 			fs::create_dir(dir.path().join("photos")).unwrap();
 			fs::write(dir.path().join("photos").join("a.jpg"), b"jpg").unwrap();
-			Self {
-				dir,
-				probes: std::cell::RefCell::default(),
-			}
+			Self { dir }
 		}
 
 		fn path(&self, relative: &str) -> String {
@@ -322,16 +303,7 @@ mod tests {
 		}
 
 		fn validate(&self, source: &str, destination: &str, name: &str) -> Validation {
-			validate(
-				&self.path(source),
-				&self.path(destination),
-				name,
-				&mut self.probes.borrow_mut(),
-			)
-		}
-
-		fn probes_made(&self) -> usize {
-			self.probes.borrow().made()
+			validate(&self.path(source), &self.path(destination), name)
 		}
 
 		fn entries(&self) -> Vec<String> {
@@ -344,6 +316,14 @@ mod tests {
 		}
 	}
 
+	/// A folder's entries and modification time: creating and removing an entry changes the time.
+	fn state(folder: &Path) -> (usize, SystemTime) {
+		(
+			fs::read_dir(folder).unwrap().count(),
+			fs::metadata(folder).unwrap().modified().unwrap(),
+		)
+	}
+
 	fn invalid(check: &Check) -> String {
 		match check {
 			Check::Invalid(reason) => reason.clone(),
@@ -354,6 +334,7 @@ mod tests {
 	#[test]
 	fn a_valid_form_passes_and_leaves_nothing_behind() {
 		let folders = Folders::new();
+		let before = state(folders.dir.path());
 
 		let validation = folders.validate("photos", "archive", "Photos");
 
@@ -367,6 +348,7 @@ mod tests {
 		);
 		assert!(validation.free_space.is_some_and(|free| free > 0));
 		assert_eq!(folders.entries(), ["photos"]);
+		assert_eq!(state(folders.dir.path()), before);
 	}
 
 	#[test]
@@ -375,11 +357,7 @@ mod tests {
 
 		assert!(invalid(&folders.validate("missing", "archive", "a").source).contains("doesn't exist"));
 		assert!(invalid(&folders.validate("photos/a.jpg", "archive", "a").source).contains("not a folder"));
-		assert!(
-			!validate("", &folders.path("archive"), "a", &mut Probes::default())
-				.source
-				.is_valid()
-		);
+		assert!(!validate("", &folders.path("archive"), "a").source.is_valid());
 	}
 
 	#[test]
@@ -414,45 +392,36 @@ mod tests {
 		);
 		assert_eq!(folders.entries(), ["photos"]);
 		assert_eq!(fs::read_dir(folders.path("photos")).unwrap().count(), 1);
-		assert_eq!(folders.probes_made(), 0);
 	}
 
 	#[test]
-	fn nothing_is_probed_while_the_source_does_not_check_out() {
+	fn validating_while_typing_never_writes() {
 		let folders = Folders::new();
 		fs::create_dir(folders.path("photos2")).unwrap();
+		let (root, photos2) = (state(folders.dir.path()), state(Path::new(&folders.path("photos2"))));
 
-		for source in ["photo", "photos/a.jpg", "missing/deeper"] {
-			let validation = folders.validate(source, "photos2/archive", "a");
-
-			assert_eq!(validation.destination, Check::Pending(NOT_CHECKED.into()), "{source}");
-			assert!(!validation.passes());
+		for source in ["", "photo", "photos/a.jpg", "missing/deeper", "photos"] {
+			for destination in ["photos2/archive", "photos2", "new/archive"] {
+				folders.validate(source, destination, "a");
+			}
 		}
-		let mut probes = Probes::default();
-		let unfilled = validate("", &folders.path("photos2/archive"), "a", &mut probes);
-		assert_eq!(unfilled.destination, Check::Pending(NOT_CHECKED.into()));
-		assert_eq!(probes.made(), 0);
-		assert_eq!(folders.probes_made(), 0);
-		assert_eq!(fs::read_dir(folders.path("photos2")).unwrap().count(), 0);
 
-		assert_eq!(
-			folders.validate("photos", "photos2/archive", "a").destination,
-			Check::Valid
-		);
-		assert_eq!(folders.probes_made(), 1);
+		assert_eq!(state(folders.dir.path()), root);
+		assert_eq!(state(Path::new(&folders.path("photos2"))), photos2);
 	}
 
 	#[test]
-	fn editing_other_fields_does_not_probe_again() {
+	fn a_half_typed_source_that_names_an_existing_sibling_gets_no_write() {
 		let folders = Folders::new();
+		let typing = folders.dir.path().join("photos 2024");
+		fs::create_dir(&typing).unwrap();
+		let before = state(&typing);
 
-		for name in ["P", "Ph", "Photos"] {
-			assert!(folders.validate("photos", "archive", name).passes());
-		}
-		assert_eq!(folders.probes_made(), 1);
+		let validation = folders.validate("photos", "photos 2024/archive", "a");
 
-		folders.validate("photos", "archive2", "Photos");
-		assert_eq!(folders.probes_made(), 2);
+		assert_eq!(validation.destination, Check::Valid);
+		assert_eq!(state(&typing), before);
+		assert_eq!(state(Path::new(&folders.path("photos"))).0, 1);
 	}
 
 	#[test]
@@ -461,46 +430,48 @@ mod tests {
 		fs::write(folders.path("file"), b"").unwrap();
 
 		assert!(invalid(&folders.validate("photos", "file", "a").destination).contains("not a folder"));
-		assert!(!folders.validate("photos", "file/archive", "a").destination.is_valid());
-		assert!(
-			!validate(&folders.path("photos"), "", "a", &mut Probes::default())
-				.destination
-				.is_valid()
+		assert!(invalid(&folders.validate("photos", "file/archive", "a").destination).contains("not a folder"));
+		assert!(!validate(&folders.path("photos"), "", "a").destination.is_valid());
+	}
+
+	#[test]
+	fn the_probe_at_create_writes_only_outside_the_source_and_cleans_up() {
+		let folders = Folders::new();
+		let source = Path::new(&folders.path("photos")).to_path_buf();
+
+		assert_eq!(
+			probe_destination(&source, Path::new(&folders.path("new/archive"))),
+			Probe::Writable
 		);
+		assert_eq!(
+			probe_destination(&source, Path::new(&folders.path("photos/archive"))),
+			Probe::Failed("its nearest existing folder is inside the source".into())
+		);
+		assert_eq!(folders.entries(), ["photos"]);
+		assert_eq!(state(&source).0, 1);
 	}
 
 	#[test]
 	fn a_probe_that_cannot_be_removed_is_a_warning_naming_it() {
 		let folders = Folders::new();
-		let archive = folders.dir.path().join("archive");
-		fs::create_dir(&archive).unwrap();
-		let source = fs::canonicalize(folders.path("photos")).unwrap();
+		let source = Path::new(&folders.path("photos")).to_path_buf();
 		let held = |_: &Path| Err(io::Error::other("held open"));
 
-		let written = probe(&fs::canonicalize(&archive).unwrap(), true, &source, &held);
-		let created = probe(
-			&fs::canonicalize(folders.dir.path()).unwrap().join("new"),
-			false,
-			&source,
-			&held,
-		);
+		let probe = probe_with(&source, Path::new(&folders.path("archive")), &held);
 
-		for (probe, exists) in [(&written, true), (&created, false)] {
-			let Check::Warning(text) = destination_check(probe, exists, &archive) else {
-				panic!("{probe:?}");
-			};
-			assert!(text.starts_with("writable"), "{text}");
-			assert!(text.contains(PROBE_PREFIX), "{text}");
-			let Probe::Leftover { path, .. } = probe else {
-				panic!("{probe:?}");
-			};
-			if exists {
-				fs::remove_file(path).unwrap();
-			} else {
-				fs::remove_dir_all(path).unwrap();
-			}
-		}
-		assert_eq!(folders.entries(), ["archive", "photos"]);
+		let Probe::Leftover(text) = probe else {
+			panic!("{probe:?}");
+		};
+		assert!(text.starts_with("the destination is writable"), "{text}");
+		assert!(text.contains(PROBE_PREFIX), "{text}");
+		let leftover: Vec<PathBuf> = fs::read_dir(folders.dir.path())
+			.unwrap()
+			.map(|entry| entry.unwrap().path())
+			.filter(|path| path.to_string_lossy().contains(PROBE_PREFIX))
+			.collect();
+		assert_eq!(leftover.len(), 1);
+		fs::remove_dir_all(&leftover[0]).unwrap();
+		assert_eq!(folders.entries(), ["photos"]);
 	}
 
 	#[test]
@@ -568,6 +539,24 @@ mod tests {
 
 		assert!(invalid(&validation.name).contains("already exists"));
 		assert!(!validation.passes());
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn a_read_only_mark_on_a_windows_folder_is_only_a_warning() {
+		let folders = Folders::new();
+		let archive = folders.dir.path().join("archive");
+		fs::create_dir(&archive).unwrap();
+		let original = fs::metadata(&archive).unwrap().permissions();
+		let mut marked = original.clone();
+		marked.set_readonly(true);
+		fs::set_permissions(&archive, marked).unwrap();
+
+		let validation = folders.validate("photos", "archive", "a");
+		fs::set_permissions(&archive, original).unwrap();
+
+		assert_eq!(validation.destination, Check::Warning(MARKED_READ_ONLY.into()));
+		assert!(validation.passes());
 	}
 
 	/// Takes rights away from a folder for the current user, and gives them back when dropped.
@@ -651,8 +640,7 @@ mod tests {
 			invalid(&validation.source).contains("can't be listed"),
 			"{validation:?}"
 		);
-		assert_eq!(validation.destination, Check::Pending(NOT_CHECKED.into()));
-		assert_eq!(folders.probes_made(), 0);
+		assert!(!validation.passes());
 	}
 
 	#[test]
@@ -661,27 +649,26 @@ mod tests {
 		let archive = folders.dir.path().join("archive");
 		fs::create_dir(&archive).unwrap();
 		let attempt = archive.join("attempt");
+		let source = Path::new(&folders.path("photos")).to_path_buf();
 
 		let Some(denied) = Denied::apply(&archive, NO_NEW_ENTRIES, || {
-			let refused = create_file(&attempt).is_err();
-			let _ = fs::remove_file(&attempt);
+			let refused = fs::create_dir(&attempt).is_err();
+			let _ = fs::remove_dir(&attempt);
 			refused
 		}) else {
 			eprintln!("skipped: new entries are still allowed for this user");
 			return;
 		};
-		let existing = folders.validate("photos", "archive", "a");
-		let missing = folders.validate("photos", "archive/new", "a");
+		let existing = probe_destination(&source, &archive);
+		let missing = probe_destination(&source, &archive.join("new"));
+		let live = folders.validate("photos", "archive", "a");
 		drop(denied);
 
-		assert!(
-			invalid(&existing.destination).contains("can't be written"),
-			"{existing:?}"
-		);
-		assert!(
-			invalid(&missing.destination).contains("can't be created"),
-			"{missing:?}"
-		);
+		assert!(matches!(existing, Probe::Failed(_)), "{existing:?}");
+		assert!(matches!(missing, Probe::Failed(_)), "{missing:?}");
+		if cfg!(unix) {
+			assert!(invalid(&live.destination).contains("can't be written"), "{live:?}");
+		}
 		assert_eq!(fs::read_dir(&archive).unwrap().count(), 0);
 	}
 }
