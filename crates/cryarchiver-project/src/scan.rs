@@ -185,6 +185,8 @@ pub fn diff<S: BuildHasher>(stored: &HashMap<OsString, (u64, i64), S>, listing: 
 pub struct DestinationFile {
 	pub path: RelPath,
 	pub size: u64,
+	/// A link or a junction, listed as itself and never followed: never an archived file.
+	pub link: bool,
 }
 
 /// Every file in the destination except the project's own: the `.cryarchiver` folder and the project file.
@@ -211,7 +213,11 @@ pub fn walk_destination(root: &Path, project_file: &OsStr) -> Vec<DestinationFil
 			if kind.is_dir() {
 				folders.push_back(path);
 			} else if let Ok(meta) = entry.metadata() {
-				files.push(DestinationFile { path, size: meta.len() });
+				files.push(DestinationFile {
+					path,
+					size: meta.len(),
+					link: kind.is_symlink(),
+				});
 			}
 		}
 	}
@@ -406,6 +412,36 @@ mod tests {
 				("notes.txt".to_owned(), 2)
 			]
 		);
+	}
+
+	#[test]
+	fn the_destination_walk_lists_a_link_as_itself_and_never_follows_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().join("archive");
+		let elsewhere = dir.path().join("elsewhere");
+		fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&elsewhere).unwrap();
+		fs::write(elsewhere.join("a.avif"), b"1234").unwrap();
+		fs::write(root.join("notes.txt"), b"12").unwrap();
+
+		#[cfg(windows)]
+		let linked = std::process::Command::new("cmd")
+			.args(["/C", "mklink", "/J"])
+			.arg(root.join("Photos"))
+			.arg(&elsewhere)
+			.output()
+			.is_ok_and(|out| out.status.success());
+		#[cfg(unix)]
+		let linked = std::os::unix::fs::symlink(&elsewhere, root.join("Photos")).is_ok();
+		if !linked {
+			eprintln!("skipped: no folder link can be made here");
+			return;
+		}
+
+		let files = walk_destination(&root, OsStr::new("archive.cryarchive"));
+
+		let found: Vec<(String, bool)> = files.iter().map(|file| (file.path.display(), file.link)).collect();
+		assert_eq!(found, [("Photos".to_owned(), true), ("notes.txt".to_owned(), false)]);
 	}
 
 	#[test]

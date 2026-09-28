@@ -73,6 +73,7 @@ async fn archival_jobs_are_staged_with_the_source_times() {
 		.unwrap()
 		.set_modified(modified)
 		.unwrap();
+	fs::create_dir(dir.path().join("archive")).unwrap();
 	let sink = ArchivalSink::new(&dir.path().join("archive"));
 	let engine: Box<dyn Encode> = Box::new(Engine::new(support::toolchain().await));
 	let archival = Job {
@@ -91,6 +92,46 @@ async fn archival_jobs_are_staged_with_the_source_times() {
 	assert_eq!(output.extension().unwrap(), "opus");
 	assert_eq!(fs::metadata(&output).unwrap().modified().unwrap(), modified);
 	assert_eq!(fs::read_dir(sink.archive_work_root()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn an_archival_job_never_works_or_removes_anything_through_a_linked_work_area() {
+	let dir = tempfile::tempdir().unwrap();
+	let flac = support::tone(dir.path(), "a.flac", "stereo", 2, 10, &["-c:a", "flac"]);
+	let archive = dir.path().join("archive");
+	let elsewhere = dir.path().join("elsewhere");
+	fs::create_dir(&archive).unwrap();
+	fs::create_dir_all(elsewhere.join("work")).unwrap();
+	#[cfg(windows)]
+	let linked = std::process::Command::new("cmd")
+		.args(["/C", "mklink", "/J"])
+		.arg(archive.join(".cryarchiver"))
+		.arg(&elsewhere)
+		.output()
+		.is_ok_and(|out| out.status.success());
+	#[cfg(unix)]
+	let linked = std::os::unix::fs::symlink(&elsewhere, archive.join(".cryarchiver")).is_ok();
+	if !linked {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+	let engine: Box<dyn Encode> = Box::new(Engine::new(support::toolchain().await));
+
+	let outcome = engine
+		.encode(
+			&job(&flac),
+			&ArchivalSink::new(&archive),
+			&|_| {},
+			&CancellationToken::new(),
+		)
+		.await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if matches!(err.kind, ErrorKind::UnsafeDestination(_))),
+		"{outcome:?}"
+	);
+	assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 1);
+	assert_eq!(fs::read_dir(elsewhere.join("work")).unwrap().count(), 0);
 }
 
 #[derive(Default)]

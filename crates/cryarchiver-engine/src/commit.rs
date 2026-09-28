@@ -1,11 +1,13 @@
 use std::fs::{self, File, FileTimes, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::outcome::{ErrorKind, is_sharing_violation};
 use crate::text::display_path;
+use crate::workspace::CheckedFolders;
 
 const TRANSIENT_ATTEMPTS: u32 = 6;
 
@@ -34,6 +36,11 @@ pub enum Replace {
 
 pub trait OutputSink: Send + Sync {
 	fn work_root(&self, source: &Path) -> PathBuf;
+
+	/// The check the work root and each job folder in it must pass, when the sink has one.
+	fn work_folders(&self) -> Option<Arc<dyn CheckedFolders>> {
+		None
+	}
 
 	fn commit(&self, artifact: &Artifact) -> Result<PathBuf, CommitError>;
 }

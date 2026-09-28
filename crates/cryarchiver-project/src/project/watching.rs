@@ -8,9 +8,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::path::Path;
 use std::time::Instant;
 
-use cryarchiver_engine::text::display_name;
+use cryarchiver_engine::text::{display_name, display_path};
+use cryarchiver_engine::workspace::{IS_A_LINK, UnsafeFolder, check_real_folders, is_link};
 
 use super::owner::{Message, Owner};
 use crate::issues::{IssueKey, Problem};
@@ -58,6 +60,8 @@ impl WatchState {
 enum Found {
 	Size(u64),
 	Missing,
+	/// A link or a junction stands in its place or on its way.
+	Link(String),
 	Unclear(String),
 }
 
@@ -197,7 +201,11 @@ impl Owner {
 
 	pub(super) fn on_destination_listed(&mut self, files: &[DestinationFile]) {
 		self.watching.destination_walk = false;
-		let sizes: HashMap<&RelPath, u64> = files.iter().map(|file| (&file.path, file.size)).collect();
+		let sizes: HashMap<&RelPath, u64> = files
+			.iter()
+			.filter(|file| !file.link)
+			.map(|file| (&file.path, file.size))
+			.collect();
 
 		let mut ours: HashSet<RelPath> = self.placeholders_to_remove().cloned().collect();
 		let ids: Vec<FileId> = self.tree.file_ids().collect();
@@ -252,19 +260,14 @@ impl Owner {
 	}
 
 	/// The walk didn't find the output as recorded; only a direct look decides. A gone original's only copy going
-	/// missing or changing raises a Warning too, remembered so it isn't repeated on every reconcile.
+	/// missing, changing or turning into a link raises a Warning too, remembered so it isn't repeated on every
+	/// reconcile.
 	fn check_output(&mut self, file: FileId, output: Output) {
-		let found = match fs::symlink_metadata(self.destination_path(&output.path)) {
-			Ok(meta) if meta.is_file() => Found::Size(meta.len()),
-			Ok(_) => Found::Unclear("something other than a file is in its place".into()),
-			Err(err) if err.kind() == io::ErrorKind::NotFound => Found::Missing,
-			Err(err) => Found::Unclear(err.to_string()),
-		};
-
-		let (reason, changed) = match found {
+		let (reason, verb) = match self.look_up(&self.destination_path(&output.path)) {
 			Found::Size(size) if size == output.size => return,
-			Found::Size(_) => ("the archived file changed size", true),
-			Found::Missing => ("the archived file is missing", false),
+			Found::Size(_) => ("the archived file changed size".to_owned(), "has changed"),
+			Found::Missing => ("the archived file is missing".to_owned(), "is missing"),
+			Found::Link(reason) => (reason, "is behind a link"),
 			Found::Unclear(reason) => {
 				self.log(
 					LogKind::Action,
@@ -283,15 +286,33 @@ impl Owner {
 				FileState::Issue {
 					kind: IssueKind::OutputMissing,
 					attempt: 0,
-					reason: reason.into(),
+					reason,
 					output: Some(output),
 				},
 			),
 			FileState::SourceGone(_) | FileState::OriginalDeleted(_) => {
 				self.log(LogKind::Action, format!("{}: {reason}", output.path.display()));
-				self.warn_only_copy(file, if changed { "has changed" } else { "is missing" });
+				self.warn_only_copy(file, verb);
 			}
 			_ => self.log(LogKind::Action, format!("{}: {reason}", output.path.display())),
+		}
+	}
+
+	/// A link on the way to the output, or in its place, is named: whatever it leads to is no archived file.
+	fn look_up(&self, path: &Path) -> Found {
+		let refused = path
+			.parent()
+			.and_then(|folder| check_real_folders(&self.settings.destination, folder).err());
+		if let Some(link) = refused.as_ref().and_then(UnsafeFolder::of) {
+			return Found::Link(format!("the archived file's folder {link}"));
+		}
+
+		match fs::symlink_metadata(path) {
+			Ok(meta) if is_link(&meta) => Found::Link(format!("the archived file {} {IS_A_LINK}", display_path(path))),
+			Ok(meta) if meta.is_file() => Found::Size(meta.len()),
+			Ok(_) => Found::Unclear("something other than a file is in its place".into()),
+			Err(err) if err.kind() == io::ErrorKind::NotFound => Found::Missing,
+			Err(err) => Found::Unclear(err.to_string()),
 		}
 	}
 
@@ -459,6 +480,78 @@ mod tests {
 		assert_eq!(owner.watching.unknown.get(&key("old.doc")), Some(&true));
 	}
 
+	/// A second name for the folder `target`: a junction on Windows, a symbolic link elsewhere.
+	fn link_folder(link: &std::path::Path, target: &std::path::Path) -> bool {
+		#[cfg(windows)]
+		return std::process::Command::new("cmd")
+			.args(["/C", "mklink", "/J"])
+			.arg(link)
+			.arg(target)
+			.output()
+			.is_ok_and(|out| out.status.success());
+
+		#[cfg(unix)]
+		return std::os::unix::fs::symlink(target, link).is_ok();
+	}
+
+	fn walked(destination: &std::path::Path) -> Vec<DestinationFile> {
+		walk_destination(destination, OsStr::new("archive.cryarchive"))
+	}
+
+	#[test]
+	fn an_archived_file_replaced_by_a_link_is_an_issue_that_names_it_and_never_deleted_for() {
+		let (dir, mut owner, _updates, destination) = fixture();
+		let original = dir.path().join("source").join("a.txt");
+		fs::write(&original, b"four").unwrap();
+		#[cfg(unix)]
+		let linked = std::os::unix::fs::symlink(&original, destination.join("a.txt")).is_ok();
+		#[cfg(windows)]
+		let linked = std::os::windows::fs::symlink_file(&original, destination.join("a.txt")).is_ok();
+		if !linked {
+			eprintln!("skipped: no file link can be made here");
+			return;
+		}
+		let file = add(&mut owner, "a.txt", FileState::Done(copied("a.txt", 4)));
+
+		owner.on_destination_listed(&walked(&destination));
+
+		let FileState::Issue { kind, reason, .. } = state(&owner, file) else {
+			panic!("not an issue: {:?}", state(&owner, file));
+		};
+		assert_eq!(*kind, IssueKind::OutputMissing);
+		assert!(reason.contains("a.txt") && reason.contains("link"), "{reason}");
+		assert!(!owner.deletable(file));
+		assert_eq!(fs::read(&original).unwrap(), b"four");
+	}
+
+	#[test]
+	fn an_archived_files_folder_swapped_for_a_link_is_named_in_its_issue() {
+		let (dir, mut owner, _updates, destination) = fixture();
+		let elsewhere = dir.path().join("elsewhere");
+		fs::create_dir_all(&elsewhere).unwrap();
+		fs::write(elsewhere.join("a.txt"), b"four").unwrap();
+		if !link_folder(&destination.join("Photos"), &elsewhere) {
+			eprintln!("skipped: no folder link can be made here");
+			return;
+		}
+		let photos = owner.tree.ensure_folder(&key("Photos"));
+		let record = FileRecord {
+			state: FileState::Done(copied("Photos/a.txt", 4)),
+			..FileRecord::discovered(4, 1)
+		};
+		let file = owner.tree.add_file(photos, OsStr::new("a.txt"), record);
+
+		owner.on_destination_listed(&walked(&destination));
+
+		let FileState::Issue { reason, .. } = state(&owner, file) else {
+			panic!("not an issue: {:?}", state(&owner, file));
+		};
+		assert!(
+			reason.starts_with("the archived file's folder ") && reason.contains("Photos") && reason.contains("link"),
+			"{reason}"
+		);
+	}
+
 	#[test]
 	fn only_files_no_record_names_are_unknown() {
 		let (_dir, mut owner, _updates, destination) = fixture();
@@ -478,6 +571,7 @@ mod tests {
 			.map(|name| DestinationFile {
 				path: key(name),
 				size: 1,
+				link: false,
 			})
 			.collect();
 

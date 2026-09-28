@@ -52,6 +52,10 @@ pub enum StoreError {
 	Unavailable,
 	#[error("not a project file")]
 	NotAProjectFile,
+	#[error(
+		"the project file has {0} names (hard links), and writing it would change it under every other name too; it is neither opened nor made while it has more than one"
+	)]
+	HardLinked(u64),
 	#[error(transparent)]
 	Io(#[from] io::Error),
 	#[error("project file error: {0}")]
@@ -152,6 +156,7 @@ impl Store {
 			Err(err) if err.kind() == io::ErrorKind::AlreadyExists => return Err(exists()),
 			result => result?,
 		};
+		refuse_other_names(&file)?;
 		let db = Database::builder().create_file(file)?;
 		write_new(&db, settings)?;
 
@@ -163,9 +168,8 @@ impl Store {
 	}
 
 	pub fn open(path: &Path) -> Result<(Self, Meta, Loaded), StoreError> {
-		if !path.is_file() {
-			return Err(io::Error::new(io::ErrorKind::NotFound, "no project file at this path").into());
-		}
+		require_a_file(path)?;
+		refuse_other_names(&open_in_place(path)?)?;
 
 		let db = Database::open(path)?;
 		let meta = read_meta(&db)?;
@@ -423,6 +427,65 @@ fn create_new_file(path: &Path) -> io::Result<fs::File> {
 		.open(path)
 }
 
+fn require_a_file(path: &Path) -> Result<(), StoreError> {
+	if path.is_file() {
+		return Ok(());
+	}
+	Err(io::Error::new(io::ErrorKind::NotFound, "no project file at this path").into())
+}
+
+/// Another name for the project file, inside a source say, would have that file written too.
+fn refuse_other_names(file: &fs::File) -> Result<(), StoreError> {
+	match link_count(file)? {
+		0 | 1 => Ok(()),
+		names => Err(StoreError::HardLinked(names)),
+	}
+}
+
+/// Opens the entry itself, never a link's target, for reading its information only.
+#[cfg(windows)]
+fn open_in_place(path: &Path) -> io::Result<fs::File> {
+	use std::os::windows::fs::OpenOptionsExt;
+
+	use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+	fs::OpenOptions::new()
+		.access_mode(0)
+		.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+		.open(path)
+}
+
+#[cfg(unix)]
+fn open_in_place(path: &Path) -> io::Result<fs::File> {
+	use std::os::unix::fs::OpenOptionsExt;
+
+	fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+		.open(path)
+}
+
+#[cfg(windows)]
+fn link_count(file: &fs::File) -> io::Result<u64> {
+	use std::os::windows::io::AsRawHandle;
+
+	use windows::Win32::Foundation::HANDLE;
+	use windows::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+
+	let mut info = BY_HANDLE_FILE_INFORMATION::default();
+	// SAFETY: the handle is owned by `file` and valid for the call.
+	unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut info) }
+		.map_err(|err| io::Error::from_raw_os_error(err.code().0 & 0xFFFF))?;
+	Ok(u64::from(info.nNumberOfLinks))
+}
+
+#[cfg(unix)]
+fn link_count(file: &fs::File) -> io::Result<u64> {
+	use std::os::unix::fs::MetadataExt;
+
+	Ok(file.metadata()?.nlink())
+}
+
 fn write_new(db: &Database, settings: &Settings) -> Result<(), StoreError> {
 	let created = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -520,8 +583,19 @@ pub fn peek(path: &Path) -> Result<Peeked, StoreError> {
 		Presence::Unavailable => return Err(StoreError::Unavailable),
 	}
 
+	peek_within(path, RECOVERY_PEEK_LIMIT)
+}
+
+/// The meta table of a project that isn't open, read without writing anything to the file, whatever its size: an open
+/// decides its refusals on it before the file is opened for writing, which writes to it at once.
+pub fn read_closed(path: &Path) -> Result<Meta, StoreError> {
+	require_a_file(path)?;
+	peek_within(path, u64::MAX).map(|peeked| peeked.meta)
+}
+
+fn peek_within(path: &Path, recovery_limit: u64) -> Result<Peeked, StoreError> {
 	let (meta, needs_recovery) = match ReadOnlyDatabase::open(path) {
-		Err(redb::DatabaseError::RepairAborted) => (read_unclean(path)?, true),
+		Err(redb::DatabaseError::RepairAborted) => (read_unclean(path, recovery_limit)?, true),
 		opened => (read_meta(&opened?)?, false),
 	};
 	if meta.format > FORMAT_VERSION {
@@ -531,13 +605,13 @@ pub fn peek(path: &Path) -> Result<Peeked, StoreError> {
 }
 
 /// Copies the file into memory under a shared lock and lets redb recover the copy, so the settings of a project that
-/// wasn't closed cleanly can be shown without opening it.
-fn read_unclean(path: &Path) -> Result<Meta, StoreError> {
+/// wasn't closed cleanly can be read without opening it.
+fn read_unclean(path: &Path, limit: u64) -> Result<Meta, StoreError> {
 	use std::fs::TryLockError;
 	use std::io::Read;
 
 	let mut file = std::fs::File::open(path)?;
-	if file.metadata()?.len() > RECOVERY_PEEK_LIMIT {
+	if file.metadata()?.len() > limit {
 		return Err(StoreError::NeedsRecovery);
 	}
 

@@ -1,10 +1,12 @@
+use std::fmt;
 use std::fs::{self, File, FileType, Metadata, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use ulid::Ulid;
 
-use crate::commit::retry_transient;
+use crate::commit::{OutputSink, retry_transient};
 use crate::text::display_path;
 
 pub const CLI_WORK_DIR: &str = ".cry-work";
@@ -17,26 +19,82 @@ pub const OUTSIDE_THE_DESTINATION: &str = "leads out of the destination";
 
 const LOCK_FILE: &str = "job.lock";
 
+/// The folders an archive makes, and removes anything from, only while they pass the archive's own check.
+pub trait CheckedFolders: Send + Sync + fmt::Debug {
+	/// Creates what `folder` lacks, one name at a time and never through a link; each folder a new name goes into is
+	/// checked first, and `folder` itself last.
+	fn prepare(&self, folder: &Path) -> io::Result<()>;
+
+	/// Checks a folder that must already be there, creating nothing.
+	fn check(&self, folder: &Path) -> io::Result<()>;
+}
+
+/// The least an archive's folders must be: below the base folder, and reached without a link.
+#[derive(Debug, Clone)]
+pub struct RealFolders(pub PathBuf);
+
+impl CheckedFolders for RealFolders {
+	fn prepare(&self, folder: &Path) -> io::Result<()> {
+		create_real_folders(&self.0, folder, |_| Ok(())).map(drop)
+	}
+
+	fn check(&self, folder: &Path) -> io::Result<()> {
+		check_real_folders(&self.0, folder)
+	}
+}
+
 pub struct Workspace {
 	dir: PathBuf,
 	root: PathBuf,
 	lock: Option<File>,
+	folders: Option<Arc<dyn CheckedFolders>>,
 }
 
 impl Workspace {
+	/// A job folder in `root`, which must not be a link itself; the folders above it may be.
 	pub fn create(root: &Path, source: &Path) -> io::Result<Self> {
 		if fs::symlink_metadata(root).is_ok_and(|meta| is_link(&meta)) {
 			return Err(UnsafeFolder::error(root, IS_A_LINK));
 		}
 
+		fs::create_dir_all(root)?;
+		Self::make(root, source, None)
+	}
+
+	/// A job folder in `root`, where `root` and the job folder are made through `folders`, and nothing is removed
+	/// from either unless it still passes them.
+	pub fn create_checked(root: &Path, source: &Path, folders: Arc<dyn CheckedFolders>) -> io::Result<Self> {
+		folders.prepare(root)?;
+		Self::make(root, source, Some(folders))
+	}
+
+	/// The job folder `sink` has the work for `source` done in.
+	pub fn for_sink(sink: &dyn OutputSink, source: &Path) -> io::Result<Self> {
+		let root = sink.work_root(source);
+		match sink.work_folders() {
+			Some(folders) => Self::create_checked(&root, source, folders),
+			None => Self::create(&root, source),
+		}
+	}
+
+	fn make(root: &Path, source: &Path, folders: Option<Arc<dyn CheckedFolders>>) -> io::Result<Self> {
 		let dir = root.join(Ulid::generate().to_string());
-		fs::create_dir_all(&dir)?;
+		fs::create_dir(&dir)?;
+		let mut workspace = Self {
+			dir,
+			root: root.to_path_buf(),
+			lock: None,
+			folders,
+		};
+
+		workspace.check_root()?;
+		real_folder(&workspace.dir)?;
 
 		let lock = OpenOptions::new()
 			.create(true)
 			.write(true)
 			.truncate(true)
-			.open(dir.join(LOCK_FILE))?;
+			.open(workspace.file(LOCK_FILE))?;
 		match lock.try_lock() {
 			Ok(()) | Err(TryLockError::Error(_)) => {
 				// Filesystems without lock support report an error; the job then runs unlocked
@@ -44,19 +102,16 @@ impl Workspace {
 			}
 			Err(TryLockError::WouldBlock) => return Err(io::Error::other("workspace is locked by another job")),
 		}
+		workspace.lock = Some(lock);
 
 		let info = serde_json::json!({
 			"source": source.to_string_lossy(),
 			"pid": std::process::id(),
 			"version": crate::VERSION,
 		});
-		fs::write(dir.join("job.json"), info.to_string())?;
+		fs::write(workspace.file("job.json"), info.to_string())?;
 
-		Ok(Self {
-			dir,
-			root: root.to_path_buf(),
-			lock: Some(lock),
-		})
+		Ok(workspace)
 	}
 
 	pub fn dir(&self) -> &Path {
@@ -66,13 +121,29 @@ impl Workspace {
 	pub fn file(&self, name: &str) -> PathBuf {
 		self.dir.join(name)
 	}
+
+	/// A job folder that is a real folder right in a root that passes is one too, so only the root gets the full check.
+	fn check_root(&self) -> io::Result<()> {
+		match &self.folders {
+			Some(folders) => folders.check(&self.root),
+			None => real_folder(&self.root),
+		}
+	}
 }
 
+/// Nothing is removed through a link: the removal would land wherever it leads.
 impl Drop for Workspace {
 	fn drop(&mut self) {
 		drop(self.lock.take());
-		remove_dir(&self.dir);
-		let _ = fs::remove_dir(&self.root);
+
+		let root_ours = self.check_root().is_ok();
+		if root_ours && real_folder(&self.dir).is_ok() {
+			remove_dir(&self.dir);
+		}
+
+		if root_ours {
+			let _ = fs::remove_dir(&self.root);
+		}
 	}
 }
 

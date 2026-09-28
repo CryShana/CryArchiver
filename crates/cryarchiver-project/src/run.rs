@@ -9,7 +9,9 @@ use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use cryarchiver_engine::commit::{FileIdentity, SourceTimes, file_id, rename_no_replace, retry_transient};
-use cryarchiver_engine::workspace::{OUTSIDE_THE_DESTINATION, UnsafeFolder, check_real_folders, create_real_folders};
+use cryarchiver_engine::workspace::{
+	CheckedFolders, OUTSIDE_THE_DESTINATION, UnsafeFolder, check_real_folders, create_real_folders,
+};
 
 use crate::dedup::full_hash;
 use crate::record::{Hash, Identity, mtime_ns};
@@ -19,6 +21,8 @@ const COPY_BUFFER: usize = 1 << 20;
 const READ_BACK_BUFFER: usize = 4 << 20;
 
 pub const INSIDE_THE_SOURCE: &str = "leads into the source";
+pub const LINK_OR_NOT_A_FILE: &str = "is a link, a junction or not a regular file";
+pub const THE_ORIGINAL_ITSELF: &str = "is the original itself, or a hard link to it";
 
 const NOT_A_REGULAR_FILE: &str = "not a regular file";
 const OUTSIDE_THE_SOURCE: &str = "its real path is outside the source folder";
@@ -160,6 +164,16 @@ impl ArchiveFolders {
 	}
 }
 
+impl CheckedFolders for ArchiveFolders {
+	fn prepare(&self, folder: &Path) -> io::Result<()> {
+		ArchiveFolders::prepare(self, folder).map(drop)
+	}
+
+	fn check(&self, folder: &Path) -> io::Result<()> {
+		ArchiveFolders::check(self, folder)
+	}
+}
+
 /// Renames a staged file to its final path. It never replaces anything, except the output this same source file
 /// had before (a re-archive after the source changed, or a rewritten placeholder). Both folders must pass
 /// [`ArchiveFolders`]: the staged file's may be another output's, taken over.
@@ -204,12 +218,39 @@ pub fn placeholder_links_to(text: &str, link: &str) -> bool {
 	text.lines().nth(1) == Some(link.replace('/', MAIN_SEPARATOR_STR).as_str())
 }
 
+/// What reading an archived file back found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBack {
+	Matches,
+	Differs,
+	/// Not a copy of its own, whatever it holds: what it is instead.
+	NotACopy(&'static str),
+}
+
 /// Reads the file back from the medium, past the page cache, with large sequential reads, and checks its size and
-/// BLAKE3.
-pub fn read_back(path: &Path, size: u64, hash: Hash) -> io::Result<bool> {
-	let mut file = native::open_uncached(path)?;
-	if file.metadata()?.len() != size {
-		return Ok(false);
+/// BLAKE3. Only a regular file of its own counts: it is opened without following a link, and a link or any other
+/// reparse point, or a file with the identity of one of `originals` (the original itself, or a hard link to it), is
+/// never read as the copy.
+pub fn read_back(path: &Path, size: u64, hash: Hash, originals: &[Identity]) -> io::Result<ReadBack> {
+	if native::not_a_plain_file(&fs::symlink_metadata(path)?) {
+		return Ok(ReadBack::NotACopy(LINK_OR_NOT_A_FILE));
+	}
+
+	let mut file = match native::open_uncached(path) {
+		Err(err) if native::is_a_link(&err) => return Ok(ReadBack::NotACopy(LINK_OR_NOT_A_FILE)),
+		opened => opened?,
+	};
+	let held = file.metadata()?;
+	if native::not_a_plain_file(&held) {
+		return Ok(ReadBack::NotACopy(LINK_OR_NOT_A_FILE));
+	}
+
+	if originals.contains(&native::identity(&file)?) {
+		return Ok(ReadBack::NotACopy(THE_ORIGINAL_ITSELF));
+	}
+
+	if held.len() != size {
+		return Ok(ReadBack::Differs);
 	}
 
 	#[cfg(windows)]
@@ -218,7 +259,11 @@ pub fn read_back(path: &Path, size: u64, hash: Hash) -> io::Result<bool> {
 	let mut buffer = vec![0; READ_BACK_BUFFER];
 	let (read, actual) = hash_through(&mut file, &mut buffer, SHORT_READ_IS_EOF, |_| Ok(()))?;
 
-	Ok(read == size && actual == hash)
+	Ok(if read == size && actual == hash {
+		ReadBack::Matches
+	} else {
+		ReadBack::Differs
+	})
 }
 
 pub fn source_unchanged(path: &Path, size: u64, modified_ns: i64) -> bool {
@@ -357,7 +402,7 @@ fn sync_entries(_target: &Path, _created: &[PathBuf]) {}
 mod native {
 	use std::alloc::{self, Layout};
 	use std::ffi::OsString;
-	use std::fs::{File, OpenOptions};
+	use std::fs::{File, Metadata, OpenOptions};
 	use std::io;
 	use std::ops::{Deref, DerefMut};
 	use std::os::windows::ffi::OsStringExt;
@@ -437,11 +482,21 @@ mod native {
 		.map_err(|err| to_io(&err))
 	}
 
+	/// A link or other reparse point is opened in its own place, never followed.
 	pub fn open_uncached(path: &Path) -> io::Result<File> {
 		OpenOptions::new()
 			.read(true)
-			.custom_flags(FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_SEQUENTIAL_SCAN.0)
+			.custom_flags(FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_SEQUENTIAL_SCAN.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
 			.open(path)
+	}
+
+	pub fn not_a_plain_file(meta: &Metadata) -> bool {
+		!meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+	}
+
+	/// Windows opens a link in its own place instead of refusing it.
+	pub fn is_a_link(_err: &io::Error) -> bool {
+		false
 	}
 
 	pub fn open_folder_for_times(path: &Path) -> io::Result<File> {
@@ -491,7 +546,7 @@ mod native {
 		}
 	}
 
-	fn identity(file: &File) -> io::Result<Identity> {
+	pub fn identity(file: &File) -> io::Result<Identity> {
 		let mut info = BY_HANDLE_FILE_INFORMATION::default();
 
 		// SAFETY: the handle is owned by `file` and valid for the call.
@@ -715,9 +770,13 @@ mod native {
 		fs::rename(from, to)
 	}
 
-	/// The fsync writes back any dirty pages so that dropping the cached ones leaves nothing to read but the medium.
+	/// Never through a link. The fsync writes back any dirty pages so that dropping the cached ones leaves nothing to
+	/// read but the medium.
 	pub fn open_uncached(path: &Path) -> io::Result<File> {
-		let file = File::open(path)?;
+		let file = OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+			.open(path)?;
 
 		#[cfg(target_os = "linux")]
 		{
@@ -731,6 +790,23 @@ mod native {
 		}
 
 		Ok(file)
+	}
+
+	pub fn not_a_plain_file(meta: &fs::Metadata) -> bool {
+		!meta.is_file()
+	}
+
+	/// What opening a link without following it gives.
+	pub fn is_a_link(err: &io::Error) -> bool {
+		err.raw_os_error() == Some(libc::ELOOP)
+	}
+
+	pub fn identity(file: &File) -> io::Result<Identity> {
+		let meta = file.metadata()?;
+		Ok(Identity {
+			volume: meta.dev(),
+			index: meta.ino(),
+		})
 	}
 
 	pub fn open_folder_for_times(path: &Path) -> io::Result<File> {
@@ -1085,12 +1161,66 @@ mod tests {
 		let output = dir.path().join("a.avif");
 		let staged = write_staged(&output, b"encoded bytes", None).unwrap();
 
-		assert!(read_back(&output, staged.size, staged.hash).unwrap());
+		assert_eq!(
+			read_back(&output, staged.size, staged.hash, &[]).unwrap(),
+			ReadBack::Matches
+		);
 
 		fs::write(&output, b"encoded bytez").unwrap();
-		assert!(!read_back(&output, staged.size, staged.hash).unwrap());
+		assert_eq!(
+			read_back(&output, staged.size, staged.hash, &[]).unwrap(),
+			ReadBack::Differs
+		);
 		fs::write(&output, b"short").unwrap();
-		assert!(!read_back(&output, staged.size, staged.hash).unwrap());
+		assert_eq!(
+			read_back(&output, staged.size, staged.hash, &[]).unwrap(),
+			ReadBack::Differs
+		);
+	}
+
+	#[test]
+	fn read_back_never_takes_a_link_or_the_original_itself_for_the_copy() {
+		let dir = tempfile::tempdir().unwrap();
+		let original = dir.path().join("a.pdf");
+		fs::write(&original, b"the only copy").unwrap();
+		let hash = Hash(*blake3::hash(b"the only copy").as_bytes());
+		let originals = [Identity::from(file_id(&original).unwrap())];
+		let output = dir.path().join("archived.pdf");
+
+		fs::hard_link(&original, &output).unwrap();
+		assert_eq!(
+			read_back(&output, 13, hash, &originals).unwrap(),
+			ReadBack::NotACopy(THE_ORIGINAL_ITSELF)
+		);
+		assert_eq!(
+			read_back(&original, 13, hash, &originals).unwrap(),
+			ReadBack::NotACopy(THE_ORIGINAL_ITSELF)
+		);
+		fs::remove_file(&output).unwrap();
+
+		fs::create_dir(&output).unwrap();
+		assert_eq!(
+			read_back(&output, 13, hash, &originals).unwrap(),
+			ReadBack::NotACopy(LINK_OR_NOT_A_FILE)
+		);
+		fs::remove_dir(&output).unwrap();
+
+		#[cfg(unix)]
+		let linked = std::os::unix::fs::symlink(&original, &output).is_ok();
+		#[cfg(windows)]
+		let linked = std::os::windows::fs::symlink_file(&original, &output).is_ok();
+		if linked {
+			assert_eq!(
+				read_back(&output, 13, hash, &[]).unwrap(),
+				ReadBack::NotACopy(LINK_OR_NOT_A_FILE)
+			);
+			fs::remove_file(&output).unwrap();
+		} else {
+			eprintln!("skipped the file link: can't create one here");
+		}
+
+		fs::copy(&original, &output).unwrap();
+		assert_eq!(read_back(&output, 13, hash, &originals).unwrap(), ReadBack::Matches);
 	}
 
 	#[test]
@@ -1104,12 +1234,12 @@ mod tests {
 		let size = content.len() as u64;
 		let hash = Hash(*blake3::hash(&content).as_bytes());
 
-		assert!(read_back(&output, size, hash).unwrap());
-		assert!(!read_back(&output, size + 1, hash).unwrap());
+		assert_eq!(read_back(&output, size, hash, &[]).unwrap(), ReadBack::Matches);
+		assert_eq!(read_back(&output, size + 1, hash, &[]).unwrap(), ReadBack::Differs);
 
 		*content.last_mut().unwrap() ^= 1;
 		fs::write(&output, &content).unwrap();
-		assert!(!read_back(&output, size, hash).unwrap());
+		assert_eq!(read_back(&output, size, hash, &[]).unwrap(), ReadBack::Differs);
 	}
 
 	#[cfg(target_os = "linux")]

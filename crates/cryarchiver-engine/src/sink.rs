@@ -1,13 +1,14 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ulid::Ulid;
 
 use crate::commit::{Artifact, CommitError, OutputSink, Replace, commit_file};
 use crate::container::OUTPUT_EXTENSIONS;
 use crate::naming::{cli_output_dir, cli_output_path};
-use crate::workspace::{ARCHIVE_DIR, ARCHIVE_WORK_DIR, CLI_WORK_DIR, STAGED_DIR, create_real_folders};
+use crate::workspace::{ARCHIVE_DIR, ARCHIVE_WORK_DIR, CLI_WORK_DIR, CheckedFolders, RealFolders, STAGED_DIR};
 
 #[derive(Debug, Clone)]
 pub struct CliSink {
@@ -57,12 +58,20 @@ impl OutputSink for CliSink {
 #[derive(Debug, Clone)]
 pub struct ArchivalSink {
 	destination: PathBuf,
+	folders: Arc<dyn CheckedFolders>,
 }
 
 impl ArchivalSink {
+	/// Its folders are made and used only while every one from the destination down is a real folder.
 	pub fn new(destination: &Path) -> Self {
+		Self::checked_by(destination, Arc::new(RealFolders(destination.to_path_buf())))
+	}
+
+	/// Every folder the sink or a job's workspace makes, or removes anything from, passes `folders` first.
+	pub fn checked_by(destination: &Path, folders: Arc<dyn CheckedFolders>) -> Self {
 		Self {
 			destination: destination.to_path_buf(),
+			folders,
 		}
 	}
 
@@ -89,10 +98,14 @@ impl OutputSink for ArchivalSink {
 		self.archive_work_root()
 	}
 
+	fn work_folders(&self) -> Option<Arc<dyn CheckedFolders>> {
+		Some(self.folders.clone())
+	}
+
 	fn commit(&self, artifact: &Artifact) -> Result<PathBuf, CommitError> {
 		let extension = artifact.path.extension().unwrap_or_default().to_string_lossy();
 		let staged = self.staged_path(&extension);
-		create_real_folders(&self.destination, &self.staged_dir(), |_| Ok(()))?;
+		self.folders.prepare(&self.staged_dir())?;
 
 		commit_file(artifact, &staged, Replace::Never)?;
 		Ok(staged)

@@ -1,9 +1,13 @@
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::workspace::{
-	CLI_WORK_DIR, UnsafeFolder, Workspace, check_real_folders, create_real_folders, sweep,
+	ARCHIVE_DIR, ARCHIVE_WORK_DIR, CLI_WORK_DIR, CheckedFolders, RealFolders, UnsafeFolder, Workspace,
+	check_real_folders, create_real_folders, sweep,
 };
 
 /// A second name for the folder `target`: a junction on Windows, a symbolic link elsewhere. False when one can't be
@@ -145,6 +149,129 @@ fn a_workspace_is_never_made_through_a_link() {
 	assert!(Workspace::create(&root, "a.flac".as_ref()).is_err());
 
 	assert_untouched(&outside);
+}
+
+/// A destination beside `outside`, and a user's empty `work` folder in `outside`.
+fn archive_beside(out: &Path, outside: &Path) -> PathBuf {
+	let archive = out.join("archive");
+	fs::create_dir(&archive).unwrap();
+	fs::create_dir(outside.join("work")).unwrap();
+	archive
+}
+
+#[test]
+fn an_archive_workspace_is_never_made_through_a_link_above_its_root() {
+	let out = tempfile::tempdir().unwrap();
+	let outside = outside(out.path());
+	let archive = archive_beside(out.path(), &outside);
+	let link = archive.join(ARCHIVE_DIR);
+	if !link_folder(&link, &outside) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+
+	let refused = Workspace::for_sink(&ArchivalSink::new(&archive), "a.flac".as_ref())
+		.err()
+		.expect("the workspace was made through the link");
+
+	assert_eq!(UnsafeFolder::of(&refused).map(|folder| &folder.path), Some(&link));
+	assert_eq!(fs::read_dir(outside.join("work")).unwrap().count(), 0);
+	assert_eq!(fs::read_dir(&outside).unwrap().count(), 3);
+	assert_untouched_but_work(&outside);
+}
+
+#[test]
+fn an_archive_workspace_removes_nothing_through_a_link_planted_while_it_runs() {
+	let out = tempfile::tempdir().unwrap();
+	let outside = outside(out.path());
+	let archive = archive_beside(out.path(), &outside);
+	let workspace = Workspace::for_sink(&ArchivalSink::new(&archive), "a.flac".as_ref()).unwrap();
+	let job = workspace.dir().file_name().unwrap().to_owned();
+	assert_eq!(
+		workspace.dir(),
+		archive.join(ARCHIVE_DIR).join(ARCHIVE_WORK_DIR).join(&job)
+	);
+
+	if fs::rename(archive.join(ARCHIVE_DIR), archive.join("moved")).is_err() {
+		eprintln!("skipped: the work area can't be moved while its job holds the lock here");
+		return;
+	}
+	fs::create_dir(outside.join("work").join(&job)).unwrap();
+	fs::write(outside.join("work").join(&job).join("keep.txt"), b"keep").unwrap();
+	if !link_folder(&archive.join(ARCHIVE_DIR), &outside) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+	drop(workspace);
+
+	assert_eq!(
+		fs::read(outside.join("work").join(&job).join("keep.txt")).unwrap(),
+		b"keep"
+	);
+	assert_untouched_but_work(&outside);
+}
+
+/// Real folders below the base, until `refuse` is set.
+#[derive(Debug)]
+struct Refusable {
+	real: RealFolders,
+	refuse: AtomicBool,
+}
+
+impl CheckedFolders for Refusable {
+	fn prepare(&self, folder: &Path) -> io::Result<()> {
+		self.real.prepare(folder)
+	}
+
+	fn check(&self, folder: &Path) -> io::Result<()> {
+		if self.refuse.load(Ordering::SeqCst) {
+			return Err(io::Error::other("refused"));
+		}
+		self.real.check(folder)
+	}
+}
+
+#[test]
+fn an_archive_workspace_is_removed_only_while_its_folders_still_pass_their_check() {
+	let out = tempfile::tempdir().unwrap();
+	let archive = out.path().join("archive");
+	fs::create_dir(&archive).unwrap();
+	let folders = Arc::new(Refusable {
+		real: RealFolders(archive.clone()),
+		refuse: AtomicBool::new(false),
+	});
+	let root = archive.join(ARCHIVE_DIR).join(ARCHIVE_WORK_DIR);
+
+	let workspace = Workspace::create_checked(&root, "a.flac".as_ref(), folders.clone()).unwrap();
+	let dir = workspace.dir().to_path_buf();
+	folders.refuse.store(true, Ordering::SeqCst);
+	drop(workspace);
+
+	assert!(dir.join("job.lock").is_file());
+	assert!(dir.join("job.json").is_file());
+}
+
+#[test]
+fn an_archive_workspace_is_made_one_folder_at_a_time_and_removed_after() {
+	let out = tempfile::tempdir().unwrap();
+	let archive = out.path().join("archive");
+	fs::create_dir(&archive).unwrap();
+
+	let workspace = Workspace::for_sink(&ArchivalSink::new(&archive), "a.flac".as_ref()).unwrap();
+	let dir = workspace.dir().to_path_buf();
+	assert!(dir.join("job.lock").is_file());
+	drop(workspace);
+
+	assert!(!dir.exists());
+	assert!(!archive.join(ARCHIVE_DIR).join(ARCHIVE_WORK_DIR).exists());
+	assert!(Workspace::for_sink(&ArchivalSink::new(&out.path().join("missing")), "a.flac".as_ref()).is_err());
+	assert!(!out.path().join("missing").exists());
+}
+
+fn assert_untouched_but_work(outside: &Path) {
+	assert_eq!(fs::read(outside.join("victim").join("keep.txt")).unwrap(), b"keep");
+	assert_eq!(fs::read(outside.join("top.txt")).unwrap(), b"top");
+	assert!(outside.join("work").is_dir());
 }
 
 #[test]

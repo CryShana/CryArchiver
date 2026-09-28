@@ -117,6 +117,8 @@ impl Pipeline {
 		memory: Arc<MemoryBudget>,
 		quality: Arc<SharedMemory>,
 	) -> Self {
+		let folders = ArchiveFolders::new(source, destination);
+
 		Self {
 			observed: HashMap::new(),
 			checking: HashSet::new(),
@@ -134,8 +136,8 @@ impl Pipeline {
 			image_threads,
 			memory,
 			quality,
-			sink: ArchivalSink::new(destination),
-			folders: ArchiveFolders::new(source, destination),
+			sink: ArchivalSink::checked_by(destination, Arc::new(folders.clone())),
+			folders,
 			refused_folders: HashSet::new(),
 			disk: DiskGuard::default(),
 			last_disk_check: None,

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::owner::Message;
 use crate::keys::RelPath;
 use crate::record::{CopyReason, Hash, How, Identity, mtime_ns};
-use crate::run::{self, ArchiveFolders, Deletion, Expected, Staged};
+use crate::run::{self, ArchiveFolders, Deletion, Expected, ReadBack, Staged};
 use crate::tree::FileId;
 
 /// How an output was made, before the project names it.
@@ -483,22 +483,29 @@ impl JobContext {
 
 /// The read-back and source checks of spec §9, cheapest first. A source that can't be reached is an error: it proves
 /// neither a change nor that the original is gone. So is an archived file that can't be read back: only its content
-/// can prove it damaged.
+/// can prove it damaged. An archived file that is a link, or the original itself under another name, is no copy at
+/// all, whatever it reads.
 fn verify_before_delete(
 	check: &DeleteCheck,
 	source: &Path,
 	size: u64,
 	mtime_ns: i64,
 ) -> Result<Result<(), Refusal>, JobError> {
-	let read_back = |path: &Path, size, hash| read_back(path, size, hash).map_err(|err| destination_error(path, &err));
-
 	let archived = source_as_archived(source, size, mtime_ns).map_err(|err| JobError::io(IoSide::Source(source), &err));
 	if let Err(refusal) = archived? {
 		return Ok(Err(refusal));
 	}
 
-	if !read_back(&check.output, check.size, check.hash)? {
-		return Ok(Err(Refusal::OutputDamaged));
+	let originals: Vec<Identity> = std::iter::once(check.identity)
+		.chain(file_id(source).ok().map(Identity::from))
+		.collect();
+	let read_back =
+		|path: &Path, size, hash| read_back(path, size, hash, &originals).map_err(|err| destination_error(path, &err));
+
+	match read_back(&check.output, check.size, check.hash)? {
+		ReadBack::Matches => {}
+		ReadBack::Differs => return Ok(Err(Refusal::OutputDamaged)),
+		ReadBack::NotACopy(what) => return Ok(Err(Refusal::Kept(format!("the archived copy {what}")))),
 	}
 
 	let Some(placeholder) = &check.placeholder else {
@@ -516,10 +523,16 @@ fn verify_before_delete(
 		)));
 	}
 
-	if !read_back(&placeholder.output, placeholder.size, placeholder.hash)? {
-		return Ok(Err(Refusal::Kept(
-			"the archived copy it points to doesn't match its BLAKE3".into(),
-		)));
+	match read_back(&placeholder.output, placeholder.size, placeholder.hash)? {
+		ReadBack::Matches => {}
+		ReadBack::Differs => {
+			return Ok(Err(Refusal::Kept(
+				"the archived copy it points to doesn't match its BLAKE3".into(),
+			)));
+		}
+		ReadBack::NotACopy(what) => {
+			return Ok(Err(Refusal::Kept(format!("the archived copy it points to {what}"))));
+		}
 	}
 
 	if let Some(canonical) = &placeholder.same_file {
@@ -541,9 +554,9 @@ fn verify_before_delete(
 }
 
 /// A missing archived file is as good as a damaged one; any other error reading it proves nothing.
-fn read_back(path: &Path, size: u64, hash: Hash) -> io::Result<bool> {
-	match run::read_back(path, size, hash) {
-		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+fn read_back(path: &Path, size: u64, hash: Hash, originals: &[Identity]) -> io::Result<ReadBack> {
+	match run::read_back(path, size, hash, originals) {
+		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ReadBack::Differs),
 		result => result,
 	}
 }

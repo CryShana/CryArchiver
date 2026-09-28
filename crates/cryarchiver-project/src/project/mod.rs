@@ -229,13 +229,18 @@ fn checked_name(name: &OsStr) -> Result<(), ProjectError> {
 	})
 }
 
-/// Creates `<destination>/<name>.cryarchive` for a new project. The destination is created if needed.
+/// Creates `<destination>/<name>.cryarchive` for a new project. The destination is created if needed. Nothing is
+/// created for settings that are refused.
 pub fn create(
 	source: &Path,
 	destination: &Path,
 	name: &OsStr,
 	configure: impl FnOnce(&mut Settings),
 ) -> Result<PathBuf, ProjectError> {
+	let mut settings = Settings::new(source, destination);
+	configure(&mut settings);
+	settings.overrides.validate().map_err(SettingsError::Overrides)?;
+
 	checked_name(name)?;
 	let (canonical_source, planned) = approved_destination(source, destination)?;
 	create_folders(&planned, |folder| outside_source(&canonical_source, folder))?;
@@ -243,8 +248,8 @@ pub fn create(
 
 	let path = project_file(&destination, name)?;
 	refuse_outside(&path, &destination, name)?;
-	let mut settings = Settings::new(&source, &destination);
-	configure(&mut settings);
+	settings.source = source;
+	settings.destination = destination;
 	settings.overrides = settings.overrides.normalized();
 	Store::create(&path, &settings)?;
 	Ok(path)
@@ -395,6 +400,8 @@ impl Project {
 				path: display_path(path),
 			});
 		}
+
+		open::refuse_to_open(path, &crate::store::read_closed(path)?.settings)?;
 
 		let (store, meta, loaded) = Store::open(path)?;
 		let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -38,6 +38,14 @@ use crate::tree::{FileId, FolderId, Tree};
 use crate::view::Update;
 use crate::watch::Debouncer;
 
+/// Every refusal an open makes from the project file's place and settings alone. They run on the settings read
+/// without writing, before the file is opened for writing, and again on the settings that open loads.
+pub(super) fn refuse_to_open(project_file: &Path, settings: &Settings) -> Result<(), ProjectError> {
+	refuse_a_moved_project(project_file, &settings.destination)?;
+	refuse_a_linked_work_area(&settings.destination)?;
+	refuse_overlapping_roots(settings)
+}
+
 /// Every destination path is the stored one, so a project file copied or moved elsewhere would drive the archive it
 /// came from; it is opened only from its own archive's folder, found from the file's real path.
 fn refuse_a_moved_project(project_file: &Path, destination: &Path) -> Result<(), ProjectError> {
@@ -100,9 +108,7 @@ impl Owner {
 		options: ProjectOptions,
 		updates: Sender<Update>,
 	) -> Result<Self, ProjectError> {
-		refuse_a_moved_project(project_file, &settings.destination)?;
-		refuse_a_linked_work_area(&settings.destination)?;
-		refuse_overlapping_roots(&settings)?;
+		refuse_to_open(project_file, &settings)?;
 		fs::create_dir_all(&settings.destination)?;
 		let (messages, inbox) = unbounded_channel();
 		let unknown = loaded

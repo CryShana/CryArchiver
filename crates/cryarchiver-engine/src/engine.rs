@@ -310,7 +310,7 @@ impl Engine {
 			SourceTimes::from_metadata(&meta).map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
 		let work_root = sink.work_root(&job.source);
 		// Must outlive `finish`: dropping the workspace deletes the staged output.
-		let workspace = open_workspace(&work_root, &job.source, meta.len())?;
+		let workspace = open_workspace(sink, &work_root, &job.source, meta.len())?;
 
 		let cx = Context {
 			job,
@@ -1063,9 +1063,14 @@ fn disk_full(err: JobError, work_root: &Path, source_bytes: u64) -> JobError {
 	JobError::with_log(ErrorKind::InsufficientSpace { need, free }, err.log_tail)
 }
 
-fn open_workspace(work_root: &Path, source: &Path, source_bytes: u64) -> Result<Workspace, JobError> {
+fn open_workspace(
+	sink: &dyn OutputSink,
+	work_root: &Path,
+	source: &Path,
+	source_bytes: u64,
+) -> Result<Workspace, JobError> {
 	check_space(work_root, source_bytes)?;
-	Workspace::create(work_root, source).map_err(|err| JobError::io(IoSide::Destination(work_root), &err))
+	Workspace::for_sink(sink, source).map_err(|err| JobError::io(IoSide::Destination(work_root), &err))
 }
 
 fn finish(

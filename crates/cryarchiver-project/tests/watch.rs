@@ -66,6 +66,45 @@ fn files_created_during_a_watched_run_are_archived() {
 }
 
 #[test]
+fn a_work_area_linked_into_the_source_while_watching_gets_nothing_made_in_it_or_removed_from_it() {
+	let setup = setup(|settings| settings.watch = true);
+	write(&setup.source, "first.jpg", &jpeg(1, 100));
+	let victim = setup.source.join("Other");
+	fs::create_dir_all(victim.join("work")).unwrap();
+	let project = support::open(&setup, &FakeEncoder::new());
+	let mut snapshot = Snapshot::default();
+	start(&project);
+	wait_for_file(&project, &mut snapshot, &setup.destination.join("first.avif"));
+	wait_for(&project, &mut snapshot, "watching", watching);
+
+	let work_area = setup.destination.join(".cryarchiver");
+	if work_area.exists() {
+		fs::remove_dir_all(&work_area).unwrap();
+	}
+	if !support::link_folder(&work_area, &victim) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+	write(&setup.source, "second.jpg", &jpeg(2, 100));
+
+	wait_for(&project, &mut snapshot, "an issue for second.jpg", |s| {
+		s.issues.iter().any(|issue| issue.name == "second.jpg")
+	});
+	drop(project);
+
+	assert_eq!(support::names_in(&victim), ["work"]);
+	assert!(support::names_in(&victim.join("work")).is_empty());
+	assert!(!setup.destination.join("second.avif").exists());
+	let FileState::Issue { reason, .. } = state(&setup, "second.jpg") else {
+		panic!("second.jpg is not an issue: {:?}", state(&setup, "second.jpg"));
+	};
+	assert!(
+		reason.contains(&support::shown(&work_area)) && reason.contains("link"),
+		"{reason}"
+	);
+}
+
+#[test]
 fn a_file_written_slowly_is_archived_only_once_it_is_still() {
 	let setup = setup(|settings| {
 		settings.watch = true;

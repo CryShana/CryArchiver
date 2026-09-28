@@ -730,6 +730,102 @@ mod tests {
 	}
 
 	#[test]
+	fn a_verified_archived_copy_lets_its_original_go() {
+		let mut fixture = Fixture::new();
+		let notes = fixture.copy("notes.txt", b"notes");
+		fixture.owner.start(true);
+
+		fixture.run_deletes();
+
+		assert!(!fixture.source("notes.txt").exists());
+		assert_eq!(fs::read(fixture.destination("notes.txt")).unwrap(), b"notes");
+		assert_eq!(
+			fixture.state(notes),
+			FileState::OriginalDeleted(copied("notes.txt", b"notes"))
+		);
+	}
+
+	#[test]
+	fn an_archived_copy_replaced_by_a_link_to_its_original_never_lets_the_original_go() {
+		let mut fixture = Fixture::new();
+		let notes = fixture.copy("notes.txt", b"notes");
+		fs::remove_file(fixture.destination("notes.txt")).unwrap();
+		#[cfg(unix)]
+		let linked = std::os::unix::fs::symlink(fixture.source("notes.txt"), fixture.destination("notes.txt")).is_ok();
+		#[cfg(windows)]
+		let linked =
+			std::os::windows::fs::symlink_file(fixture.source("notes.txt"), fixture.destination("notes.txt")).is_ok();
+		if !linked {
+			eprintln!("skipped: no file link can be made here");
+			return;
+		}
+		fixture.owner.start(true);
+
+		fixture.run_deletes();
+
+		assert_eq!(fs::read(fixture.source("notes.txt")).unwrap(), b"notes");
+		assert!(matches!(fixture.state(notes), FileState::Done(_)));
+		let said = fixture.said();
+		assert!(
+			said.contains(
+				&"notes.txt: original kept: the archived copy is a link, a junction or not a regular file".into()
+			),
+			"{said:?}"
+		);
+	}
+
+	#[test]
+	fn an_archived_copy_that_is_a_hard_link_to_its_original_never_lets_the_original_go() {
+		let mut fixture = Fixture::new();
+		let notes = fixture.copy("notes.txt", b"notes");
+		fs::remove_file(fixture.destination("notes.txt")).unwrap();
+		fs::hard_link(fixture.source("notes.txt"), fixture.destination("notes.txt")).unwrap();
+		fixture.owner.start(true);
+
+		fixture.run_deletes();
+
+		assert_eq!(fs::read(fixture.source("notes.txt")).unwrap(), b"notes");
+		assert!(matches!(fixture.state(notes), FileState::Done(_)));
+		let said = fixture.said();
+		assert!(
+			said.contains(
+				&"notes.txt: original kept: the archived copy is the original itself, or a hard link to it".into()
+			),
+			"{said:?}"
+		);
+	}
+
+	#[test]
+	fn a_placeholders_original_is_kept_while_its_canonical_copys_archived_file_is_that_original() {
+		let content = vec![7; 1000];
+		let mut fixture = Fixture::new();
+		let canonical = fixture.copy("a.bin", &content);
+		let duplicate = fixture.placeholder("b.bin", &content, "a.bin");
+		fs::remove_file(fixture.destination("a.bin")).unwrap();
+		fs::hard_link(fixture.source("b.bin"), fixture.destination("a.bin")).unwrap();
+		fixture.owner.start(true);
+		fixture
+			.owner
+			.pipeline
+			.queues
+			.get_mut(&Work::Delete)
+			.unwrap()
+			.remove(canonical);
+
+		fixture.run_deletes();
+
+		assert_eq!(fs::read(fixture.source("b.bin")).unwrap(), content);
+		assert!(matches!(fixture.state(duplicate), FileState::Done(_)));
+		let said = fixture.said();
+		assert!(
+			said.iter().any(|line| line.ends_with(
+				"original kept: the archived copy it points to is the original itself, or a hard link to it"
+			)),
+			"{said:?}"
+		);
+	}
+
+	#[test]
 	fn a_placeholder_is_deleted_only_while_its_canonical_copy_holds_the_content() {
 		let content = vec![7; 1000];
 		let mut fixture = Fixture::new();

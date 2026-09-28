@@ -159,7 +159,11 @@ impl Owner {
 			return;
 		}
 
-		let present: HashSet<RelPath> = files.iter().map(|file| file.path.clone()).collect();
+		let present: HashSet<RelPath> = files
+			.iter()
+			.filter(|file| !file.link)
+			.map(|file| file.path.clone())
+			.collect();
 		let mut report = complete::check(
 			self.tree
 				.file_ids()

@@ -1395,8 +1395,8 @@ fn a_new_project_stores_its_overrides_normalized() {
 				mean: 90.04,
 				floor: 85.06,
 			}),
-			image: Some(200.0),
-			audio_stereo_kbps: Some(99),
+			image: Some(80.04),
+			audio_stereo_kbps: Some(160),
 		};
 	});
 
@@ -1409,8 +1409,81 @@ fn a_new_project_stores_its_overrides_normalized() {
 				mean: 90.0,
 				floor: 85.1,
 			}),
-			image: Some(95.0),
-			audio_stereo_kbps: Some(96),
+			image: Some(80.0),
+			audio_stereo_kbps: Some(160),
 		}
 	);
+}
+
+#[test]
+fn a_new_project_with_an_invalid_override_is_refused_with_its_reason_and_nothing_is_created() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+	let destination = dir.path().join("new").join("archive");
+
+	for (overrides, reason) in [
+		(
+			Overrides {
+				image: Some(200.0),
+				..Overrides::default()
+			},
+			"between 50 and 95",
+		),
+		(
+			Overrides {
+				audio_stereo_kbps: Some(99),
+				..Overrides::default()
+			},
+			"in steps of 8",
+		),
+	] {
+		let refused = cryarchiver_project::create(&source, &destination, OsStr::new("archive"), |settings| {
+			settings.overrides = overrides;
+		});
+
+		let Err(err) = refused else {
+			panic!("{overrides:?}: the project was made");
+		};
+		assert!(err.to_string().contains(reason), "{err}");
+		assert!(!dir.path().join("new").exists(), "{overrides:?}");
+		assert_eq!(support::names_in(dir.path()), ["source"]);
+	}
+}
+
+#[test]
+fn a_project_file_with_another_name_is_refused_and_never_written() {
+	let setup = setup(|_| {});
+	let other_name = setup.dir.path().join("other name.cryarchive");
+	fs::hard_link(&setup.project, &other_name).unwrap();
+	let before = fs::read(&setup.project).unwrap();
+
+	let refused = try_open(&setup.project);
+
+	let Err(err @ ProjectError::Store(StoreError::HardLinked(2))) = refused else {
+		panic!("the hard-linked project file opened");
+	};
+	assert!(err.to_string().contains("hard link"), "{err}");
+	assert_eq!(fs::read(&setup.project).unwrap(), before);
+	assert_eq!(fs::read(&other_name).unwrap(), before);
+
+	fs::remove_file(&other_name).unwrap();
+	assert!(try_open(&setup.project).is_ok());
+}
+
+#[test]
+fn a_refused_open_leaves_the_project_file_as_it_was() {
+	let setup = setup(|_| {});
+	drop(support::open(&setup, &FakeEncoder::new()));
+	let elsewhere = setup.dir.path().join("elsewhere");
+	fs::create_dir(&elsewhere).unwrap();
+	let copy = elsewhere.join("archive.cryarchive");
+	fs::copy(&setup.project, &copy).unwrap();
+	let before = fs::read(&copy).unwrap();
+
+	let refused = try_open(&copy);
+
+	assert!(matches!(refused, Err(ProjectError::Moved { .. })), "the copy opened");
+	assert!(fs::read(&copy).unwrap() == before, "the refused copy was written");
+	assert_eq!(support::names_in(&elsewhere), ["archive.cryarchive"]);
 }

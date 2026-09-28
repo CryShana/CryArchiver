@@ -13,8 +13,9 @@ use std::time::{Duration, Instant, SystemTime};
 use cryarchiver_engine::commit::{Artifact, OutputSink, SourceTimes};
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::naming::is_media_name;
-use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome, KeepReason};
+use cryarchiver_engine::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use cryarchiver_engine::quality::memory::QualityMemory;
+use cryarchiver_engine::workspace::Workspace;
 use cryarchiver_project::issues::IssueId;
 use cryarchiver_project::settings::Settings;
 use cryarchiver_project::tree::{FileId, FolderId, FolderStats};
@@ -179,10 +180,13 @@ fn replace_keeping_the_time(path: &Path, content: &[u8], scratch: &Path) {
 	fs::rename(&replacement, path).unwrap();
 }
 
+/// Works in a job folder of the engine's own workspace, as the engine does.
 fn stage(job: &Job, sink: &dyn OutputSink, extension: &str, name: &str) -> JobOutcome {
-	let work_root = sink.work_root(&job.source);
-	fs::create_dir_all(&work_root).unwrap();
-	let work = work_root.join(format!("fake-{}.{extension}", ulid::Ulid::generate()));
+	let workspace = match Workspace::for_sink(sink, &job.source) {
+		Ok(workspace) => workspace,
+		Err(err) => return JobOutcome::Failed(JobError::io(IoSide::Destination(&sink.work_root(&job.source)), &err)),
+	};
+	let work = workspace.file(&format!("fake.{extension}"));
 	fs::write(&work, format!("encoded {name}")).unwrap();
 
 	let times = SourceTimes::from_metadata(&fs::metadata(&job.source).unwrap()).unwrap();
