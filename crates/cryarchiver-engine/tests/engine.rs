@@ -11,6 +11,7 @@ use cryarchiver_engine::images::plan::worst_case_memory;
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::{Stream, probe};
+use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
 use tokio_util::sync::CancellationToken;
@@ -918,4 +919,271 @@ async fn a_video_that_shrinks_passes_the_prediction() {
 
 	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
 	assert!(stages.lock().unwrap().contains(&JobEvent::Stage(Stage::Sample)));
+}
+
+async fn run_recording(engine: &Engine, job: &Job, out_dir: &Path) -> (JobOutcome, Vec<JobEvent>) {
+	let events = Mutex::new(Vec::new());
+	let outcome = engine
+		.run(
+			job,
+			&sink(out_dir),
+			&|event| events.lock().unwrap().push(event),
+			&CancellationToken::new(),
+		)
+		.await;
+	(outcome, events.into_inner().unwrap())
+}
+
+fn stages(events: &[JobEvent], stage: Stage) -> usize {
+	events.iter().filter(|event| **event == JobEvent::Stage(stage)).count()
+}
+
+#[tokio::test]
+async fn moderate_video_is_searched_checked_and_learned() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, events) = run_recording(&engine, &job(&clip), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
+	assert_eq!(
+		stages(&events, Stage::Verify),
+		2,
+		"the VMAF check and the final checks: {events:?}"
+	);
+	assert_eq!(stages(&events, Stage::Encode), 1, "{events:?}");
+	let entries = memory.entries();
+	assert_eq!(entries.len(), 1, "{entries:?}");
+	assert!(
+		entries[0].0.starts_with("video/mpeg4/sd/fps25/sdr8/progressive/"),
+		"{entries:?}"
+	);
+	assert!(entries[0].0.contains("|p5|"), "{entries:?}");
+	assert!(entries[0].1.bpp.is_some_and(|bpp| bpp > 0.0), "{entries:?}");
+}
+
+#[tokio::test]
+async fn a_learned_group_skips_the_search_at_moderate() {
+	let dir = tempfile::tempdir().unwrap();
+	let first = support::mpeg4(dir.path(), "first.mp4", 3);
+	let second = support::mpeg4(dir.path(), "second.mp4", 3);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	run_recording(&engine, &job(&first), dir.path()).await;
+	let (outcome, events) = run_recording(&engine, &job(&second), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	assert_eq!(stages(&events, Stage::Sample), 0, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 2, "{events:?}");
+	assert_eq!(memory.entries()[0].1.observations, 2);
+}
+
+#[tokio::test]
+async fn fast_video_is_never_measured_or_learned() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, events) = run_recording(&engine, &fast(&clip), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	assert_eq!(stages(&events, Stage::Sample), 0, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 1, "{events:?}");
+	assert!(memory.entries().is_empty());
+}
+
+#[tokio::test]
+async fn a_missed_check_encodes_the_video_once_more_at_most() {
+	let dir = tempfile::tempdir().unwrap();
+	let first = support::mpeg4(dir.path(), "first.mp4", 3);
+	let second = support::mpeg4(dir.path(), "second.mp4", 3);
+	let tools = support::toolchain().await;
+	let learned = Arc::new(SharedMemory::default());
+	run_recording(
+		&Engine::new(tools.clone()).with_quality_memory(learned.clone()),
+		&job(&first),
+		dir.path(),
+	)
+	.await;
+	let (key, stats) = learned.entries().remove(0);
+	let careless = Arc::new(SharedMemory::with_entries([(
+		key,
+		GroupStats { setting: 55.0, ..stats },
+	)]));
+	let engine = Engine::new(tools).with_quality_memory(careless);
+
+	let (outcome, events) = run_recording(&engine, &job(&second), dir.path()).await;
+
+	assert_eq!(stages(&events, Stage::Encode), 2, "{events:?}");
+	match outcome {
+		JobOutcome::Encoded { warnings, .. } => assert!(
+			warnings.iter().any(|warning| warning.contains("encoded again at CRF")),
+			"{warnings:?}"
+		),
+		JobOutcome::KeptOriginal {
+			reason: KeepReason::QualityUnreachable(_) | KeepReason::NotSmaller { .. },
+		} => {}
+		other => panic!("{other:?}"),
+	}
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn interlaced_moderate_video_is_verified_at_double_rate() {
+	let dir = tempfile::tempdir().unwrap();
+	let interlaced = dir.path().join("tff.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=720x576:r=50:d=4,interlace=scan=tff,setfield=tff",
+		"-c:v",
+		"mpeg2video",
+		"-b:v",
+		"12M",
+		"-flags",
+		"+ilme+ildct",
+		interlaced.to_str().unwrap(),
+	]);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, events) = run_recording(&engine, &job(&interlaced), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	assert_eq!(stages(&events, Stage::Verify), 2, "{events:?}");
+	let entries = memory.entries();
+	assert!(
+		entries[0].0.starts_with("video/mpeg2/sd/fps50/sdr8/interlaced/"),
+		"{entries:?}"
+	);
+}
+
+#[tokio::test]
+async fn cancelling_the_search_leaves_nothing_behind() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 20);
+	let engine = Engine::new(support::toolchain().await);
+	let cancel = CancellationToken::new();
+	let trigger = cancel.clone();
+	let on_event = move |event: JobEvent| {
+		if event == JobEvent::Stage(Stage::Sample) {
+			let trigger = trigger.clone();
+			tokio::spawn(async move {
+				tokio::time::sleep(Duration::from_millis(300)).await;
+				trigger.cancel();
+			});
+		}
+	};
+
+	let outcome = engine.run(&job(&clip), &sink(dir.path()), &on_event, &cancel).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.kind == ErrorKind::Cancelled),
+		"{outcome:?}"
+	);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+	assert!(!dir.path().join("clip.cry.mkv").exists());
+}
+
+#[tokio::test]
+async fn a_video_of_unknown_duration_is_encoded_at_the_table_crf_and_checked() {
+	let dir = tempfile::tempdir().unwrap();
+	let live = dir.path().join("live.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=3",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		"-live",
+		"1",
+		live.to_str().unwrap(),
+	]);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, events) = run_recording(&engine, &job(&live), dir.path()).await;
+
+	let JobOutcome::Encoded { warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings.iter().any(|warning| warning.contains("not searched")),
+		"{warnings:?}"
+	);
+	assert_eq!(stages(&events, Stage::Sample), 0, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 2, "{events:?}");
+	assert_eq!(memory.entries().len(), 1);
+}
+
+#[tokio::test]
+async fn a_long_searched_video_is_predicted_from_the_search_samples() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "long.mp4", 125);
+	let engine = Engine::new(support::toolchain().await);
+	let demanding = Job {
+		min_savings: 1.0,
+		..job(&clip)
+	};
+
+	let (outcome, events) = run_recording(&engine, &demanding, dir.path()).await;
+
+	assert!(
+		matches!(
+			outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::PredictedNotSmaller { .. }
+			}
+		),
+		"{outcome:?}"
+	);
+	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
+	assert_eq!(stages(&events, Stage::Encode), 0, "{events:?}");
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn a_search_that_cannot_reach_the_target_keeps_the_original_before_encoding() {
+	let dir = tempfile::tempdir().unwrap();
+	let faint_noise = dir.path().join("faint-noise.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=gray:s=320x240:r=25:d=3,noise=alls=10:allf=t",
+		"-pix_fmt",
+		"yuv420p",
+		"-c:v",
+		"ffv1",
+		faint_noise.to_str().unwrap(),
+	]);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, events) = run_recording(&engine, &job(&faint_noise), dir.path()).await;
+
+	let JobOutcome::KeptOriginal {
+		reason: KeepReason::QualityUnreachable(reason),
+	} = outcome
+	else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		reason.contains("target 93.0 / 89.0") || reason.contains("target 91.0 / 86.5"),
+		"{reason}"
+	);
+	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
+	assert!(events.contains(&JobEvent::Progress(0.75)), "four probes: {events:?}");
+	assert_eq!(stages(&events, Stage::Encode), 0, "{events:?}");
+	assert!(memory.entries().is_empty());
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
 }

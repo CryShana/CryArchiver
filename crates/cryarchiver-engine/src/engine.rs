@@ -18,10 +18,16 @@ use crate::metadata::MetadataMode;
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use crate::preset::Speed;
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
+use crate::quality::keys::{CacheKey, Group, VideoGroup};
+use crate::quality::memory::{GroupStats, Observation, QualityMemory, SharedMemory};
+use crate::quality::search::{self, DEFAULT_SLOPE, MAX_PROBES, Target};
 use crate::text::display_path;
 use crate::toolchain::{MediaKind, Toolchain};
+use crate::video::analyze::Analysis;
+use crate::video::encode::{EncodedVideo, Sample};
 use crate::video::mux::{self, Attachment, MuxInputs, MuxPlan};
-use crate::video::plan::{self as video_plan, VideoCaps, VideoPlan, plan_video, precheck};
+use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck};
+use crate::video::quality::{self as video_quality, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{Extracted, StreamPlan, plan_streams};
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
@@ -98,7 +104,9 @@ pub struct Engine {
 	tools: Toolchain,
 	video_slots: Semaphore,
 	image_threads: usize,
+	metric_threads: usize,
 	memory_gate: Option<Arc<dyn MemoryGate>>,
+	quality: Arc<dyn QualityMemory>,
 }
 
 struct Context<'a> {
@@ -142,17 +150,54 @@ struct Temp {
 struct EncodedTemps {
 	video: Temp,
 	audio: Option<Temp>,
+	encoded: EncodedVideo,
 	warnings: Vec<String>,
+}
+
+struct VideoInputs<'a> {
+	info: &'a MediaInfo,
+	streams: &'a StreamPlan,
+	declared_s: Option<f64>,
+}
+
+struct VideoQuality {
+	key: CacheKey,
+	stats: Option<GroupStats>,
+	target: Target,
+	strategy: Strategy,
+	slope: f64,
+}
+
+impl VideoQuality {
+	fn start(&self) -> f64 {
+		match self.strategy {
+			Strategy::Search { start } => start,
+			Strategy::Fixed { crf, .. } => crf,
+		}
+	}
+}
+
+enum Tuning {
+	Keep(KeepReason),
+	Encode { verify: bool },
 }
 
 impl Engine {
 	pub fn new(tools: Toolchain) -> Self {
+		let cores = std::thread::available_parallelism().map_or(1, usize::from);
 		Self {
 			tools,
 			video_slots: Semaphore::new(1),
-			image_threads: std::thread::available_parallelism().map_or(1, usize::from),
+			image_threads: cores,
+			metric_threads: cores,
 			memory_gate: None,
+			quality: Arc::new(SharedMemory::default()),
 		}
+	}
+
+	#[must_use]
+	pub fn with_quality_memory(self, quality: Arc<dyn QualityMemory>) -> Self {
+		Self { quality, ..self }
 	}
 
 	#[must_use]
@@ -430,23 +475,48 @@ impl Engine {
 
 		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
 		let declared_s = main.declared_duration().or(info.format.duration);
+		let segments = video_quality::analysis_segments(cx.job.speed);
 		let analysis = Box::pin(analyze::analyze(
 			&self.tools,
 			source,
 			main,
 			declared_s,
-			analyze::DEFAULT_SEGMENTS,
+			segments,
 			cx.cancel,
 		))
 		.await?;
-		let video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
-
-		if let Some(reason) = Box::pin(self.sample_gate(cx, workspace, &info, &video, &streams, declared_s)).await? {
-			return Ok(Produced::Kept(reason));
+		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
+		let mut quality = self.video_quality(cx.job.speed, main, &analysis, &video);
+		if cx.job.speed != Speed::Fast && !self.tools.has_vmaf() {
+			video
+				.warnings
+				.push("libvmaf is not available: the video quality was not measured".to_owned());
 		}
 
+		let learned_bpp = quality.stats.and_then(|stats| stats.bpp);
+		if let Some(reason) = learned_bpp.and_then(|bpp| video_plan::efficient_at(&info, main, bpp)) {
+			return Ok(Produced::Kept(KeepReason::AlreadyEfficient(reason)));
+		}
+
+		let inputs = VideoInputs {
+			info: &info,
+			streams: &streams,
+			declared_s,
+		};
+		let verify =
+			match Box::pin(self.choose_crf(cx, workspace, &inputs, &analysis, &mut video, &mut quality)).await? {
+				Tuning::Keep(reason) => return Ok(Produced::Kept(reason)),
+				Tuning::Encode { verify } => verify,
+			};
+
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
-		let temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &streams, declared_s)).await?;
+		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &streams, declared_s)).await?;
+		if verify
+			&& let Some(reason) =
+				Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await?
+		{
+			return Ok(Produced::Kept(reason));
+		}
 
 		let job = VideoJob {
 			info: &info,
@@ -457,6 +527,231 @@ impl Engine {
 			streams: &streams,
 		};
 		Box::pin(self.mux_and_verify(cx, workspace, &job, temps)).await
+	}
+
+	fn video_quality(&self, speed: Speed, main: &Stream, analysis: &Analysis, video: &VideoPlan) -> VideoQuality {
+		let target = video_quality::target(speed, video.encoder.film_grain());
+		let key = CacheKey {
+			group: Group::Video(VideoGroup::of(main, analysis, video)),
+			encoder: self.encoder_id(&video.encoder),
+			preset: video.encoder.preset(),
+			target: target.mean,
+			floor: Some(target.floor),
+		};
+		let stats = self.quality.lookup(&key);
+
+		VideoQuality {
+			strategy: video_quality::strategy(speed, stats.as_ref(), video.encoder.crf(), self.tools.has_vmaf()),
+			slope: stats.and_then(|stats| stats.slope).unwrap_or(DEFAULT_SLOPE),
+			key,
+			stats,
+			target,
+		}
+	}
+
+	fn encoder_id(&self, encoder: &Encoder) -> String {
+		match encoder {
+			Encoder::SvtAv1 { .. } => self
+				.tools
+				.svt_av1
+				.map_or_else(|| "svt-av1".to_owned(), |version| format!("svt-av1-{version}")),
+			Encoder::Aom { .. } => "libaom-av1".to_owned(),
+			Encoder::Vp9Alpha { .. } => "libvpx-vp9".to_owned(),
+		}
+	}
+
+	fn scorer<'a>(&'a self, cx: &'a Context<'_>, workspace: &'a Workspace, video: &'a VideoPlan) -> Scorer<'a> {
+		Scorer {
+			tools: &self.tools,
+			source: &cx.job.source,
+			workspace,
+			plan: video,
+			threads: self.metric_threads,
+			cancel: cx.cancel,
+		}
+	}
+
+	async fn choose_crf(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		inputs: &VideoInputs<'_>,
+		analysis: &Analysis,
+		video: &mut VideoPlan,
+		quality: &mut VideoQuality,
+	) -> Result<Tuning, JobError> {
+		let samples = video_quality::search_samples(analysis, inputs.declared_s, cx.job.speed);
+		let verify = match quality.strategy {
+			Strategy::Search { .. } if !samples.is_empty() => {
+				return Box::pin(self.search_crf(cx, workspace, inputs, &samples, video, quality)).await;
+			}
+			Strategy::Search { start } => {
+				video.warnings.push(unsearched_warning(inputs.declared_s, start));
+				quality.strategy = Strategy::Fixed {
+					crf: start,
+					verify: true,
+				};
+				true
+			}
+			Strategy::Fixed { verify, .. } => verify,
+		};
+
+		video.encoder = video.encoder.with_crf(quality.start());
+		let gate = Box::pin(self.sample_gate(cx, workspace, inputs.info, video, inputs.streams, inputs.declared_s));
+		Ok(match gate.await? {
+			Some(reason) => Tuning::Keep(reason),
+			None => Tuning::Encode { verify },
+		})
+	}
+
+	async fn search_crf(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		inputs: &VideoInputs<'_>,
+		samples: &[Sample],
+		video: &mut VideoPlan,
+		quality: &mut VideoQuality,
+	) -> Result<Tuning, JobError> {
+		(cx.on_event)(JobEvent::Stage(Stage::Sample));
+		let searched = {
+			let scorer = self.scorer(cx, workspace, video);
+			let on_round = |round: usize| {
+				#[allow(clippy::cast_precision_loss)]
+				(cx.on_event)(JobEvent::Progress(round as f64 / MAX_PROBES as f64));
+			};
+			Box::pin(video_quality::search(
+				&scorer,
+				samples,
+				quality.start(),
+				quality.target,
+				quality.slope,
+				on_round,
+			))
+			.await?
+		};
+
+		let found = match searched {
+			Searched::Found(found) => found,
+			Searched::Unreachable { crf, score } => {
+				return Ok(Tuning::Keep(video_quality::unreachable_reason(
+					crf,
+					score,
+					quality.target,
+				)));
+			}
+		};
+		video.encoder = video.encoder.with_crf(found.crf);
+		quality.slope = found.slope;
+
+		if let Some(duration_s) = inputs
+			.declared_s
+			.filter(|duration| *duration >= video_encode::MIN_PREDICTED_DURATION_S)
+		{
+			let other = video_encode::other_bitrate(inputs.info, inputs.streams);
+			let predicted = video_encode::predicted_bytes(found.sample_bytes, samples, duration_s, other);
+			if let Some(reason) = video_encode::predicted_keep(cx.source_bytes, predicted, cx.job.min_savings) {
+				return Ok(Tuning::Keep(reason));
+			}
+		}
+		Ok(Tuning::Encode { verify: true })
+	}
+
+	async fn check_quality(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		inputs: &VideoInputs<'_>,
+		video: &mut VideoPlan,
+		temps: &mut EncodedTemps,
+		quality: &VideoQuality,
+	) -> Result<Option<KeepReason>, JobError> {
+		let windows = video_quality::verify_windows(temps.encoded.frames, temps.encoded.decoded_s, cx.job.speed);
+		let bounds = video_quality::bounds(&video.encoder);
+		let mut attempt = 1;
+
+		loop {
+			(cx.on_event)(JobEvent::Stage(Stage::Verify));
+			let score = {
+				let scorer = self.scorer(cx, workspace, video);
+				let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
+				Box::pin(scorer.verify(&temps.video.path, &windows, temps.encoded.frames, on_fraction)).await?
+			};
+
+			let crf = video.encoder.crf();
+			if quality.target.met(score) {
+				let bpp = output_bpp(&temps.video.path, video, temps.encoded.frames);
+				let observation = Observation {
+					setting: crf,
+					slope: Some(quality.slope),
+					bpp,
+				};
+				self.quality.record(&quality.key, observation);
+				return Ok(None);
+			}
+
+			let lower = if attempt <= MAX_RETRIES {
+				search::retry_crf(crf, score, quality.target, quality.slope, bounds)
+			} else {
+				None
+			};
+			let Some(lower) = lower else {
+				return Ok(Some(video_quality::unreachable_reason(crf, score, quality.target)));
+			};
+
+			temps.warnings.push(format!(
+				"the quality check measured VMAF {:.1} / {:.1} at CRF {crf}; the video was encoded again at CRF {lower}",
+				score.mean, score.p5
+			));
+			video.encoder = video.encoder.with_crf(lower);
+			attempt += 1;
+
+			(cx.on_event)(JobEvent::Stage(Stage::Encode));
+			Box::pin(self.reencode_video(cx, workspace, inputs.declared_s, video, temps, attempt)).await?;
+		}
+	}
+
+	async fn reencode_video(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		declared_s: Option<f64>,
+		video: &VideoPlan,
+		temps: &mut EncodedTemps,
+		attempt: u32,
+	) -> Result<(), JobError> {
+		let _ = fs::remove_file(&temps.video.path);
+
+		let path = workspace.file(&format!("video.a{attempt}.mkv"));
+		let cmd = video_encode::video_command(&self.tools.ffmpeg, &cx.job.source, &path, video);
+		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
+		let encoded = Box::pin(video_encode::encode_video(
+			&cmd,
+			video,
+			declared_s,
+			on_fraction,
+			cx.cancel,
+		))
+		.await?;
+
+		let (temp, _) = self.video_temp(path, video, &encoded, declared_s, cx.cancel).await?;
+		temps.video = temp;
+		temps.encoded = encoded;
+		Ok(())
+	}
+
+	async fn video_temp(
+		&self,
+		path: PathBuf,
+		video: &VideoPlan,
+		encoded: &EncodedVideo,
+		declared_s: Option<f64>,
+		cancel: &CancellationToken,
+	) -> Result<(Temp, Option<String>), JobError> {
+		let info = probe_temp(&self.tools, &path, cancel).await?;
+		let start_s = earliest_video_start(&info).unwrap_or(0.0);
+		let warning = video_encode::check_video_temp(video, encoded, declared_s, start_s)?;
+		Ok((Temp { path, info }, warning))
 	}
 
 	async fn sample_gate(
@@ -584,10 +879,10 @@ impl Engine {
 		streams: &StreamPlan,
 		declared_s: Option<f64>,
 	) -> Result<EncodedTemps, JobError> {
-		let video_temp = workspace.file("video.a1.mkv");
+		let video_path = workspace.file("video.a1.mkv");
 		let audio_temp = workspace.file("audio.mka");
 		let audio_plan = video_encode::audio_plan(streams);
-		let video_cmd = video_encode::video_command(&self.tools.ffmpeg, source, &video_temp, video);
+		let video_cmd = video_encode::video_command(&self.tools.ffmpeg, source, &video_path, video);
 		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
 
 		let audio_job = async {
@@ -610,11 +905,9 @@ impl Engine {
 			video_encode::extract(&self.tools.ffmpeg, source, workspace, &streams.extracted, cx.cancel),
 		)?;
 
-		let video_info = probe_temp(&self.tools, &video_temp, cx.cancel).await?;
-		let start_s = earliest_video_start(&video_info).unwrap_or(0.0);
-		let warnings: Vec<String> = video_encode::check_video_temp(video, &encoded, declared_s, start_s)?
-			.into_iter()
-			.collect();
+		let (video_temp, warning) = self
+			.video_temp(video_path, video, &encoded, declared_s, cx.cancel)
+			.await?;
 
 		let audio = match (&audio_plan, &source_levels) {
 			(Some(plan), Some(source_levels)) => {
@@ -629,12 +922,10 @@ impl Engine {
 		};
 
 		Ok(EncodedTemps {
-			video: Temp {
-				path: video_temp,
-				info: video_info,
-			},
+			video: video_temp,
 			audio,
-			warnings,
+			encoded,
+			warnings: warning.into_iter().collect(),
 		})
 	}
 
@@ -783,6 +1074,22 @@ fn finish(
 			&err,
 		)),
 	}
+}
+
+fn unsearched_warning(declared_s: Option<f64>, crf: f64) -> String {
+	let why = if declared_s.is_some() {
+		"no part of the video could be sampled"
+	} else {
+		"the video's duration is unknown"
+	};
+	format!("the CRF was not searched because {why}; the video was encoded at CRF {crf} and checked")
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn output_bpp(path: &Path, video: &VideoPlan, frames: u64) -> Option<f64> {
+	let bytes = fs::metadata(path).ok()?.len();
+	let pixels = f64::from(video.width) * f64::from(video.height) * frames as f64;
+	(pixels > 0.0).then(|| bytes as f64 * 8.0 / pixels)
 }
 
 #[allow(clippy::cast_precision_loss)]

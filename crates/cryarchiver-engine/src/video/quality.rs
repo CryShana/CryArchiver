@@ -33,7 +33,6 @@ const TARGETS: [Target; 3] = [
 const GRAIN_ALLOWANCE: Target = Target { mean: 2.0, floor: 2.5 };
 const SLOW_ANALYSIS_SEGMENTS: usize = 8;
 const SEARCH_SEGMENT_S: f64 = 4.0;
-const WHOLE_FILE_BELOW_S: f64 = 12.0;
 const VERIFY_WINDOW_S: f64 = 5.0;
 const EDGE_SKIP: f64 = 0.05;
 const FALLBACK_FPS: f64 = 25.0;
@@ -131,7 +130,7 @@ pub fn strategy(speed: Speed, stats: Option<&GroupStats>, table_crf: f64, vmaf: 
 }
 
 pub fn search_samples(analysis: &Analysis, declared_s: Option<f64>, speed: Speed) -> Vec<Sample> {
-	let count = match speed {
+	let count: u8 = match speed {
 		Speed::Slow => 6,
 		Speed::Moderate => 3,
 		Speed::Fast => 0,
@@ -140,11 +139,12 @@ pub fn search_samples(analysis: &Analysis, declared_s: Option<f64>, speed: Speed
 		return Vec::new();
 	};
 
-	if duration < WHOLE_FILE_BELOW_S {
-		return vec![Sample {
-			start_s: 0.0,
-			length_s: duration,
-		}];
+	let whole = vec![Sample {
+		start_s: 0.0,
+		length_s: duration,
+	}];
+	if SEARCH_SEGMENT_S * f64::from(count) >= duration {
+		return whole;
 	}
 
 	let any_usable = analysis.detail.iter().any(|detail| detail.usable);
@@ -157,14 +157,18 @@ pub fn search_samples(analysis: &Analysis, declared_s: Option<f64>, speed: Speed
 
 	let mut samples: Vec<Sample> = ranked
 		.into_iter()
-		.take(count)
+		.take(usize::from(count))
 		.map(|detail| Sample {
 			start_s: detail.start_s,
 			length_s: SEARCH_SEGMENT_S.min(duration - detail.start_s),
 		})
 		.collect();
 	samples.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
-	samples
+
+	let overlapping = samples
+		.windows(2)
+		.any(|pair| pair[0].start_s + pair[0].length_s > pair[1].start_s);
+	if overlapping { whole } else { samples }
 }
 
 #[allow(
@@ -337,7 +341,7 @@ fn pooled(scores: &[f64]) -> Result<Score, JobError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::video::analyze::{NoiseClass, ScanType};
+	use crate::video::analyze::{NoiseClass, ScanType, segments};
 
 	fn detail(start_s: f64, si: f64, usable: bool) -> Detail {
 		Detail {
@@ -458,6 +462,33 @@ mod tests {
 				length_s: 8.5
 			}]
 		);
+	}
+
+	#[test]
+	fn short_files_are_sampled_whole_instead_of_in_overlapping_samples() {
+		let analysis = |duration: f64, count: usize| Analysis {
+			scan: ScanType::Progressive,
+			noise: NoiseClass::Clean,
+			detail: segments(Some(duration), count)
+				.iter()
+				.zip(0_u32..)
+				.map(|(segment, index)| detail(segment.start_s, 50.0 + f64::from(index), true))
+				.collect(),
+		};
+		let whole = |length_s: f64| vec![Sample { start_s: 0.0, length_s }];
+
+		assert_eq!(
+			search_samples(&analysis(12.0, 4), Some(12.0), Speed::Moderate),
+			whole(12.0)
+		);
+		assert_eq!(
+			search_samples(&analysis(16.0, 4), Some(16.0), Speed::Moderate),
+			whole(16.0)
+		);
+		assert_eq!(search_samples(&analysis(24.0, 8), Some(24.0), Speed::Slow), whole(24.0));
+		assert_eq!(search_samples(&analysis(34.0, 8), Some(34.0), Speed::Slow), whole(34.0));
+		assert_eq!(search_samples(&analysis(17.0, 4), Some(17.0), Speed::Moderate).len(), 3);
+		assert_eq!(search_samples(&analysis(35.0, 8), Some(35.0), Speed::Slow).len(), 6);
 	}
 
 	#[test]
