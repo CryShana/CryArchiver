@@ -740,6 +740,78 @@ fn a_destination_through_a_link_into_the_source_is_refused() {
 	assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
 }
 
+struct NameSetup {
+	dir: tempfile::TempDir,
+	source: PathBuf,
+	destination: PathBuf,
+}
+
+impl NameSetup {
+	fn new() -> Self {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("src");
+		fs::create_dir_all(source.join("sub")).unwrap();
+		fs::create_dir(dir.path().join("d")).unwrap();
+		Self {
+			destination: dir.path().join("d").join("archive"),
+			source,
+			dir,
+		}
+	}
+
+	/// The name is refused before anything is created, and the source keeps only its `sub` folder, empty.
+	fn assert_refused(&self, name: &str) {
+		let created = cryarchiver_project::create(&self.source, &self.destination, OsStr::new(name), |_| {});
+
+		assert!(matches!(created, Err(ProjectError::Name { .. })), "{name}: {created:?}");
+		assert!(!self.destination.exists(), "{name}");
+		let entries: Vec<_> = fs::read_dir(&self.source)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect();
+		assert_eq!(entries, ["sub"], "{name}");
+		assert_eq!(fs::read_dir(self.source.join("sub")).unwrap().count(), 0, "{name}");
+	}
+}
+
+#[test]
+fn a_name_that_climbs_or_is_absolute_is_refused() {
+	let setup = NameSetup::new();
+
+	setup.assert_refused("../../src/fwd");
+	setup.assert_refused(&setup.source.join("abs").display().to_string());
+	setup.assert_refused("..");
+	setup.assert_refused(".");
+	setup.assert_refused("");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_names_that_leave_the_destination_are_refused() {
+	let setup = NameSetup::new();
+	let _ = std::process::Command::new("cmd")
+		.args(["/C", "mklink", "/J"])
+		.arg(setup.dir.path().join("d").join("j"))
+		.arg(setup.source.join("sub"))
+		.stdout(std::process::Stdio::null())
+		.status();
+
+	setup.assert_refused(r"..\..\src\evil");
+	setup.assert_refused(r"..\j\evil");
+	setup.assert_refused("C:rel");
+	setup.assert_refused(&format!(r"\\?\{}\abs", setup.source.display()));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_unix_name_through_a_link_is_refused() {
+	let setup = NameSetup::new();
+	std::os::unix::fs::symlink(setup.source.join("sub"), setup.dir.path().join("d").join("lnk")).unwrap();
+
+	setup.assert_refused("../lnk/evil");
+	setup.assert_refused("../../src/evil");
+}
+
 #[test]
 fn the_project_file_is_named_before_the_destination_exists() {
 	let dir = tempfile::tempdir().unwrap();

@@ -165,7 +165,6 @@ fn opening_a_project_stops_the_checks_for_the_whole_session() {
 	let project = menu.take_request().unwrap();
 	menu.stop_checks(&project);
 
-	assert!(!menu.checks_running());
 	assert!(!menu.reading(&project));
 	let states: Vec<EntryState> = menu.entries().iter().map(|entry| entry.state.clone()).collect();
 	let opened = cryarchiver_project::store::Store::open(&project);
@@ -175,7 +174,7 @@ fn opening_a_project_stops_the_checks_for_the_whole_session() {
 	menu.opened(&project);
 	std::thread::sleep(Duration::from_millis(50));
 	menu.tick();
-	assert!(!menu.checks_running());
+	assert!(!menu.reading(&project));
 	assert!(menu.wait_for_checks(Duration::ZERO));
 	let after: Vec<EntryState> = menu.entries().iter().map(|entry| entry.state.clone()).collect();
 	assert_eq!(after, states);

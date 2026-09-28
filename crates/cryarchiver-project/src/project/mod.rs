@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+use cryarchiver_engine::commit::file_id;
 use cryarchiver_engine::engine::{Encode, MemoryGate};
 use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::text::display_path;
@@ -167,6 +168,54 @@ pub enum ProjectError {
 		"this project file was moved or copied away from its archive, which is {destination}; open the project file there"
 	)]
 	Moved { destination: String },
+	#[error("the project name {name:?} can't be used: {reason}")]
+	Name { name: String, reason: String },
+}
+
+pub const MAX_NAME_CHARS: usize = 100;
+const INVALID_NAME_CHARS: &str = "<>:\"/\\|?*";
+
+/// The rules for a project name, the same for every front end: one plain file name that every supported system can
+/// hold, so `<destination>/<name>.cryarchive` always stays in the destination. The reason reads after the name.
+pub fn check_name(name: &OsStr) -> Result<(), String> {
+	let text = name.to_string_lossy();
+	if text.is_empty() {
+		return Err("enter a name for the project".into());
+	}
+
+	if text.chars().count() > MAX_NAME_CHARS {
+		return Err(format!("at most {MAX_NAME_CHARS} characters"));
+	}
+
+	if text.chars().any(char::is_control) {
+		return Err("can't contain control characters".into());
+	}
+
+	if let Some(bad) = text.chars().find(|c| INVALID_NAME_CHARS.contains(*c)) {
+		return Err(format!("can't contain {bad}"));
+	}
+
+	if text.ends_with(['.', ' ']) {
+		return Err("can't end with a dot or a space".into());
+	}
+
+	let stem = text.split('.').next().unwrap_or(&text).trim_end();
+	if cryarchiver_engine::naming::is_reserved_device_name(stem) {
+		return Err(format!("{stem} is reserved by Windows for a device"));
+	}
+
+	let mut components = Path::new(name).components();
+	match (components.next(), components.next()) {
+		(Some(Component::Normal(only)), None) if only == name => Ok(()),
+		_ => Err("must be a plain file name".into()),
+	}
+}
+
+fn checked_name(name: &OsStr) -> Result<(), ProjectError> {
+	check_name(name).map_err(|reason| ProjectError::Name {
+		name: name.to_string_lossy().into_owned(),
+		reason,
+	})
 }
 
 /// Creates `<destination>/<name>.cryarchive` for a new project. The destination is created if needed.
@@ -176,19 +225,40 @@ pub fn create(
 	name: &OsStr,
 	configure: impl FnOnce(&mut Settings),
 ) -> Result<PathBuf, ProjectError> {
+	checked_name(name)?;
 	let (canonical_source, planned) = approved_destination(source, destination)?;
 	create_folders(&planned, |folder| outside_source(&canonical_source, folder))?;
 	let (source, destination) = check_roots(source, &planned)?;
 
 	let path = project_file(&destination, name)?;
+	refuse_outside(&path, &destination, name)?;
 	let mut settings = Settings::new(&source, &destination);
 	configure(&mut settings);
 	Store::create(&path, &settings)?;
 	Ok(path)
 }
 
+/// The project file must sit directly in the checked destination, by path and by folder identity.
+fn refuse_outside(path: &Path, destination: &Path, name: &OsStr) -> Result<(), ProjectError> {
+	let parent = path.parent().unwrap_or(path);
+	let same_identity = match (file_id(parent), file_id(destination)) {
+		(Ok(parent), Ok(destination)) => parent == destination,
+		_ => false,
+	};
+
+	if parent == destination && same_identity {
+		return Ok(());
+	}
+	Err(ProjectError::Name {
+		name: name.to_string_lossy().into_owned(),
+		reason: "the project file would not be in the destination".into(),
+	})
+}
+
 /// Where [`create`] writes the project file for `destination`, whether the destination exists yet or not.
-pub fn project_file(destination: &Path, name: &OsStr) -> io::Result<PathBuf> {
+pub fn project_file(destination: &Path, name: &OsStr) -> Result<PathBuf, ProjectError> {
+	checked_name(name)?;
+
 	let mut file_name = name.to_os_string();
 	file_name.push(".");
 	file_name.push(PROJECT_EXTENSION);
@@ -196,9 +266,8 @@ pub fn project_file(destination: &Path, name: &OsStr) -> io::Result<PathBuf> {
 }
 
 /// Runs before anything is created, and returns the canonical source and the only path that may be created: the
-/// destination's planned path, with no `.` or `..` left. `create_dir_all` walks the typed text literally, so
-/// `<source>/new/../../archive` would create `<source>/new` on the way. The source must already be a folder: creating a
-/// destination against a missing source could create the source's own folders.
+/// destination's planned path, with no `.` or `..` left. The source must already be a folder: creating a destination
+/// against a missing source could create the source's own folders.
 fn approved_destination(source: &Path, destination: &Path) -> Result<(PathBuf, PathBuf), ProjectError> {
 	let meta = fs::metadata(source).map_err(|err| naming(source, &err))?;
 	if !meta.is_dir() {
@@ -414,6 +483,40 @@ mod tests {
 		assert!(matches!(created, Err(ProjectError::Settings(_))), "{created:?}");
 		assert_eq!(fs::read_dir(source.join("sub")).unwrap().count(), 0);
 		fs::remove_dir(&link).or_else(|_| fs::remove_file(&link)).unwrap();
+	}
+
+	#[test]
+	fn a_name_is_one_plain_file_name() {
+		let refused = |name: &str| check_name(OsStr::new(name)).unwrap_err();
+
+		assert!(check_name(OsStr::new("Photos 2026")).is_ok());
+		assert!(check_name(OsStr::new("nul-free.v2")).is_ok());
+		assert!(refused("").contains("enter"));
+		assert!(refused("a/b").contains("can't contain /"));
+		assert!(refused(r"a\b").contains(r"can't contain \"));
+		assert!(refused("C:rel").contains("can't contain :"));
+		assert!(refused("a\u{0}b").contains("control"));
+		assert!(refused("trailing.").contains("end with"));
+		assert!(refused("..").contains("end with"));
+		assert!(refused("con.backup").contains("reserved"));
+		assert!(refused(&"x".repeat(MAX_NAME_CHARS + 1)).contains("at most"));
+		assert!(check_name(OsStr::new(&"é".repeat(MAX_NAME_CHARS))).is_ok());
+	}
+
+	#[test]
+	fn the_project_file_must_sit_directly_in_the_destination() {
+		let dir = tempfile::tempdir().unwrap();
+		let destination = dir.path().join("archive");
+		fs::create_dir_all(dir.path().join("other")).unwrap();
+		fs::create_dir(&destination).unwrap();
+		let name = OsStr::new("a");
+
+		assert!(refuse_outside(&destination.join("a.cryarchive"), &destination, name).is_ok());
+		assert!(matches!(
+			refuse_outside(&dir.path().join("other").join("a.cryarchive"), &destination, name),
+			Err(ProjectError::Name { .. })
+		));
+		assert!(refuse_outside(&destination.join("x").join("a.cryarchive"), &destination, name).is_err());
 	}
 
 	#[test]

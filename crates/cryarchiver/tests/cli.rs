@@ -102,6 +102,76 @@ fn project_create_refuses_a_destination_inside_the_source() {
 	assert!(stderr(&out).contains("inside the source"), "{}", stderr(&out));
 }
 
+/// Runs `project create src d/archive --name <name>` from `cwd` and checks it exits with 2, naming the reason, with
+/// nothing created in the source or the destination.
+fn assert_name_refused(dir: &Path, cwd: &Path, name: &str) {
+	let (source, destination) = (dir.join("src"), dir.join("d").join("archive"));
+
+	let out = cryarchiver(
+		cwd,
+		&[
+			"project",
+			"create",
+			source.to_str().unwrap(),
+			destination.to_str().unwrap(),
+			"--name",
+			name,
+		],
+	);
+
+	assert_eq!(out.status.code(), Some(2), "{name}: {}", stdout(&out));
+	assert!(stderr(&out).contains("can't be used"), "{name}: {}", stderr(&out));
+	assert!(!destination.exists(), "{name}");
+	let entries: Vec<_> = fs::read_dir(&source)
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name())
+		.collect();
+	assert_eq!(entries, ["sub"], "{name}");
+	assert_eq!(fs::read_dir(source.join("sub")).unwrap().count(), 0, "{name}");
+}
+
+fn name_setup() -> tempfile::TempDir {
+	let dir = tempfile::tempdir().unwrap();
+	fs::create_dir_all(dir.path().join("src").join("sub")).unwrap();
+	fs::create_dir(dir.path().join("d")).unwrap();
+	dir
+}
+
+#[test]
+fn project_create_refuses_a_name_that_leaves_the_destination() {
+	let dir = name_setup();
+	let absolute = dir.path().join("src").join("abs");
+
+	assert_name_refused(dir.path(), dir.path(), "../../src/fwd");
+	assert_name_refused(dir.path(), dir.path(), absolute.to_str().unwrap());
+}
+
+#[cfg(windows)]
+#[test]
+fn project_create_refuses_windows_names_that_leave_the_destination() {
+	let dir = name_setup();
+	let _ = Command::new("cmd")
+		.args(["/C", "mklink", "/J"])
+		.arg(dir.path().join("d").join("j"))
+		.arg(dir.path().join("src").join("sub"))
+		.stdout(std::process::Stdio::null())
+		.status();
+	let inside_source = dir.path().join("src");
+
+	assert_name_refused(dir.path(), dir.path(), r"..\..\src\evil");
+	assert_name_refused(dir.path(), dir.path(), r"..\j\evil");
+	assert_name_refused(dir.path(), &inside_source, "C:rel");
+}
+
+#[cfg(unix)]
+#[test]
+fn project_create_refuses_a_unix_name_through_a_link() {
+	let dir = name_setup();
+	std::os::unix::fs::symlink(dir.path().join("src").join("sub"), dir.path().join("d").join("lnk")).unwrap();
+
+	assert_name_refused(dir.path(), dir.path(), "../lnk/evil");
+}
+
 fn project_with(dir: &Path, delete_originals: bool) -> PathBuf {
 	fs::create_dir_all(dir.join("source")).unwrap();
 	cryarchiver_project::create(

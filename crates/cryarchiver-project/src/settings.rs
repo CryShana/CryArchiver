@@ -182,6 +182,7 @@ pub fn planned_path(path: &Path) -> io::Result<PathBuf> {
 		}
 		planned = next;
 	}
+
 	Ok(planned)
 }
 

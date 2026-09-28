@@ -7,13 +7,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::commit::free_space;
-use cryarchiver_engine::naming::is_reserved_device_name;
 use cryarchiver_engine::text::display_path;
+pub use cryarchiver_project::project::MAX_NAME_CHARS;
 use cryarchiver_project::project_file;
 use cryarchiver_project::settings::{RootConflict, identity_conflict, may_create_in, planned_path, root_conflict};
 
-pub const MAX_NAME_CHARS: usize = 100;
-const INVALID_CHARS: &str = "<>:\"/\\|?*";
 pub const NOT_EMPTY: &str = "files already there will be listed as unknown and never touched";
 #[cfg(windows)]
 pub const MARKED_READ_ONLY: &str = "marked read-only; Create checks that it can be written";
@@ -158,29 +156,8 @@ fn nearest_folder(destination: &Path) -> Result<PathBuf, String> {
 }
 
 fn check_name(name: &str, project_file: Option<&Path>) -> Check {
-	if name.is_empty() {
-		return Check::Invalid("enter a name for the project".into());
-	}
-
-	if name.chars().count() > MAX_NAME_CHARS {
-		return Check::Invalid(format!("at most {MAX_NAME_CHARS} characters"));
-	}
-
-	if name.chars().any(char::is_control) {
-		return Check::Invalid("can't contain control characters".into());
-	}
-
-	if let Some(bad) = name.chars().find(|c| INVALID_CHARS.contains(*c)) {
-		return Check::Invalid(format!("can't contain {bad}"));
-	}
-
-	if name.ends_with(['.', ' ']) {
-		return Check::Invalid("can't end with a dot or a space".into());
-	}
-
-	let stem = name.split('.').next().unwrap_or(name).trim_end();
-	if is_reserved_device_name(stem) {
-		return Check::Invalid(format!("{stem} is reserved by Windows for a device"));
+	if let Err(reason) = cryarchiver_project::check_name(OsStr::new(name)) {
+		return Check::Invalid(reason);
 	}
 
 	match project_file {
