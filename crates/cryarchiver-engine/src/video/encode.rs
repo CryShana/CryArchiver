@@ -9,7 +9,7 @@ use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
 use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
 use crate::video::analyze;
-use crate::video::plan::{Encoder, VideoPlan};
+use crate::video::plan::{Encoder, VideoPlan, svt_params};
 use crate::video::run_ffmpeg;
 use crate::video::streams::{Extracted, StreamPlan};
 use crate::workspace::Workspace;
@@ -98,11 +98,15 @@ fn encode_command(
 
 fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder) {
 	match encoder {
-		Encoder::SvtAv1 { preset, params } => {
+		Encoder::SvtAv1 {
+			preset,
+			crf,
+			film_grain,
+		} => {
 			cmd.args(["-c:v", "libsvtav1", "-preset"])
 				.arg(preset.to_string())
 				.args(["-err_detect", "explode", "-dolbyvision", "0", "-svtav1-params"])
-				.arg(params);
+				.arg(svt_params(*crf, *film_grain));
 		}
 		Encoder::Aom { cpu_used, crf } => {
 			cmd.args(["-c:v", "libaom-av1", "-crf"])
@@ -363,7 +367,8 @@ mod tests {
 	fn svt() -> Encoder {
 		Encoder::SvtAv1 {
 			preset: 8,
-			params: "tune=0:crf=32".into(),
+			crf: 32.0,
+			film_grain: false,
 		}
 	}
 
@@ -409,11 +414,38 @@ mod tests {
 			"{args}"
 		);
 		assert!(
-			args.contains("-c:v libsvtav1 -preset 8 -err_detect explode -dolbyvision 0 -svtav1-params tune=0:crf=32"),
+			args.contains(
+				"-c:v libsvtav1 -preset 8 -err_detect explode -dolbyvision 0 -svtav1-params tune=0:keyint=5s:crf=32"
+			),
 			"{args}"
 		);
+		assert!(!args.contains("variance-boost"), "{args}");
 		assert!(args.contains("-fps_mode passthrough -f matroska"), "{args}");
 		assert_eq!(cmd.counted, DECODE_ERRORS);
+	}
+
+	#[test]
+	fn film_grain_comes_with_denoise_only_when_planned() {
+		let grainy = plan(
+			Encoder::SvtAv1 {
+				preset: 5,
+				crf: 29.25,
+				film_grain: true,
+			},
+			None,
+		);
+
+		let args = joined(&video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mp4"),
+			Path::new("v.mkv"),
+			&grainy,
+		));
+
+		assert!(
+			args.contains("-svtav1-params tune=0:keyint=5s:crf=29.25:film-grain=8:film-grain-denoise=1 "),
+			"{args}"
+		);
 	}
 
 	#[test]

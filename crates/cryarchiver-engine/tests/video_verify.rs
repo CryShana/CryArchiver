@@ -18,7 +18,8 @@ fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan 
 		} else {
 			Encoder::SvtAv1 {
 				preset: 10,
-				params: String::new(),
+				crf: 32.0,
+				film_grain: false,
 			}
 		},
 		expected_frames: None,

@@ -60,14 +60,53 @@ impl Resolution {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Encoder {
-	SvtAv1 { preset: u8, params: String },
+	SvtAv1 { preset: u8, crf: f64, film_grain: bool },
 	Aom { cpu_used: u8, crf: u8 },
 	Vp9Alpha { cpu_used: u8, crf: u8 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Encoder {
+	pub fn crf(&self) -> f64 {
+		match self {
+			Self::SvtAv1 { crf, .. } => *crf,
+			Self::Aom { crf, .. } | Self::Vp9Alpha { crf, .. } => f64::from(*crf),
+		}
+	}
+
+	#[must_use]
+	pub fn with_crf(&self, crf: f64) -> Self {
+		match self {
+			Self::SvtAv1 { preset, film_grain, .. } => Self::SvtAv1 {
+				preset: *preset,
+				crf: (crf * 4.0).round() / 4.0,
+				film_grain: *film_grain,
+			},
+			Self::Aom { cpu_used, .. } => Self::Aom {
+				cpu_used: *cpu_used,
+				crf: rounded_crf(crf),
+			},
+			Self::Vp9Alpha { cpu_used, .. } => Self::Vp9Alpha {
+				cpu_used: *cpu_used,
+				crf: rounded_crf(crf),
+			},
+		}
+	}
+
+	pub fn preset(&self) -> u8 {
+		match self {
+			Self::SvtAv1 { preset, .. } => *preset,
+			Self::Aom { cpu_used, .. } | Self::Vp9Alpha { cpu_used, .. } => *cpu_used,
+		}
+	}
+
+	pub fn film_grain(&self) -> bool {
+		matches!(self, Self::SvtAv1 { film_grain: true, .. })
+	}
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct VideoPlan {
 	pub streams: Vec<u32>,
 	pub decoder: Option<&'static str>,
@@ -148,7 +187,8 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 		let grain = speed != Speed::Fast && analysis.noise == NoiseClass::Light;
 		Encoder::SvtAv1 {
 			preset: pick(speed, [3, 5, 8]),
-			params: svt_params(svt_crf(speed, resolution), grain),
+			crf: svt_crf(speed, resolution),
+			film_grain: grain,
 		}
 	};
 
@@ -224,8 +264,8 @@ fn frame_tolerance(scan: ScanType) -> u64 {
 	}
 }
 
-fn svt_params(crf: f64, grain: bool) -> String {
-	let grain = if grain {
+pub fn svt_params(crf: f64, film_grain: bool) -> String {
+	let grain = if film_grain {
 		":film-grain=8:film-grain-denoise=1"
 	} else {
 		""
@@ -287,11 +327,7 @@ fn has_side_data(frames: &[Frame], kind: &str) -> bool {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn already_efficient(info: &MediaInfo, main: &Stream) -> Option<String> {
-	if !EFFICIENT_CODECS.contains(&main.codec_name.as_str()) {
-		return None;
-	}
-
+pub fn source_bpp(info: &MediaInfo, main: &Stream) -> Option<f64> {
 	let bits_per_second = main.bit_rate.or_else(|| {
 		let single_video = info.streams.iter().filter(|stream| stream.is_real_video()).count() == 1;
 		let audio: u64 = info.audio_streams().filter_map(|stream| stream.bit_rate).sum();
@@ -303,10 +339,22 @@ fn already_efficient(info: &MediaInfo, main: &Stream) -> Option<String> {
 	let (width, height) = (main.width?, main.height?);
 	let fps = main.fps()?;
 
-	let bpp = bits_per_second as f64 / (f64::from(width) * f64::from(height) * fps);
-	let expected = EXPECTED_BPP[Resolution::of(width, height).index()];
-	(bpp <= expected * EFFICIENCY_HEADROOM)
+	Some(bits_per_second as f64 / (f64::from(width) * f64::from(height) * fps))
+}
+
+pub fn efficient_at(info: &MediaInfo, main: &Stream, expected_bpp: f64) -> Option<String> {
+	if !EFFICIENT_CODECS.contains(&main.codec_name.as_str()) {
+		return None;
+	}
+
+	let bpp = source_bpp(info, main)?;
+	(bpp <= expected_bpp * EFFICIENCY_HEADROOM)
 		.then(|| format!("already {} at {bpp:.3} bits per pixel", main.codec_name.to_uppercase()))
+}
+
+fn already_efficient(info: &MediaInfo, main: &Stream) -> Option<String> {
+	let expected = EXPECTED_BPP[Resolution::of(main.width?, main.height?).index()];
+	efficient_at(info, main, expected)
 }
 
 #[cfg(test)]
@@ -317,7 +365,8 @@ pub(crate) fn test_plan() -> VideoPlan {
 		filters: String::new(),
 		encoder: Encoder::SvtAv1 {
 			preset: 8,
-			params: String::new(),
+			crf: 32.0,
+			film_grain: false,
 		},
 		expected_frames: None,
 		frame_tolerance: SOURCE_FRAME_TOLERANCE,
@@ -390,7 +439,8 @@ mod tests {
 			plan.encoder,
 			Encoder::SvtAv1 {
 				preset: 5,
-				params: "tune=0:keyint=5s:crf=29".into(),
+				crf: 29.0,
+				film_grain: false,
 			}
 		);
 		assert_eq!(plan.expected_frames, Some(250));
@@ -446,8 +496,22 @@ mod tests {
 		let fast = plan(&h264(""), &[], PROGRESSIVE_CLEAN, Speed::Fast);
 		let slow = plan(&h264(""), &[], PROGRESSIVE_CLEAN, Speed::Slow);
 
-		assert!(matches!(fast.encoder, Encoder::SvtAv1 { preset: 8, ref params } if params.ends_with("crf=35")));
-		assert!(matches!(slow.encoder, Encoder::SvtAv1 { preset: 3, ref params } if params.ends_with("crf=25")));
+		assert_eq!(
+			fast.encoder,
+			Encoder::SvtAv1 {
+				preset: 8,
+				crf: 35.0,
+				film_grain: false,
+			}
+		);
+		assert_eq!(
+			slow.encoder,
+			Encoder::SvtAv1 {
+				preset: 3,
+				crf: 25.0,
+				film_grain: false,
+			}
+		);
 	}
 
 	#[test]
@@ -504,11 +568,23 @@ mod tests {
 		let slow = plan(&h264(""), &[], grainy, Speed::Slow);
 		let fast = plan(&h264(""), &[], grainy, Speed::Fast);
 
-		assert!(matches!(moderate.encoder, Encoder::SvtAv1 { ref params, .. }
-			if params == "tune=0:keyint=5s:crf=29:film-grain=8:film-grain-denoise=1"));
-		assert!(matches!(slow.encoder, Encoder::SvtAv1 { ref params, .. }
-			if params == "tune=0:keyint=5s:crf=25:film-grain=8:film-grain-denoise=1"));
-		assert!(matches!(fast.encoder, Encoder::SvtAv1 { ref params, .. } if !params.contains("film-grain")));
+		assert_eq!(
+			moderate.encoder,
+			Encoder::SvtAv1 {
+				preset: 5,
+				crf: 29.0,
+				film_grain: true,
+			}
+		);
+		assert_eq!(
+			slow.encoder,
+			Encoder::SvtAv1 {
+				preset: 3,
+				crf: 25.0,
+				film_grain: true,
+			}
+		);
+		assert!(!fast.encoder.film_grain());
 	}
 
 	#[test]
@@ -659,5 +735,54 @@ mod tests {
 		assert_eq!(Resolution::of(3440, 1440), Resolution::Qhd1440);
 		assert_eq!(Resolution::of(3840, 2160), Resolution::Uhd4k);
 		assert_eq!(Resolution::of(7680, 4320), Resolution::Uhd8k);
+	}
+
+	#[test]
+	fn a_new_crf_keeps_the_encoder_and_rounds_to_its_step() {
+		let svt = Encoder::SvtAv1 {
+			preset: 5,
+			crf: 29.0,
+			film_grain: true,
+		};
+		let vp9 = Encoder::Vp9Alpha { cpu_used: 2, crf: 33 };
+
+		assert_eq!(
+			svt.with_crf(26.3),
+			Encoder::SvtAv1 {
+				preset: 5,
+				crf: 26.25,
+				film_grain: true,
+			}
+		);
+		assert_eq!(vp9.with_crf(30.6), Encoder::Vp9Alpha { cpu_used: 2, crf: 31 });
+		assert_eq!(
+			Encoder::Aom { cpu_used: 4, crf: 30 }.with_crf(80.0),
+			Encoder::Aom { cpu_used: 4, crf: 63 }
+		);
+		assert_eq!((svt.preset(), vp9.preset()), (5, 2));
+		assert_eq!(
+			svt_params(29.25, true),
+			"tune=0:keyint=5s:crf=29.25:film-grain=8:film-grain-denoise=1"
+		);
+		assert_eq!(svt_params(29.0, false), "tune=0:keyint=5s:crf=29");
+	}
+
+	#[test]
+	fn a_learned_bits_per_pixel_can_keep_an_efficient_source() {
+		let av1 = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"av1","width":1920,"height":1080,
+			"avg_frame_rate":"30/1","bit_rate":"34000000"}]}"#,
+		);
+		let main = &av1.streams[0];
+
+		let bpp = source_bpp(&av1, main).unwrap();
+
+		assert!((bpp - 0.546).abs() < 0.001, "{bpp}");
+		assert!(efficient_at(&av1, main, 0.5).is_some());
+		assert_eq!(efficient_at(&av1, main, 0.3), None);
+		assert_eq!(
+			efficient_at(&h264(r#","bit_rate":"1000""#), &h264("").streams[0], 10.0),
+			None
+		);
 	}
 }
