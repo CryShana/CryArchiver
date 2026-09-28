@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use cryarchiver_engine::commit::OutputSink;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate};
 use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome};
+use cryarchiver_engine::preset::{Overrides, VmafOverride};
 use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_project::{Backend, Project, ProjectOptions, SystemSample, Tuning};
 use cryarchiver_tui::recent::{FILE_NAME, RecentStore};
-use cryarchiver_tui::source::Target;
+use cryarchiver_tui::source::{SettingsChange, Target};
 use cryarchiver_tui::view::{FileState, NoticeLevel, RunState};
 use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, OverlayKind, ProjectSource, StartMenu};
 use ratatui::Terminal;
@@ -302,7 +303,7 @@ fn a_deleting_project_archives_but_deletes_nothing_until_delete_is_typed_this_se
 	let mut app = App::new(source, ColorDepth::TrueColor);
 	assert!(screen(&mut app).contains("deleting paused: type DELETE to allow"));
 	press(&mut app, KeyCode::Char('s'));
-	for _ in 0..6 {
+	for _ in 0..10 {
 		press(&mut app, KeyCode::Down);
 	}
 	press(&mut app, KeyCode::Enter);
@@ -339,7 +340,7 @@ fn the_delete_typed_when_creating_in_the_start_menu_does_not_confirm_the_session
 	menu.handle_event(&Event::Paste(display_path(&source)), Instant::now());
 	key(&mut menu, KeyCode::Tab);
 	menu.handle_event(&Event::Paste(display_path(&dir.path().join("archive"))), Instant::now());
-	for _ in 0..3 {
+	for _ in 0..4 {
 		key(&mut menu, KeyCode::Tab);
 	}
 	key(&mut menu, KeyCode::Enter);
@@ -383,6 +384,73 @@ fn a_real_project_shows_only_what_it_knows() {
 	let screen = screen(&mut app);
 	assert!(!screen.contains("LATEST"), "{screen}");
 	assert!(!screen.contains("running ·"), "{screen}");
+}
+
+#[test]
+fn quality_overrides_reach_the_project_and_come_back_normalized() {
+	let setup = setup(&[("a.txt", b"a")]);
+	let mut source = open(&setup.project);
+	assert_eq!(source.view().settings.overrides, Overrides::default());
+
+	source.perform(Action::ChangeSettings(SettingsChange::Overrides(Overrides {
+		image: Some(80.04),
+		audio_stereo_kbps: Some(160),
+		..Overrides::default()
+	})));
+	let custom = Overrides {
+		image: Some(80.0),
+		audio_stereo_kbps: Some(160),
+		..Overrides::default()
+	};
+	refresh_until(&mut source, "the new overrides", |s| {
+		s.view().settings.overrides == custom
+	});
+
+	let mut app = App::new(source, ColorDepth::TrueColor);
+	assert!(screen(&mut app).contains(" MODERATE · custom "));
+	drop(app);
+
+	let mut source = open(&setup.project);
+	assert_eq!(source.view().settings.overrides, custom);
+	refresh_until(&mut source, "the finish", finished);
+}
+
+#[test]
+fn a_project_shows_its_stored_overrides_as_the_engine_reads_them() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+	let project = cryarchiver_project::create(
+		&source,
+		&dir.path().join("archive"),
+		OsStr::new("archive"),
+		|settings| {
+			settings.overrides = Overrides {
+				video: Some(VmafOverride {
+					mean: 90.0,
+					floor: 85.0,
+				}),
+				..Overrides::default()
+			};
+			settings.speed = cryarchiver_project::settings::Speed::Fast;
+		},
+	)
+	.unwrap();
+
+	let mut app = App::new(open(&project), ColorDepth::TrueColor);
+	let shown = screen(&mut app);
+
+	assert!(shown.contains(" FAST "), "{shown}");
+	assert!(
+		!shown.contains("custom"),
+		"a video override is not used at FAST: {shown}"
+	);
+	press(&mut app, KeyCode::Char('s'));
+	let shown = screen(&mut app);
+	assert!(
+		shown.contains("90/85 · not used: FAST never measures video quality"),
+		"{shown}"
+	);
 }
 
 #[test]

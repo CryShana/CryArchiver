@@ -330,7 +330,7 @@ fn create_checks_again_and_creates_nothing_once_the_source_is_gone() {
 	fill(&mut menu, &source, &setup.path("archive"));
 	fs::remove_dir(&source).unwrap();
 
-	for _ in 0..4 {
+	for _ in 0..5 {
 		press(&mut menu, KeyCode::Tab);
 	}
 	press(&mut menu, KeyCode::Enter);
@@ -391,7 +391,7 @@ fn the_form_creates_the_project_opens_it_and_lists_it() {
 	assert!(form.can_create(), "{:?}", form.validation());
 	assert!(shows(&mut menu, "Holiday.cryarchive"));
 
-	for _ in 0..4 {
+	for _ in 0..5 {
 		press(&mut menu, KeyCode::Tab);
 	}
 	assert_eq!(menu.form().unwrap().focus(), FormField::Create);
@@ -424,7 +424,7 @@ fn create_stays_disabled_while_a_check_fails() {
 fn turning_deletion_on_asks_for_delete_and_shows_the_warning() {
 	let setup = Setup::new();
 	let mut menu = setup.menu();
-	for _ in 0..4 {
+	for _ in 0..5 {
 		press(&mut menu, KeyCode::Tab);
 	}
 	assert_eq!(menu.form().unwrap().focus(), FormField::DeleteOriginals);
@@ -512,7 +512,7 @@ fn escape_in_an_edited_form_asks_before_discarding() {
 fn the_delete_prompt_chips_work_with_the_mouse() {
 	let setup = Setup::new();
 	let mut menu = setup.menu();
-	for _ in 0..4 {
+	for _ in 0..5 {
 		press(&mut menu, KeyCode::Tab);
 	}
 
@@ -528,6 +528,66 @@ fn the_delete_prompt_chips_work_with_the_mouse() {
 	click(&mut menu, confirm, Instant::now());
 	assert!(menu.form().unwrap().confirming().is_none());
 	assert!(menu.form().unwrap().delete_originals());
+}
+
+#[test]
+fn custom_quality_is_collapsed_until_opened_and_shows_what_the_project_gets() {
+	let setup = Setup::new();
+	let mut menu = setup.menu();
+	assert!(shows(&mut menu, "Custom quality…"));
+	assert!(shows(&mut menu, "the preset's targets"));
+	assert!(!shows(&mut menu, "Video VMAF"));
+
+	for _ in 0..4 {
+		press(&mut menu, KeyCode::Tab);
+	}
+	assert_eq!(menu.form().unwrap().focus(), FormField::CustomQuality);
+	press(&mut menu, KeyCode::Enter);
+
+	assert!(shows(&mut menu, "Video VMAF"));
+	assert!(shows(&mut menu, "preset 93/89"));
+	assert!(shows(&mut menu, "preset 128 kbps"));
+	press(&mut menu, KeyCode::Tab);
+	press(&mut menu, KeyCode::Tab);
+	assert_eq!(menu.form().unwrap().focus(), FormField::ImageTarget);
+	paste(&mut menu, "120");
+	assert!(shows(
+		&mut menu,
+		"✗ the image SSIMULACRA2 target must be between 50 and 95"
+	));
+	press(&mut menu, KeyCode::Backspace);
+	press(&mut menu, KeyCode::Backspace);
+	press(&mut menu, KeyCode::Backspace);
+	paste(&mut menu, "80.04");
+	assert!(shows(&mut menu, "custom"));
+
+	press(&mut menu, KeyCode::BackTab);
+	press(&mut menu, KeyCode::BackTab);
+	press(&mut menu, KeyCode::Enter);
+	assert!(!shows(&mut menu, "Video VMAF"));
+	assert!(shows(&mut menu, "custom: image 80"));
+	assert!(!shows(&mut menu, "80.04"), "the project stores the rounded value");
+	assert!(
+		screen(&mut menu, 100, 30)
+			.iter()
+			.any(|line| line.contains("[ Create ]"))
+	);
+}
+
+#[test]
+fn the_open_custom_quality_section_fits_the_smallest_terminal() {
+	let setup = Setup::new();
+	let mut menu = setup.menu();
+	for _ in 0..4 {
+		press(&mut menu, KeyCode::Tab);
+	}
+	press(&mut menu, KeyCode::Enter);
+
+	let lines = screen(&mut menu, 100, 30);
+
+	assert!(lines.iter().any(|line| line.contains("Audio stereo kbps")));
+	assert!(lines.iter().any(|line| line.contains("[ Create ]")));
+	assert!(lines[29].contains("Esc"));
 }
 
 #[test]

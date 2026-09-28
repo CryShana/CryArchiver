@@ -11,13 +11,14 @@ use super::footer::{Chip, chip, draw_chips, render_toast};
 use super::settings::delete_prompt;
 use super::widgets::{Chrome, bold, fg, modal, panel, put, to_u16, wrap};
 use super::{MIN_HEIGHT, MIN_WIDTH, small};
-use crate::app::HitMap;
+use crate::app::{FAST_NEVER_MEASURES_VIDEO, HitMap, QUALITY_FIELDS, QualityField};
 use crate::format::{bytes, fit, fit_middle, width};
 use crate::recent::{CAPACITY, now_unix_ms};
-use crate::start::form::{FormField, NewProjectForm};
+use crate::start::form::{FormField, NewProjectForm, QualityCheck};
 use crate::start::validate::Check;
 use crate::start::{Dialog, EntryState, RecentEntry, StartHit, StartMenu, opened_ago};
 use crate::theme::Theme;
+use crate::view::Overrides;
 
 const BADGE: &str = " CryArchiver ";
 const ENTRY_ROWS: u16 = 3;
@@ -31,6 +32,11 @@ const SPEEDS: [(Speed, &str, &str); 3] = [
 	),
 	(Speed::Moderate, "MODERATE", "a balance of size, quality and time"),
 	(Speed::Fast, "FAST", "the quickest; files come out somewhat larger"),
+];
+const QUALITY_ROWS: [(FormField, &str); 3] = [
+	(FormField::VideoVmaf, "  Video VMAF"),
+	(FormField::ImageTarget, "  Image SSIMULACRA2"),
+	(FormField::AudioKbps, "  Audio stereo kbps"),
 ];
 
 pub fn draw(frame: &mut Frame, menu: &mut StartMenu) {
@@ -174,10 +180,18 @@ fn chips(form: Option<&NewProjectForm>) -> Vec<Chip> {
 	}
 
 	let enter = match form.focus() {
+		FormField::CustomQuality if form.custom_quality_open() => "close",
+		FormField::CustomQuality => "open",
 		FormField::DeleteOriginals => "toggle",
 		FormField::Create => "create",
 		FormField::Cancel => "cancel",
-		FormField::Source | FormField::Destination | FormField::Name | FormField::Speed => "next field",
+		FormField::Source
+		| FormField::Destination
+		| FormField::Name
+		| FormField::Speed
+		| FormField::VideoVmaf
+		| FormField::ImageTarget
+		| FormField::AudioKbps => "next field",
 	};
 	let mut chips = vec![
 		chip("Tab", "next field", Some(KeyCode::Tab)),
@@ -379,6 +393,19 @@ fn render_form(buf: &mut Buffer, body: Rect, form: &NewProjectForm, theme: &Them
 	layout.speed_row(buf, y, form, hits);
 	y += 2;
 
+	layout.custom_quality_row(buf, y, form, hits);
+	if form.custom_quality_open() {
+		for (field, label) in QUALITY_ROWS {
+			y += 1;
+			layout.text_row(buf, y, form, field, label, hits);
+			if let Some(check) = form.quality_check(field) {
+				layout.quality_check_row(buf, y + 1, &check);
+			}
+			y += 1;
+		}
+	}
+	y += 2;
+
 	layout.delete_row(buf, y, form, hits);
 	y += 3;
 
@@ -479,6 +506,50 @@ impl FormLayout<'_> {
 		put(buf, self.value_x, y + 1, explanation, fg(theme.dim), self.right);
 	}
 
+	/// Closed, it names what the project gets: the preset's targets, or the custom values typed below it.
+	fn custom_quality_row(&self, buf: &mut Buffer, y: u16, form: &NewProjectForm, hits: &mut HitMap<StartHit>) {
+		let theme = self.theme;
+		let focused = form.focus() == FormField::CustomQuality && form.confirming().is_none();
+		self.label(buf, y, "Custom quality…", focused);
+
+		let (text, style) = match (form.custom_quality_open(), form.overrides()) {
+			(_, Err(reason)) => (format!("✗ {reason}"), fg(theme.error)),
+			(true, Ok(_)) => (
+				"▾ leave a field empty to keep the preset's value".to_owned(),
+				fg(theme.text),
+			),
+			(false, Ok(overrides)) if overrides.is_empty() => {
+				("▸ the preset's targets · ⏎ to set your own".to_owned(), fg(theme.text))
+			}
+			(false, Ok(overrides)) => (
+				format!("▸ {}", custom_values(&overrides.normalized())),
+				bold(theme.accent),
+			),
+		};
+		let style = if focused { style.bg(theme.selection) } else { style };
+		let cells = usize::from(self.right.saturating_sub(self.value_x));
+		let end = put(buf, self.value_x, y, &fit(&text, cells), style, self.right);
+		hits.push(
+			Rect::new(self.label_x, y, end.saturating_sub(self.label_x), 1),
+			StartHit::Field(FormField::CustomQuality),
+		);
+	}
+
+	fn quality_check_row(&self, buf: &mut Buffer, y: u16, check: &QualityCheck) {
+		let theme = self.theme;
+		let (text, style) = match check {
+			QualityCheck::Preset(preset) => (format!("{preset} · leave empty to keep it"), fg(theme.dim)),
+			QualityCheck::Custom => ("✓ custom".to_owned(), fg(theme.done)),
+			QualityCheck::NotUsed => (
+				format!("{FAST_NEVER_MEASURES_VIDEO}; a value here isn't stored"),
+				fg(theme.dim),
+			),
+			QualityCheck::Invalid(reason) => (format!("✗ {reason}"), fg(theme.error)),
+		};
+		let cells = usize::from(self.right.saturating_sub(self.value_x));
+		put(buf, self.value_x, y, &fit(&text, cells), style, self.right);
+	}
+
 	fn delete_row(&self, buf: &mut Buffer, y: u16, form: &NewProjectForm, hits: &mut HitMap<StartHit>) {
 		let theme = self.theme;
 		let focused = form.focus() == FormField::DeleteOriginals && form.confirming().is_none();
@@ -540,6 +611,22 @@ impl FormLayout<'_> {
 		let cells = usize::from(self.right.saturating_sub(x + 1));
 		put(buf, x + 1, y, &fit(&reason, cells), style, self.right);
 	}
+}
+
+/// `custom: video VMAF 90/85, image 80, audio 160 kbps`, as the project will store them.
+fn custom_values(overrides: &Overrides) -> String {
+	let values: Vec<String> = QUALITY_FIELDS
+		.into_iter()
+		.filter_map(|field| {
+			let value = field.shown(&field.text(overrides)?);
+			Some(match field {
+				QualityField::Video => format!("video VMAF {value}"),
+				QualityField::Image => format!("image {value}"),
+				QualityField::Audio => format!("audio {value}"),
+			})
+		})
+		.collect();
+	format!("custom: {}", values.join(", "))
 }
 
 /// The value, scrolled so the cursor stays in view while focused; the cursor is the reversed cell.

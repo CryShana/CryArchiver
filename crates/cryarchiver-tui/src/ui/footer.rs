@@ -139,7 +139,12 @@ fn chips(view: &ArchiveView, details: Option<&FileDetails>, ui: &Ui) -> Vec<Chip
 			chip("↑↓", "move", None),
 			chip("←→", "change", None),
 			chip("⏎", "toggle", Some(KeyCode::Enter)),
+			chip("r", "reset to preset", Some(KeyCode::Char('r'))),
 			chip("Esc", "close", Some(KeyCode::Esc)),
+		],
+		(Some(Overlay::EditQuality { .. }), _) => vec![
+			chip("⏎", "apply", Some(KeyCode::Enter)),
+			chip("Esc", "cancel", Some(KeyCode::Esc)),
 		],
 		(Some(Overlay::ConfirmDelete(_)), _) => vec![
 			chip("⏎", "confirm", Some(KeyCode::Enter)),

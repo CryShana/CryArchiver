@@ -66,6 +66,17 @@ impl Overrides {
 		}
 	}
 
+	/// The normalized overrides the engine applies at `speed`. FAST never measures video quality, so a stored video
+	/// override stays in the settings but takes no effect there.
+	#[must_use]
+	pub fn effective(&self, speed: Speed) -> Self {
+		let mut effective = self.normalized();
+		if speed == Speed::Fast {
+			effective.video = None;
+		}
+		effective
+	}
+
 	pub fn validate(&self) -> Result<(), String> {
 		if let Some(video) = self.video {
 			if !VIDEO_MEAN_RANGE.contains(&video.mean) {
@@ -219,6 +230,25 @@ mod tests {
 		assert_eq!(video(f64::INFINITY, 80.0).normalized(), Overrides::default());
 		assert_eq!(video(95.0, 91.0).normalized().validate(), Ok(()));
 		assert_eq!(video(120.0, 10.0).normalized().validate(), Ok(()));
+	}
+
+	#[test]
+	fn only_overrides_that_take_effect_are_effective() {
+		let custom = Overrides {
+			video: Some(VmafOverride {
+				mean: 90.04,
+				floor: 85.0,
+			}),
+			image: Some(80.04),
+			audio_stereo_kbps: None,
+		};
+
+		assert_eq!(custom.effective(Speed::Moderate), custom.normalized());
+		assert_eq!(custom.effective(Speed::Slow), custom.normalized());
+		assert_eq!(custom.effective(Speed::Fast), image(80.0));
+		assert!(video(90.0, 85.0).effective(Speed::Fast).is_empty());
+		assert!(!video(90.0, 85.0).effective(Speed::Moderate).is_empty());
+		assert!(image(f64::NAN).effective(Speed::Moderate).is_empty());
 	}
 
 	#[test]

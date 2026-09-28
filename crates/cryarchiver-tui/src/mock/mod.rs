@@ -19,7 +19,7 @@ use self::store::FileStore;
 use crate::source::{Action, ArchiveSource};
 use crate::view::{
 	ArchiveView, FileDetails, FileId, FileRow, FilterResult, Header, IssueId, Log, NodeId, Notification, Overall,
-	RunState, Settings, Speed, SystemStats, WorkKind, Workers,
+	Overrides, RunState, Settings, Speed, SystemStats, WorkKind, Workers,
 };
 
 const TICK: Duration = Duration::from_millis(500);
@@ -121,6 +121,7 @@ impl MockSource {
 				},
 				settings: Settings {
 					speed: Speed::Moderate,
+					overrides: Overrides::default(),
 					min_savings: 10,
 					watch: false,
 					performance_limit: None,

@@ -103,6 +103,13 @@ impl MockSource {
 		let settings = &mut self.view.settings;
 		match change {
 			SettingsChange::Speed(speed) => settings.speed = speed,
+			SettingsChange::Overrides(overrides) => {
+				if let Err(reason) = overrides.validate() {
+					self.notify(NoticeLevel::Error, format!("the quality stays as it was: {reason}"));
+					return;
+				}
+				settings.overrides = overrides.normalized();
+			}
 			SettingsChange::MinSavings(percent) => settings.min_savings = percent.min(90),
 			SettingsChange::Watch(on) => settings.watch = on,
 			SettingsChange::StabilityWindow(window) => settings.stability_window = window,

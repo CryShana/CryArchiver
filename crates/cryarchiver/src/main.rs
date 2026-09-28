@@ -229,9 +229,11 @@ fn parse_audio_kbps(text: &str) -> Result<u32, String> {
 	Ok(overrides.audio_stereo_kbps.unwrap_or(kbps))
 }
 
-/// `MODERATE · custom: video VMAF 90/85, image 80, audio 160 kbps`, or `None` without overrides.
+/// `MODERATE · custom: video VMAF 90/85, image 80, audio 160 kbps`, or `None` without an override that takes effect.
+/// The values are the ones the engine uses; a video override stored for FAST is listed last as not used.
 fn quality_label(speed: Speed, overrides: &Overrides) -> Option<String> {
-	if overrides.is_empty() {
+	let effective = overrides.effective(speed);
+	if effective.is_empty() {
 		return None;
 	}
 
@@ -240,12 +242,18 @@ fn quality_label(speed: Speed, overrides: &Overrides) -> Option<String> {
 		Speed::Moderate => "MODERATE",
 		Speed::Fast => "FAST",
 	};
+	let unused_video = overrides
+		.normalized()
+		.video
+		.filter(|_| effective.video.is_none())
+		.map(|video| format!("video VMAF {}/{} not used at FAST", video.mean, video.floor));
 	let values: Vec<String> = [
-		overrides
+		effective
 			.video
 			.map(|video| format!("video VMAF {}/{}", video.mean, video.floor)),
-		overrides.image.map(|image| format!("image {image}")),
-		overrides.audio_stereo_kbps.map(|kbps| format!("audio {kbps} kbps")),
+		effective.image.map(|image| format!("image {image}")),
+		effective.audio_stereo_kbps.map(|kbps| format!("audio {kbps} kbps")),
+		unused_video,
 	]
 	.into_iter()
 	.flatten()
@@ -1038,6 +1046,55 @@ mod tests {
 			)
 			.as_deref(),
 			Some("SLOW · custom: image 62.5")
+		);
+	}
+
+	#[test]
+	fn the_label_counts_only_overrides_that_take_effect() {
+		let video = Overrides {
+			video: Some(VmafOverride {
+				mean: 90.0,
+				floor: 85.0,
+			}),
+			..Overrides::default()
+		};
+		let video_and_image = Overrides {
+			image: Some(80.0),
+			..video
+		};
+
+		assert_eq!(quality_label(Speed::Fast, &video), None);
+		assert_eq!(
+			quality_label(Speed::Fast, &video_and_image).as_deref(),
+			Some("FAST · custom: image 80, video VMAF 90/85 not used at FAST")
+		);
+		assert_eq!(
+			quality_label(Speed::Moderate, &video).as_deref(),
+			Some("MODERATE · custom: video VMAF 90/85")
+		);
+	}
+
+	#[test]
+	fn the_label_shows_the_values_the_engine_uses() {
+		let stored = Overrides {
+			image: Some(200.0),
+			audio_stereo_kbps: Some(99),
+			..Overrides::default()
+		};
+
+		assert_eq!(
+			quality_label(Speed::Moderate, &stored).as_deref(),
+			Some("MODERATE · custom: image 95, audio 96 kbps")
+		);
+		assert_eq!(
+			quality_label(
+				Speed::Moderate,
+				&Overrides {
+					image: Some(f64::NAN),
+					..Overrides::default()
+				}
+			),
+			None
 		);
 	}
 

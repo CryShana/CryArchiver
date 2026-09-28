@@ -15,7 +15,11 @@ impl Ui {
 			return Outcome::Done;
 		}
 
-		let typing = self.search.is_some() || matches!(self.overlay, Some(Overlay::ConfirmDelete(_)));
+		let typing = self.search.is_some()
+			|| matches!(
+				self.overlay,
+				Some(Overlay::ConfirmDelete(_) | Overlay::EditQuality { .. })
+			);
 		if burst && (!typing || key.code == KeyCode::Enter) {
 			return Outcome::Ignored;
 		}
@@ -42,7 +46,8 @@ impl Ui {
 
 	/// Bracketed paste only reaches text inputs, so pasted text never fires shortcuts.
 	pub(super) fn on_paste(&mut self, source: &dyn ArchiveSource, text: &str) {
-		let ((Some(input), _) | (None, Some(Overlay::ConfirmDelete(input)))) = (&mut self.search, &mut self.overlay)
+		let ((Some(input), _) | (None, Some(Overlay::ConfirmDelete(input) | Overlay::EditQuality { input, .. }))) =
+			(&mut self.search, &mut self.overlay)
 		else {
 			return;
 		};
@@ -99,6 +104,7 @@ impl Ui {
 				let selected = *selected;
 				return self.on_settings_key(source, key, selected);
 			}
+			Some(Overlay::EditQuality { .. }) => return self.on_edit_quality_key(source, key),
 			Some(Overlay::ConfirmDelete(_)) => return self.on_confirm_delete_key(key),
 			Some(Overlay::ConfirmRestart) => return self.on_confirm_restart_key(key),
 			Some(Overlay::Help) | None => match key.code {

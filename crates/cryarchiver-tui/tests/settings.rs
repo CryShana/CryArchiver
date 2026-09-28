@@ -2,17 +2,212 @@ mod support;
 
 use std::time::Instant;
 
+use cryarchiver_engine::preset::{Overrides, VmafOverride};
 use cryarchiver_tui::view::{Limit, Speed};
-use cryarchiver_tui::{ArchiveSource, OverlayKind, ViewMode};
+use cryarchiver_tui::{App, ArchiveSource, MockSource, OverlayKind, ViewMode};
 use ratatui::crossterm::event::{Event, KeyCode};
 
-use support::{app, draw, find_row, press, type_text};
+use support::{app, draw, find_on_row, find_row, press, row_text, type_text};
 
-fn open_row(app: &mut cryarchiver_tui::App<cryarchiver_tui::MockSource>, row: usize) {
+const SPEED: usize = 0;
+const VIDEO: usize = 1;
+const IMAGE: usize = 2;
+const AUDIO: usize = 3;
+const RESET_QUALITY: usize = 4;
+const MIN_SAVINGS: usize = 5;
+const LIMIT: usize = 7;
+const DELETE_ORIGINALS: usize = 10;
+const RESTART_PENDING_JOBS: usize = 12;
+
+fn open_row(app: &mut App<MockSource>, row: usize) {
 	press(app, KeyCode::Char('s'));
 	for _ in 0..row {
 		press(app, KeyCode::Down);
 	}
+}
+
+/// Types `text` into the quality row's editor and presses ⏎; the settings stay open.
+fn enter_quality(app: &mut App<MockSource>, row: usize, text: &str) {
+	open_row(app, row);
+	press(app, KeyCode::Enter);
+	assert_eq!(app.overlay(), Some(OverlayKind::EditQuality));
+	type_text(app, text);
+	press(app, KeyCode::Enter);
+}
+
+fn shown_row(app: &mut App<MockSource>, label: &str) -> String {
+	let terminal = draw(app, 120, 36);
+	let row = find_row(&terminal, label).unwrap_or_else(|| panic!("no row shows {label}"));
+	row_text(&terminal, row)
+}
+
+fn overrides(app: &App<MockSource>) -> Overrides {
+	app.source().view().settings.overrides
+}
+
+#[test]
+fn quality_rows_show_the_preset_dimmed_until_edited() {
+	let mut app = app();
+	open_row(&mut app, IMAGE);
+
+	assert!(shown_row(&mut app, "Video VMAF").contains("preset · 93/89"));
+	assert!(shown_row(&mut app, "Audio stereo").contains("preset · 128 kbps"));
+	let terminal = draw(&mut app, 120, 36);
+	let row = find_row(&terminal, "Image SSIMULACRA2").unwrap();
+	assert!(row_text(&terminal, row).contains("preset · 85"));
+	let preset_color = terminal.backend().buffer()[(find_on_row(&terminal, row, "preset").unwrap(), row)].fg;
+
+	press(&mut app, KeyCode::Esc);
+	enter_quality(&mut app, IMAGE, "80");
+
+	assert_eq!(overrides(&app).image, Some(80.0));
+	assert_eq!(app.overlay(), Some(OverlayKind::Settings));
+	let terminal = draw(&mut app, 120, 36);
+	let row = find_row(&terminal, "Image SSIMULACRA2").unwrap();
+	let text = row_text(&terminal, row);
+	assert!(text.contains("custom · 80"), "{text}");
+	assert!(!text.contains("preset"), "{text}");
+	let custom_color = terminal.backend().buffer()[(find_on_row(&terminal, row, "custom").unwrap(), row)].fg;
+	assert_ne!(preset_color, custom_color);
+	assert!(shown_row(&mut app, "Video VMAF").contains("preset · 93/89"));
+}
+
+#[test]
+fn quality_edits_are_validated_as_they_are_typed_and_invalid_ones_are_not_applied() {
+	let mut app = app();
+
+	enter_quality(&mut app, IMAGE, "120");
+	assert_eq!(app.overlay(), Some(OverlayKind::EditQuality));
+	assert!(find_row(&draw(&mut app, 120, 36), "must be between 50 and 95").is_some());
+	assert!(!app.should_quit());
+	press(&mut app, KeyCode::Esc);
+	assert_eq!(overrides(&app), Overrides::default());
+	press(&mut app, KeyCode::Esc);
+
+	enter_quality(&mut app, VIDEO, "93");
+	assert!(find_row(&draw(&mut app, 120, 36), "MEAN/FLOOR").is_some());
+	type_text(&mut app, "/95");
+	assert!(find_row(&draw(&mut app, 120, 36), "between 70 and the mean (93)").is_some());
+	press(&mut app, KeyCode::Enter);
+	assert_eq!(overrides(&app), Overrides::default());
+	press(&mut app, KeyCode::Esc);
+	press(&mut app, KeyCode::Esc);
+
+	enter_quality(&mut app, AUDIO, "100");
+	assert!(find_row(&draw(&mut app, 120, 36), "in steps of 8").is_some());
+	press(&mut app, KeyCode::Esc);
+	press(&mut app, KeyCode::Esc);
+
+	enter_quality(&mut app, AUDIO, "loud");
+	assert!(find_row(&draw(&mut app, 120, 36), "\"loud\" is not a number").is_some());
+	assert!(!app.should_quit(), "typing goes into the editor");
+	press(&mut app, KeyCode::Esc);
+	assert_eq!(overrides(&app), Overrides::default());
+}
+
+#[test]
+fn reset_returns_one_row_or_every_row_to_the_preset() {
+	let mut app = app();
+	enter_quality(&mut app, VIDEO, "90/85");
+	press(&mut app, KeyCode::Esc);
+	enter_quality(&mut app, IMAGE, "80");
+	press(&mut app, KeyCode::Esc);
+	enter_quality(&mut app, AUDIO, "160");
+	assert_eq!(
+		overrides(&app),
+		Overrides {
+			video: Some(VmafOverride {
+				mean: 90.0,
+				floor: 85.0
+			}),
+			image: Some(80.0),
+			audio_stereo_kbps: Some(160),
+		}
+	);
+	press(&mut app, KeyCode::Esc);
+
+	open_row(&mut app, IMAGE);
+	press(&mut app, KeyCode::Char('r'));
+	assert_eq!(overrides(&app).image, None);
+	assert_eq!(overrides(&app).audio_stereo_kbps, Some(160));
+	assert!(shown_row(&mut app, "Image SSIMULACRA2").contains("preset · 85"));
+	press(&mut app, KeyCode::Esc);
+
+	open_row(&mut app, RESET_QUALITY);
+	press(&mut app, KeyCode::Enter);
+	assert_eq!(overrides(&app), Overrides::default());
+	assert!(shown_row(&mut app, "Reset quality").contains("nothing to reset"));
+}
+
+#[test]
+fn an_emptied_editor_returns_the_row_to_the_preset() {
+	let mut app = app();
+	enter_quality(&mut app, IMAGE, "80");
+
+	press(&mut app, KeyCode::Enter);
+	press(&mut app, KeyCode::Backspace);
+	press(&mut app, KeyCode::Backspace);
+	press(&mut app, KeyCode::Enter);
+
+	assert_eq!(overrides(&app), Overrides::default());
+}
+
+#[test]
+fn the_header_names_a_custom_profile() {
+	let mut app = app();
+	let header = |app: &mut App<MockSource>| row_text(&draw(app, 120, 36), 0);
+	assert!(header(&mut app).contains(" MODERATE · LATEST "));
+
+	enter_quality(&mut app, AUDIO, "160");
+
+	assert!(header(&mut app).contains(" MODERATE · custom · LATEST "));
+	press(&mut app, KeyCode::Char('r'));
+	assert!(!header(&mut app).contains("custom"));
+}
+
+#[test]
+fn at_fast_the_video_row_is_disabled_and_keeps_its_value() {
+	let mut app = app();
+	enter_quality(&mut app, VIDEO, "90/85");
+	press(&mut app, KeyCode::Esc);
+	open_row(&mut app, SPEED);
+	press(&mut app, KeyCode::Right);
+	assert_eq!(app.source().view().settings.speed, Speed::Fast);
+
+	let video = shown_row(&mut app, "Video VMAF");
+	assert!(video.contains("FAST never measures video quality"), "{video}");
+	assert!(video.contains("90/85"), "{video}");
+	assert!(!video.contains("custom"), "{video}");
+	let header = row_text(&draw(&mut app, 120, 36), 0);
+	assert!(header.contains(" FAST · LATEST "), "{header}");
+
+	press(&mut app, KeyCode::Down);
+	press(&mut app, KeyCode::Enter);
+	assert_eq!(app.overlay(), Some(OverlayKind::Settings), "the row can't be edited");
+	press(&mut app, KeyCode::Char('r'));
+	assert!(overrides(&app).video.is_some(), "nor reset");
+
+	press(&mut app, KeyCode::Up);
+	press(&mut app, KeyCode::Left);
+	assert_eq!(app.source().view().settings.speed, Speed::Moderate);
+	assert!(shown_row(&mut app, "Video VMAF").contains("custom · 90/85"));
+	assert!(row_text(&draw(&mut app, 120, 36), 0).contains(" MODERATE · custom · LATEST "));
+}
+
+#[test]
+fn a_fast_project_with_an_unused_video_override_can_still_be_reset() {
+	let mut app = app();
+	enter_quality(&mut app, VIDEO, "90/85");
+	press(&mut app, KeyCode::Esc);
+	open_row(&mut app, SPEED);
+	press(&mut app, KeyCode::Right);
+
+	for _ in 0..RESET_QUALITY {
+		press(&mut app, KeyCode::Down);
+	}
+	press(&mut app, KeyCode::Enter);
+
+	assert_eq!(overrides(&app), Overrides::default());
 }
 
 #[test]
@@ -24,7 +219,9 @@ fn s_opens_settings_and_arrows_change_them() {
 	press(&mut app, KeyCode::Right);
 	assert_eq!(app.source().view().settings.speed, Speed::Fast);
 
-	press(&mut app, KeyCode::Down);
+	for _ in 0..MIN_SAVINGS {
+		press(&mut app, KeyCode::Down);
+	}
 	press(&mut app, KeyCode::Left);
 	assert_eq!(app.source().view().settings.min_savings, 5);
 
@@ -39,7 +236,7 @@ fn s_opens_settings_and_arrows_change_them() {
 #[test]
 fn deleting_originals_needs_delete_typed() {
 	let mut app = app();
-	open_row(&mut app, 6);
+	open_row(&mut app, DELETE_ORIGINALS);
 	press(&mut app, KeyCode::Enter);
 	assert_eq!(app.overlay(), Some(OverlayKind::ConfirmDelete));
 
@@ -67,14 +264,14 @@ fn restarting_pending_jobs_asks_first() {
 	press(&mut app, KeyCode::Char('e'));
 	assert!(app.source().view().limit().is_some_and(|limit| limit.pending));
 
-	open_row(&mut app, 8);
+	open_row(&mut app, RESTART_PENDING_JOBS);
 	press(&mut app, KeyCode::Enter);
 	assert_eq!(app.overlay(), Some(OverlayKind::ConfirmRestart));
 
 	press(&mut app, KeyCode::Esc);
 	assert!(app.source().view().limit().is_some_and(|limit| limit.pending));
 
-	open_row(&mut app, 8);
+	open_row(&mut app, RESTART_PENDING_JOBS);
 	press(&mut app, KeyCode::Enter);
 	press(&mut app, KeyCode::Enter);
 	assert_eq!(
@@ -90,7 +287,7 @@ fn restarting_pending_jobs_asks_first() {
 #[test]
 fn limit_steps_through_caps() {
 	let mut app = app();
-	open_row(&mut app, 3);
+	open_row(&mut app, LIMIT);
 
 	press(&mut app, KeyCode::Right);
 	assert_eq!(app.source().view().settings.performance_limit, Some(25));

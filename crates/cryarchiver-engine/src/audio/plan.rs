@@ -151,7 +151,7 @@ pub fn plan_track(
 	}))
 }
 
-fn table_rate(channels: u32, speed: Speed, overrides: &Overrides) -> u32 {
+pub fn table_rate(channels: u32, speed: Speed, overrides: &Overrides) -> u32 {
 	let (mono, stereo, five_one, seven_one) = match speed {
 		Speed::Fast => (48, 96, 192, 288),
 		Speed::Moderate => (64, 128, 256, 384),

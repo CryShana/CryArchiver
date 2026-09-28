@@ -463,10 +463,16 @@ impl StartMenu {
 
 		match field {
 			FormField::Speed => form.set_speed(next_speed(form.speed(), 1)),
+			FormField::CustomQuality => form.toggle_custom_quality(),
 			FormField::DeleteOriginals => form.toggle_delete(),
 			FormField::Create => self.create(),
 			FormField::Cancel => self.leave_form(),
-			FormField::Source | FormField::Destination | FormField::Name => {}
+			FormField::Source
+			| FormField::Destination
+			| FormField::Name
+			| FormField::VideoVmaf
+			| FormField::ImageTarget
+			| FormField::AudioKbps => {}
 		}
 	}
 

@@ -1386,3 +1386,31 @@ fn an_overrides_change_is_stored_and_read_back_on_reopen() {
 
 	assert_eq!(project.settings().overrides, custom);
 }
+
+#[test]
+fn a_new_project_stores_its_overrides_normalized() {
+	let setup = setup(|settings| {
+		settings.overrides = Overrides {
+			video: Some(VmafOverride {
+				mean: 90.04,
+				floor: 85.06,
+			}),
+			image: Some(200.0),
+			audio_stereo_kbps: Some(99),
+		};
+	});
+
+	let (_, meta, _) = Store::open(&setup.project).unwrap();
+
+	assert_eq!(
+		meta.settings.overrides,
+		Overrides {
+			video: Some(VmafOverride {
+				mean: 90.0,
+				floor: 85.1,
+			}),
+			image: Some(95.0),
+			audio_stereo_kbps: Some(96),
+		}
+	);
+}

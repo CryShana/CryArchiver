@@ -119,7 +119,9 @@ impl Ui {
 					}
 				};
 			}
-			Some(Overlay::ConfirmDelete(_) | Overlay::ConfirmRestart) => return Outcome::Ignored,
+			Some(Overlay::ConfirmDelete(_) | Overlay::ConfirmRestart | Overlay::EditQuality { .. }) => {
+				return Outcome::Ignored;
+			}
 			Some(Overlay::Help) => {
 				self.overlay = None;
 				return Outcome::Done;

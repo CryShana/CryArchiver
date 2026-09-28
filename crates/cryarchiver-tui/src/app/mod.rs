@@ -17,7 +17,7 @@ pub(crate) use self::burst::{BURST_GAP, burst_flags};
 pub(crate) use self::menu::Menu;
 use self::mouse::Click;
 pub(crate) use self::mouse::{DOUBLE_CLICK, Hit, HitMap};
-pub(crate) use self::settings::{SETTINGS_ROWS, SettingsRow};
+pub(crate) use self::settings::{FAST_NEVER_MEASURES_VIDEO, QUALITY_FIELDS, QualityField, SETTINGS_ROWS, SettingsRow};
 pub use self::tree::Selection;
 use self::tree::TreeState;
 use crate::source::{Action, ArchiveSource};
@@ -38,6 +38,7 @@ pub enum OverlayKind {
 	Help,
 	Menu,
 	Settings,
+	EditQuality,
 	ConfirmDelete,
 	ConfirmRestart,
 }
@@ -46,6 +47,11 @@ pub(crate) enum Overlay {
 	Help,
 	Menu(Menu),
 	Settings(usize),
+	/// A quality row of the settings being typed into; `row` indexes [`SETTINGS_ROWS`].
+	EditQuality {
+		row: usize,
+		input: Input,
+	},
 	ConfirmDelete(Input),
 	ConfirmRestart,
 }
@@ -380,6 +386,7 @@ impl<S: ArchiveSource> App<S> {
 			Overlay::Help => OverlayKind::Help,
 			Overlay::Menu(_) => OverlayKind::Menu,
 			Overlay::Settings(_) => OverlayKind::Settings,
+			Overlay::EditQuality { .. } => OverlayKind::EditQuality,
 			Overlay::ConfirmDelete(_) => OverlayKind::ConfirmDelete,
 			Overlay::ConfirmRestart => OverlayKind::ConfirmRestart,
 		})

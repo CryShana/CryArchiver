@@ -245,6 +245,7 @@ pub fn create(
 	refuse_outside(&path, &destination, name)?;
 	let mut settings = Settings::new(&source, &destination);
 	configure(&mut settings);
+	settings.overrides = settings.overrides.normalized();
 	Store::create(&path, &settings)?;
 	Ok(path)
 }

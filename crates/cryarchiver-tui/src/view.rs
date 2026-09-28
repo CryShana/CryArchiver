@@ -6,6 +6,9 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+pub use cryarchiver_engine::preset::Overrides;
+use cryarchiver_engine::preset::Speed as PresetSpeed;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArchiveView {
 	pub header: Header,
@@ -63,9 +66,11 @@ pub enum RunState {
 }
 
 /// The project settings of the project layer spec §4, as currently stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
 	pub speed: Speed,
+	/// Normalized, as the engine reads them. A video override stays stored at FAST, where it takes no effect.
+	pub overrides: Overrides,
 	pub min_savings: u8,
 	pub watch: bool,
 	/// The CPU cap in percent while the performance limit is on.
@@ -88,6 +93,25 @@ impl Speed {
 			Self::Slow => "SLOW",
 			Self::Moderate => "MODERATE",
 			Self::Fast => "FAST",
+		}
+	}
+
+	pub const fn preset(self) -> PresetSpeed {
+		match self {
+			Self::Slow => PresetSpeed::Slow,
+			Self::Moderate => PresetSpeed::Moderate,
+			Self::Fast => PresetSpeed::Fast,
+		}
+	}
+}
+
+impl Settings {
+	/// `MODERATE · custom` while an override that takes effect at this speed is set, else the plain preset.
+	pub fn profile_label(&self) -> String {
+		if self.overrides.effective(self.speed.preset()).is_empty() {
+			self.speed.label().to_owned()
+		} else {
+			format!("{} · custom", self.speed.label())
 		}
 	}
 }

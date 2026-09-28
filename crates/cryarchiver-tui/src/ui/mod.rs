@@ -169,7 +169,12 @@ fn draw_overlay(buf: &mut ratatui::buffer::Buffer, screen: Rect, main: Rect, vie
 			let default_anchor = (screen.x + 24, row.min(main.bottom()));
 			overlay::menu(buf, screen, menu, default_anchor, &ui.theme, &mut ui.hits);
 		}
-		Some(Overlay::Settings(selected)) => settings::render(buf, screen, view, *selected, &ui.theme, &mut ui.hits),
+		Some(Overlay::Settings(selected)) => {
+			settings::render(buf, screen, view, (*selected, None), &ui.theme, &mut ui.hits);
+		}
+		Some(Overlay::EditQuality { row, input }) => {
+			settings::render(buf, screen, view, (*row, Some(input)), &ui.theme, &mut ui.hits);
+		}
 		Some(Overlay::ConfirmDelete(input)) => {
 			settings::confirm_delete(buf, screen, view, input, &ui.theme, &mut ui.hits);
 		}

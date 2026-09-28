@@ -4,10 +4,12 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use cryarchiver_engine::preset::{Overrides, Speed as PresetSpeed};
 use cryarchiver_project::settings::{DELETE_CONFIRMATION, SettingsChange, Speed};
 use tui_input::Input;
 
 use super::validate::{Probe, Validation, probe_destination, validate};
+use crate::app::{QUALITY_FIELDS, QualityField};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormField {
@@ -15,16 +17,25 @@ pub enum FormField {
 	Destination,
 	Name,
 	Speed,
+	/// Opens and closes the section with the three quality fields.
+	CustomQuality,
+	VideoVmaf,
+	ImageTarget,
+	AudioKbps,
 	DeleteOriginals,
 	Create,
 	Cancel,
 }
 
-pub const FORM_FIELDS: [FormField; 7] = [
+pub const FORM_FIELDS: [FormField; 11] = [
 	FormField::Source,
 	FormField::Destination,
 	FormField::Name,
 	FormField::Speed,
+	FormField::CustomQuality,
+	FormField::VideoVmaf,
+	FormField::ImageTarget,
+	FormField::AudioKbps,
 	FormField::DeleteOriginals,
 	FormField::Create,
 	FormField::Cancel,
@@ -32,8 +43,31 @@ pub const FORM_FIELDS: [FormField; 7] = [
 
 impl FormField {
 	pub const fn is_text(self) -> bool {
-		matches!(self, Self::Source | Self::Destination | Self::Name)
+		matches!(
+			self,
+			Self::Source | Self::Destination | Self::Name | Self::VideoVmaf | Self::ImageTarget | Self::AudioKbps
+		)
 	}
+
+	const fn quality(self) -> Option<QualityField> {
+		match self {
+			Self::VideoVmaf => Some(QualityField::Video),
+			Self::ImageTarget => Some(QualityField::Image),
+			Self::AudioKbps => Some(QualityField::Audio),
+			_ => None,
+		}
+	}
+}
+
+/// What a quality field of the form gives the project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualityCheck {
+	/// Left empty, so the project uses the preset's value, shown as `preset 93/89`.
+	Preset(String),
+	Custom,
+	/// FAST never measures video quality, so the value isn't stored.
+	NotUsed,
+	Invalid(String),
 }
 
 pub struct NewProjectForm {
@@ -42,6 +76,9 @@ pub struct NewProjectForm {
 	name: Input,
 	name_edited: bool,
 	speed: Speed,
+	/// In the order of [`QUALITY_FIELDS`].
+	quality: [Input; 3],
+	custom_quality_open: bool,
 	/// The typed confirmation that turned deleting originals on.
 	delete_confirmation: Option<String>,
 	/// The `DELETE` prompt while it is open.
@@ -64,6 +101,8 @@ impl NewProjectForm {
 			name: Input::default(),
 			name_edited: false,
 			speed: Speed::default(),
+			quality: Default::default(),
+			custom_quality_open: false,
 			delete_confirmation: None,
 			confirming: None,
 			focus: FormField::Source,
@@ -91,16 +130,17 @@ impl NewProjectForm {
 			FormField::Source => Some(&self.source),
 			FormField::Destination => Some(&self.destination),
 			FormField::Name => Some(&self.name),
-			_ => None,
+			_ => field.quality().map(|quality| &self.quality[quality_index(quality)]),
 		}
 	}
 
 	/// Edits a text field. Editing the source renames the project too, until the name was edited itself.
 	pub fn edit(&mut self, field: FormField, change: impl FnOnce(&mut Input)) {
-		let input = match field {
-			FormField::Source => &mut self.source,
-			FormField::Destination => &mut self.destination,
-			FormField::Name => &mut self.name,
+		let input = match (field, field.quality()) {
+			(FormField::Source, _) => &mut self.source,
+			(FormField::Destination, _) => &mut self.destination,
+			(FormField::Name, _) => &mut self.name,
+			(_, Some(quality)) => &mut self.quality[quality_index(quality)],
 			_ => return,
 		};
 		let before = input.value().to_owned();
@@ -110,6 +150,11 @@ impl NewProjectForm {
 		}
 
 		self.edited = true;
+		if field.quality().is_some() {
+			self.error = None;
+			return;
+		}
+
 		match field {
 			FormField::Name => self.name_edited = !self.name.value().is_empty(),
 			FormField::Source if !self.name_edited => {
@@ -137,14 +182,60 @@ impl NewProjectForm {
 		self.focus = field;
 	}
 
+	/// Steps through the fields on screen; a closed "Custom quality…" section hides its fields.
 	pub fn move_focus(&mut self, step: isize) {
-		let index = FORM_FIELDS.iter().position(|&field| field == self.focus).unwrap_or(0);
-		let last = FORM_FIELDS.len() - 1;
-		self.focus = FORM_FIELDS[index.saturating_add_signed(step).min(last)];
+		let visible: Vec<FormField> = FORM_FIELDS
+			.into_iter()
+			.filter(|field| self.custom_quality_open || field.quality().is_none())
+			.collect();
+		let index = visible.iter().position(|&field| field == self.focus).unwrap_or(0);
+		let last = visible.len() - 1;
+		self.focus = visible[index.saturating_add_signed(step).min(last)];
 	}
 
 	pub fn speed(&self) -> Speed {
 		self.speed
+	}
+
+	pub fn custom_quality_open(&self) -> bool {
+		self.custom_quality_open
+	}
+
+	/// Closing the section keeps what was typed in it: the project still gets those values.
+	pub fn toggle_custom_quality(&mut self) {
+		self.custom_quality_open = !self.custom_quality_open;
+		if !self.custom_quality_open && self.focus.quality().is_some() {
+			self.focus = FormField::CustomQuality;
+		}
+	}
+
+	/// `None` for a field that isn't a quality field.
+	pub fn quality_check(&self, field: FormField) -> Option<QualityCheck> {
+		let quality = field.quality()?;
+		let speed = PresetSpeed::from(self.speed);
+		let typed = self.quality[quality_index(quality)].value();
+
+		let Some(preset) = quality.preset_text(speed) else {
+			return Some(QualityCheck::NotUsed);
+		};
+		Some(match quality.with(Overrides::default(), typed) {
+			Err(reason) => QualityCheck::Invalid(reason),
+			Ok(overrides) if overrides.is_empty() => QualityCheck::Preset(format!("preset {}", quality.shown(&preset))),
+			Ok(_) => QualityCheck::Custom,
+		})
+	}
+
+	/// The overrides the project is created with, or the first reason a quality field can't be used. A video value
+	/// isn't stored at FAST, which never measures video quality.
+	pub fn overrides(&self) -> Result<Overrides, String> {
+		let speed = PresetSpeed::from(self.speed);
+		QUALITY_FIELDS
+			.into_iter()
+			.zip(&self.quality)
+			.filter(|(field, _)| field.applies(speed))
+			.try_fold(Overrides::default(), |overrides, (field, input)| {
+				field.with(overrides, input.value())
+			})
 	}
 
 	pub fn set_speed(&mut self, speed: Speed) {
@@ -193,7 +284,7 @@ impl NewProjectForm {
 	}
 
 	pub fn can_create(&self) -> bool {
-		self.validation.passes() && self.confirming.is_none()
+		self.validation.passes() && self.confirming.is_none() && self.overrides().is_ok()
 	}
 
 	pub fn error(&self) -> Option<&str> {
@@ -221,8 +312,10 @@ impl NewProjectForm {
 		}
 
 		let (speed, confirmation) = (self.speed, self.delete_confirmation.clone());
+		let overrides = self.overrides().unwrap_or_default();
 		let created = cryarchiver_project::create(source, destination, OsStr::new(self.name.value()), |settings| {
 			settings.speed = speed;
+			settings.overrides = overrides;
 			if let Some(confirmation) = confirmation {
 				settings
 					.apply(SettingsChange::DeleteOriginals {
@@ -249,10 +342,19 @@ impl Default for NewProjectForm {
 	}
 }
 
+fn quality_index(field: QualityField) -> usize {
+	QUALITY_FIELDS
+		.iter()
+		.position(|&candidate| candidate == field)
+		.unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::fs;
 	use std::path::MAIN_SEPARATOR;
+
+	use cryarchiver_engine::preset::VmafOverride;
 
 	use super::*;
 
@@ -406,6 +508,8 @@ mod tests {
 		let mut form = filled(&setup);
 		typed(&mut form, FormField::Name, " 2026");
 		form.set_speed(Speed::Slow);
+		form.toggle_custom_quality();
+		typed(&mut form, FormField::ImageTarget, "88");
 		assert!(form.can_create());
 		assert_eq!(folder(setup.dir.path()), before);
 
@@ -431,6 +535,145 @@ mod tests {
 		let mut form = NewProjectForm::new();
 		typed(&mut form, FormField::Source, "D");
 		assert!(form.edited());
+	}
+
+	#[test]
+	fn custom_quality_round_trips_into_the_created_project() {
+		let setup = setup();
+		let mut form = filled(&setup);
+		form.toggle_custom_quality();
+		replace(&mut form, FormField::VideoVmaf, "90/85");
+		replace(&mut form, FormField::ImageTarget, "80");
+		replace(&mut form, FormField::AudioKbps, "160");
+		assert!(form.can_create(), "{:?}", form.overrides());
+
+		let path = form.create().unwrap();
+
+		let meta = cryarchiver_project::store::peek(&path).unwrap().meta;
+		assert_eq!(
+			meta.settings.overrides,
+			Overrides {
+				video: Some(VmafOverride {
+					mean: 90.0,
+					floor: 85.0,
+				}),
+				image: Some(80.0),
+				audio_stereo_kbps: Some(160),
+			}
+		);
+	}
+
+	#[test]
+	fn empty_quality_fields_keep_the_preset() {
+		let setup = setup();
+		let mut form = filled(&setup);
+		form.set_speed(Speed::Slow);
+
+		assert_eq!(
+			form.quality_check(FormField::VideoVmaf),
+			Some(QualityCheck::Preset("preset 95/91".into()))
+		);
+		assert_eq!(
+			form.quality_check(FormField::ImageTarget),
+			Some(QualityCheck::Preset("preset 90".into()))
+		);
+		assert_eq!(
+			form.quality_check(FormField::AudioKbps),
+			Some(QualityCheck::Preset("preset 160 kbps".into()))
+		);
+		assert_eq!(form.quality_check(FormField::Name), None);
+
+		let path = form.create().unwrap();
+		assert!(
+			cryarchiver_project::store::peek(&path)
+				.unwrap()
+				.meta
+				.settings
+				.overrides
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn quality_fields_are_checked_as_they_are_typed() {
+		let setup = setup();
+		let mut form = filled(&setup);
+		form.toggle_custom_quality();
+
+		typed(&mut form, FormField::ImageTarget, "120");
+		assert!(
+			matches!(form.quality_check(FormField::ImageTarget), Some(QualityCheck::Invalid(reason)) if reason.contains("between 50 and 95"))
+		);
+		assert!(!form.can_create());
+		assert!(form.create().is_none());
+		assert!(!setup.dir.path().join("archive").exists());
+
+		replace(&mut form, FormField::ImageTarget, "80");
+		assert_eq!(form.quality_check(FormField::ImageTarget), Some(QualityCheck::Custom));
+		typed(&mut form, FormField::VideoVmaf, "93");
+		assert!(
+			matches!(form.quality_check(FormField::VideoVmaf), Some(QualityCheck::Invalid(reason)) if reason.contains("MEAN/FLOOR"))
+		);
+		typed(&mut form, FormField::VideoVmaf, "/95");
+		assert!(
+			matches!(form.quality_check(FormField::VideoVmaf), Some(QualityCheck::Invalid(reason)) if reason.contains("the mean (93)"))
+		);
+		replace(&mut form, FormField::VideoVmaf, "");
+		typed(&mut form, FormField::AudioKbps, "100");
+		assert!(
+			matches!(form.quality_check(FormField::AudioKbps), Some(QualityCheck::Invalid(reason)) if reason.contains("steps of 8"))
+		);
+
+		form.toggle_custom_quality();
+		assert!(!form.can_create(), "a collapsed section still counts");
+		replace(&mut form, FormField::AudioKbps, "96");
+		assert!(form.can_create());
+	}
+
+	#[test]
+	fn at_fast_the_video_field_is_not_stored() {
+		let setup = setup();
+		let mut form = filled(&setup);
+		form.toggle_custom_quality();
+		replace(&mut form, FormField::VideoVmaf, "90/85");
+		replace(&mut form, FormField::ImageTarget, "80");
+		form.set_speed(Speed::Fast);
+
+		assert_eq!(form.quality_check(FormField::VideoVmaf), Some(QualityCheck::NotUsed));
+		let path = form.create().unwrap();
+
+		let meta = cryarchiver_project::store::peek(&path).unwrap().meta;
+		assert_eq!(
+			meta.settings.overrides,
+			Overrides {
+				image: Some(80.0),
+				..Overrides::default()
+			}
+		);
+	}
+
+	#[test]
+	fn a_collapsed_section_is_skipped_by_the_focus() {
+		let mut form = NewProjectForm::new();
+		form.set_focus(FormField::CustomQuality);
+
+		form.move_focus(1);
+		assert_eq!(form.focus(), FormField::DeleteOriginals);
+
+		form.toggle_custom_quality();
+		form.set_focus(FormField::CustomQuality);
+		form.move_focus(1);
+		assert_eq!(form.focus(), FormField::VideoVmaf);
+		form.move_focus(3);
+		assert_eq!(form.focus(), FormField::DeleteOriginals);
+		form.move_focus(-1);
+		assert_eq!(form.focus(), FormField::AudioKbps);
+
+		form.set_focus(FormField::ImageTarget);
+		form.toggle_custom_quality();
+		assert_eq!(form.focus(), FormField::CustomQuality);
+		form.move_focus(-1);
+		assert_eq!(form.focus(), FormField::Speed);
 	}
 
 	#[test]

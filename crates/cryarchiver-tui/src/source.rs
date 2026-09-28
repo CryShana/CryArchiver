@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::view::{
-	ArchiveView, FileDetails, FileId, FileRow, FilterResult, IssueId, NodeId, Notification, Speed, Verb,
+	ArchiveView, FileDetails, FileId, FileRow, FilterResult, IssueId, NodeId, Notification, Overrides, Speed, Verb,
 };
 
 /// Everything the TUI reads from an archive run and every command it sends back (project layer spec §11.3).
@@ -48,7 +48,7 @@ pub trait ArchiveSource {
 	fn shutdown(&mut self);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
 	Start,
 	Pause,
@@ -73,9 +73,11 @@ pub enum Target {
 	File(FileId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SettingsChange {
 	Speed(Speed),
+	/// Replaces every override; `Overrides::default()` returns to the preset. The source validates and normalizes.
+	Overrides(Overrides),
 	MinSavings(u8),
 	Watch(bool),
 	PerformanceLimit(Option<u8>),

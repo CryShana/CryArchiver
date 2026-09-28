@@ -80,9 +80,10 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	buf.set_style(area, Style::new().bg(background));
 	let (y, right) = (area.y, area.right());
 
+	let profile = view.settings.profile_label();
 	let preset = match &header.codecs {
-		Some(codecs) => format!(" {} · {codecs} ", view.settings.speed.label()),
-		None => format!(" {} ", view.settings.speed.label()),
+		Some(codecs) => format!(" {profile} · {codecs} "),
+		None => format!(" {profile} "),
 	};
 	let (run, run_color) = run_state(header.run_state, theme);
 	let room = usize::from(area.width).saturating_sub(width(run) + 2);
