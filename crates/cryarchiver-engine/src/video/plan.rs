@@ -395,6 +395,7 @@ mod tests {
 	const PROGRESSIVE_CLEAN: Analysis = Analysis {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,
+		detail: Vec::new(),
 	};
 
 	#[test]
@@ -410,6 +411,7 @@ mod tests {
 		MediaInfo::parse(json.as_bytes()).unwrap()
 	}
 
+	#[allow(clippy::needless_pass_by_value)]
 	fn plan(info: &MediaInfo, frames: &[Frame], analysis: Analysis, speed: Speed) -> VideoPlan {
 		let main = precheck(info, &CAPS).unwrap();
 		plan_video(info, main, frames, &analysis, speed)
@@ -536,10 +538,12 @@ mod tests {
 		let tff = Analysis {
 			scan: ScanType::Interlaced { top_first: true },
 			noise: NoiseClass::Clean,
+			detail: Vec::new(),
 		};
 		let telecined = Analysis {
 			scan: ScanType::Telecined,
 			noise: NoiseClass::Clean,
+			detail: Vec::new(),
 		};
 
 		let deinterlaced = plan(&h264(""), &[], tff, Speed::Moderate);
@@ -562,10 +566,11 @@ mod tests {
 		let grainy = Analysis {
 			scan: ScanType::Progressive,
 			noise: NoiseClass::Light,
+			detail: Vec::new(),
 		};
 
-		let moderate = plan(&h264(""), &[], grainy, Speed::Moderate);
-		let slow = plan(&h264(""), &[], grainy, Speed::Slow);
+		let moderate = plan(&h264(""), &[], grainy.clone(), Speed::Moderate);
+		let slow = plan(&h264(""), &[], grainy.clone(), Speed::Slow);
 		let fast = plan(&h264(""), &[], grainy, Speed::Fast);
 
 		assert_eq!(

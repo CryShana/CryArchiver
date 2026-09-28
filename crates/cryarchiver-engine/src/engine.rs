@@ -430,7 +430,15 @@ impl Engine {
 
 		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
 		let declared_s = main.declared_duration().or(info.format.duration);
-		let analysis = Box::pin(analyze::analyze(&self.tools, source, main, declared_s, cx.cancel)).await?;
+		let analysis = Box::pin(analyze::analyze(
+			&self.tools,
+			source,
+			main,
+			declared_s,
+			analyze::DEFAULT_SEGMENTS,
+			cx.cancel,
+		))
+		.await?;
 		let video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
 
 		if let Some(reason) = Box::pin(self.sample_gate(cx, workspace, &info, &video, &streams, declared_s)).await? {

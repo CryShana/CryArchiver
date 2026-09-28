@@ -18,9 +18,12 @@ const FIELD_ORDER_SHARE: f64 = 0.8;
 const REJECT_SHARE: f64 = 0.5;
 const INTERLACED_FIELD_ORDERS: &[&str] = &["tt", "bb", "tb", "bt"];
 const CLEAN_PSNR_DB: f64 = 50.0;
+const LOW_DETAIL_SI: f64 = 15.0;
 const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:d=1,\
 	scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,\
-	split[a][b];[b]hqdn3d[d];[a][d]psnr[out]";
+	split=3[a][b][s];[s]format=yuv420p,siti=print_summary=1,nullsink;[b]hqdn3d[d];[a][d]psnr[out]";
+
+pub const DEFAULT_SEGMENTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanType {
@@ -35,10 +38,19 @@ pub enum NoiseClass {
 	Light,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Analysis {
 	pub scan: ScanType,
 	pub noise: NoiseClass,
+	pub detail: Vec<Detail>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Detail {
+	pub start_s: f64,
+	pub length_s: f64,
+	pub si: Option<f64>,
+	pub usable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,6 +61,7 @@ pub struct Segment {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SegmentStats {
+	pub start_s: f64,
 	pub length_s: f64,
 	pub neither: u64,
 	pub top: u64,
@@ -58,14 +71,17 @@ pub struct SegmentStats {
 	pub black_s: f64,
 	pub frozen_s: f64,
 	pub psnr_y: Option<f64>,
+	pub si: Option<f64>,
 }
 
-pub fn segments(duration_s: Option<f64>) -> Vec<Segment> {
+pub fn segments(duration_s: Option<f64>, count: usize) -> Vec<Segment> {
+	let count = u32::try_from(count.max(2)).unwrap_or(u32::MAX);
+
 	match duration_s {
-		Some(duration) if duration >= WHOLE_FILE_BELOW_S => (0..4)
+		Some(duration) if duration >= WHOLE_FILE_BELOW_S => (0..count)
 			.map(|index| Segment {
 				start_s: EDGE_SKIP * duration
-					+ f64::from(index) * (duration * (1.0 - 2.0 * EDGE_SKIP) - SEGMENT_S) / 3.0,
+					+ f64::from(index) * (duration * (1.0 - 2.0 * EDGE_SKIP) - SEGMENT_S) / f64::from(count - 1),
 				length_s: Some(SEGMENT_S),
 			})
 			.collect(),
@@ -105,12 +121,14 @@ pub fn segment_command(
 	cmd
 }
 
-pub fn parse_segment(stderr: &[String], length_s: f64) -> Option<SegmentStats> {
+pub fn parse_segment(stderr: &[String], start_s: f64, length_s: f64) -> Option<SegmentStats> {
 	let mut stats = SegmentStats {
+		start_s,
 		length_s,
 		..SegmentStats::default()
 	};
 	let mut open_freeze: Option<f64> = None;
+	let mut spatial = false;
 
 	for line in stderr {
 		if let Some(rest) = line.split("Repeated Fields:").nth(1) {
@@ -118,6 +136,13 @@ pub fn parse_segment(stderr: &[String], length_s: f64) -> Option<SegmentStats> {
 		} else if let Some(rest) = line.split("Single frame detection:").nth(1) {
 			let [tff, bff, _] = counts(rest);
 			(stats.tff, stats.bff) = (tff, bff);
+		} else if line.contains("Spatial Information:") {
+			spatial = true;
+		} else if spatial && let Some(value) = field(line, "Average:") {
+			spatial = false;
+			if value.is_finite() {
+				stats.si = Some(value);
+			}
 		} else if let Some(value) = field(line, "black_duration:") {
 			stats.black_s += value;
 		} else if let Some(value) = field(line, "freeze_start:") {
@@ -138,12 +163,7 @@ pub fn parse_segment(stderr: &[String], length_s: f64) -> Option<SegmentStats> {
 
 #[allow(clippy::cast_precision_loss)]
 pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&str>) -> Analysis {
-	let voting: Vec<&SegmentStats> = stats
-		.iter()
-		.filter(|segment| {
-			segment.black_s < REJECT_SHARE * segment.length_s && segment.frozen_s < REJECT_SHARE * segment.length_s
-		})
-		.collect();
+	let voting: Vec<&SegmentStats> = stats.iter().filter(|segment| !blank(segment)).collect();
 	let voting = if voting.is_empty() {
 		stats.iter().collect()
 	} else {
@@ -187,7 +207,21 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 	} else {
 		NoiseClass::Light
 	};
-	Analysis { scan, noise }
+
+	let detail = stats
+		.iter()
+		.map(|segment| Detail {
+			start_s: segment.start_s,
+			length_s: segment.length_s,
+			si: segment.si,
+			usable: !blank(segment) && segment.si.is_none_or(|si| si >= LOW_DETAIL_SI),
+		})
+		.collect();
+	Analysis { scan, noise, detail }
+}
+
+fn blank(segment: &SegmentStats) -> bool {
+	segment.black_s >= REJECT_SHARE * segment.length_s || segment.frozen_s >= REJECT_SHARE * segment.length_s
 }
 
 pub async fn analyze(
@@ -195,9 +229,10 @@ pub async fn analyze(
 	source: &Path,
 	main: &Stream,
 	duration_s: Option<f64>,
+	count: usize,
 	cancel: &CancellationToken,
 ) -> Result<Analysis, JobError> {
-	let segments = segments(duration_s);
+	let segments = segments(duration_s, count);
 
 	let run = |segment: Option<Segment>| async move {
 		let Some(segment) = segment else {
@@ -207,16 +242,23 @@ pub async fn analyze(
 		let cmd = segment_command(&tools.ffmpeg, source, main.index, forced_decoder(main), &segment);
 		let out = super::run_ffmpeg(&cmd, |_| {}, cancel).await?;
 
-		Ok::<_, JobError>(parse_segment(&out.stderr_tail, segment_length(&segment, duration_s)))
+		Ok::<_, JobError>(parse_segment(
+			&out.stderr_tail,
+			segment.start_s,
+			segment_length(&segment, duration_s),
+		))
 	};
 
-	let (first, second, third, fourth) = tokio::join!(
-		run(segments.first().copied()),
-		run(segments.get(1).copied()),
-		run(segments.get(2).copied()),
-		run(segments.get(3).copied())
-	);
-	let stats: Vec<SegmentStats> = [first?, second?, third?, fourth?].into_iter().flatten().collect();
+	let mut stats = Vec::new();
+	for chunk in segments.chunks(4) {
+		let (first, second, third, fourth) = tokio::join!(
+			run(chunk.first().copied()),
+			run(chunk.get(1).copied()),
+			run(chunk.get(2).copied()),
+			run(chunk.get(3).copied())
+		);
+		stats.extend([first?, second?, third?, fourth?].into_iter().flatten());
+	}
 
 	Ok(classify(&stats, main.fps(), main.field_order.as_deref()))
 }
@@ -263,6 +305,7 @@ mod tests {
 
 	fn stats(repeated: [u64; 3], single: [u64; 2]) -> SegmentStats {
 		SegmentStats {
+			start_s: 0.0,
 			length_s: 3.0,
 			neither: repeated[0],
 			top: repeated[1],
@@ -272,56 +315,78 @@ mod tests {
 			black_s: 0.0,
 			frozen_s: 0.0,
 			psnr_y: Some(45.4),
+			si: Some(60.0),
 		}
 	}
 
 	#[test]
 	fn segments_skip_the_ends_and_short_files_are_whole() {
-		let four = segments(Some(100.0));
+		let four = segments(Some(100.0), 4);
 
 		assert_eq!(four.len(), 4);
 		assert!((four[0].start_s - 5.0).abs() < 1e-9);
 		assert!((four[3].start_s + 3.0 - 95.0).abs() < 1e-9);
 		assert!(four.iter().all(|segment| segment.length_s == Some(3.0)));
 		assert_eq!(
-			segments(Some(11.9)),
+			segments(Some(11.9), 4),
 			vec![Segment {
 				start_s: 0.0,
 				length_s: None
 			}]
 		);
 		assert_eq!(
-			segments(None),
+			segments(None, 4),
 			vec![Segment {
 				start_s: 0.0,
 				length_s: None
 			}]
 		);
+
+		let eight = segments(Some(100.0), 8);
+		assert_eq!(eight.len(), 8);
+		assert!((eight[0].start_s - 5.0).abs() < 1e-9);
+		assert!((eight[7].start_s + 3.0 - 95.0).abs() < 1e-9);
 	}
 
 	#[test]
-	fn parses_the_last_idet_block_black_freeze_and_psnr() {
+	fn parses_the_last_idet_block_black_freeze_psnr_and_detail() {
 		let lines = [
 			"[Parsed_idet_0 @ 000001cfd580c3c0] Repeated Fields: Neither:     0 Top:     0 Bottom:     0",
 			"[Parsed_idet_0 @ 000001cfd580c3c0] Single frame detection: TFF:     0 BFF:     0 Progressive:     0 Undetermined:     0",
+			"[Parsed_siti_6 @ 00000297d99eaf40] SITI Summary:",
+			"Total frames: 0",
+			"",
+			"Spatial Information:",
+			"Average: nan",
 			"[Parsed_blackdetect_1 @ 0000017c27a45900] black_start:0 black_end:1.2 black_duration:1.2",
 			"[Parsed_freezedetect_2 @ 0000017c27a45100] lavfi.freezedetect.freeze_start: 0",
 			"[Parsed_freezedetect_2 @ 0000017c27a45100] lavfi.freezedetect.freeze_duration: 1.2",
 			"[Parsed_freezedetect_2 @ 0000017c27a45100] lavfi.freezedetect.freeze_end: 1.2",
 			"[Parsed_freezedetect_2 @ 0000017c27a45100] lavfi.freezedetect.freeze_start: 2.5",
-			"[Parsed_psnr_6 @ 0000017c27a44000] PSNR y:57.184443 u:57.445223 v:57.552183 average:57.286586 min:50.874693 max:inf",
+			"[Parsed_psnr_9 @ 0000017c27a44000] PSNR y:57.184443 u:57.445223 v:57.552183 average:57.286586 min:50.874693 max:inf",
+			"[Parsed_siti_6 @ 00000297db9eb200] SITI Summary:",
+			"Total frames: 90",
+			"",
+			"Spatial Information:",
+			"Average: 102.528107",
+			"Max: 103.951012",
+			"",
+			"Temporal Information:",
+			"Average: 13.375446",
 			"[Parsed_idet_0 @ 000001cfd580c3c0] Repeated Fields: Neither:    54 Top:    18 Bottom:    18",
 			"[Parsed_idet_0 @ 000001cfd580c3c0] Single frame detection: TFF:    72 BFF:     0 Progressive:    18 Undetermined:     0",
 		]
 		.map(str::to_owned);
 
-		let parsed = parse_segment(&lines, 3.0).unwrap();
+		let parsed = parse_segment(&lines, 12.5, 3.0).unwrap();
 
+		assert!((parsed.start_s - 12.5).abs() < 1e-9);
 		assert_eq!((parsed.neither, parsed.top, parsed.bottom), (54, 18, 18));
 		assert_eq!((parsed.tff, parsed.bff), (72, 0));
 		assert!((parsed.black_s - 1.2).abs() < 1e-9);
 		assert!((parsed.frozen_s - 1.7).abs() < 1e-9);
 		assert_eq!(parsed.psnr_y, Some(57.184_443));
+		assert_eq!(parsed.si, Some(102.528_107));
 	}
 
 	#[test]
@@ -336,8 +401,8 @@ mod tests {
 			"[Parsed_psnr_6 @ 0000] PSNR y:inf u:inf v:inf average:inf min:inf max:inf".to_owned(),
 		];
 
-		assert_eq!(parse_segment(&empty, 3.0), None);
-		assert_eq!(parse_segment(&black, 3.0).unwrap().psnr_y, Some(f64::INFINITY));
+		assert_eq!(parse_segment(&empty, 0.0, 3.0), None);
+		assert_eq!(parse_segment(&black, 0.0, 3.0).unwrap().psnr_y, Some(f64::INFINITY));
 	}
 
 	#[test]
@@ -429,7 +494,44 @@ mod tests {
 			Analysis {
 				scan: ScanType::Progressive,
 				noise: NoiseClass::Clean,
+				detail: Vec::new(),
 			}
 		);
+	}
+
+	#[test]
+	fn blank_and_low_detail_segments_are_not_usable() {
+		let detailed = SegmentStats {
+			start_s: 10.0,
+			si: Some(80.0),
+			..stats([90, 0, 0], [0, 0])
+		};
+		let flat = SegmentStats {
+			start_s: 40.0,
+			si: Some(4.0),
+			..stats([90, 0, 0], [0, 0])
+		};
+		let black = SegmentStats {
+			start_s: 70.0,
+			black_s: 2.9,
+			..stats([90, 0, 0], [0, 0])
+		};
+		let unmeasured = SegmentStats {
+			start_s: 100.0,
+			si: None,
+			..stats([90, 0, 0], [0, 0])
+		};
+
+		let analysis = classify(&[detailed, flat, black, unmeasured], Some(25.0), None);
+
+		assert_eq!(
+			analysis
+				.detail
+				.iter()
+				.map(|detail| (detail.start_s, detail.usable))
+				.collect::<Vec<_>>(),
+			[(10.0, true), (40.0, false), (70.0, false), (100.0, true)]
+		);
+		assert_eq!(analysis.detail[0].si, Some(80.0));
 	}
 }

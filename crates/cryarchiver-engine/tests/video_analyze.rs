@@ -3,7 +3,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::probe::probe;
-use cryarchiver_engine::video::analyze::{NoiseClass, ScanType, analyze};
+use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, ScanType, analyze};
 use tokio_util::sync::CancellationToken;
 
 fn encode(dir: &Path, name: &str, source: &str, args: &[&str]) -> PathBuf {
@@ -21,9 +21,16 @@ async fn scan_and_noise(path: &Path) -> (ScanType, NoiseClass) {
 	let info = probe(&tools, path, &cancel).await.unwrap();
 	let main = info.streams.iter().find(|stream| stream.is_real_video()).unwrap();
 
-	let analysis = Box::pin(analyze(&tools, path, main, info.format.duration, &cancel))
-		.await
-		.unwrap();
+	let analysis = Box::pin(analyze(
+		&tools,
+		path,
+		main,
+		info.format.duration,
+		DEFAULT_SEGMENTS,
+		&cancel,
+	))
+	.await
+	.unwrap();
 	(analysis.scan, analysis.noise)
 }
 
@@ -103,5 +110,34 @@ async fn corpus_scan_types() {
 			.await
 			.0,
 		ScanType::Interlaced { top_first: true }
+	);
+}
+
+#[tokio::test]
+async fn detail_is_measured_for_every_segment() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = encode(
+		dir.path(),
+		"detailed.mp4",
+		"testsrc2=s=640x360:r=30:d=14",
+		&["-c:v", "mpeg4", "-q:v", "2"],
+	);
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let info = probe(&tools, &clip, &cancel).await.unwrap();
+	let main = info.streams.iter().find(|stream| stream.is_real_video()).unwrap();
+
+	let analysis = Box::pin(analyze(&tools, &clip, main, info.format.duration, 8, &cancel))
+		.await
+		.unwrap();
+
+	assert_eq!(analysis.detail.len(), 8);
+	assert!(
+		analysis
+			.detail
+			.iter()
+			.all(|detail| detail.usable && detail.si.is_some_and(|si| si > 15.0)),
+		"{:?}",
+		analysis.detail
 	);
 }

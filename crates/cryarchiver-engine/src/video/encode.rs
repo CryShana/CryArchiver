@@ -129,7 +129,7 @@ pub fn samples(declared_s: Option<f64>) -> Vec<Sample> {
 		return Vec::new();
 	};
 
-	analyze::segments(Some(duration))
+	analyze::segments(Some(duration), analyze::DEFAULT_SEGMENTS)
 		.into_iter()
 		.map(|segment| {
 			segment.length_s.map(|length_s| Sample {
