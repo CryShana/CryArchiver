@@ -5,6 +5,7 @@ pub mod validate;
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::text::display_path;
@@ -30,9 +31,33 @@ pub struct RecentEntry {
 	pub recent: Recent,
 	/// The project file's name without `.cryarchive`.
 	pub name: String,
-	/// What the project says about itself, or why it can't be read.
-	pub summary: Result<Summary, String>,
-	pub missing: bool,
+	pub state: EntryState,
+}
+
+/// What reading a recent project found. The list shows at once, and each entry is read in the background.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryState {
+	Checking,
+	Ready(Summary),
+	/// The file is gone from a folder that is still there; "clear missing" removes it.
+	Missing,
+	/// Its drive, share or folder can't be reached now; it stays in the list.
+	Unavailable,
+	/// Why the project can't be read.
+	Unreadable(String),
+}
+
+impl RecentEntry {
+	pub fn missing(&self) -> bool {
+		self.state == EntryState::Missing
+	}
+
+	pub fn summary(&self) -> Option<&Summary> {
+		match &self.state {
+			EntryState::Ready(summary) => Some(summary),
+			_ => None,
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,11 +70,23 @@ pub enum StartHit {
 	Modal,
 }
 
+/// A question or a message over the menu, answered before anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dialog {
+	/// Why opening or creating a project failed, in full.
+	Error { title: String, text: String },
+	/// Esc in a form that was edited.
+	Discard,
+}
+
+type Peeks = Receiver<(u64, usize, EntryState)>;
+
 pub struct StartMenu {
 	store: RecentStore,
 	pub(crate) entries: Vec<RecentEntry>,
 	pub(crate) selected: usize,
 	pub(crate) form: Option<NewProjectForm>,
+	pub(crate) dialog: Option<Dialog>,
 	notice: Option<(Notification, Instant)>,
 	request: Option<PathBuf>,
 	pub(crate) opening: Option<String>,
@@ -59,6 +96,8 @@ pub struct StartMenu {
 	pub(crate) hits: HitMap<StartHit>,
 	last_click: Option<(Position, Instant)>,
 	last_key: Option<Instant>,
+	generation: u64,
+	peeks: Option<Peeks>,
 }
 
 impl StartMenu {
@@ -70,6 +109,7 @@ impl StartMenu {
 			entries: Vec::new(),
 			selected: 0,
 			form: None,
+			dialog: None,
 			notice: None,
 			request: None,
 			opening: None,
@@ -79,12 +119,15 @@ impl StartMenu {
 			hits: HitMap::default(),
 			last_click: None,
 			last_key: None,
+			generation: 0,
+			peeks: None,
 		};
 
 		menu.set_entries(loaded.entries);
 		if menu.entries.is_empty() {
 			menu.form = Some(NewProjectForm::new());
 		}
+
 		if let Some(text) = loaded.notice {
 			menu.notify(NoticeLevel::Warning, text);
 		}
@@ -103,6 +146,10 @@ impl StartMenu {
 		self.form.as_ref()
 	}
 
+	pub fn dialog(&self) -> Option<&Dialog> {
+		self.dialog.as_ref()
+	}
+
 	pub fn notice(&self) -> Option<&Notification> {
 		self.notice.as_ref().map(|(notice, _)| notice)
 	}
@@ -118,9 +165,12 @@ impl StartMenu {
 	}
 
 	pub fn open_failed(&mut self, message: String) {
-		self.opening = None;
+		let name = self.opening.take().unwrap_or_default();
 		self.reload();
-		self.notify(NoticeLevel::Error, message);
+		self.dialog = Some(Dialog::Error {
+			title: format!("{name} didn't open"),
+			text: message,
+		});
 	}
 
 	pub fn should_quit(&self) -> bool {
@@ -135,8 +185,17 @@ impl StartMenu {
 		self.mouse_capture = captured;
 	}
 
-	/// Drops an expired notice; returns whether a redraw is due.
+	/// Takes in the entries read since the last tick and drops an expired notice; returns whether a redraw is due.
 	pub fn tick(&mut self) -> bool {
+		let mut changed = false;
+		while let Some(peeks) = &self.peeks {
+			match peeks.try_recv() {
+				Ok(result) => changed |= self.apply_peek(result),
+				Err(mpsc::TryRecvError::Empty) => break,
+				Err(mpsc::TryRecvError::Disconnected) => self.peeks = None,
+			}
+		}
+
 		let expired = self
 			.notice
 			.as_ref()
@@ -144,7 +203,36 @@ impl StartMenu {
 		if expired {
 			self.notice = None;
 		}
-		expired
+		changed || expired
+	}
+
+	/// Waits until every entry has been read, or `timeout` passes; returns whether all were read.
+	pub fn wait_for_checks(&mut self, timeout: Duration) -> bool {
+		let deadline = Instant::now() + timeout;
+		while let Some(peeks) = &self.peeks {
+			match peeks.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+				Ok(result) => {
+					self.apply_peek(result);
+				}
+				Err(RecvTimeoutError::Disconnected) => self.peeks = None,
+				Err(RecvTimeoutError::Timeout) => return false,
+			}
+		}
+		true
+	}
+
+	fn apply_peek(&mut self, (generation, index, state): (u64, usize, EntryState)) -> bool {
+		if generation != self.generation {
+			return false;
+		}
+
+		match self.entries.get_mut(index) {
+			Some(entry) => {
+				entry.state = state;
+				true
+			}
+			None => false,
+		}
 	}
 
 	pub fn draw(&mut self, frame: &mut Frame) {
@@ -182,25 +270,28 @@ impl StartMenu {
 			Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(*key, burst),
 			Event::Mouse(mouse) => {
 				let position = Position::new(mouse.column, mouse.row);
+				let scrolls = self.form.is_none() && self.dialog.is_none();
 				match mouse.kind {
 					MouseEventKind::Down(MouseButton::Left) => {
 						let double = self.register_click(position, now);
 						self.on_click(position, double);
 					}
-					MouseEventKind::ScrollDown if self.form.is_none() => self.move_selection(1),
-					MouseEventKind::ScrollUp if self.form.is_none() => self.move_selection(-1),
+					MouseEventKind::ScrollDown if scrolls => self.move_selection(1),
+					MouseEventKind::ScrollUp if scrolls => self.move_selection(-1),
 					_ => {}
 				}
 			}
-			Event::Paste(text) => self.on_paste(text),
+			Event::Paste(text) if self.dialog.is_none() => self.on_paste(text),
 			_ => {}
 		}
 	}
 
 	fn typing(&self) -> bool {
-		self.form
-			.as_ref()
-			.is_some_and(|form| form.confirming().is_some() || form.focus().is_text())
+		self.dialog.is_none()
+			&& self
+				.form
+				.as_ref()
+				.is_some_and(|form| form.confirming().is_some() || form.focus().is_text())
 	}
 
 	fn on_key(&mut self, key: KeyEvent, burst: bool) {
@@ -213,6 +304,11 @@ impl StartMenu {
 			return;
 		}
 
+		if self.dialog.is_some() {
+			self.on_dialog_key(key.code);
+			return;
+		}
+
 		if key.code == KeyCode::F(2) {
 			self.mouse_capture = !self.mouse_capture;
 			return;
@@ -222,6 +318,17 @@ impl StartMenu {
 			self.on_form_key(key);
 		} else {
 			self.on_recents_key(key);
+		}
+	}
+
+	fn on_dialog_key(&mut self, code: KeyCode) {
+		match (&self.dialog, code) {
+			(Some(Dialog::Discard), KeyCode::Enter) => {
+				self.dialog = None;
+				self.form = None;
+			}
+			(Some(_), KeyCode::Enter | KeyCode::Esc) => self.dialog = None,
+			_ => {}
 		}
 	}
 
@@ -265,7 +372,7 @@ impl StartMenu {
 
 		let focus = form.focus();
 		match key.code {
-			KeyCode::Esc => self.form = None,
+			KeyCode::Esc => self.leave_form(),
 			KeyCode::Tab | KeyCode::Down => form.move_focus(1),
 			KeyCode::BackTab | KeyCode::Up => form.move_focus(-1),
 			KeyCode::Left if focus == FormField::Speed => form.set_speed(next_speed(form.speed(), -1)),
@@ -280,6 +387,15 @@ impl StartMenu {
 		}
 	}
 
+	/// An edited form asks before the typed values are thrown away.
+	fn leave_form(&mut self) {
+		if self.form.as_ref().is_some_and(NewProjectForm::edited) {
+			self.dialog = Some(Dialog::Discard);
+		} else {
+			self.form = None;
+		}
+	}
+
 	fn activate(&mut self, field: FormField) {
 		let Some(form) = self.form.as_mut() else { return };
 
@@ -287,14 +403,22 @@ impl StartMenu {
 			FormField::Speed => form.set_speed(next_speed(form.speed(), 1)),
 			FormField::DeleteOriginals => form.toggle_delete(),
 			FormField::Create => self.create(),
-			FormField::Cancel => self.form = None,
+			FormField::Cancel => self.leave_form(),
 			FormField::Source | FormField::Destination | FormField::Name => {}
 		}
 	}
 
 	/// A new project joins the list at once, so it stays reachable even when opening it fails.
 	fn create(&mut self) {
-		let Some(path) = self.form.as_mut().and_then(NewProjectForm::create) else {
+		let Some(form) = self.form.as_mut() else { return };
+
+		let Some(path) = form.create() else {
+			if let Some(error) = form.error() {
+				self.dialog = Some(Dialog::Error {
+					title: "The project wasn't created".into(),
+					text: error.to_owned(),
+				});
+			}
 			return;
 		};
 
@@ -332,12 +456,18 @@ impl StartMenu {
 		double
 	}
 
+	/// While a dialog or the `DELETE` prompt is open, only its footer chips take clicks.
 	fn on_click(&mut self, position: Position, double: bool) {
-		if self.form.as_ref().is_some_and(|form| form.confirming().is_some()) {
+		let hit = self.hits.at(position);
+		let modal = self.dialog.is_some() || self.form.as_ref().is_some_and(|form| form.confirming().is_some());
+		if modal {
+			if let Some(StartHit::Footer(code)) = hit {
+				self.on_key(KeyEvent::new(code, KeyModifiers::NONE), false);
+			}
 			return;
 		}
 
-		match self.hits.at(position) {
+		match hit {
 			Some(StartHit::Footer(code)) => self.on_key(KeyEvent::new(code, KeyModifiers::NONE), false),
 			Some(StartHit::Entry(index)) => {
 				self.selected = index;
@@ -350,6 +480,7 @@ impl StartMenu {
 				if let Some(form) = self.form.as_mut() {
 					form.set_focus(field);
 				}
+
 				if !field.is_text() && field != FormField::Speed {
 					self.activate(field);
 				}
@@ -374,11 +505,13 @@ impl StartMenu {
 			return;
 		};
 
-		if entry.missing {
-			self.notify(
-				NoticeLevel::Warning,
-				"the project file is missing; x removes it from the list".into(),
-			);
+		let refusal = match entry.state {
+			EntryState::Missing => Some("the project file is missing; x removes it from the list"),
+			EntryState::Unavailable => Some("the project's drive, share or folder can't be reached right now"),
+			_ => None,
+		};
+		if let Some(text) = refusal {
+			self.notify(NoticeLevel::Warning, text.into());
 			return;
 		}
 
@@ -425,9 +558,21 @@ impl StartMenu {
 		self.set_entries(loaded.entries);
 	}
 
+	/// Shows the entries at once as being checked, and reads them on a worker thread.
 	fn set_entries(&mut self, recents: Vec<Recent>) {
-		self.entries = recents.into_iter().map(entry).collect();
+		let paths: Vec<PathBuf> = recents.iter().map(|recent| recent.path.clone()).collect();
+		self.entries = recents
+			.into_iter()
+			.map(|recent| RecentEntry {
+				name: project_name(&recent.path),
+				state: EntryState::Checking,
+				recent,
+			})
+			.collect();
 		self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+
+		self.generation += 1;
+		self.peeks = (!paths.is_empty()).then(|| spawn_peeks(self.generation, paths));
 	}
 
 	fn notify(&mut self, level: NoticeLevel, text: String) {
@@ -435,24 +580,24 @@ impl StartMenu {
 	}
 }
 
-fn entry(recent: Recent) -> RecentEntry {
-	let summary = cryarchiver_project::peek(&recent.path);
-	let missing = matches!(
-		&summary,
-		Err(ProjectError::Store(StoreError::Io(err))) if err.kind() == io::ErrorKind::NotFound
-	);
-
-	RecentEntry {
-		name: project_name(&recent.path),
-		summary: summary.map_err(|err| {
-			if missing {
-				"the project file is missing".to_owned()
-			} else {
-				err.to_string()
+fn spawn_peeks(generation: u64, paths: Vec<PathBuf>) -> Peeks {
+	let (sender, receiver) = mpsc::channel();
+	std::thread::spawn(move || {
+		for (index, path) in paths.iter().enumerate() {
+			if sender.send((generation, index, peek(path))).is_err() {
+				return;
 			}
-		}),
-		missing,
-		recent,
+		}
+	});
+	receiver
+}
+
+fn peek(path: &Path) -> EntryState {
+	match cryarchiver_project::peek(path) {
+		Ok(summary) => EntryState::Ready(summary),
+		Err(ProjectError::Store(StoreError::Missing)) => EntryState::Missing,
+		Err(ProjectError::Store(StoreError::Unavailable)) => EntryState::Unavailable,
+		Err(err) => EntryState::Unreadable(err.to_string()),
 	}
 }
 

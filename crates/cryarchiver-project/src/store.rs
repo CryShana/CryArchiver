@@ -45,6 +45,12 @@ pub enum StoreError {
 	Damaged(String),
 	#[error("the project wasn't closed cleanly; opening it recovers it")]
 	NeedsRecovery,
+	#[error("the project file is missing")]
+	Missing,
+	#[error("unavailable (drive or share offline)")]
+	Unavailable,
+	#[error("not a project file")]
+	NotAProjectFile,
 	#[error(transparent)]
 	Io(#[from] io::Error),
 	#[error("project file error: {0}")]
@@ -140,25 +146,7 @@ impl Store {
 		}
 
 		let db = Database::create(path)?;
-		let created = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.map_or(0, |since| since.as_secs());
-		let txn = db.begin_write()?;
-		{
-			let mut meta = txn.open_table(META)?;
-			meta.insert(FORMAT_KEY, rmp_serde::to_vec_named(&FORMAT_VERSION)?.as_slice())?;
-			meta.insert(
-				APP_VERSION_KEY,
-				rmp_serde::to_vec_named(cryarchiver_engine::VERSION)?.as_slice(),
-			)?;
-			meta.insert(CREATED_KEY, rmp_serde::to_vec_named(&created)?.as_slice())?;
-			meta.insert(SETTINGS_KEY, rmp_serde::to_vec_named(settings)?.as_slice())?;
-			txn.open_table(FILES)?;
-			txn.open_table(FOLDERS)?;
-			txn.open_table(LOGS)?;
-			txn.open_table(UNKNOWN)?;
-		}
-		txn.commit()?;
+		write_new(&db, settings)?;
 
 		Ok(Self {
 			db,
@@ -392,6 +380,29 @@ impl Store {
 	}
 }
 
+fn write_new(db: &Database, settings: &Settings) -> Result<(), StoreError> {
+	let created = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |since| since.as_secs());
+	let txn = db.begin_write()?;
+	{
+		let mut meta = txn.open_table(META)?;
+		meta.insert(FORMAT_KEY, rmp_serde::to_vec_named(&FORMAT_VERSION)?.as_slice())?;
+		meta.insert(
+			APP_VERSION_KEY,
+			rmp_serde::to_vec_named(cryarchiver_engine::VERSION)?.as_slice(),
+		)?;
+		meta.insert(CREATED_KEY, rmp_serde::to_vec_named(&created)?.as_slice())?;
+		meta.insert(SETTINGS_KEY, rmp_serde::to_vec_named(settings)?.as_slice())?;
+		txn.open_table(FILES)?;
+		txn.open_table(FOLDERS)?;
+		txn.open_table(LOGS)?;
+		txn.open_table(UNKNOWN)?;
+	}
+	txn.commit()?;
+	Ok(())
+}
+
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
 	Ok(rmp_serde::from_slice(bytes)?)
 }
@@ -414,18 +425,101 @@ fn read_meta(db: &impl ReadableDatabase) -> Result<Meta, StoreError> {
 	})
 }
 
-/// Reads the meta table of a closed project. The read-only handle takes a shared lock only while it lives, so it
-/// never keeps an open from taking the project.
-pub fn peek(path: &Path) -> Result<Meta, StoreError> {
-	if !path.is_file() {
-		return Err(io::Error::new(io::ErrorKind::NotFound, "no project file at this path").into());
+/// Whether a project file is there to read. The peek and the recent projects list both decide with this, so they
+/// agree on what is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+	File,
+	/// Something other than a file, such as a folder, is at the path.
+	NotAFile,
+	/// The file is gone from a folder that is still there.
+	Missing,
+	/// The folder, drive or share that holds the file can't be reached now.
+	Unavailable,
+}
+
+pub fn presence(path: &Path) -> Presence {
+	match std::fs::metadata(path) {
+		Ok(meta) if meta.is_file() => Presence::File,
+		Ok(_) => Presence::NotAFile,
+		Err(err) if err.kind() == io::ErrorKind::NotFound && parent_folder(path).is_dir() => Presence::Missing,
+		Err(_) => Presence::Unavailable,
+	}
+}
+
+fn parent_folder(path: &Path) -> &Path {
+	match path.parent() {
+		Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+		Some(parent) => parent,
+		None => path,
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peeked {
+	pub meta: Meta,
+	/// The project wasn't closed cleanly; opening it recovers it.
+	pub needs_recovery: bool,
+}
+
+/// A project that wasn't closed cleanly is read into memory and recovered there, up to this size; the file itself is
+/// never written.
+const RECOVERY_PEEK_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// Reads the meta table of a closed project without writing to it. The read-only handle holds a shared lock while
+/// it reads and releases it before returning; an open that starts in that same moment fails with
+/// [`StoreError::AlreadyOpen`], and may simply be tried again.
+pub fn peek(path: &Path) -> Result<Peeked, StoreError> {
+	match presence(path) {
+		Presence::File => {}
+		Presence::NotAFile => return Err(StoreError::NotAProjectFile),
+		Presence::Missing => return Err(StoreError::Missing),
+		Presence::Unavailable => return Err(StoreError::Unavailable),
 	}
 
-	let db = match ReadOnlyDatabase::open(path) {
-		Err(redb::DatabaseError::RepairAborted) => return Err(StoreError::NeedsRecovery),
-		opened => opened?,
+	let (meta, needs_recovery) = match ReadOnlyDatabase::open(path) {
+		Err(redb::DatabaseError::RepairAborted) => (read_unclean(path)?, true),
+		opened => (read_meta(&opened?)?, false),
 	};
+	if meta.format > FORMAT_VERSION {
+		return Err(StoreError::TooNew(meta.format));
+	}
+	Ok(Peeked { meta, needs_recovery })
+}
+
+/// Copies the file into memory under a shared lock and lets redb recover the copy, so the settings of a project that
+/// wasn't closed cleanly can be shown without opening it.
+fn read_unclean(path: &Path) -> Result<Meta, StoreError> {
+	use std::fs::TryLockError;
+	use std::io::Read;
+
+	let mut file = std::fs::File::open(path)?;
+	if file.metadata()?.len() > RECOVERY_PEEK_LIMIT {
+		return Err(StoreError::NeedsRecovery);
+	}
+
+	match file.try_lock_shared() {
+		Ok(()) => {}
+		Err(TryLockError::WouldBlock) => return Err(StoreError::AlreadyOpen),
+		Err(TryLockError::Error(err)) => return Err(err.into()),
+	}
+	let mut bytes = Vec::new();
+	file.read_to_end(&mut bytes)?;
+	drop(file);
+
+	let db = redb::Builder::new()
+		.create_with_backend(memory_backend(&bytes)?)
+		.map_err(|_| StoreError::NeedsRecovery)?;
 	read_meta(&db)
+}
+
+fn memory_backend(bytes: &[u8]) -> io::Result<redb::backends::InMemoryBackend> {
+	use redb::StorageBackend;
+
+	let backend = redb::backends::InMemoryBackend::new();
+	backend.set_len(bytes.len() as u64)?;
+	backend.write(0, bytes)?;
+	Ok(backend)
 }
 
 /// Prints every table as readable text, for debugging (`cryarchiver project dump`).
@@ -633,6 +727,12 @@ mod tests {
 			Store::open(&project(dir.path())),
 			Err(StoreError::TooNew(format)) if format == FORMAT_VERSION + 1
 		));
+		let peeked = peek(&project(dir.path()));
+		assert!(
+			matches!(peeked, Err(StoreError::TooNew(format)) if format == FORMAT_VERSION + 1),
+			"{peeked:?}"
+		);
+		assert!(peeked.unwrap_err().to_string().contains("made by a newer CryArchiver"));
 	}
 
 	#[test]
@@ -641,15 +741,91 @@ mod tests {
 		let settings = Settings::new(Path::new("src"), Path::new("dst"));
 		drop(Store::create(&project(dir.path()), &settings).unwrap());
 
-		assert_eq!(peek(&project(dir.path())).unwrap().settings, settings);
+		let peeked = peek(&project(dir.path())).unwrap();
+		assert_eq!(peeked.meta.settings, settings);
+		assert!(!peeked.needs_recovery);
 		let opened = Store::open(&project(dir.path())).unwrap();
 
 		assert!(matches!(peek(&project(dir.path())), Err(StoreError::AlreadyOpen)));
 		drop(opened);
 		assert!(matches!(
 			peek(&dir.path().join("missing.cryarchive")),
-			Err(StoreError::Io(err)) if err.kind() == io::ErrorKind::NotFound
+			Err(StoreError::Missing)
 		));
+	}
+
+	#[test]
+	fn a_file_is_missing_only_while_its_folder_is_there() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::create_dir(dir.path().join("folder.cryarchive")).unwrap();
+		let offline = dir.path().join("gone").join("a.cryarchive");
+
+		assert_eq!(presence(&dir.path().join("a.cryarchive")), Presence::Missing);
+		assert_eq!(presence(&offline), Presence::Unavailable);
+		assert_eq!(presence(&dir.path().join("folder.cryarchive")), Presence::NotAFile);
+		assert!(matches!(peek(&offline), Err(StoreError::Unavailable)));
+		assert!(matches!(
+			peek(&dir.path().join("folder.cryarchive")),
+			Err(StoreError::NotAProjectFile)
+		));
+		assert_eq!(
+			StoreError::Unavailable.to_string(),
+			"unavailable (drive or share offline)"
+		);
+	}
+
+	/// Shares one in-memory file between the database that writes it and the test that copies it out.
+	#[derive(Debug, Clone)]
+	struct SharedMemory(std::sync::Arc<redb::backends::InMemoryBackend>);
+
+	impl redb::StorageBackend for SharedMemory {
+		fn len(&self) -> Result<u64, io::Error> {
+			self.0.len()
+		}
+
+		fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), io::Error> {
+			self.0.read(offset, out)
+		}
+
+		fn set_len(&self, len: u64) -> Result<(), io::Error> {
+			self.0.set_len(len)
+		}
+
+		fn sync_data(&self) -> Result<(), io::Error> {
+			self.0.sync_data()
+		}
+
+		fn write(&self, offset: u64, data: &[u8]) -> Result<(), io::Error> {
+			self.0.write(offset, data)
+		}
+	}
+
+	#[test]
+	fn a_project_that_was_not_closed_cleanly_still_shows_its_settings() {
+		use redb::StorageBackend;
+
+		let dir = tempfile::tempdir().unwrap();
+		let settings = Settings {
+			delete_originals: true,
+			..Settings::new(Path::new("src"), Path::new("dst"))
+		};
+		let memory = SharedMemory(std::sync::Arc::default());
+		let db = redb::Builder::new().create_with_backend(memory.clone()).unwrap();
+		write_new(&db, &settings).unwrap();
+		let mut bytes = vec![0; usize::try_from(memory.len().unwrap()).unwrap()];
+		memory.read(0, &mut bytes).unwrap();
+		std::mem::forget(db);
+		std::fs::write(project(dir.path()), &bytes).unwrap();
+		assert!(matches!(
+			ReadOnlyDatabase::open(project(dir.path())),
+			Err(redb::DatabaseError::RepairAborted)
+		));
+
+		let peeked = peek(&project(dir.path())).unwrap();
+
+		assert!(peeked.needs_recovery);
+		assert_eq!(peeked.meta.settings, settings);
+		assert_eq!(std::fs::read(project(dir.path())).unwrap(), bytes);
 	}
 
 	#[test]

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use cryarchiver_project::settings::{DELETE_CONFIRMATION, SettingsChange, Speed};
 use tui_input::Input;
 
-use super::validate::{Validation, validate};
+use super::validate::{Probes, Validation, validate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormField {
@@ -48,12 +48,16 @@ pub struct NewProjectForm {
 	confirming: Option<Input>,
 	focus: FormField,
 	validation: Validation,
+	probes: Probes,
+	/// Anything was changed since the form opened.
+	edited: bool,
 	/// Why the last Create failed.
 	error: Option<String>,
 }
 
 impl NewProjectForm {
 	pub fn new() -> Self {
+		let mut probes = Probes::default();
 		Self {
 			source: Input::default(),
 			destination: Input::default(),
@@ -63,9 +67,19 @@ impl NewProjectForm {
 			delete_confirmation: None,
 			confirming: None,
 			focus: FormField::Source,
-			validation: validate("", "", ""),
+			validation: validate("", "", "", &mut probes),
+			probes,
+			edited: false,
 			error: None,
 		}
+	}
+
+	pub fn edited(&self) -> bool {
+		self.edited
+	}
+
+	pub fn probes_made(&self) -> usize {
+		self.probes.made()
 	}
 
 	pub fn value(&self, field: FormField) -> &str {
@@ -95,6 +109,7 @@ impl NewProjectForm {
 			return;
 		}
 
+		self.edited = true;
 		match field {
 			FormField::Name => self.name_edited = !self.name.value().is_empty(),
 			FormField::Source if !self.name_edited => {
@@ -111,7 +126,12 @@ impl NewProjectForm {
 
 	fn revalidate(&mut self) {
 		self.error = None;
-		self.validation = validate(self.source.value(), self.destination.value(), self.name.value());
+		self.validation = validate(
+			self.source.value(),
+			self.destination.value(),
+			self.name.value(),
+			&mut self.probes,
+		);
 	}
 
 	pub fn focus(&self) -> FormField {
@@ -133,6 +153,7 @@ impl NewProjectForm {
 	}
 
 	pub fn set_speed(&mut self, speed: Speed) {
+		self.edited |= speed != self.speed;
 		self.speed = speed;
 	}
 
@@ -144,6 +165,8 @@ impl NewProjectForm {
 	pub fn toggle_delete(&mut self) {
 		if self.delete_confirmation.take().is_none() {
 			self.confirming = Some(Input::default());
+		} else {
+			self.edited = true;
 		}
 	}
 
@@ -161,6 +184,7 @@ impl NewProjectForm {
 		let confirmed = typed.as_deref() == Some(DELETE_CONFIRMATION);
 		if confirmed {
 			self.delete_confirmation = typed;
+			self.edited = true;
 		}
 		confirmed
 	}
@@ -348,10 +372,54 @@ mod tests {
 		let path = form.create().unwrap();
 
 		assert_eq!(path, setup.dir.path().join("archive").join("Holiday.cryarchive"));
-		let meta = cryarchiver_project::store::peek(&path).unwrap();
+		let meta = cryarchiver_project::store::peek(&path).unwrap().meta;
 		assert_eq!(meta.settings.speed, Speed::Fast);
 		assert!(meta.settings.delete_originals);
 		assert!(form.error().is_none());
+	}
+
+	#[test]
+	fn the_shown_project_file_is_the_one_created() {
+		let setup = setup();
+		let mut form = filled(&setup);
+		let shown = form.validation().project_file.clone().unwrap();
+
+		let created = form.create().unwrap();
+
+		assert_eq!(shown, created);
+	}
+
+	#[test]
+	fn typing_the_name_or_changing_the_speed_does_not_probe_again() {
+		let setup = setup();
+		let mut form = filled(&setup);
+		assert_eq!(form.probes_made(), 1);
+
+		typed(&mut form, FormField::Name, " 2026");
+		form.set_speed(Speed::Slow);
+		form.toggle_delete();
+		form.cancel_delete();
+
+		assert_eq!(form.probes_made(), 1);
+		assert!(form.can_create());
+	}
+
+	#[test]
+	fn a_form_counts_as_edited_once_anything_changes() {
+		let mut form = NewProjectForm::new();
+		assert!(!form.edited());
+
+		form.set_speed(Speed::Moderate);
+		form.toggle_delete();
+		form.cancel_delete();
+		assert!(!form.edited());
+
+		form.set_speed(Speed::Fast);
+		assert!(form.edited());
+
+		let mut form = NewProjectForm::new();
+		typed(&mut form, FormField::Source, "D");
+		assert!(form.edited());
 	}
 
 	#[test]

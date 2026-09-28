@@ -749,6 +749,7 @@ dependencies = [
  "cryarchiver-project",
  "insta",
  "ratatui",
+ "redb",
  "rmp-serde",
  "serde",
  "tempfile",

@@ -573,13 +573,81 @@ fn creating_a_project_over_a_missing_source_names_it() {
 	let dir = tempfile::tempdir().unwrap();
 	let missing = dir.path().join("missing");
 
-	let err = cryarchiver_project::create(&missing, &dir.path().join("archive"), OsStr::new("a"), |_| {}).unwrap_err();
+	let err = cryarchiver_project::create(
+		&missing,
+		&dir.path().join("archive").join("deep"),
+		OsStr::new("a"),
+		|_| {},
+	)
+	.unwrap_err();
 
 	assert!(
 		err.to_string()
 			.contains(&cryarchiver_engine::text::display_path(&missing)),
 		"{err}"
 	);
+	assert!(!dir.path().join("archive").exists());
+}
+
+#[test]
+fn creating_over_a_source_that_is_a_file_creates_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let file = dir.path().join("photos.zip");
+	fs::write(&file, b"zip").unwrap();
+
+	let err = cryarchiver_project::create(&file, &dir.path().join("archive"), OsStr::new("a"), |_| {}).unwrap_err();
+
+	assert!(err.to_string().contains("not a folder"), "{err}");
+	assert!(!dir.path().join("archive").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_case_variant_destination_of_a_missing_source_does_not_create_the_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("new").join("a");
+	let destination = dir.path().join("NEW").join("a").join("b");
+
+	let created = cryarchiver_project::create(&source, &destination, OsStr::new("a"), |_| {});
+
+	assert!(created.is_err());
+	assert!(!dir.path().join("new").exists());
+}
+
+#[test]
+fn dot_dot_in_a_destination_cannot_reach_into_the_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+
+	for destination in [
+		source.join("new").join("..").join("x"),
+		source.join("new").join("deep").join(".."),
+		dir.path().join("missing").join("..").join("source").join("sub"),
+	] {
+		let created = cryarchiver_project::create(&source, &destination, OsStr::new("a"), |_| {});
+
+		assert!(
+			matches!(created, Err(ProjectError::Settings(_))),
+			"{}: {created:?}",
+			destination.display()
+		);
+	}
+	assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+	assert!(!dir.path().join("missing").exists());
+}
+
+#[test]
+fn the_project_file_is_named_before_the_destination_exists() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir(&source).unwrap();
+	let destination = dir.path().join("new").join(".").join("archive");
+
+	let planned = cryarchiver_project::project_file(&destination, OsStr::new("a")).unwrap();
+	let created = cryarchiver_project::create(&source, &destination, OsStr::new("a"), |_| {}).unwrap();
+
+	assert_eq!(planned, created);
 }
 
 #[test]

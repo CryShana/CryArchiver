@@ -1,5 +1,5 @@
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use cryarchiver_engine::preset::Speed as EngineSpeed;
@@ -164,26 +164,53 @@ impl RootConflict {
 	}
 }
 
-/// Where `path` will be once it exists: its nearest existing ancestor, canonical, followed by the missing names. A
-/// path with no existing ancestor at all is only made absolute.
+/// Where `path` will be once it exists: its nearest existing ancestor, canonical, followed by the missing names with
+/// `.` and `..` resolved on the names alone. A path with no existing ancestor at all is resolved the same way and made
+/// absolute.
 pub fn planned_path(path: &Path) -> io::Result<PathBuf> {
-	let mut existing = path;
-	let mut missing = Vec::new();
-	while !existing.exists() {
-		let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-			return std::path::absolute(path);
-		};
-		missing.push(name);
-		existing = if parent.as_os_str().is_empty() {
-			Path::new(".")
+	let components: Vec<Component> = path.components().collect();
+	let mut existing = components.len();
+	let ancestor = loop {
+		let prefix: PathBuf = components[..existing].iter().collect();
+		let prefix = if prefix.as_os_str().is_empty() {
+			PathBuf::from(".")
 		} else {
-			parent
+			prefix
 		};
+		if prefix.exists() {
+			break Some(prefix);
+		}
+
+		if existing == 0 {
+			break None;
+		}
+		existing -= 1;
+	};
+
+	let (mut planned, missing) = match &ancestor {
+		Some(ancestor) => (
+			std::fs::canonicalize(ancestor)
+				.map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", display_path(ancestor))))?,
+			&components[existing..],
+		),
+		None => (PathBuf::new(), &components[..]),
+	};
+
+	for component in missing {
+		match component {
+			Component::CurDir => {}
+			Component::ParentDir => {
+				if planned.file_name().is_some() {
+					planned.pop();
+				}
+			}
+			other => planned.push(other),
+		}
 	}
 
-	let mut planned = std::fs::canonicalize(existing)
-		.map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", display_path(existing))))?;
-	planned.extend(missing.iter().rev());
+	if ancestor.is_none() {
+		return std::path::absolute(&planned);
+	}
 	Ok(planned)
 }
 
@@ -208,19 +235,28 @@ pub fn check_roots(source: &Path, destination: &Path) -> Result<(PathBuf, PathBu
 	Ok((source, destination))
 }
 
-// `fs::canonicalize` returns `\\?\C:\...` on Windows; keep that form out of stored settings and messages when a
-// plain path means the same.
 fn dunce_canonicalize(path: &Path) -> io::Result<PathBuf> {
-	let canonical = std::fs::canonicalize(path)?;
+	std::fs::canonicalize(path).map(plain_path)
+}
 
+/// `fs::canonicalize` returns `\\?\C:\...` on Windows; this keeps that form out of stored settings, messages and
+/// lists when a plain path means the same. Other paths are returned as they are.
+pub fn plain_path(path: PathBuf) -> PathBuf {
 	#[cfg(windows)]
-	if let Some(plain) = canonical.to_str().and_then(|text| text.strip_prefix(r"\\?\"))
-		&& !plain.starts_with("UNC\\")
-		&& plain.len() < 260
 	{
-		return Ok(PathBuf::from(plain));
+		use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+		let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+		let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+		let unc: Vec<u16> = "UNC\\".encode_utf16().collect();
+		if let Some(plain) = wide.strip_prefix(verbatim.as_slice())
+			&& !plain.starts_with(&unc)
+			&& plain.len() < 260
+		{
+			return PathBuf::from(std::ffi::OsString::from_wide(plain));
+		}
 	}
-	Ok(canonical)
+	path
 }
 
 #[cfg(test)]
@@ -363,5 +399,68 @@ mod tests {
 			planned,
 			fs::canonicalize(dir.path().join("here")).unwrap().join("later")
 		);
+	}
+
+	#[test]
+	fn dot_dot_among_the_missing_names_is_resolved_before_comparing() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("photos");
+		fs::create_dir(&source).unwrap();
+		let conflict = |destination: &Path| root_conflict(&source, destination).unwrap();
+
+		assert_eq!(
+			planned_path(&dir.path().join("missing").join("..").join("photos").join("sub")).unwrap(),
+			fs::canonicalize(&source).unwrap().join("sub")
+		);
+		assert_eq!(
+			conflict(&source.join("new").join("..").join("x")),
+			Some(RootConflict::DestinationInsideSource)
+		);
+		assert_eq!(
+			conflict(&source.join("new").join("deep").join("..")),
+			Some(RootConflict::DestinationInsideSource)
+		);
+		assert_eq!(conflict(&source.join("new").join("..")), Some(RootConflict::Same));
+		assert_eq!(conflict(&dir.path().join("new").join("..").join("archive")), None);
+		assert!(!source.join("new").exists());
+		assert!(!dir.path().join("missing").exists());
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_paths_resolve_dot_dot_and_case_among_the_missing_names() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("Photos");
+		fs::create_dir(&source).unwrap();
+		let typed = |tail: &str| PathBuf::from(format!(r"{}\{tail}", dir.path().display()));
+
+		assert_eq!(
+			planned_path(&typed(r"PHOTOS\new\deep\..\.\x")).unwrap(),
+			fs::canonicalize(&source).unwrap().join("new").join("x")
+		);
+		assert_eq!(
+			root_conflict(&source, &typed(r"photos\new\deep\..")).unwrap(),
+			Some(RootConflict::DestinationInsideSource)
+		);
+		assert_eq!(root_conflict(&source, &typed(r"new\deep\..\..\archive")).unwrap(), None);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn unix_paths_resolve_dot_dot_among_the_missing_names() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("photos");
+		fs::create_dir(&source).unwrap();
+		let typed = |tail: &str| PathBuf::from(format!("{}/{tail}", dir.path().display()));
+
+		assert_eq!(
+			root_conflict(&source, &typed("missing/../photos/sub")).unwrap(),
+			Some(RootConflict::DestinationInsideSource)
+		);
+		assert_eq!(
+			planned_path(&typed("missing/deeper/../../photos/./sub")).unwrap(),
+			fs::canonicalize(&source).unwrap().join("sub")
+		);
+		assert!(!dir.path().join("missing").exists());
 	}
 }

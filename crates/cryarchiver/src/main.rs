@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use cryarchiver_engine::commit::{OutputSink, check_space};
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::cli_output_path;
@@ -263,7 +263,7 @@ fn launch_from(args: Vec<OsString>) -> Launch {
 		return Launch::Tui(TuiTarget::Menu, None);
 	}
 
-	let cli = Cli::parse_from(args);
+	let cli = parse(args).unwrap_or_else(|err| err.exit());
 	match cli.command {
 		Some(Command::Doctor { ffmpeg }) => Launch::Doctor(ffmpeg),
 		Some(Command::Tui { project, demo, ffmpeg }) => Launch::Tui(TuiTarget::new(project, demo), ffmpeg),
@@ -284,6 +284,32 @@ fn launch_from(args: Vec<OsString>) -> Launch {
 		),
 		None => Launch::Compress(cli.compress),
 	}
+}
+
+/// A top-level `--demo` only goes with the bare launch. Clap would read a subcommand after it as an input file, so
+/// that case is refused first, naming both.
+fn parse(args: Vec<OsString>) -> Result<Cli, clap::Error> {
+	let mut command = Cli::command();
+	let first_word = args
+		.iter()
+		.skip(1)
+		.position(|arg| !arg.to_string_lossy().starts_with('-'));
+	let subcommand = first_word
+		.map(|index| args[index + 1].to_string_lossy().into_owned())
+		.filter(|word| command.find_subcommand(word).is_some());
+
+	if let (Some(index), Some(subcommand)) = (first_word, subcommand)
+		&& args[1..=index].iter().any(|arg| arg == "--demo")
+	{
+		return Err(command.error(
+			clap::error::ErrorKind::ArgumentConflict,
+			format!(
+				"--demo can't be used with the {subcommand} command; use \"cryarchiver --demo\" or \"cryarchiver tui --demo\""
+			),
+		));
+	}
+
+	Cli::try_parse_from(args)
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -691,6 +717,25 @@ mod tests {
 		assert_eq!(tui_target(&["tui", "--demo"]), Some(TuiTarget::Demo));
 		assert!(Cli::try_parse_from(args(&["tui", "family.cryarchive", "--demo"])).is_err());
 		assert!(Cli::try_parse_from(args(&["--demo", "song.flac"])).is_err());
+	}
+
+	#[test]
+	fn a_top_level_demo_with_a_subcommand_names_both() {
+		for (given, subcommand) in [
+			(&["--demo", "doctor"][..], "doctor"),
+			(&["--demo", "tui", "family.cryarchive"][..], "tui"),
+			(&["--demo", "project", "dump", "family.cryarchive"][..], "project"),
+		] {
+			let err = parse(args(given))
+				.err()
+				.unwrap_or_else(|| panic!("{given:?} was accepted"));
+			let text = err.to_string();
+
+			assert!(text.contains("--demo"), "{text}");
+			assert!(text.contains(subcommand), "{text}");
+		}
+		assert!(parse(args(&["--demo"])).is_ok());
+		assert!(parse(args(&["tui", "--demo"])).is_ok());
 	}
 
 	#[test]

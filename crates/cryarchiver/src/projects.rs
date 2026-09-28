@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::process::limits::{self, Limits};
@@ -12,7 +13,8 @@ use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::toolchain::{ToolConfig, Toolchain};
 use cryarchiver_project::backend::EngineBackend;
 use cryarchiver_project::settings::Speed as ProjectSpeed;
-use cryarchiver_project::{Project, ProjectOptions, Tuning};
+use cryarchiver_project::store::StoreError;
+use cryarchiver_project::{Project, ProjectError, ProjectOptions, Tuning};
 use tokio_util::sync::CancellationToken;
 
 use crate::block_on;
@@ -41,15 +43,35 @@ pub fn open(path: &Path, ffmpeg: Option<PathBuf>) -> Result<Project, String> {
 		));
 	}
 
-	Project::open(
-		path,
-		ProjectOptions {
-			backend: Arc::new(EngineBackend::new(tools)),
-			tuning: Tuning::default(),
-			fault: None,
-		},
-	)
+	let backend: Arc<EngineBackend> = Arc::new(EngineBackend::new(tools));
+	retry_once_if_busy(BUSY_RETRY, || {
+		Project::open(
+			path,
+			ProjectOptions {
+				backend: backend.clone(),
+				tuning: Tuning::default(),
+				fault: None,
+			},
+		)
+	})
 	.map_err(|err| format!("{}: {err}", display_path(path)))
+}
+
+const BUSY_RETRY: Duration = Duration::from_millis(250);
+
+/// A start menu, this one or another instance's, reads each recent project for a moment; an open that lands in that
+/// moment is refused as already open, so it is tried once more.
+fn retry_once_if_busy<T>(
+	delay: Duration,
+	mut open: impl FnMut() -> Result<T, ProjectError>,
+) -> Result<T, ProjectError> {
+	match open() {
+		Err(ProjectError::Store(StoreError::AlreadyOpen)) => {
+			std::thread::sleep(delay);
+			open()
+		}
+		opened => opened,
+	}
 }
 
 pub fn create(
@@ -121,4 +143,39 @@ pub fn stop_on_ctrl_c(interrupted: &Arc<AtomicBool>) {
 			}
 		});
 	});
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn an_open_refused_as_already_open_is_tried_once_more() {
+		let mut calls = 0;
+		let opened = retry_once_if_busy(Duration::ZERO, || {
+			calls += 1;
+			if calls == 1 {
+				Err(ProjectError::Store(StoreError::AlreadyOpen))
+			} else {
+				Ok(calls)
+			}
+		});
+		assert_eq!(opened.unwrap(), 2);
+
+		let mut calls = 0;
+		let refused: Result<(), _> = retry_once_if_busy(Duration::ZERO, || {
+			calls += 1;
+			Err(ProjectError::Store(StoreError::AlreadyOpen))
+		});
+		assert!(refused.is_err());
+		assert_eq!(calls, 2);
+
+		let mut calls = 0;
+		let failed: Result<(), _> = retry_once_if_busy(Duration::ZERO, || {
+			calls += 1;
+			Err(ProjectError::Store(StoreError::Missing))
+		});
+		assert!(failed.is_err());
+		assert_eq!(calls, 1);
+	}
 }

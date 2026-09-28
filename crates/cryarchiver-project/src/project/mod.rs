@@ -32,7 +32,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use crate::issues::{IssueId, Verb};
-use crate::settings::{Settings, SettingsChange, SettingsError, check_roots, root_conflict};
+use crate::settings::{RootConflict, Settings, SettingsChange, SettingsError, check_roots, plain_path, planned_path};
 use crate::store::{Store, StoreError};
 use crate::tree::{FileId, FolderId};
 use crate::view::Update;
@@ -178,21 +178,32 @@ pub fn create(
 	fs::create_dir_all(destination).map_err(|err| naming(destination, &err))?;
 	let (source, destination) = check_roots(source, destination)?;
 
-	let mut file_name = name.to_os_string();
-	file_name.push(".");
-	file_name.push(PROJECT_EXTENSION);
-	let path = destination.join(file_name);
-
+	let path = project_file(&destination, name)?;
 	let mut settings = Settings::new(&source, &destination);
 	configure(&mut settings);
 	Store::create(&path, &settings)?;
 	Ok(path)
 }
 
-/// The destination may not exist yet; creating it inside the source would already write to the source, so the
-/// roots are compared on their planned paths first.
+/// Where [`create`] writes the project file for `destination`, whether the destination exists yet or not.
+pub fn project_file(destination: &Path, name: &OsStr) -> io::Result<PathBuf> {
+	let mut file_name = name.to_os_string();
+	file_name.push(".");
+	file_name.push(PROJECT_EXTENSION);
+	Ok(plain_path(planned_path(destination)?).join(file_name))
+}
+
+/// Runs before anything is created. The source must already be a folder: creating a destination against a missing
+/// source could create the source's own folders, and the destination may not exist yet, so it is compared on its
+/// planned path.
 fn refuse_overlapping_roots(source: &Path, destination: &Path) -> Result<(), ProjectError> {
-	match root_conflict(source, destination)? {
+	let meta = fs::metadata(source).map_err(|err| naming(source, &err))?;
+	if !meta.is_dir() {
+		return Err(SettingsError::Roots(format!("{}: the source is not a folder", display_path(source))).into());
+	}
+
+	let source = fs::canonicalize(source).map_err(|err| naming(source, &err))?;
+	match RootConflict::between(&source, &planned_path(destination)?) {
 		Some(conflict) => Err(SettingsError::Roots(conflict.message().into()).into()),
 		None => Ok(()),
 	}
@@ -208,16 +219,20 @@ pub struct Summary {
 	pub source: PathBuf,
 	pub destination: PathBuf,
 	pub delete_originals: bool,
+	/// The project wasn't closed cleanly; opening it recovers it.
+	pub needs_recovery: bool,
 }
 
-/// Reads a closed project's settings through a read-only handle that is dropped before returning, so it never holds
-/// the lock an open takes. A project open elsewhere is [`StoreError::AlreadyOpen`].
+/// Reads a closed project's settings without writing to it, through [`crate::store::peek`]: a project open elsewhere
+/// is [`StoreError::AlreadyOpen`], and an open that starts while the peek reads can fail the same way.
 pub fn peek(path: &Path) -> Result<Summary, ProjectError> {
-	let meta = crate::store::peek(path)?;
+	let peeked = crate::store::peek(path)?;
+	let settings = peeked.meta.settings;
 	Ok(Summary {
-		source: meta.settings.source,
-		destination: meta.settings.destination,
-		delete_originals: meta.settings.delete_originals,
+		source: settings.source,
+		destination: settings.destination,
+		delete_originals: settings.delete_originals,
+		needs_recovery: peeked.needs_recovery,
 	})
 }
 

@@ -9,14 +9,14 @@ use tui_input::Input;
 
 use super::footer::{Chip, chip, draw_chips, render_toast};
 use super::settings::delete_prompt;
-use super::widgets::{Chrome, bold, fg, modal, panel, put, to_u16};
+use super::widgets::{Chrome, bold, fg, modal, panel, put, to_u16, wrap};
 use super::{MIN_HEIGHT, MIN_WIDTH, small};
 use crate::app::HitMap;
 use crate::format::{bytes, fit, fit_middle, width};
 use crate::recent::{CAPACITY, now_unix_ms};
 use crate::start::form::{FormField, NewProjectForm};
 use crate::start::validate::Check;
-use crate::start::{RecentEntry, StartHit, StartMenu, opened_ago};
+use crate::start::{Dialog, EntryState, RecentEntry, StartHit, StartMenu, opened_ago};
 use crate::theme::Theme;
 
 const BADGE: &str = " CryArchiver ";
@@ -62,6 +62,7 @@ pub fn draw(frame: &mut Frame, menu: &mut StartMenu) {
 		entries,
 		selected,
 		form,
+		dialog,
 		opening,
 		hits,
 		..
@@ -80,16 +81,63 @@ pub fn draw(frame: &mut Frame, menu: &mut StartMenu) {
 		Some(notice) => render_toast(buf, footer, notice, &theme),
 		None => footer.right(),
 	};
-	draw_chips(buf, footer, right, chips(form.as_ref()), &theme, hits, StartHit::Footer);
+	let chips = match dialog {
+		Some(dialog) => dialog_chips(dialog),
+		None => chips(form.as_ref()),
+	};
+	draw_chips(buf, footer, right, chips, &theme, hits, StartHit::Footer);
 
 	if let Some(input) = form.as_ref().and_then(NewProjectForm::confirming) {
 		let prompt = delete_prompt(buf, area, "Type DELETE to turn it on:", input, &theme);
 		hits.push(prompt, StartHit::Modal);
 	}
 
+	if let Some(dialog) = dialog {
+		let modal = render_dialog(buf, area, dialog, &theme);
+		hits.push(modal, StartHit::Modal);
+	}
+
 	if let Some(name) = opening {
 		render_opening(buf, area, name, &theme);
 	}
+}
+
+fn dialog_chips(dialog: &Dialog) -> Vec<Chip> {
+	match dialog {
+		Dialog::Error { .. } => vec![
+			chip("⏎", "close", Some(KeyCode::Enter)),
+			chip("Esc", "close", Some(KeyCode::Esc)),
+		],
+		Dialog::Discard => vec![
+			chip("⏎", "discard", Some(KeyCode::Enter)),
+			chip("Esc", "keep editing", Some(KeyCode::Esc)),
+		],
+	}
+}
+
+/// The whole message, wrapped to the dialog's width; returns the dialog's area.
+fn render_dialog(buf: &mut Buffer, screen: Rect, dialog: &Dialog, theme: &Theme) -> Rect {
+	let width = screen.width.saturating_sub(10).min(80);
+	let cells = usize::from(width.saturating_sub(6));
+	let (title, lines) = match dialog {
+		Dialog::Error { title, text } => (title.as_str(), wrap(text, cells)),
+		Dialog::Discard => (
+			"Discard the new project?",
+			wrap(
+				"The values typed into the form are lost. Press ⏎ to discard them, or Esc to keep editing.",
+				cells,
+			),
+		),
+	};
+	let max_lines = usize::from(screen.height.saturating_sub(8));
+	let shown = lines.len().min(max_lines);
+
+	let area = screen.centered(Constraint::Length(width), Constraint::Length(to_u16(shown) + 4));
+	let inner = modal(buf, area, screen, theme, title);
+	for (y, line) in (inner.y + 1..).zip(lines.iter().take(shown)) {
+		put(buf, inner.x + 2, y, &fit(line, cells), fg(theme.text), inner.right());
+	}
+	area
 }
 
 fn render_header(buf: &mut Buffer, area: Rect, subtitle: &str, theme: &Theme) {
@@ -227,8 +275,8 @@ fn render_entry(buf: &mut Buffer, rows: Rect, entry: &RecentEntry, hot: bool, no
 	}
 
 	let (y, right) = (rows.y, rows.right().saturating_sub(1));
-	let readable = entry.summary.is_ok();
-	let name_style = match (readable, hot) {
+	let summary = entry.summary();
+	let name_style = match (summary.is_some(), hot) {
 		(false, _) => fg(theme.dim),
 		(true, true) => bold(theme.bright),
 		(true, false) => fg(theme.bright),
@@ -239,9 +287,9 @@ fn render_entry(buf: &mut Buffer, rows: Rect, entry: &RecentEntry, hot: bool, no
 	put(buf, time_x, y, &ago, fg(theme.dim), right);
 
 	let name_right = time_x.saturating_sub(2);
-	let x = put(buf, rows.x + 2, y, &entry.name, name_style, name_right);
-	if entry.summary.as_ref().is_ok_and(|summary| summary.delete_originals) {
-		put(
+	let mut x = put(buf, rows.x + 2, y, &entry.name, name_style, name_right);
+	if summary.is_some_and(|summary| summary.delete_originals) {
+		x = put(
 			buf,
 			x + 1,
 			y,
@@ -251,9 +299,21 @@ fn render_entry(buf: &mut Buffer, rows: Rect, entry: &RecentEntry, hot: bool, no
 		);
 	}
 
+	if summary.is_some_and(|summary| summary.needs_recovery) {
+		put(
+			buf,
+			x + 1,
+			y,
+			"wasn't closed cleanly; opening it recovers it",
+			fg(theme.warn),
+			name_right,
+		);
+	}
+
 	let cells = usize::from(right.saturating_sub(rows.x + 4));
-	let (detail, style) = match &entry.summary {
-		Ok(summary) => (
+	let path = display_path(&entry.recent.path);
+	let (detail, style) = match &entry.state {
+		EntryState::Ready(summary) => (
 			format!(
 				"{} → {}",
 				display_path(&summary.source),
@@ -261,17 +321,13 @@ fn render_entry(buf: &mut Buffer, rows: Rect, entry: &RecentEntry, hot: bool, no
 			),
 			fg(theme.text),
 		),
-		Err(reason) if entry.missing => (
-			format!(
-				"{reason} · {} · x removes it from the list",
-				display_path(&entry.recent.path)
-			),
+		EntryState::Checking => (format!("checking… · {path}"), fg(theme.dim)),
+		EntryState::Missing => (
+			format!("the project file is missing · {path} · x removes it from the list"),
 			fg(theme.dim),
 		),
-		Err(reason) => (
-			format!("{reason} · {}", display_path(&entry.recent.path)),
-			fg(theme.warn),
-		),
+		EntryState::Unavailable => (format!("unavailable (drive or share offline) · {path}"), fg(theme.dim)),
+		EntryState::Unreadable(reason) => (format!("{reason} · {path}"), fg(theme.warn)),
 	};
 	put(buf, rows.x + 2, y + 1, &fit_middle(&detail, cells), style, right);
 }
@@ -389,6 +445,7 @@ impl FormLayout<'_> {
 		let (text, style) = match check {
 			Check::Valid => ("✓".to_owned(), fg(theme.done)),
 			Check::Warning(reason) => (format!("⚠ {reason}"), fg(theme.warn)),
+			Check::Pending(reason) => (format!("… {reason}"), fg(theme.dim)),
 			Check::Invalid(reason) if empty => (reason.clone(), fg(theme.dim)),
 			Check::Invalid(reason) => (format!("✗ {reason}"), fg(theme.error)),
 		};
