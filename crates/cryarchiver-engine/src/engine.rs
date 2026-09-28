@@ -182,6 +182,11 @@ enum Tuning {
 	Encode { verify: bool },
 }
 
+enum Checked {
+	Passed(Observation),
+	Missed(KeepReason),
+}
+
 impl Engine {
 	pub fn new(tools: Toolchain) -> Self {
 		let cores = std::thread::available_parallelism().map_or(1, usize::from);
@@ -512,12 +517,14 @@ impl Engine {
 
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &streams, declared_s)).await?;
-		if verify
-			&& let Some(reason) =
-				Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await?
-		{
-			return Ok(Produced::Kept(reason));
-		}
+		let learned = if verify {
+			match Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await? {
+				Checked::Passed(observation) => Some(observation),
+				Checked::Missed(reason) => return Ok(Produced::Kept(reason)),
+			}
+		} else {
+			None
+		};
 
 		let job = VideoJob {
 			info: &info,
@@ -527,7 +534,12 @@ impl Engine {
 			video: &video,
 			streams: &streams,
 		};
-		Box::pin(self.mux_and_verify(cx, workspace, &job, temps)).await
+		let produced = Box::pin(self.mux_and_verify(cx, workspace, &job, temps)).await?;
+
+		if let Some(observation) = learned {
+			self.quality.record(&quality.key, observation);
+		}
+		Ok(produced)
 	}
 
 	fn video_quality(&self, speed: Speed, main: &Stream, analysis: &Analysis, video: &VideoPlan) -> VideoQuality {
@@ -582,6 +594,8 @@ impl Engine {
 		quality: &mut VideoQuality,
 	) -> Result<Tuning, JobError> {
 		let samples = video_quality::search_samples(analysis, inputs.declared_s, cx.job.speed);
+		let table_crf = video.encoder.crf();
+		let learned = matches!(quality.strategy, Strategy::Fixed { verify: true, .. });
 		let verify = match quality.strategy {
 			Strategy::Search { .. } if !samples.is_empty() => {
 				return Box::pin(self.search_crf(cx, workspace, inputs, &samples, video, quality)).await;
@@ -599,10 +613,16 @@ impl Engine {
 
 		video.encoder = video.encoder.with_crf(quality.start());
 		let gate = Box::pin(self.sample_gate(cx, workspace, inputs.info, video, inputs.streams, inputs.declared_s));
-		Ok(match gate.await? {
-			Some(reason) => Tuning::Keep(reason),
-			None => Tuning::Encode { verify },
-		})
+		match gate.await? {
+			None => Ok(Tuning::Encode { verify }),
+			Some(_) if learned && !samples.is_empty() => {
+				quality.strategy = Strategy::Search {
+					start: quality.start().max(table_crf),
+				};
+				Box::pin(self.search_crf(cx, workspace, inputs, &samples, video, quality)).await
+			}
+			Some(reason) => Ok(Tuning::Keep(reason)),
+		}
 	}
 
 	async fn search_crf(
@@ -666,7 +686,7 @@ impl Engine {
 		video: &mut VideoPlan,
 		temps: &mut EncodedTemps,
 		quality: &VideoQuality,
-	) -> Result<Option<KeepReason>, JobError> {
+	) -> Result<Checked, JobError> {
 		let windows = video_quality::verify_windows(temps.encoded.frames, temps.encoded.decoded_s, cx.job.speed);
 		let bounds = video_quality::bounds(&video.encoder);
 		let mut attempt = 1;
@@ -681,14 +701,11 @@ impl Engine {
 
 			let crf = video.encoder.crf();
 			if quality.target.met(score) {
-				let bpp = output_bpp(&temps.video.path, video, temps.encoded.frames);
-				let observation = Observation {
+				return Ok(Checked::Passed(Observation {
 					setting: crf,
 					slope: Some(quality.slope),
-					bpp,
-				};
-				self.quality.record(&quality.key, observation);
-				return Ok(None);
+					bpp: output_bpp(&temps.video.path, video, temps.encoded.frames),
+				}));
 			}
 
 			let lower = if attempt <= MAX_RETRIES {
@@ -697,7 +714,11 @@ impl Engine {
 				None
 			};
 			let Some(lower) = lower else {
-				return Ok(Some(video_quality::unreachable_reason(crf, score, quality.target)));
+				return Ok(Checked::Missed(video_quality::unreachable_reason(
+					crf,
+					score,
+					quality.target,
+				)));
 			};
 
 			temps.warnings.push(format!(

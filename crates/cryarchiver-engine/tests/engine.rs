@@ -1092,6 +1092,72 @@ async fn cancelling_the_search_leaves_nothing_behind() {
 }
 
 #[tokio::test]
+async fn a_learned_crf_too_low_for_the_size_gate_is_searched_again() {
+	let dir = tempfile::tempdir().unwrap();
+	let short = support::mpeg4(dir.path(), "short.mp4", 3);
+	let easy = support::mpeg4(dir.path(), "easy.mp4", 125);
+	let tools = support::toolchain().await;
+	let learned = Arc::new(SharedMemory::default());
+	run_recording(
+		&Engine::new(tools.clone()).with_quality_memory(learned.clone()),
+		&job(&short),
+		dir.path(),
+	)
+	.await;
+	let (key, stats) = learned.entries().remove(0);
+	let hard_won = Arc::new(SharedMemory::with_entries([(
+		key,
+		GroupStats { setting: 10.0, ..stats },
+	)]));
+	let engine = Engine::new(tools).with_quality_memory(hard_won.clone());
+	let demanding = Job {
+		min_savings: 0.6,
+		..job(&easy)
+	};
+
+	let (outcome, events) = run_recording(&engine, &demanding, dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	assert_eq!(
+		stages(&events, Stage::Sample),
+		2,
+		"the size gate, then the search: {events:?}"
+	);
+	let group = hard_won.entries().remove(0).1;
+	assert_eq!(group.observations, 2, "{group:?}");
+	assert!(group.setting > 10.0, "{group:?}");
+}
+
+#[tokio::test]
+async fn a_job_cancelled_after_a_passing_check_learns_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let cancel = CancellationToken::new();
+	let trigger = cancel.clone();
+	let events = Mutex::new(Vec::new());
+	let on_event = |event: JobEvent| {
+		if event == JobEvent::Stage(Stage::Mux) {
+			trigger.cancel();
+		}
+		events.lock().unwrap().push(event);
+	};
+
+	let outcome = engine.run(&job(&clip), &sink(dir.path()), &on_event, &cancel).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.kind == ErrorKind::Cancelled),
+		"{outcome:?}"
+	);
+	let events = events.into_inner().unwrap();
+	assert_eq!(stages(&events, Stage::Verify), 1, "the VMAF check ran: {events:?}");
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+	assert!(!dir.path().join("clip.cry.mkv").exists());
+}
+
+#[tokio::test]
 async fn a_video_of_unknown_duration_is_encoded_at_the_table_crf_and_checked() {
 	let dir = tempfile::tempdir().unwrap();
 	let live = dir.path().join("live.mkv");
