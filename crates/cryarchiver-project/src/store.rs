@@ -221,10 +221,14 @@ impl Store {
 			*last = (*last).max(attempt);
 		}
 
+		// Learned quality is only a cache: an entry this build can't read, damaged or from a later build, is skipped
+		// rather than keeping the project from opening.
 		for entry in txn.open_table(META)?.iter()? {
 			let (key, value) = entry?;
-			if let Some(quality_key) = key.value().strip_prefix(QUALITY_PREFIX) {
-				loaded.quality.push((quality_key.to_owned(), decode(value.value())?));
+			if let Some(quality_key) = key.value().strip_prefix(QUALITY_PREFIX)
+				&& let Ok(stats) = decode(value.value())
+			{
+				loaded.quality.push((quality_key.to_owned(), stats));
 			}
 		}
 		Ok(loaded)
@@ -574,8 +578,10 @@ pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 	for entry in txn.open_table(META)?.iter()? {
 		let (key, value) = entry?;
 		if let Some(quality_key) = key.value().strip_prefix(QUALITY_PREFIX) {
-			let stats: GroupStats = decode(value.value())?;
-			writeln!(out, "{quality_key} = {stats:?}")?;
+			match decode::<GroupStats>(value.value()) {
+				Ok(stats) => writeln!(out, "{quality_key} = {stats:?}")?,
+				Err(err) => writeln!(out, "{quality_key} = unreadable ({err})")?,
+			}
 		}
 	}
 	Ok(())
@@ -883,5 +889,35 @@ mod tests {
 				.contains(&format!("[quality]\n{key} = GroupStats")),
 			"the dump lists learned quality"
 		);
+	}
+
+	#[test]
+	fn an_unreadable_quality_entry_is_skipped_and_the_project_still_opens() {
+		let dir = tempfile::tempdir().unwrap();
+		let stats = GroupStats {
+			setting: 88.0,
+			slope: None,
+			bpp: None,
+			observations: 1,
+		};
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		store.set_quality("good", &stats).unwrap();
+		store.push(Change {
+			table: Table::Meta,
+			key: format!("{QUALITY_PREFIX}x").into_bytes(),
+			value: Some(vec![0xC1, 0xFF, 0x00]),
+		});
+		store.flush().unwrap();
+		drop(store);
+
+		let (store, _, loaded) = Store::open(&project(dir.path())).unwrap();
+		drop(store);
+		let mut out = Vec::new();
+		dump(&project(dir.path()), &mut out).unwrap();
+		let text = String::from_utf8(out).unwrap();
+
+		assert_eq!(loaded.quality, vec![("good".to_owned(), stats)]);
+		assert!(text.contains("good = GroupStats"), "{text}");
+		assert!(text.contains("x = unreadable"), "{text}");
 	}
 }
