@@ -7,15 +7,17 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::audio::plan::{AudioPlan, FilePlan, plan_file};
+use crate::audio::plan::{AudioPlan, AudioRules, FilePlan, plan_file_with, retarget};
 use crate::audio::{cover, encode, verify};
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
-use crate::container::Cover;
+use crate::container::{Container, Cover};
 use crate::detect::{self, Detection, MediaClass};
+use crate::format::{OutputFormat, check_kind};
 use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
+use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::JobOptions;
+use crate::options::{JobOptions, kept_as_requested};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -27,7 +29,7 @@ use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
 use crate::video::analyze::Analysis;
 use crate::video::encode::{EncodedVideo, Sample};
 use crate::video::mux::{self, Attachment, MuxInputs, MuxPlan};
-use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck};
+use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, usable_main};
 use crate::video::quality::{self as video_quality, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{Extracted, StreamPlan, plan_streams};
 use crate::video::verify::{
@@ -133,7 +135,11 @@ enum Produced {
 }
 
 enum Planned {
-	Audio { info: Box<MediaInfo>, plan: FilePlan },
+	Audio {
+		info: Box<MediaInfo>,
+		plan: FilePlan,
+		from_video: bool,
+	},
 	Video,
 	Image(Box<ImageInput>),
 }
@@ -190,6 +196,8 @@ enum Tuning {
 enum Checked {
 	Passed(Observation),
 	Missed(KeepReason),
+	/// Written as requested; learns nothing.
+	Short,
 }
 
 impl Engine {
@@ -246,6 +254,7 @@ impl Engine {
 			.unwrap_or_else(JobOutcome::Failed)
 	}
 
+	#[allow(clippy::too_many_lines)]
 	async fn process(
 		&self,
 		job: &Job,
@@ -259,21 +268,34 @@ impl Engine {
 
 		on_event(JobEvent::Stage(Stage::Detect));
 		let Detection { meta, class, probe_log } = detect::detect(&self.tools, &job.source, cancel).await?;
+		if let (Some(format), Some(kind)) = (job.options.format, media_kind(&class)) {
+			check_kind(format, kind).map_err(ErrorKind::EncodeFailed)?;
+		}
+
 		let animated = matches!(class, MediaClass::AnimatedImage(_));
 		let planned = match class {
 			MediaClass::Audio(info) => {
 				self.require(MediaKind::Audio)?;
 				on_event(JobEvent::Stage(Stage::Plan));
-				match plan_file(&info, job.speed, &job.overrides) {
+				let rules = AudioRules {
+					forced: job.options.forced(),
+				};
+				match plan_file_with(&info, job.speed, &job.overrides, rules) {
 					AudioPlan::Encode(plan) => Planned::Audio {
+						plan: retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?,
 						info: Box::new(info),
-						plan,
+						from_video: false,
 					},
 					AudioPlan::Keep(reason) => return Ok(JobOutcome::KeptOriginal { reason }),
 				}
 			}
-			MediaClass::Video(info) => {
-				self.require(MediaKind::Video)?;
+			MediaClass::Video(info)
+				if job
+					.options
+					.format
+					.is_some_and(|format| format.kind() == MediaKind::Audio) =>
+			{
+				self.require(MediaKind::Audio)?;
 				let damage = integrity::find_damage(&job.source)
 					.map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
 				if let Some(reason) = damage {
@@ -281,7 +303,32 @@ impl Engine {
 				}
 
 				on_event(JobEvent::Stage(Stage::Plan));
-				let planned = precheck(&info, &self.video_caps())
+				match plan_file_with(&info, job.speed, &job.overrides, AudioRules { forced: true }) {
+					AudioPlan::Encode(plan) => Planned::Audio {
+						plan: extracted(retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?),
+						info: Box::new(info),
+						from_video: true,
+					},
+					AudioPlan::Keep(reason) => return Err(ErrorKind::EncodeFailed(extraction_refusal(&reason)).into()),
+				}
+			}
+			MediaClass::Video(info) => {
+				self.require(MediaKind::Video)?;
+				if matches!(job.options.format, Some(OutputFormat::Webm | OutputFormat::Mp4)) {
+					return Err(
+						ErrorKind::EncodeFailed("WebM and MP4 video output is not available yet".into()).into(),
+					);
+				}
+
+				let damage = integrity::find_damage(&job.source)
+					.map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
+				if let Some(reason) = damage {
+					return Err(ErrorKind::SourceDamaged(reason).into());
+				}
+
+				on_event(JobEvent::Stage(Stage::Plan));
+				let planned = self
+					.video_main(&info, job.options.forced())
 					.and_then(|_| plan_streams(&info, job.speed, &job.overrides, job.keep_metadata));
 				if let Err(reason) = planned {
 					return Ok(JobOutcome::KeptOriginal { reason });
@@ -323,7 +370,9 @@ impl Engine {
 			cancel,
 		};
 		let produced = match &planned {
-			Planned::Audio { info, plan } => self.produce_audio(&cx, info, plan, &workspace).await,
+			Planned::Audio { info, plan, from_video } => {
+				self.produce_audio(&cx, info, plan, *from_video, &workspace).await
+			}
 			Planned::Video => Box::pin(self.produce_video(&cx, &workspace)).await,
 			Planned::Image(input) => Box::pin(self.produce_image(&cx, input, &workspace)).await,
 		};
@@ -404,6 +453,8 @@ impl Engine {
 			on_event: cx.on_event,
 			cancel: cx.cancel,
 			memory: self.quality.as_ref(),
+			route: image_route(cx.job.options.format),
+			forced: cx.job.options.forced(),
 		};
 		Ok(match image_job::produce(&image, input, workspace).await? {
 			ImageOutcome::Output {
@@ -428,11 +479,20 @@ impl Engine {
 		}
 	}
 
+	fn video_main<'a>(&self, info: &'a MediaInfo, forced: bool) -> Result<&'a Stream, KeepReason> {
+		if forced {
+			usable_main(info, &self.video_caps())
+		} else {
+			precheck(info, &self.video_caps())
+		}
+	}
+
 	async fn produce_audio(
 		&self,
 		cx: &Context<'_>,
 		info: &MediaInfo,
 		plan: &FilePlan,
+		from_video: bool,
 		workspace: &Workspace,
 	) -> Result<Produced, JobError> {
 		let output = workspace.file(&format!("out.{}", plan.container.extension));
@@ -443,7 +503,12 @@ impl Engine {
 		let source_levels = encode::run(&cmd, plan, info.format.duration, on_fraction, cx.cancel).await?;
 
 		let decoded_s = source_levels.iter().map(|levels| levels.duration_s).fold(0.0, f64::max);
-		if let Some(reason) = info.duration_shortfall(decoded_s) {
+		let shortfall = if from_video {
+			extraction_shortfall(info, decoded_s)
+		} else {
+			info.duration_shortfall(decoded_s)
+		};
+		if let Some(reason) = shortfall {
 			return Err(ErrorKind::SourceDamaged(reason).into());
 		}
 
@@ -460,10 +525,16 @@ impl Engine {
 			.map_err(|err| JobError::io(IoSide::Destination(&output), &err))?
 			.len();
 		if !saves_enough(cx.source_bytes, bytes, cx.job.min_savings) {
-			return Ok(Produced::Kept(KeepReason::NotSmaller {
-				src_bytes: cx.source_bytes,
-				out_bytes: bytes,
-			}));
+			if !cx.job.options.forced() {
+				return Ok(Produced::Kept(KeepReason::NotSmaller {
+					src_bytes: cx.source_bytes,
+					out_bytes: bytes,
+				}));
+			}
+
+			let warning = kept_as_requested(cx.source_bytes, bytes);
+			(cx.on_event)(JobEvent::Warning(warning.clone()));
+			warnings.push(warning);
 		}
 
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
@@ -486,7 +557,7 @@ impl Engine {
 		let (info, probe_json) = probe::probe_video(&self.tools, source, cx.source_bytes, cx.cancel)
 			.await
 			.map_err(video_probe_error)?;
-		let planned = precheck(&info, &self.video_caps()).and_then(|main| {
+		let planned = self.video_main(&info, cx.job.options.forced()).and_then(|main| {
 			plan_streams(&info, cx.job.speed, &cx.job.overrides, cx.job.keep_metadata).map(|streams| (main, streams))
 		});
 		let (main, streams) = match planned {
@@ -526,7 +597,9 @@ impl Engine {
 		}
 
 		let learned_bpp = quality.stats.and_then(|stats| stats.bpp);
-		if let Some(reason) = learned_bpp.and_then(|bpp| video_plan::efficient_at(&info, main, bpp)) {
+		if !cx.job.options.forced()
+			&& let Some(reason) = learned_bpp.and_then(|bpp| video_plan::efficient_at(&info, main, bpp))
+		{
 			return Ok(Produced::Kept(KeepReason::AlreadyEfficient(reason)));
 		}
 
@@ -546,6 +619,10 @@ impl Engine {
 		let learned = if verify {
 			match Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await? {
 				Checked::Passed(observation) => Some(observation),
+				Checked::Short => {
+					self.forget_learned(&quality);
+					None
+				}
 				Checked::Missed(reason) => {
 					self.forget_learned(&quality);
 					return Ok(Produced::Kept(reason));
@@ -657,6 +734,10 @@ impl Engine {
 		};
 
 		video.encoder = video.encoder.with_crf(quality.start());
+		if cx.job.options.forced() {
+			return Ok(Tuning::Encode { verify });
+		}
+
 		let gate = Box::pin(self.sample_gate(cx, workspace, inputs.info, video, inputs.streams, inputs.declared_s));
 		match gate.await? {
 			None => Ok(Tuning::Encode { verify }),
@@ -699,6 +780,16 @@ impl Engine {
 
 		let found = match searched {
 			Searched::Found(found) => found,
+			Searched::Unreachable { crf, score } if cx.job.options.forced() => {
+				video.encoder = video.encoder.with_crf(crf);
+				video.warnings.push(format!(
+					"{}; encoded at CRF {crf} without a full check because it was requested (best predicted VMAF {:.1} / {:.1})",
+					video_quality::unreachable_text(crf, score, quality.target),
+					score.mean,
+					score.p5
+				));
+				return Ok(Tuning::Encode { verify: false });
+			}
 			Searched::Unreachable { crf, score } => {
 				return Ok(Tuning::Keep(video_quality::unreachable_reason(
 					crf,
@@ -710,9 +801,10 @@ impl Engine {
 		video.encoder = video.encoder.with_crf(found.crf);
 		quality.slope = found.slope;
 
-		if let Some(duration_s) = inputs
-			.declared_s
-			.filter(|duration| *duration >= video_encode::MIN_PREDICTED_DURATION_S)
+		if !cx.job.options.forced()
+			&& let Some(duration_s) = inputs
+				.declared_s
+				.filter(|duration| *duration >= video_encode::MIN_PREDICTED_DURATION_S)
 		{
 			let other = video_encode::other_bitrate(inputs.info, inputs.streams);
 			let predicted = video_encode::predicted_bytes(found.sample_bytes, samples, duration_s, other);
@@ -759,11 +851,15 @@ impl Engine {
 				None
 			};
 			let Some(lower) = lower else {
-				return Ok(Checked::Missed(video_quality::unreachable_reason(
-					crf,
-					score,
-					quality.target,
-				)));
+				let reason = video_quality::unreachable_text(crf, score, quality.target);
+				if cx.job.options.forced() {
+					temps
+						.warnings
+						.push(format!("{reason}; it was written because it was requested"));
+					return Ok(Checked::Short);
+				}
+
+				return Ok(Checked::Missed(KeepReason::QualityUnreachable(reason)));
 			};
 
 			temps.warnings.push(format!(
@@ -900,10 +996,14 @@ impl Engine {
 			.map_err(|err| JobError::io(IoSide::Destination(&output), &err))?
 			.len();
 		if !saves_enough(cx.source_bytes, bytes, cx.job.min_savings) {
-			return Ok(Produced::Kept(KeepReason::NotSmaller {
-				src_bytes: cx.source_bytes,
-				out_bytes: bytes,
-			}));
+			if !cx.job.options.forced() {
+				return Ok(Produced::Kept(KeepReason::NotSmaller {
+					src_bytes: cx.source_bytes,
+					out_bytes: bytes,
+				}));
+			}
+
+			warnings.push(kept_as_requested(cx.source_bytes, bytes));
 		}
 
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
@@ -1028,6 +1128,59 @@ fn metadata_mode(job: &Job) -> MetadataMode {
 	} else {
 		MetadataMode::IccOnly
 	}
+}
+
+fn media_kind(class: &MediaClass) -> Option<MediaKind> {
+	match class {
+		MediaClass::Audio(_) => Some(MediaKind::Audio),
+		MediaClass::Video(_) => Some(MediaKind::Video),
+		MediaClass::StillImage(_) | MediaClass::AnimatedImage(_) => Some(MediaKind::Image),
+		MediaClass::Kept(_) | MediaClass::Damaged(_) | MediaClass::Other(_) => None,
+	}
+}
+
+fn image_route(format: Option<OutputFormat>) -> Option<ImageRoute> {
+	match format? {
+		OutputFormat::Avif => Some(ImageRoute::Avif),
+		OutputFormat::Jxl => Some(ImageRoute::Jxl),
+		OutputFormat::Mkv
+		| OutputFormat::Webm
+		| OutputFormat::Mp4
+		| OutputFormat::Opus
+		| OutputFormat::Ogg
+		| OutputFormat::Mka => None,
+	}
+}
+
+fn extracted(plan: FilePlan) -> FilePlan {
+	let cover = match plan.container.cover {
+		Cover::Stream => Cover::Attachment,
+		other => other,
+	};
+	FilePlan {
+		container: Container {
+			cover,
+			..plan.container
+		},
+		..plan
+	}
+}
+
+fn extraction_refusal(reason: &KeepReason) -> String {
+	match reason {
+		KeepReason::Unsupported(why) => format!("the audio can't be extracted: {why}"),
+		_ => "the audio can't be extracted".to_owned(),
+	}
+}
+
+fn extraction_shortfall(info: &MediaInfo, decoded_s: f64) -> Option<String> {
+	let declared = info
+		.audio_streams()
+		.filter_map(Stream::declared_duration)
+		.fold(0.0, f64::max);
+
+	(declared > 0.0 && declared - decoded_s > (declared * 0.02).max(1.0))
+		.then(|| format!("decodes to {decoded_s:.1} s but its audio declares {declared:.1} s"))
 }
 
 fn copy_cover(source: &Path, output: &Path, info: &MediaInfo) -> Option<String> {

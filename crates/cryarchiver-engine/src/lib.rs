@@ -3,6 +3,7 @@ pub mod commit;
 pub mod container;
 pub mod detect;
 pub mod engine;
+pub mod format;
 pub mod images;
 pub mod integrity;
 pub mod metadata;

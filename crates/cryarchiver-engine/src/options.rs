@@ -1,3 +1,5 @@
+use crate::format::OutputFormat;
+
 const DURATION_SLACK_S: f64 = 0.05;
 const SIXTY: f64 = 60.0;
 
@@ -16,11 +18,12 @@ pub struct TrimWindow {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobOptions {
 	pub trim: Option<Trim>,
+	pub format: Option<OutputFormat>,
 }
 
 impl JobOptions {
 	pub fn forced(&self) -> bool {
-		self.trim.is_some()
+		self.trim.is_some() || self.format.is_some()
 	}
 }
 
@@ -44,6 +47,7 @@ impl Trim {
 				})
 				.ok_or_else(|| "the file's duration is unknown, so --to is needed".to_owned());
 		};
+
 		if self.start_s >= duration_s {
 			return Err(format!(
 				"--ss ({:.3} s) is past the end of the file ({duration_s:.3} s)",
@@ -191,6 +195,7 @@ mod tests {
 		assert!(
 			JobOptions {
 				trim: Some(trim(1.0, None)),
+				..JobOptions::default()
 			}
 			.forced()
 		);

@@ -33,14 +33,32 @@ pub const MATROSKA_VIDEO: Container = Container {
 	muxer: "matroska",
 	cover: Cover::Attachment,
 };
+pub const OGG_AUDIO: Container = Container {
+	extension: "ogg",
+	muxer: "ogg",
+	cover: Cover::VorbisPicture,
+};
+pub const WEBM_VIDEO: Container = Container {
+	extension: "webm",
+	muxer: "webm",
+	cover: Cover::Attachment,
+};
+pub const MP4_VIDEO: Container = Container {
+	extension: "mp4",
+	muxer: "mp4",
+	cover: Cover::Attachment,
+};
 
 pub const AVIF_EXTENSION: &str = "avif";
 pub const JXL_EXTENSION: &str = "jxl";
 
-pub const OUTPUT_EXTENSIONS: [&str; 5] = [
+pub const OUTPUT_EXTENSIONS: [&str; 8] = [
 	OGG_OPUS.extension,
+	OGG_AUDIO.extension,
 	MATROSKA_AUDIO.extension,
 	MATROSKA_VIDEO.extension,
+	WEBM_VIDEO.extension,
+	MP4_VIDEO.extension,
 	AVIF_EXTENSION,
 	JXL_EXTENSION,
 ];

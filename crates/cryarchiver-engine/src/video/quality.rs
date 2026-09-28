@@ -220,11 +220,15 @@ pub fn verify_windows(frames: u64, decoded_s: f64, speed: Speed) -> Vec<FrameWin
 		.collect()
 }
 
-pub fn unreachable_reason(crf: f64, score: Score, target: Target) -> KeepReason {
-	KeepReason::QualityUnreachable(format!(
+pub fn unreachable_text(crf: f64, score: Score, target: Target) -> String {
+	format!(
 		"quality target not reached at a smaller size (VMAF {:.1} / {:.1} at CRF {crf}, target {:.1} / {:.1})",
 		score.mean, score.p5, target.mean, target.floor
-	))
+	)
+}
+
+pub fn unreachable_reason(crf: f64, score: Score, target: Target) -> KeepReason {
+	KeepReason::QualityUnreachable(unreachable_text(crf, score, target))
 }
 
 impl Scorer<'_> {

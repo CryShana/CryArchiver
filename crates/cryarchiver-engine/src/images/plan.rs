@@ -4,7 +4,7 @@ use crate::images::props::Effective;
 use crate::images::ssim::padded_size;
 use crate::images::structure::Structure;
 use crate::metadata::{MetadataMode, SourceMetadata, exif, icc};
-use crate::outcome::KeepReason;
+use crate::outcome::{KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::toolchain::{LIBJXL, Toolchain};
 
@@ -282,6 +282,13 @@ fn keep(reason: String) -> Gate {
 	Gate::Keep(KeepReason::Unsupported(reason))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageRoute {
+	Avif,
+	Jxl,
+	JxlLossless,
+}
+
 pub fn image_target(speed: Speed, overrides: &Overrides) -> f64 {
 	overrides.normalized().image.unwrap_or(ssim_target(speed))
 }
@@ -291,32 +298,61 @@ pub fn plan_still(
 	speed: Speed,
 	overrides: &Overrides,
 	libjxl: bool,
-) -> Result<StillPlan, KeepReason> {
+	route: Option<ImageRoute>,
+) -> Result<StillPlan, Refusal> {
 	let pixels = u64::from(facts.width) * u64::from(facts.height);
 	let fits_avif = facts.width <= MAX_AVIF_SIDE
 		&& facts.height <= MAX_AVIF_SIDE
 		&& pixels <= MAX_AVIF_PIXELS
 		&& !facts.effective.high_depth
 		&& !facts.grey_icc;
-	let mut candidates = Vec::new();
-	if fits_avif {
-		candidates.push(Candidate::Ravif(ravif_settings(speed)));
-	} else if libjxl {
-		candidates.push(Candidate::JxlLossy(jxl_lossy_settings(speed)));
-	} else {
-		return Err(KeepReason::Unsupported(
-			"this image needs JPEG XL, and ffmpeg has no libjxl".into(),
-		));
-	}
-	if facts.graphic && libjxl {
-		candidates.push(Candidate::JxlLossless(JXL_LOSSLESS));
-	}
+	let lossy_jxl = Candidate::JxlLossy(jxl_lossy_settings(speed));
+	let lossless_jxl = Candidate::JxlLossless(JXL_LOSSLESS);
+
+	let candidates = match route {
+		Some(ImageRoute::Avif) if !fits_avif => return Err(Refusal::Impossible(not_avif(facts))),
+		Some(ImageRoute::Avif) => vec![Candidate::Ravif(ravif_settings(speed))],
+		Some(ImageRoute::Jxl | ImageRoute::JxlLossless) if !libjxl => {
+			return Err(Refusal::Impossible("JPEG XL output needs ffmpeg with libjxl".into()));
+		}
+		Some(ImageRoute::Jxl) if facts.graphic => vec![lossy_jxl, lossless_jxl],
+		Some(ImageRoute::Jxl) => vec![lossy_jxl],
+		Some(ImageRoute::JxlLossless) => vec![lossless_jxl],
+		None => {
+			let mut candidates = Vec::new();
+			if fits_avif {
+				candidates.push(Candidate::Ravif(ravif_settings(speed)));
+			} else if libjxl {
+				candidates.push(lossy_jxl);
+			} else {
+				return Err(Refusal::Keep(KeepReason::Unsupported(
+					"this image needs JPEG XL, and ffmpeg has no libjxl".into(),
+				)));
+			}
+
+			if facts.graphic && libjxl {
+				candidates.push(lossless_jxl);
+			}
+			candidates
+		}
+	};
 
 	Ok(StillPlan {
 		memory_bytes: memory_estimate(facts.width, facts.height, &candidates),
 		candidates,
 		target: image_target(speed, overrides),
 	})
+}
+
+fn not_avif(facts: &StillFacts) -> String {
+	let why = if facts.effective.high_depth {
+		"it has more than 8 bits per channel"
+	} else if facts.grey_icc {
+		"it has a grey colour profile"
+	} else {
+		"it is larger than 16384 pixels on a side or 64 MP"
+	};
+	format!("this image can't be stored as AVIF: {why}")
 }
 
 /// The estimate before decoding, while the route isn't known yet: the larger of the ravif and libjxl estimates.
@@ -393,23 +429,23 @@ mod tests {
 		};
 
 		assert_eq!(
-			kinds(&plan_still(&facts(6000, 4000), Speed::Moderate, &Overrides::default(), true).unwrap()),
+			kinds(&plan_still(&facts(6000, 4000), Speed::Moderate, &Overrides::default(), true, None).unwrap()),
 			["ravif"]
 		);
 		assert_eq!(
-			kinds(&plan_still(&facts(1293, 48277), Speed::Moderate, &Overrides::default(), true).unwrap()),
+			kinds(&plan_still(&facts(1293, 48277), Speed::Moderate, &Overrides::default(), true, None).unwrap()),
 			["jxl lossy"]
 		);
 		assert_eq!(
-			kinds(&plan_still(&facts(20000, 800), Speed::Moderate, &Overrides::default(), true).unwrap()),
+			kinds(&plan_still(&facts(20000, 800), Speed::Moderate, &Overrides::default(), true, None).unwrap()),
 			["jxl lossy"]
 		);
 		assert_eq!(
-			kinds(&plan_still(&deep, Speed::Moderate, &Overrides::default(), true).unwrap()),
+			kinds(&plan_still(&deep, Speed::Moderate, &Overrides::default(), true, None).unwrap()),
 			["jxl lossy"]
 		);
 		assert_eq!(
-			kinds(&plan_still(&grey, Speed::Moderate, &Overrides::default(), true).unwrap()),
+			kinds(&plan_still(&grey, Speed::Moderate, &Overrides::default(), true, None).unwrap()),
 			["jxl lossy"]
 		);
 	}
@@ -422,16 +458,92 @@ mod tests {
 		};
 
 		assert_eq!(
-			kinds(&plan_still(&graphic, Speed::Fast, &Overrides::default(), true).unwrap()),
+			kinds(&plan_still(&graphic, Speed::Fast, &Overrides::default(), true, None).unwrap()),
 			["ravif", "jxl lossless"]
 		);
 		assert_eq!(
-			kinds(&plan_still(&graphic, Speed::Fast, &Overrides::default(), false).unwrap()),
+			kinds(&plan_still(&graphic, Speed::Fast, &Overrides::default(), false, None).unwrap()),
 			["ravif"]
 		);
 		assert!(matches!(
-			plan_still(&facts(1293, 48277), Speed::Fast, &Overrides::default(), false),
-			Err(KeepReason::Unsupported(reason)) if reason.contains("libjxl")
+			plan_still(&facts(1293, 48277), Speed::Fast, &Overrides::default(), false, None),
+			Err(Refusal::Keep(KeepReason::Unsupported(reason))) if reason.contains("libjxl")
+		));
+	}
+
+	#[test]
+	fn a_requested_route_replaces_the_automatic_choice() {
+		let graphic = StillFacts {
+			graphic: true,
+			..facts(800, 600)
+		};
+		let deep = StillFacts {
+			effective: Effective {
+				high_depth: true,
+				alpha: false,
+			},
+			..facts(800, 600)
+		};
+
+		assert_eq!(
+			kinds(
+				&plan_still(
+					&facts(800, 600),
+					Speed::Fast,
+					&Overrides::default(),
+					true,
+					Some(ImageRoute::Jxl)
+				)
+				.unwrap()
+			),
+			["jxl lossy"]
+		);
+		assert_eq!(
+			kinds(
+				&plan_still(
+					&graphic,
+					Speed::Fast,
+					&Overrides::default(),
+					true,
+					Some(ImageRoute::Jxl)
+				)
+				.unwrap()
+			),
+			["jxl lossy", "jxl lossless"]
+		);
+		assert_eq!(
+			kinds(
+				&plan_still(
+					&graphic,
+					Speed::Fast,
+					&Overrides::default(),
+					true,
+					Some(ImageRoute::Avif)
+				)
+				.unwrap()
+			),
+			["ravif"]
+		);
+		assert_eq!(
+			kinds(
+				&plan_still(
+					&graphic,
+					Speed::Fast,
+					&Overrides::default(),
+					true,
+					Some(ImageRoute::JxlLossless)
+				)
+				.unwrap()
+			),
+			["jxl lossless"]
+		);
+		assert!(matches!(
+			plan_still(&deep, Speed::Fast, &Overrides::default(), true, Some(ImageRoute::Avif)),
+			Err(Refusal::Impossible(reason)) if reason.contains("more than 8 bits")
+		));
+		assert!(matches!(
+			plan_still(&facts(800, 600), Speed::Fast, &Overrides::default(), false, Some(ImageRoute::Jxl)),
+			Err(Refusal::Impossible(reason)) if reason.contains("libjxl")
 		));
 	}
 
@@ -518,7 +630,8 @@ mod tests {
 		};
 
 		for speed in [Speed::Fast, Speed::Moderate, Speed::Slow] {
-			let target = |overrides: &Overrides| plan_still(&facts(64, 48), speed, overrides, true).unwrap().target;
+			let target =
+				|overrides: &Overrides| plan_still(&facts(64, 48), speed, overrides, true, None).unwrap().target;
 
 			assert_eq!(
 				(target(&custom), target(&Overrides::default())),

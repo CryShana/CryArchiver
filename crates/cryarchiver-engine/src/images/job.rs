@@ -10,13 +10,14 @@ use crate::images::animated::{self, Animation, ScanError};
 use crate::images::avif::{self, AvifColour};
 use crate::images::decode::{self, Decoded, Undecodable};
 use crate::images::jxl::{self, JxlJob, JxlPixels};
-use crate::images::plan::{self, Candidate, Gate, PrecheckInput, StillFacts, StillPlan};
+use crate::images::plan::{self, Candidate, Gate, ImageRoute, PrecheckInput, StillFacts, StillPlan};
 use crate::images::props::{self, Effective};
 use crate::images::verify::{self, Expected};
 use crate::images::{blocking, structure};
 use crate::metadata::icc::{self, Cicp};
 use crate::metadata::{self, ImageFormat, MetadataMode, OutputMetadata, SourceMetadata, exif, sniff};
-use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
+use crate::options::kept_as_requested;
+use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::MediaInfo;
 use crate::quality::keys::{CacheKey, Group, ImageGroup};
@@ -54,6 +55,8 @@ pub struct ImageContext<'a> {
 	pub on_event: &'a (dyn Fn(JobEvent) + Sync),
 	pub cancel: &'a CancellationToken,
 	pub memory: &'a dyn QualityMemory,
+	pub route: Option<ImageRoute>,
+	pub forced: bool,
 }
 
 #[derive(Debug)]
@@ -82,6 +85,8 @@ struct Still {
 #[derive(Debug, Default)]
 struct Choice {
 	best: Option<(PathBuf, u64)>,
+	/// The score of `best` when it misses the target and is written only because it was requested.
+	best_short: Option<f64>,
 	best_rejected: Option<f64>,
 	smallest: Option<u64>,
 	failures: Vec<(Candidate, JobError)>,
@@ -114,6 +119,7 @@ enum Tried {
 		size: u64,
 		candidate: Candidate,
 		score: f64,
+		short: bool,
 	},
 	Rejected {
 		size: u64,
@@ -133,6 +139,35 @@ impl Choice {
 
 	fn reject(&mut self, score: f64) {
 		self.best_rejected = Some(self.best_rejected.map_or(score, |best| best.max(score)));
+	}
+
+	fn passing_size(&self) -> Option<u64> {
+		self.best
+			.as_ref()
+			.filter(|_| self.best_short.is_none())
+			.map(|(_, size)| *size)
+	}
+
+	fn offer(&mut self, path: PathBuf, size: u64, short: Option<f64>) {
+		let better = match (short, self.best_short) {
+			(None, None) => self.best.as_ref().is_none_or(|(_, best)| size < *best),
+			(None, Some(_)) => true,
+			(Some(_), None) => self.best.is_none(),
+			(Some(score), Some(best)) => score > best,
+		};
+
+		if better {
+			self.best = Some((path, size));
+			self.best_short = short;
+		}
+	}
+
+	fn short_note(&self, target: f64) -> Option<String> {
+		self.best_short.map(|score| {
+			format!(
+				"quality target not reached (SSIMULACRA2 {score:.1}, target {target:.0}); it was written because it was requested"
+			)
+		})
 	}
 }
 
@@ -241,9 +276,10 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		graphic,
 		grey_icc: grey_profile(icc.as_deref()),
 	};
-	let plan = match plan::plan_still(&facts, cx.speed, &cx.overrides, cx.caps.libjxl) {
+	let plan = match plan::plan_still(&facts, cx.speed, &cx.overrides, cx.caps.libjxl, cx.route) {
 		Ok(plan) => plan,
-		Err(reason) => return Ok(Err(reason)),
+		Err(Refusal::Keep(reason)) => return Ok(Err(reason)),
+		Err(Refusal::Impossible(reason)) => return Err(ErrorKind::EncodeFailed(reason).into()),
 	};
 
 	let metadata = metadata::build_output(&input.metadata, cx.mode, width, height);
@@ -298,7 +334,7 @@ async fn encode_and_choose(
 			.map_or(planned, |stats| planned.with_setting(cx.speed, stats.setting));
 		let slot = Slot {
 			index,
-			best: choice.best.as_ref().map(|(_, size)| *size),
+			best: choice.passing_size(),
 			table: candidate.finer_than(planned).then_some(planned),
 		};
 
@@ -308,10 +344,12 @@ async fn encode_and_choose(
 				size,
 				candidate,
 				score,
+				short,
 			} => {
 				choice.note(size);
-				choice.best = Some((path, size));
-				if let Some(key) = key
+				choice.offer(path, size, short.then_some(score));
+				if !short
+					&& let Some(key) = key
 					&& let Some(setting) = candidate.needed_setting(score, still.plan.target, cx.speed)
 				{
 					learned.push((
@@ -338,7 +376,17 @@ async fn encode_and_choose(
 		}
 	}
 
-	finish_choice(cx, workspace, choice, still.plan.target, still.warnings, learned)
+	let mut notes: Vec<String> = choice.short_note(still.plan.target).into_iter().collect();
+	if cx.forced
+		&& let Some((_, size)) = &choice.best
+		&& !saves_enough(cx.source_bytes, *size, cx.min_savings)
+	{
+		notes.push(kept_as_requested(cx.source_bytes, *size));
+	}
+
+	let mut warnings = still.warnings;
+	warnings.extend(notes);
+	finish_choice(cx, workspace, choice, still.plan.target, warnings, learned)
 }
 
 async fn try_candidate(
@@ -370,7 +418,7 @@ async fn try_candidate(
 		fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
 
 		let size = bytes.len() as u64;
-		let too_large = !saves_enough(cx.source_bytes, size, cx.min_savings);
+		let too_large = !cx.forced && !saves_enough(cx.source_bytes, size, cx.min_savings);
 		if too_large
 			&& last_score.is_none()
 			&& let Some(fallback) = table.take()
@@ -398,6 +446,7 @@ async fn try_candidate(
 				size,
 				candidate,
 				score,
+				short: false,
 			});
 		}
 
@@ -409,6 +458,15 @@ async fn try_candidate(
 				candidate = raised;
 				retries += 1;
 				last_score = Some(score);
+			}
+			None if cx.forced => {
+				return Ok(Tried::Passed {
+					path,
+					size,
+					candidate,
+					score,
+					short: true,
+				});
 			}
 			None => return Ok(Tried::Rejected { size, score }),
 		}
@@ -614,6 +672,11 @@ async fn produce_animation(
 		Err(ScanError::TooManyFrames) => return Ok(Some(keep("the animation has too many frames to verify"))),
 		Err(ScanError::Unreadable(reason)) => return Err(ErrorKind::SourceDamaged(reason).into()),
 	};
+
+	if matches!(cx.route, Some(ImageRoute::Jxl | ImageRoute::JxlLossless)) {
+		return Err(ErrorKind::EncodeFailed("animated JPEG XL output isn't supported; use -f avif".into()).into());
+	}
+
 	let animation = Animation {
 		alpha: animated::has_alpha(cx.tools, cx.source, cx.cancel).await?,
 		timeline,
@@ -652,19 +715,27 @@ async fn produce_animation(
 		.map_err(|err| JobError::io(IoSide::Destination(&output), &err))?
 		.len();
 	if !saves_enough(cx.source_bytes, bytes, cx.min_savings) {
-		return Ok(Some(ImageOutcome::Kept(KeepReason::NotSmaller {
-			src_bytes: cx.source_bytes,
-			out_bytes: bytes,
-		})));
+		if !cx.forced {
+			return Ok(Some(ImageOutcome::Kept(KeepReason::NotSmaller {
+				src_bytes: cx.source_bytes,
+				out_bytes: bytes,
+			})));
+		}
+
+		warnings.push(kept_as_requested(cx.source_bytes, bytes));
 	}
 
 	(cx.on_event)(JobEvent::Stage(Stage::Verify));
 	let score = animated::verify_animation(cx.tools, cx.source, &output, &animation, cx.cancel).await?;
 	let target = plan::image_target(cx.speed, &cx.overrides);
 	if score < target {
-		return Ok(Some(ImageOutcome::Kept(KeepReason::QualityUnreachable(format!(
-			"quality target not reached at a smaller size (SSIMULACRA2 {score:.1}, target {target:.0})"
-		)))));
+		let reason =
+			format!("quality target not reached at a smaller size (SSIMULACRA2 {score:.1}, target {target:.0})");
+		if !cx.forced {
+			return Ok(Some(ImageOutcome::Kept(KeepReason::QualityUnreachable(reason))));
+		}
+
+		warnings.push(format!("{reason}; it was written because it was requested"));
 	}
 
 	for warning in &warnings {
@@ -732,5 +803,42 @@ mod tests {
 			verdict(Choice::default(), 80.0, 1000),
 			Verdict::Kept(KeepReason::NotSmaller { .. })
 		));
+	}
+
+	#[test]
+	fn a_passing_candidate_beats_a_short_one_and_the_note_follows_the_written_one() {
+		let mut choice = Choice::default();
+
+		choice.offer(PathBuf::from("candidate0.jxl"), 100, Some(78.0));
+		let short_note = choice.short_note(85.0).unwrap();
+		let open = choice.passing_size();
+		choice.offer(PathBuf::from("candidate1.jxl"), 300, None);
+		let passed = choice.best.clone();
+		choice.offer(PathBuf::from("candidate2.jxl"), 50, Some(84.0));
+
+		assert!(short_note.contains("SSIMULACRA2 78.0, target 85"), "{short_note}");
+		assert_eq!(open, None, "a short best never stops a larger candidate");
+		assert_eq!(passed, Some((PathBuf::from("candidate1.jxl"), 300)));
+		assert_eq!(choice.best, passed);
+		assert_eq!(choice.short_note(85.0), None);
+		assert_eq!(choice.passing_size(), Some(300));
+	}
+
+	#[test]
+	fn short_candidates_compete_on_score_and_passing_ones_on_size() {
+		let mut short = Choice::default();
+		let mut passing = Choice::default();
+
+		short.offer(PathBuf::from("candidate0.avif"), 100, Some(70.0));
+		short.offer(PathBuf::from("candidate1.jxl"), 200, Some(80.0));
+		short.offer(PathBuf::from("candidate2.jxl"), 50, Some(75.0));
+		passing.offer(PathBuf::from("candidate0.avif"), 300, None);
+		passing.offer(PathBuf::from("candidate1.jxl"), 200, None);
+		passing.offer(PathBuf::from("candidate2.jxl"), 250, None);
+
+		assert_eq!(short.best, Some((PathBuf::from("candidate1.jxl"), 200)));
+		assert!(short.short_note(85.0).unwrap().contains("SSIMULACRA2 80.0"));
+		assert_eq!(passing.best, Some((PathBuf::from("candidate1.jxl"), 200)));
+		assert_eq!(passing.short_note(85.0), None);
 	}
 }

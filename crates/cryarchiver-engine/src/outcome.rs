@@ -132,6 +132,18 @@ pub enum KeepReason {
 	DecodeBomb { megapixels: u64 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+	Keep(KeepReason),
+	Impossible(String),
+}
+
+impl From<KeepReason> for Refusal {
+	fn from(reason: KeepReason) -> Self {
+		Self::Keep(reason)
+	}
+}
+
 #[derive(Debug, Clone)]
 pub enum JobOutcome {
 	Encoded {

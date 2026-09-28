@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use cryarchiver_engine::container::isobmff::parse_meta;
 use cryarchiver_engine::container::jxl::read_boxes;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
+use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::animated;
 use cryarchiver_engine::images::decode::oriented;
 use cryarchiver_engine::images::ssim::score;
@@ -895,5 +896,79 @@ async fn motion_photos_keep_the_original_unless_auxiliary_content_is_dropped() {
 			),
 			"{dropped:?}"
 		);
+	}
+}
+
+fn requested(source: &Path, format: OutputFormat) -> Job {
+	Job {
+		options: JobOptions {
+			format: Some(format),
+			..JobOptions::default()
+		},
+		..job(source)
+	}
+}
+
+#[tokio::test]
+async fn a_photo_can_be_asked_for_as_jpeg_xl() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
+
+	let output = encoded(run(&requested(&photo, OutputFormat::Jxl), dir.path()).await);
+
+	assert_eq!(output, dir.path().join("photo.cry.jxl"));
+	assert!(read_boxes(&std::fs::read(&output).unwrap()).unwrap().container);
+}
+
+#[tokio::test]
+async fn an_animation_asked_for_as_jpeg_xl_fails_instead_of_becoming_avif() {
+	let dir = tempfile::tempdir().unwrap();
+	let gif = dir.path().join("moving.gif");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=96x64:d=0.5:r=10",
+		gif.to_str().unwrap(),
+	]);
+
+	let outcome = run(&requested(&gif, OutputFormat::Jxl), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.to_string() == "encode failed: animated JPEG XL output isn't supported; use -f avif"),
+		"{outcome:?}"
+	);
+	assert!(!dir.path().join("moving.cry.avif").exists());
+	assert!(!dir.path().join("moving.cry.jxl").exists());
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn a_tiny_image_asked_for_as_avif_is_written_even_when_larger() {
+	let dir = tempfile::tempdir().unwrap();
+	let tiny = dir.path().join("tiny.png");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=red:s=3x3",
+		"-frames:v",
+		"1",
+		tiny.to_str().unwrap(),
+	]);
+
+	let outcome = run(&requested(&tiny, OutputFormat::Avif), dir.path()).await;
+
+	match outcome {
+		JobOutcome::Encoded { output, warnings, .. } => {
+			assert_eq!(output, dir.path().join("tiny.cry.avif"));
+			assert!(
+				warnings
+					.iter()
+					.any(|warning| warning.contains("because it was requested")),
+				"{warnings:?}"
+			);
+		}
+		other => panic!("{other:?}"),
 	}
 }

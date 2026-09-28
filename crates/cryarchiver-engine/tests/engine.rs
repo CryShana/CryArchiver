@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
+use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::plan::worst_case_memory;
 use cryarchiver_engine::options::JobOptions;
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
@@ -1928,4 +1929,200 @@ async fn a_search_that_cannot_reach_the_target_keeps_the_original_before_encodin
 	assert_eq!(stages(&events, Stage::Encode), 0, "{events:?}");
 	assert!(memory.entries().is_empty());
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+fn requested(source: &Path, format: OutputFormat) -> Job {
+	Job {
+		options: JobOptions {
+			format: Some(format),
+			..JobOptions::default()
+		},
+		..fast(source)
+	}
+}
+
+fn warned(outcome: &JobOutcome, text: &str) -> bool {
+	matches!(outcome, JobOutcome::Encoded { warnings, .. } if warnings.iter().any(|warning| warning.contains(text)))
+}
+
+#[tokio::test]
+async fn a_requested_container_remuxes_an_efficient_opus_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let opus = support::tone(
+		dir.path(),
+		"low.opus",
+		"mono",
+		1,
+		3,
+		&["-c:a", "libopus", "-b:a", "32k"],
+	);
+
+	let outcome = run(&requested(&opus, OutputFormat::Mka), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Encoded { output, .. } if *output == dir.path().join("low.cry.mka")),
+		"{outcome:?}"
+	);
+	assert!(warned(&outcome, "because it was requested"), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_format_for_another_kind_of_media_fails_that_file() {
+	let dir = tempfile::tempdir().unwrap();
+	let song = support::tone(dir.path(), "song.flac", "stereo", 2, 2, &["-c:a", "flac"]);
+	let photo = support::photo_png(dir.path(), "photo.png", 64, 48);
+
+	let audio = run(&requested(&song, OutputFormat::Mkv), dir.path()).await;
+	let image = run(&requested(&photo, OutputFormat::Opus), dir.path()).await;
+
+	assert!(
+		matches!(&audio, JobOutcome::Failed(err) if err.to_string().contains("an audio file can't be written as .mkv")),
+		"{audio:?}"
+	);
+	assert!(
+		matches!(&image, JobOutcome::Failed(err) if err.to_string().contains("an image can't be written as .opus")),
+		"{image:?}"
+	);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn a_video_asked_for_as_opus_keeps_only_its_audio() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+
+	let outcome = run(&requested(&clip, OutputFormat::Opus), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Encoded { output, .. } if *output == dir.path().join("clip.cry.opus")),
+		"{outcome:?}"
+	);
+	let info = encoded_info(outcome).await;
+	assert_eq!(info.audio_streams().count(), 1);
+	assert!(!info.streams.iter().any(Stream::is_video));
+}
+
+#[tokio::test]
+async fn single_track_formats_refuse_several_tracks() {
+	let dir = tempfile::tempdir().unwrap();
+	let two = dir.path().join("two.mka");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=2",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=880:duration=2",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-c:a",
+		"flac",
+		two.to_str().unwrap(),
+	]);
+
+	let outcome = run(&requested(&two, OutputFormat::Opus), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.to_string().contains("holds one audio track")),
+		"{outcome:?}"
+	);
+}
+
+#[tokio::test]
+async fn an_efficient_av1_source_is_encoded_when_mkv_is_requested() {
+	let dir = tempfile::tempdir().unwrap();
+	let av1 = dir.path().join("small.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=640x360:r=25:d=3",
+		"-c:v",
+		"libsvtav1",
+		"-preset",
+		"12",
+		"-svtav1-params",
+		"crf=63",
+		av1.to_str().unwrap(),
+	]);
+
+	let outcome = run(&requested(&av1, OutputFormat::Mkv), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_requested_video_that_misses_its_target_is_written_and_learns_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let faint_noise = dir.path().join("faint-noise.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=gray:s=320x240:r=25:d=3,noise=alls=10:allf=t",
+		"-pix_fmt",
+		"yuv420p",
+		"-c:v",
+		"ffv1",
+		faint_noise.to_str().unwrap(),
+	]);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let moderate = Job {
+		speed: Speed::Moderate,
+		..requested(&faint_noise, OutputFormat::Mkv)
+	};
+
+	let (outcome, _) = run_recording(&engine, &moderate, dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Encoded { output, .. } if *output == dir.path().join("faint-noise.cry.mkv")),
+		"{outcome:?}"
+	);
+	assert!(warned(&outcome, "quality target not reached"), "{outcome:?}");
+	assert!(warned(&outcome, "best predicted VMAF"), "{outcome:?}");
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn a_learned_crf_whose_requested_output_misses_its_check_and_its_retry_is_forgotten() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
+	let strict_key = key.replace("|t93.0/89.0", "|t99.0/98.0");
+	let memory = Arc::new(SharedMemory::with_entries([(strict_key, stats)]));
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let strict = Job {
+		overrides: Overrides {
+			video: Some(VmafOverride {
+				mean: 99.0,
+				floor: 98.0,
+			}),
+			..Overrides::default()
+		},
+		options: requested(&clip, OutputFormat::Mkv).options,
+		..job(&clip)
+	};
+
+	let (outcome, events) = run_recording(&engine, &strict, dir.path()).await;
+
+	assert!(
+		warned(&outcome, "it was written because it was requested"),
+		"{outcome:?}"
+	);
+	assert_eq!(
+		stages(&events, Stage::Sample),
+		0,
+		"the learned CRF was used: {events:?}"
+	);
+	assert_eq!(
+		stages(&events, Stage::Encode),
+		2,
+		"encoded, then encoded again: {events:?}"
+	);
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
 }

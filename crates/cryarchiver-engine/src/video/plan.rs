@@ -158,6 +158,14 @@ pub fn main_stream(info: &MediaInfo) -> Option<&Stream> {
 }
 
 pub fn precheck<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream, KeepReason> {
+	let main = usable_main(info, caps)?;
+	if let Some(reason) = already_efficient(info, main) {
+		return Err(KeepReason::AlreadyEfficient(reason));
+	}
+	Ok(main)
+}
+
+pub fn usable_main<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream, KeepReason> {
 	let main = main_stream(info).ok_or_else(|| KeepReason::Unsupported("no video stream to encode".into()))?;
 
 	if let Some((profile, compatibility)) = dolby_vision(main)
@@ -179,10 +187,6 @@ pub fn precheck<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream,
 		return Err(KeepReason::Unsupported(format!(
 			"{width}×{height} is larger than SVT-AV1 supports and libaom-av1 is not available"
 		)));
-	}
-
-	if let Some(reason) = already_efficient(info, main) {
-		return Err(KeepReason::AlreadyEfficient(reason));
 	}
 	Ok(main)
 }

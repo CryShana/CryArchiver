@@ -1,4 +1,5 @@
 use crate::container::{Container, MATROSKA_AUDIO, OGG_OPUS};
+use crate::format::OutputFormat;
 use crate::outcome::KeepReason;
 use crate::preset::{AUDIO_STEP_KBPS, Overrides, Speed};
 use crate::probe::{MediaInfo, Stream};
@@ -71,7 +72,16 @@ pub enum AudioPlan {
 	Encode(FilePlan),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioRules {
+	pub forced: bool,
+}
+
 pub fn plan_file(info: &MediaInfo, speed: Speed, overrides: &Overrides) -> AudioPlan {
+	plan_file_with(info, speed, overrides, AudioRules::default())
+}
+
+pub fn plan_file_with(info: &MediaInfo, speed: Speed, overrides: &Overrides, rules: AudioRules) -> AudioPlan {
 	let streams: Vec<&Stream> = info.audio_streams().collect();
 	if streams.is_empty() {
 		return AudioPlan::Keep(KeepReason::Unsupported("no audio streams".into()));
@@ -99,7 +109,7 @@ pub fn plan_file(info: &MediaInfo, speed: Speed, overrides: &Overrides) -> Audio
 		}
 	}
 
-	if tracks.iter().all(|track| track.plan == TrackPlan::Copy) {
+	if !rules.forced && tracks.iter().all(|track| track.plan == TrackPlan::Copy) {
 		return AudioPlan::Keep(KeepReason::AlreadyEfficient(
 			"already Opus or Vorbis at an efficient bitrate".into(),
 		));
@@ -107,6 +117,31 @@ pub fn plan_file(info: &MediaInfo, speed: Speed, overrides: &Overrides) -> Audio
 
 	let container = if tracks.len() == 1 { OGG_OPUS } else { MATROSKA_AUDIO };
 	AudioPlan::Encode(FilePlan { container, tracks })
+}
+
+pub fn retarget(plan: FilePlan, format: Option<OutputFormat>, info: &MediaInfo) -> Result<FilePlan, String> {
+	let Some((format, container)) = format.and_then(|format| Some((format, format.audio_container()?))) else {
+		return Ok(plan);
+	};
+
+	if container.muxer != MATROSKA_AUDIO.muxer && plan.tracks.len() > 1 {
+		return Err(format!(
+			"{format} holds one audio track and this file has {}; use .mka",
+			plan.tracks.len()
+		));
+	}
+
+	let copies_vorbis = plan.tracks.iter().any(|track| {
+		track.plan == TrackPlan::Copy
+			&& info
+				.streams
+				.iter()
+				.any(|stream| stream.index == track.stream_index && stream.codec_name == "vorbis")
+	});
+	if container.extension == OGG_OPUS.extension && copies_vorbis {
+		return Err("a Vorbis track can't be stored as .opus; use .ogg or .mka".into());
+	}
+	Ok(FilePlan { container, ..plan })
 }
 
 pub fn plan_track(
@@ -564,5 +599,75 @@ mod tests {
 			plan_file(&info(Vec::new(), None), Speed::Moderate, PRESET),
 			AudioPlan::Keep(KeepReason::Unsupported(_))
 		));
+	}
+
+	#[test]
+	fn a_requested_output_copies_efficient_tracks_instead_of_keeping_the_file() {
+		let opus = stream("opus", 1, Some("mono"), None);
+		let forced = AudioRules { forced: true };
+
+		let AudioPlan::Encode(plan) = plan_file_with(
+			&info(vec![opus], Some(32_000)),
+			Speed::Moderate,
+			&Overrides::default(),
+			forced,
+		) else {
+			panic!("a requested output is always produced")
+		};
+
+		assert_eq!(plan.tracks[0].plan, TrackPlan::Copy);
+	}
+
+	#[test]
+	fn single_track_containers_refuse_what_they_can_not_hold() {
+		let flac = stream("flac", 2, Some("stereo"), None);
+		let vorbis = stream("vorbis", 2, Some("stereo"), Some(96));
+		let two = info(
+			vec![
+				flac.clone(),
+				Stream {
+					index: 1,
+					..flac.clone()
+				},
+			],
+			None,
+		);
+		let AudioPlan::Encode(both) = plan_file(&two, Speed::Moderate, &Overrides::default()) else {
+			panic!()
+		};
+		let vorbis_file = info(vec![vorbis], None);
+		let AudioPlan::Encode(copied) = plan_file_with(
+			&vorbis_file,
+			Speed::Moderate,
+			&Overrides::default(),
+			AudioRules { forced: true },
+		) else {
+			panic!()
+		};
+
+		assert!(
+			retarget(both.clone(), Some(OutputFormat::Opus), &two)
+				.unwrap_err()
+				.contains("holds one audio track")
+		);
+		assert_eq!(
+			retarget(both, Some(OutputFormat::Mka), &two)
+				.unwrap()
+				.container
+				.extension,
+			"mka"
+		);
+		assert!(
+			retarget(copied.clone(), Some(OutputFormat::Opus), &vorbis_file)
+				.unwrap_err()
+				.contains("Vorbis")
+		);
+		assert_eq!(
+			retarget(copied, Some(OutputFormat::Ogg), &vorbis_file)
+				.unwrap()
+				.container
+				.muxer,
+			"ogg"
+		);
 	}
 }
