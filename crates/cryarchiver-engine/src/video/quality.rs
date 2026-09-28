@@ -147,12 +147,13 @@ pub fn search_samples(analysis: &Analysis, declared_s: Option<f64>, speed: Speed
 		}];
 	}
 
-	let mut ranked: Vec<&Detail> = analysis.detail.iter().collect();
-	ranked.sort_by(|a, b| {
-		b.usable
-			.cmp(&a.usable)
-			.then(b.si.unwrap_or(0.0).total_cmp(&a.si.unwrap_or(0.0)))
-	});
+	let any_usable = analysis.detail.iter().any(|detail| detail.usable);
+	let mut ranked: Vec<&Detail> = analysis
+		.detail
+		.iter()
+		.filter(|detail| detail.usable || !any_usable)
+		.collect();
+	ranked.sort_by(|a, b| b.si.unwrap_or(0.0).total_cmp(&a.si.unwrap_or(0.0)));
 
 	let mut samples: Vec<Sample> = ranked
 		.into_iter()
@@ -446,7 +447,7 @@ mod tests {
 		);
 		assert_eq!(
 			search_samples(&analysis, Some(100.0), Speed::Slow),
-			vec![four(5.0), four(35.0), four(65.0), four(95.0)]
+			vec![four(5.0), four(35.0), four(65.0)]
 		);
 		assert!(search_samples(&analysis, Some(100.0), Speed::Fast).is_empty());
 		assert!(search_samples(&analysis, None, Speed::Moderate).is_empty());
@@ -456,6 +457,42 @@ mod tests {
 				start_s: 0.0,
 				length_s: 8.5
 			}]
+		);
+	}
+
+	#[test]
+	fn low_detail_segments_are_sampled_only_when_no_segment_is_usable() {
+		let analysis = |detail: Vec<Detail>| Analysis {
+			scan: ScanType::Progressive,
+			noise: NoiseClass::Clean,
+			detail,
+		};
+		let four = |start_s: f64| Sample { start_s, length_s: 4.0 };
+		let one_usable = analysis(vec![
+			detail(5.0, 0.0, false),
+			detail(35.0, 60.0, true),
+			detail(65.0, 12.0, false),
+			detail(95.0, 14.0, false),
+		]);
+		let none_usable = analysis(vec![
+			detail(5.0, 0.0, false),
+			detail(35.0, 9.0, false),
+			detail(65.0, 12.0, false),
+			detail(95.0, 14.0, false),
+		]);
+
+		assert_eq!(
+			search_samples(&one_usable, Some(100.0), Speed::Moderate),
+			vec![four(35.0)]
+		);
+		assert_eq!(search_samples(&one_usable, Some(100.0), Speed::Slow), vec![four(35.0)]);
+		assert_eq!(
+			search_samples(&none_usable, Some(100.0), Speed::Moderate),
+			vec![four(35.0), four(65.0), four(95.0)]
+		);
+		assert_eq!(
+			search_samples(&none_usable, Some(100.0), Speed::Slow),
+			vec![four(5.0), four(35.0), four(65.0), four(95.0)]
 		);
 	}
 
