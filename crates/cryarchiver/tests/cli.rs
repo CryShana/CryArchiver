@@ -10,6 +10,10 @@ use std::process::{Command, Output};
 fn cryarchiver(dir: &Path, args: &[&str]) -> Output {
 	Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
 		.current_dir(dir)
+		.env(
+			"CRYARCHIVER_CACHE_DIR",
+			std::env::temp_dir().join("cryarchiver-cli-test-cache"),
+		)
 		.args(args)
 		.output()
 		.unwrap()
@@ -410,6 +414,26 @@ fn rerun_skips_existing_video_outputs() {
 
 	assert!(out.status.success());
 	assert!(stdout(&out).contains("already exists"), "{}", stdout(&out));
+}
+
+#[test]
+fn moderate_runs_teach_the_quality_cache() {
+	let dir = tempfile::tempdir().unwrap();
+	let cache = tempfile::tempdir().unwrap();
+	support::mpeg4(dir.path(), "clip.mp4", 3);
+
+	let out = Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
+		.current_dir(dir.path())
+		.env("CRYARCHIVER_CACHE_DIR", cache.path())
+		.arg("clip.mp4")
+		.output()
+		.unwrap();
+
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	let saved: serde_json::Value =
+		serde_json::from_slice(&fs::read(cache.path().join("quality-cache.json")).unwrap()).unwrap();
+	let keys: Vec<&String> = saved["entries"].as_object().unwrap().keys().collect();
+	assert!(keys.iter().any(|key| key.starts_with("video/mpeg4/")), "{keys:?}");
 }
 
 #[test]
