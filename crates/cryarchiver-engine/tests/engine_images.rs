@@ -2,7 +2,7 @@ mod support;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::container::isobmff::parse_meta;
@@ -14,6 +14,7 @@ use cryarchiver_engine::images::ssim::score;
 use cryarchiver_engine::metadata::exif::orientation;
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::Speed;
+use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
 use image::codecs::png::PngEncoder;
@@ -52,6 +53,76 @@ fn encoded(outcome: JobOutcome) -> PathBuf {
 		JobOutcome::Encoded { output, .. } => output,
 		other => panic!("{other:?}"),
 	}
+}
+
+const PHOTO_GROUP_AT_FAST: &str = "image/png/photo/opaque/8bit/mp1|ravif-0.13|p9|t80.0";
+
+#[tokio::test]
+async fn a_photo_teaches_its_group_the_quality_it_needs() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await)
+		.with_image_threads(4)
+		.with_quality_memory(memory.clone());
+
+	let outcome = engine
+		.run(&job(&photo), &sink(dir.path()), &|_| {}, &CancellationToken::new())
+		.await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	let entries = memory.entries();
+	assert_eq!(entries.len(), 1, "{entries:?}");
+	assert_eq!(entries[0].0, PHOTO_GROUP_AT_FAST);
+}
+
+#[tokio::test]
+async fn the_next_photo_of_a_group_starts_from_the_learned_quality() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
+	let tools = support::toolchain().await;
+	let generous = Arc::new(SharedMemory::with_entries([(
+		PHOTO_GROUP_AT_FAST.to_owned(),
+		GroupStats {
+			setting: 96.0,
+			slope: None,
+			bpp: None,
+			observations: 5,
+		},
+	)]));
+	let any_size = Job {
+		min_savings: 0.0,
+		..job(&photo)
+	};
+
+	let plain = encoded(
+		Engine::new(tools.clone())
+			.with_image_threads(4)
+			.run(
+				&any_size,
+				&sink(&dir.path().join("plain")),
+				&|_| {},
+				&CancellationToken::new(),
+			)
+			.await,
+	);
+	let learned = encoded(
+		Engine::new(tools)
+			.with_image_threads(4)
+			.with_quality_memory(generous)
+			.run(
+				&any_size,
+				&sink(&dir.path().join("learned")),
+				&|_| {},
+				&CancellationToken::new(),
+			)
+			.await,
+	);
+
+	assert!(
+		std::fs::metadata(&learned).unwrap().len() > std::fs::metadata(&plain).unwrap().len(),
+		"quality 96 must produce a larger AVIF than FAST's 88"
+	);
 }
 
 fn rotated_png(dir: &Path, name: &str) -> PathBuf {

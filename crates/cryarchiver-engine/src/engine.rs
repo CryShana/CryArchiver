@@ -384,6 +384,7 @@ impl Engine {
 			caps: self.image_caps(),
 			on_event: cx.on_event,
 			cancel: cx.cancel,
+			memory: self.quality.as_ref(),
 		};
 		Ok(match image_job::produce(&image, input, workspace).await? {
 			ImageOutcome::Output { path, bytes, warnings } => Produced::Output(Staged { path, bytes, warnings }),

@@ -8,6 +8,17 @@ pub const MAX_AVIF_SIDE: u32 = 16_384;
 pub const MAX_AVIF_PIXELS: u64 = 64_000_000;
 pub const BOMB_PIXELS: u64 = 500_000_000;
 pub const MAX_VERIFY_PIXELS: u64 = fast_ssim2::MAX_IMAGE_PIXELS as u64;
+pub const MAX_RETRIES: u32 = 2;
+
+const RAVIF_POINTS_PER_QUALITY: f64 = 1.25;
+const JXL_POINTS_PER_DISTANCE: f64 = 8.0;
+const LEARNED_HEADROOM: f64 = 2.0;
+const RAISE_QUALITY_MARGIN: f64 = 1.0;
+const RAISE_DISTANCE_MARGIN: f64 = 0.1;
+const MAX_QUALITY: f64 = 100.0;
+const MIN_DISTANCE: f64 = 0.1;
+const LEARNED_QUALITY_BELOW_TABLE: f64 = 8.0;
+const LEARNED_DISTANCE_ABOVE_TABLE: f64 = 1.0;
 
 const CMYK_COMPONENTS: u8 = 4;
 const YCCK_TRANSFORM: u8 = 2;
@@ -77,6 +88,87 @@ impl Candidate {
 		match self {
 			Self::Ravif(_) => "avif",
 			Self::JxlLossy(_) | Self::JxlLossless(_) => "jxl",
+		}
+	}
+
+	pub fn setting(self) -> Option<f64> {
+		match self {
+			Self::Ravif(settings) => Some(f64::from(settings.quality)),
+			Self::JxlLossy(settings) => Some(f64::from(settings.distance)),
+			Self::JxlLossless(_) => None,
+		}
+	}
+
+	#[must_use]
+	#[allow(clippy::cast_possible_truncation)]
+	pub fn with_setting(self, speed: Speed, setting: f64) -> Self {
+		match self {
+			Self::Ravif(settings) => {
+				let table = f64::from(ravif_settings(speed).quality);
+				Self::Ravif(RavifSettings {
+					quality: setting.clamp(table - LEARNED_QUALITY_BELOW_TABLE, MAX_QUALITY) as f32,
+					..settings
+				})
+			}
+			Self::JxlLossy(settings) => {
+				let table = f64::from(jxl_lossy_settings(speed).distance);
+				Self::JxlLossy(JxlSettings {
+					distance: setting.clamp(MIN_DISTANCE, table + LEARNED_DISTANCE_ABOVE_TABLE) as f32,
+					..settings
+				})
+			}
+			Self::JxlLossless(_) => self,
+		}
+	}
+
+	#[allow(clippy::cast_possible_truncation)]
+	pub fn raised(self, score: f64, target: f64) -> Option<Self> {
+		let deficit = target - score;
+
+		match self {
+			Self::Ravif(settings) => {
+				let quality = f64::from(settings.quality);
+				let raised = (quality + deficit / RAVIF_POINTS_PER_QUALITY + RAISE_QUALITY_MARGIN).min(MAX_QUALITY);
+				(raised > quality).then_some(Self::Ravif(RavifSettings {
+					quality: raised as f32,
+					..settings
+				}))
+			}
+			Self::JxlLossy(settings) => {
+				let distance = f64::from(settings.distance);
+				let lowered = (distance - deficit / JXL_POINTS_PER_DISTANCE - RAISE_DISTANCE_MARGIN).max(MIN_DISTANCE);
+				(lowered < distance).then_some(Self::JxlLossy(JxlSettings {
+					distance: lowered as f32,
+					..settings
+				}))
+			}
+			Self::JxlLossless(_) => None,
+		}
+	}
+
+	pub fn needed_setting(self, score: f64, target: f64, speed: Speed) -> Option<f64> {
+		let spare = score - target - LEARNED_HEADROOM;
+		let needed = match self {
+			Self::Ravif(settings) => f64::from(settings.quality) - spare / RAVIF_POINTS_PER_QUALITY,
+			Self::JxlLossy(settings) => f64::from(settings.distance) + spare / JXL_POINTS_PER_DISTANCE,
+			Self::JxlLossless(_) => return None,
+		};
+
+		self.with_setting(speed, needed).setting()
+	}
+
+	pub fn encoder_id(self) -> &'static str {
+		match self {
+			Self::Ravif(_) => "ravif-0.13",
+			Self::JxlLossy(_) => "libjxl",
+			Self::JxlLossless(_) => "libjxl-lossless",
+		}
+	}
+
+	pub fn preset(self) -> u8 {
+		match self {
+			Self::Ravif(settings) => settings.speed,
+			Self::JxlLossy(settings) | Self::JxlLossless(settings) => settings.effort,
 		}
 	}
 }
@@ -398,6 +490,68 @@ mod tests {
 	fn the_worst_case_covers_both_encoders() {
 		assert_eq!(worst_case_memory(4000, 3000), 12_000_000 * (8 + 36 + 34));
 		assert_eq!(worst_case_memory(100, 100), 10_000 * (8 + 36 + 7) + (250 << 20));
+	}
+
+	#[test]
+	fn learned_settings_stay_near_the_table() {
+		let ravif = Candidate::Ravif(ravif_settings(Speed::Moderate));
+		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Moderate));
+		let lossless = Candidate::JxlLossless(JXL_LOSSLESS);
+
+		assert_eq!(ravif.with_setting(Speed::Moderate, 60.0).setting(), Some(84.0));
+		assert_eq!(ravif.with_setting(Speed::Moderate, 120.0).setting(), Some(100.0));
+		assert_eq!(ravif.with_setting(Speed::Moderate, 90.0).setting(), Some(90.0));
+		assert_eq!(jxl.with_setting(Speed::Moderate, 5.0).setting(), Some(2.0));
+		assert_eq!(
+			jxl.with_setting(Speed::Moderate, 0.0)
+				.setting()
+				.map(|distance| (distance * 10.0).round()),
+			Some(1.0)
+		);
+		assert_eq!(lossless.with_setting(Speed::Moderate, 3.0), lossless);
+		assert_eq!(lossless.setting(), None);
+	}
+
+	#[test]
+	fn a_miss_raises_the_quality_by_the_deficit() {
+		let ravif = Candidate::Ravif(RavifSettings {
+			quality: 88.0,
+			speed: 9,
+		});
+		let jxl = Candidate::JxlLossy(JxlSettings {
+			distance: 1.6,
+			effort: 5,
+		});
+
+		assert_eq!(ravif.raised(75.0, 80.0).and_then(Candidate::setting), Some(93.0));
+		assert_eq!(ravif.raised(99.0, 80.0), None);
+		assert_eq!(
+			Candidate::Ravif(RavifSettings {
+				quality: 100.0,
+				speed: 9
+			})
+			.raised(70.0, 80.0),
+			None
+		);
+		let lowered = jxl.raised(76.0, 80.0).and_then(Candidate::setting).unwrap();
+		assert!((lowered - 1.0).abs() < 1e-6, "{lowered}");
+		assert_eq!(Candidate::JxlLossless(JXL_LOSSLESS).raised(10.0, 80.0), None);
+	}
+
+	#[test]
+	fn a_pass_teaches_the_setting_that_would_have_cleared_the_floor_by_two() {
+		let ravif = Candidate::Ravif(ravif_settings(Speed::Moderate));
+
+		let generous = ravif.needed_setting(90.0, 85.0, Speed::Moderate).unwrap();
+		let narrow = ravif.needed_setting(85.5, 85.0, Speed::Moderate).unwrap();
+
+		assert!((generous - 89.6).abs() < 1e-4, "{generous}");
+		assert!((narrow - 93.2).abs() < 1e-4, "{narrow}");
+		assert_eq!(
+			Candidate::JxlLossless(JXL_LOSSLESS).needed_setting(99.0, 85.0, Speed::Moderate),
+			None
+		);
+		assert_eq!((ravif.encoder_id(), ravif.preset()), ("ravif-0.13", 6));
 	}
 
 	fn input<'a>(structure: &'a Structure, metadata: &'a SourceMetadata) -> PrecheckInput<'a> {

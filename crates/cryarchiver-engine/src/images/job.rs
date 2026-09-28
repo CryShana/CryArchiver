@@ -19,6 +19,8 @@ use crate::metadata::{self, ImageFormat, MetadataMode, OutputMetadata, SourceMet
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
 use crate::preset::Speed;
 use crate::probe::MediaInfo;
+use crate::quality::keys::{CacheKey, Group, ImageGroup};
+use crate::quality::memory::{Observation, QualityMemory};
 use crate::toolchain::Toolchain;
 use crate::video::run_ffmpeg;
 use crate::workspace::Workspace;
@@ -50,6 +52,7 @@ pub struct ImageContext<'a> {
 	pub caps: ImageCaps,
 	pub on_event: &'a (dyn Fn(JobEvent) + Sync),
 	pub cancel: &'a CancellationToken,
+	pub memory: &'a dyn QualityMemory,
 }
 
 #[derive(Debug)]
@@ -67,6 +70,7 @@ struct Still {
 	icc: Option<Vec<u8>>,
 	cicp: Option<Cicp>,
 	effective: Effective,
+	graphic: bool,
 	plan: StillPlan,
 	metadata: OutputMetadata,
 	warnings: Vec<String>,
@@ -85,6 +89,47 @@ enum Verdict {
 	Output(PathBuf, u64),
 	Kept(KeepReason),
 	Failed(JobError),
+}
+
+struct Env<'a> {
+	colour: AvifColour<'a>,
+	expected: Expected<'a>,
+	reference: Option<Arc<DynamicImage>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+	index: usize,
+	best: Option<u64>,
+}
+
+#[derive(Debug)]
+enum Tried {
+	Passed {
+		path: PathBuf,
+		size: u64,
+		candidate: Candidate,
+		score: f64,
+	},
+	Rejected {
+		size: u64,
+		score: f64,
+	},
+	TooLarge {
+		size: u64,
+		score: Option<f64>,
+	},
+	Failed(JobError),
+}
+
+impl Choice {
+	fn note(&mut self, size: u64) {
+		self.smallest = Some(self.smallest.map_or(size, |smallest| smallest.min(size)));
+	}
+
+	fn reject(&mut self, score: f64) {
+		self.best_rejected = Some(self.best_rejected.map_or(score, |best| best.max(score)));
+	}
 }
 
 pub fn prepare(
@@ -208,6 +253,7 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		icc,
 		cicp,
 		effective,
+		graphic,
 		plan,
 		metadata,
 		warnings,
@@ -225,64 +271,179 @@ async fn encode_and_choose(
 		icc: still.icc.as_deref(),
 		cicp: still.cicp,
 	};
-	let expected = Expected {
-		width,
-		height,
-		alpha: still.effective.alpha,
-		icc: still.icc.as_deref(),
-		cicp: avif::output_cicp(colour),
-		metadata: &still.metadata,
+	let env = Env {
+		colour,
+		expected: Expected {
+			width,
+			height,
+			alpha: still.effective.alpha,
+			icc: still.icc.as_deref(),
+			cicp: avif::output_cicp(colour),
+			metadata: &still.metadata,
+		},
+		reference: eight_bit_reference(cx, &still).await?,
 	};
-	let reference = eight_bit_reference(cx, &still).await?;
 	let mut choice = Choice::default();
 
-	for (index, candidate) in still.plan.candidates.iter().enumerate() {
-		(cx.on_event)(JobEvent::Stage(Stage::Encode));
-		let path = workspace.file(&format!("candidate{index}.{}", candidate.extension()));
-		let bytes = encode_candidate(cx, input, workspace, &still, *candidate, colour, reference.as_ref()).await?;
-		fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
-
-		let size = bytes.len() as u64;
-		choice.smallest = Some(choice.smallest.map_or(size, |smallest| smallest.min(size)));
-		let beaten = choice.best.as_ref().is_some_and(|(_, best)| *best <= size);
-		if !saves_enough(cx.source_bytes, size, cx.min_savings) || beaten {
-			continue;
-		}
-
-		(cx.on_event)(JobEvent::Stage(Stage::Verify));
-		let verified = match candidate {
-			Candidate::Ravif(_) => {
-				let reference = Arc::clone(reference.as_ref().expect("prepared for AVIF candidates"));
-				verify::verify_avif(cx.tools, &path, &bytes, reference, &expected, cx.cancel).await
-			}
-			Candidate::JxlLossy(_) | Candidate::JxlLossless(_) => {
-				let lossless = matches!(candidate, Candidate::JxlLossless(_));
-				verify::verify_jxl(
-					Arc::new(bytes),
-					Arc::clone(&still.image),
-					&expected,
-					lossless,
-					cx.cancel,
-				)
-				.await
-			}
+	for (index, planned) in still.plan.candidates.iter().copied().enumerate() {
+		let key = candidate_key(input, &still, planned);
+		let candidate = key
+			.as_ref()
+			.and_then(|key| cx.memory.lookup(key))
+			.map_or(planned, |stats| planned.with_setting(cx.speed, stats.setting));
+		let slot = Slot {
+			index,
+			best: choice.best.as_ref().map(|(_, size)| *size),
 		};
-		let score = match verified {
-			Ok(score) => score,
-			Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => {
-				choice.failures.push((*candidate, err));
-				continue;
+
+		match Box::pin(try_candidate(cx, input, workspace, &still, &env, candidate, slot)).await? {
+			Tried::Passed {
+				path,
+				size,
+				candidate,
+				score,
+			} => {
+				choice.note(size);
+				choice.best = Some((path, size));
+				if let Some(key) = &key
+					&& let Some(setting) = candidate.needed_setting(score, still.plan.target, cx.speed)
+				{
+					cx.memory.record(
+						key,
+						Observation {
+							setting,
+							slope: None,
+							bpp: None,
+						},
+					);
+				}
 			}
-			Err(err) => return Err(err),
-		};
-		if score >= still.plan.target {
-			choice.best = Some((path, size));
-		} else {
-			choice.best_rejected = Some(choice.best_rejected.map_or(score, |best| best.max(score)));
+			Tried::Rejected { size, score } => {
+				choice.note(size);
+				choice.reject(score);
+			}
+			Tried::TooLarge { size, score } => {
+				choice.note(size);
+				if let Some(score) = score {
+					choice.reject(score);
+				}
+			}
+			Tried::Failed(err) => choice.failures.push((candidate, err)),
 		}
 	}
 
 	finish_choice(cx, workspace, choice, still.plan.target, still.warnings)
+}
+
+async fn try_candidate(
+	cx: &ImageContext<'_>,
+	input: &ImageInput,
+	workspace: &Workspace,
+	still: &Still,
+	env: &Env<'_>,
+	mut candidate: Candidate,
+	slot: Slot,
+) -> Result<Tried, JobError> {
+	let mut retries = 0;
+	let mut last_score = None;
+
+	loop {
+		(cx.on_event)(JobEvent::Stage(Stage::Encode));
+		let path = workspace.file(&format!("candidate{}.{}", slot.index, candidate.extension()));
+		let bytes = encode_candidate(
+			cx,
+			input,
+			workspace,
+			still,
+			candidate,
+			env.colour,
+			env.reference.as_ref(),
+		)
+		.await?;
+		fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
+
+		let size = bytes.len() as u64;
+		if !saves_enough(cx.source_bytes, size, cx.min_savings) || slot.best.is_some_and(|best| best <= size) {
+			return Ok(Tried::TooLarge {
+				size,
+				score: last_score,
+			});
+		}
+
+		(cx.on_event)(JobEvent::Stage(Stage::Verify));
+		let score = match verify_candidate(cx, still, env, candidate, &path, bytes).await {
+			Ok(score) => score,
+			Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Tried::Failed(err)),
+			Err(err) => return Err(err),
+		};
+		if score >= still.plan.target {
+			return Ok(Tried::Passed {
+				path,
+				size,
+				candidate,
+				score,
+			});
+		}
+
+		match candidate
+			.raised(score, still.plan.target)
+			.filter(|_| retries < plan::MAX_RETRIES)
+		{
+			Some(raised) => {
+				candidate = raised;
+				retries += 1;
+				last_score = Some(score);
+			}
+			None => return Ok(Tried::Rejected { size, score }),
+		}
+	}
+}
+
+async fn verify_candidate(
+	cx: &ImageContext<'_>,
+	still: &Still,
+	env: &Env<'_>,
+	candidate: Candidate,
+	path: &Path,
+	bytes: Vec<u8>,
+) -> Result<f64, JobError> {
+	match candidate {
+		Candidate::Ravif(_) => {
+			let reference = Arc::clone(env.reference.as_ref().expect("prepared for AVIF candidates"));
+			verify::verify_avif(cx.tools, path, &bytes, reference, &env.expected, cx.cancel).await
+		}
+		Candidate::JxlLossy(_) | Candidate::JxlLossless(_) => {
+			let lossless = matches!(candidate, Candidate::JxlLossless(_));
+			verify::verify_jxl(
+				Arc::new(bytes),
+				Arc::clone(&still.image),
+				&env.expected,
+				lossless,
+				cx.cancel,
+			)
+			.await
+		}
+	}
+}
+
+fn candidate_key(input: &ImageInput, still: &Still, candidate: Candidate) -> Option<CacheKey> {
+	candidate.setting()?;
+	let (width, height) = still.image.dimensions();
+
+	Some(CacheKey {
+		group: Group::Image(ImageGroup::new(
+			sniff(&input.bytes),
+			still.graphic,
+			still.effective.alpha,
+			still.effective.high_depth,
+			width,
+			height,
+		)),
+		encoder: candidate.encoder_id().to_owned(),
+		preset: candidate.preset(),
+		target: still.plan.target,
+		floor: None,
+	})
 }
 
 async fn eight_bit_reference(cx: &ImageContext<'_>, still: &Still) -> Result<Option<Arc<DynamicImage>>, JobError> {
