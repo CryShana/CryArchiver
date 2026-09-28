@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, ScanType, analyze};
+use cryarchiver_engine::video::plan::grain_level;
 use tokio_util::sync::CancellationToken;
 
 fn encode(dir: &Path, name: &str, source: &str, args: &[&str]) -> PathBuf {
@@ -111,6 +112,32 @@ async fn corpus_scan_types() {
 			.0,
 		ScanType::Interlaced { top_first: true }
 	);
+}
+
+#[tokio::test]
+#[ignore = "needs a grainy real clip (set CRY_GRAIN_CLIP to its path)"]
+async fn a_strongly_grainy_real_clip_gets_the_strongest_grain() {
+	let Some(clip) = std::env::var_os("CRY_GRAIN_CLIP").map(PathBuf::from) else {
+		return;
+	};
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let info = probe(&tools, &clip, &cancel).await.unwrap();
+	let main = info.streams.iter().find(|stream| stream.is_real_video()).unwrap();
+
+	let analysis = Box::pin(analyze(
+		&tools,
+		&clip,
+		main,
+		info.format.duration,
+		DEFAULT_SEGMENTS,
+		&cancel,
+	))
+	.await
+	.unwrap();
+
+	assert_eq!(analysis.noise, NoiseClass::Light, "{:?}", analysis.noise_db);
+	assert_eq!(grain_level(analysis.noise_db), Some(20), "{:?}", analysis.noise_db);
 }
 
 #[tokio::test]

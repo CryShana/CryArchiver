@@ -2,10 +2,12 @@ mod support;
 
 use std::fs;
 
+use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::probe;
+use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, analyze};
 use cryarchiver_engine::video::colour::{ColourTags, Range};
 use cryarchiver_engine::video::encode::{check_video_temp, encode_video, extract, video_command};
-use cryarchiver_engine::video::plan::{Encoder, VideoPlan};
+use cryarchiver_engine::video::plan::{Encoder, VideoCaps, VideoPlan, grain_level, plan_video, precheck};
 use cryarchiver_engine::video::streams::Extracted;
 use cryarchiver_engine::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +21,7 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 		encoder: Encoder::SvtAv1 {
 			preset: 12,
 			crf: 40.0,
-			film_grain: false,
+			film_grain: None,
 		},
 		expected_frames,
 		frame_tolerance: 2,
@@ -64,6 +66,64 @@ async fn encodes_the_video_temp_and_reports_frames_and_duration() {
 	let info = probe(&tools, &output, &CancellationToken::new()).await.unwrap();
 	assert_eq!(info.streams.len(), 1);
 	assert_eq!(info.streams[0].codec_name, "av1");
+}
+
+#[tokio::test]
+async fn a_noisy_clip_is_encoded_with_the_grain_level_its_noise_measures() {
+	let dir = tempfile::tempdir().unwrap();
+	let noisy = dir.path().join("noisy.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=gray:s=320x240:r=25:d=3,noise=alls=10:allf=t",
+		"-pix_fmt",
+		"yuv420p",
+		"-c:v",
+		"ffv1",
+		noisy.to_str().unwrap(),
+	]);
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let info = probe(&tools, &noisy, &cancel).await.unwrap();
+	let caps = VideoCaps {
+		vp9_alpha: false,
+		libaom: false,
+	};
+	let main = precheck(&info, &caps).unwrap();
+	let analysis = Box::pin(analyze(
+		&tools,
+		&noisy,
+		main,
+		info.format.duration,
+		DEFAULT_SEGMENTS,
+		&cancel,
+	))
+	.await
+	.unwrap();
+	let mut video = plan_video(&info, main, &[], &analysis, Speed::Moderate);
+	video.encoder = video.encoder.with_crf(45.0);
+	let output = dir.path().join("video.a1.mkv");
+
+	let cmd = video_command(&tools.ffmpeg, &noisy, &output, &video);
+	let encoded = encode_video(&cmd, &video, info.format.duration, |_| {}, &cancel)
+		.await
+		.unwrap();
+
+	let level = grain_level(analysis.noise_db);
+	assert_eq!(analysis.noise, NoiseClass::Light, "{analysis:?}");
+	assert!(level.is_some(), "{analysis:?}");
+	assert_eq!(video.encoder.grain_level(), level);
+	let grain = format!(":film-grain={}:film-grain-denoise=1", level.unwrap());
+	assert!(
+		cmd.args
+			.iter()
+			.any(|arg| arg.to_str().is_some_and(|arg| arg.ends_with(&grain))),
+		"{:?}",
+		cmd.args
+	);
+	assert_eq!(encoded.frames, 75);
+	assert_eq!(encoded.decode_errors, 0);
 }
 
 #[tokio::test]

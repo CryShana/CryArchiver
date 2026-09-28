@@ -379,7 +379,7 @@ mod tests {
 		Encoder::SvtAv1 {
 			preset: 8,
 			crf: 32.0,
-			film_grain: false,
+			film_grain: None,
 		}
 	}
 
@@ -441,7 +441,7 @@ mod tests {
 			Encoder::SvtAv1 {
 				preset: 5,
 				crf: 29.25,
-				film_grain: true,
+				film_grain: Some(20),
 			},
 			None,
 		);
@@ -454,7 +454,7 @@ mod tests {
 		));
 
 		assert!(
-			args.contains("-svtav1-params tune=0:keyint=5s:crf=29.25:film-grain=8:film-grain-denoise=1 "),
+			args.contains("-svtav1-params tune=0:keyint=5s:crf=29.25:film-grain=20:film-grain-denoise=1 "),
 			"{args}"
 		);
 	}

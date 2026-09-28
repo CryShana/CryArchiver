@@ -95,6 +95,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 	let analysis = Analysis {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,
+		noise_db: None,
 		detail: Vec::new(),
 	};
 	let caps = VideoCaps {

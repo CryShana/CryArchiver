@@ -19,7 +19,7 @@ fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan 
 			Encoder::SvtAv1 {
 				preset: 10,
 				crf: 32.0,
-				film_grain: false,
+				film_grain: None,
 			}
 		},
 		expected_frames: None,

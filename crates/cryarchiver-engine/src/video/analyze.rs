@@ -19,9 +19,11 @@ const REJECT_SHARE: f64 = 0.5;
 const INTERLACED_FIELD_ORDERS: &[&str] = &["tt", "bb", "tb", "bt"];
 const CLEAN_PSNR_DB: f64 = 50.0;
 const LOW_DETAIL_SI: f64 = 15.0;
-const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:d=1,\
-	scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,\
+const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:d=1,split[n][m];\
+	[n]split[na][nb];[nb]hqdn3d[nd];[na][nd]psnr@native,nullsink;\
+	[m]scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,\
 	split=3[a][b][s];[s]format=yuv420p,siti=print_summary=1,nullsink;[b]hqdn3d[d];[a][d]psnr[out]";
+const NATIVE_PSNR_LOG: &str = "[psnr@native @";
 
 pub const DEFAULT_SEGMENTS: usize = 4;
 
@@ -42,6 +44,7 @@ pub enum NoiseClass {
 pub struct Analysis {
 	pub scan: ScanType,
 	pub noise: NoiseClass,
+	pub noise_db: Option<f64>,
 	pub detail: Vec<Detail>,
 }
 
@@ -71,6 +74,7 @@ pub struct SegmentStats {
 	pub black_s: f64,
 	pub frozen_s: f64,
 	pub psnr_y: Option<f64>,
+	pub native_psnr_y: Option<f64>,
 	pub si: Option<f64>,
 }
 
@@ -151,7 +155,11 @@ pub fn parse_segment(stderr: &[String], start_s: f64, length_s: f64) -> Option<S
 			stats.frozen_s += value;
 			open_freeze = None;
 		} else if let Some(value) = field(line, "PSNR y:") {
-			stats.psnr_y = Some(value);
+			if line.contains(NATIVE_PSNR_LOG) {
+				stats.native_psnr_y = Some(value);
+			} else {
+				stats.psnr_y = Some(value);
+			}
 		}
 	}
 
@@ -197,12 +205,9 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 		_ => ScanType::Progressive,
 	};
 
-	let finite: Vec<f64> = voting
-		.iter()
-		.filter_map(|segment| segment.psnr_y)
-		.filter(|db| db.is_finite())
-		.collect();
-	let noise = if finite.is_empty() || finite.iter().sum::<f64>() / finite.len() as f64 >= CLEAN_PSNR_DB {
+	let scaled_db = finite_mean(voting.iter().map(|segment| segment.psnr_y));
+	let noise_db = finite_mean(voting.iter().map(|segment| segment.native_psnr_y));
+	let noise = if scaled_db.is_none_or(|db| db >= CLEAN_PSNR_DB) {
 		NoiseClass::Clean
 	} else {
 		NoiseClass::Light
@@ -217,7 +222,18 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 			usable: !blank(segment) && segment.si.is_none_or(|si| si >= LOW_DETAIL_SI),
 		})
 		.collect();
-	Analysis { scan, noise, detail }
+	Analysis {
+		scan,
+		noise,
+		noise_db,
+		detail,
+	}
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn finite_mean(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+	let finite: Vec<f64> = values.flatten().filter(|db| db.is_finite()).collect();
+	(!finite.is_empty()).then(|| finite.iter().sum::<f64>() / finite.len() as f64)
 }
 
 fn blank(segment: &SegmentStats) -> bool {
@@ -302,6 +318,7 @@ fn field(line: &str, key: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::video::plan::grain_level;
 
 	fn stats(repeated: [u64; 3], single: [u64; 2]) -> SegmentStats {
 		SegmentStats {
@@ -315,6 +332,7 @@ mod tests {
 			black_s: 0.0,
 			frozen_s: 0.0,
 			psnr_y: Some(45.4),
+			native_psnr_y: Some(45.4),
 			si: Some(60.0),
 		}
 	}
@@ -364,6 +382,7 @@ mod tests {
 			"[Parsed_freezedetect_2 @ 0000017c27a45100] lavfi.freezedetect.freeze_end: 1.2",
 			"[Parsed_freezedetect_2 @ 0000017c27a45100] lavfi.freezedetect.freeze_start: 2.5",
 			"[Parsed_psnr_9 @ 0000017c27a44000] PSNR y:57.184443 u:57.445223 v:57.552183 average:57.286586 min:50.874693 max:inf",
+			"[psnr@native @ 0000017c27a44100] PSNR y:42.809130 u:46.427337 v:46.440324 average:43.805400 min:43.716648 max:56.904948",
 			"[Parsed_siti_6 @ 00000297db9eb200] SITI Summary:",
 			"Total frames: 90",
 			"",
@@ -386,6 +405,7 @@ mod tests {
 		assert!((parsed.black_s - 1.2).abs() < 1e-9);
 		assert!((parsed.frozen_s - 1.7).abs() < 1e-9);
 		assert_eq!(parsed.psnr_y, Some(57.184_443));
+		assert_eq!(parsed.native_psnr_y, Some(42.809_13));
 		assert_eq!(parsed.si, Some(102.528_107));
 	}
 
@@ -494,9 +514,59 @@ mod tests {
 			Analysis {
 				scan: ScanType::Progressive,
 				noise: NoiseClass::Clean,
+				noise_db: None,
 				detail: Vec::new(),
 			}
 		);
+	}
+
+	#[test]
+	fn the_noise_level_is_the_average_finite_luma_psnr() {
+		let psnr = |db: f64| SegmentStats {
+			psnr_y: Some(db),
+			native_psnr_y: Some(db),
+			..stats([90, 0, 0], [0, 0])
+		};
+		let mut black = psnr(30.0);
+		black.black_s = 2.9;
+
+		let grainy = classify(&[psnr(42.0), psnr(44.0), psnr(f64::INFINITY), black], Some(25.0), None);
+		let still = classify(&[psnr(f64::INFINITY)], Some(25.0), None);
+		let unmeasured = classify(
+			&[SegmentStats {
+				psnr_y: None,
+				native_psnr_y: None,
+				..stats([90, 0, 0], [0, 0])
+			}],
+			Some(25.0),
+			None,
+		);
+
+		assert_eq!(grainy.noise_db, Some(43.0));
+		assert_eq!(grainy.noise, NoiseClass::Light);
+		assert_eq!(still.noise_db, None);
+		assert_eq!(unmeasured.noise_db, None);
+	}
+
+	#[test]
+	fn the_noise_level_is_the_native_measure_and_the_class_the_scaled_one() {
+		let segment = |scaled: f64, native: f64| SegmentStats {
+			psnr_y: Some(scaled),
+			native_psnr_y: Some(native),
+			..stats([90, 0, 0], [0, 0])
+		};
+
+		let grainy_4k = classify(&[segment(45.8, 42.8), segment(45.6, 42.6)], Some(60.0), None);
+		let sharp_4k = classify(&[segment(51.0, 46.0)], Some(60.0), None);
+
+		assert_eq!(grainy_4k.noise, NoiseClass::Light);
+		assert!(
+			grainy_4k.noise_db.is_some_and(|db| (db - 42.7).abs() < 1e-9),
+			"{grainy_4k:?}"
+		);
+		assert_eq!(grain_level(grainy_4k.noise_db), Some(20));
+		assert_eq!(sharp_4k.noise, NoiseClass::Clean);
+		assert_eq!(sharp_4k.noise_db, Some(46.0));
 	}
 
 	#[test]

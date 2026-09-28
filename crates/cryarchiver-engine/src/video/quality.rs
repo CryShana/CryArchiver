@@ -436,6 +436,7 @@ mod tests {
 		let analysis = Analysis {
 			scan: ScanType::Progressive,
 			noise: NoiseClass::Clean,
+			noise_db: None,
 			detail: vec![
 				detail(5.0, 40.0, true),
 				detail(35.0, 90.0, true),
@@ -469,6 +470,7 @@ mod tests {
 		let analysis = |duration: f64, count: usize| Analysis {
 			scan: ScanType::Progressive,
 			noise: NoiseClass::Clean,
+			noise_db: None,
 			detail: segments(Some(duration), count)
 				.iter()
 				.zip(0_u32..)
@@ -496,6 +498,7 @@ mod tests {
 		let analysis = |detail: Vec<Detail>| Analysis {
 			scan: ScanType::Progressive,
 			noise: NoiseClass::Clean,
+			noise_db: None,
 			detail,
 		};
 		let four = |start_s: f64| Sample { start_s, length_s: 4.0 };
@@ -556,7 +559,7 @@ mod tests {
 			(bounds(&Encoder::SvtAv1 {
 				preset: 5,
 				crf: 29.0,
-				film_grain: false
+				film_grain: None
 			})
 			.step - 0.25)
 				.abs() < 1e-9

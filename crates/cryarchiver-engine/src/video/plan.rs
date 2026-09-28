@@ -26,6 +26,8 @@ const MIN_PACKET_SLACK: f64 = 2.0;
 const SOURCE_FRAME_TOLERANCE: u64 = 2;
 const VIDEO_BASE_BYTES: u64 = 512 << 20;
 const VIDEO_BYTES_PER_PIXEL: u64 = 540;
+/// (luma PSNR against `hqdn3d` below which the level applies, film-grain level), noisiest first.
+const GRAIN_LEVELS: [(f64, u8); 3] = [(44.0, 20), (47.0, 14), (50.0, 8)];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoCaps {
@@ -62,9 +64,19 @@ impl Resolution {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Encoder {
-	SvtAv1 { preset: u8, crf: f64, film_grain: bool },
-	Aom { cpu_used: u8, crf: u8 },
-	Vp9Alpha { cpu_used: u8, crf: u8 },
+	SvtAv1 {
+		preset: u8,
+		crf: f64,
+		film_grain: Option<u8>,
+	},
+	Aom {
+		cpu_used: u8,
+		crf: u8,
+	},
+	Vp9Alpha {
+		cpu_used: u8,
+		crf: u8,
+	},
 }
 
 impl Encoder {
@@ -102,7 +114,14 @@ impl Encoder {
 	}
 
 	pub fn film_grain(&self) -> bool {
-		matches!(self, Self::SvtAv1 { film_grain: true, .. })
+		self.grain_level().is_some()
+	}
+
+	pub fn grain_level(&self) -> Option<u8> {
+		match self {
+			Self::SvtAv1 { film_grain, .. } => *film_grain,
+			Self::Aom { .. } | Self::Vp9Alpha { .. } => None,
+		}
 	}
 }
 
@@ -184,11 +203,10 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 			crf: rounded_crf(svt_crf(speed, resolution)),
 		}
 	} else {
-		let grain = speed != Speed::Fast && analysis.noise == NoiseClass::Light;
 		Encoder::SvtAv1 {
 			preset: pick(speed, [3, 5, 8]),
 			crf: svt_crf(speed, resolution),
-			film_grain: grain,
+			film_grain: source_grain(analysis).filter(|_| speed != Speed::Fast),
 		}
 	};
 
@@ -264,13 +282,25 @@ fn frame_tolerance(scan: ScanType) -> u64 {
 	}
 }
 
-pub fn svt_params(crf: f64, film_grain: bool) -> String {
-	let grain = if film_grain {
-		":film-grain=8:film-grain-denoise=1"
-	} else {
-		""
-	};
+pub fn svt_params(crf: f64, grain: Option<u8>) -> String {
+	let grain = grain.map_or_else(String::new, |level| format!(":film-grain={level}:film-grain-denoise=1"));
 	format!("tune=0:keyint=5s:crf={crf}{grain}")
+}
+
+/// The scaled noise class decides whether a source is grainy at all; the native measure only picks how strongly.
+pub fn source_grain(analysis: &Analysis) -> Option<u8> {
+	let lightest = GRAIN_LEVELS[GRAIN_LEVELS.len() - 1].1;
+
+	(analysis.noise == NoiseClass::Light).then(|| grain_level(analysis.noise_db).unwrap_or(lightest))
+}
+
+pub fn grain_level(noise_db: Option<f64>) -> Option<u8> {
+	let noise_db = noise_db?;
+
+	GRAIN_LEVELS
+		.iter()
+		.find(|(below_db, _)| noise_db < *below_db)
+		.map(|(_, level)| *level)
 }
 
 fn svt_crf(speed: Speed, resolution: Resolution) -> f64 {
@@ -366,7 +396,7 @@ pub(crate) fn test_plan() -> VideoPlan {
 		encoder: Encoder::SvtAv1 {
 			preset: 8,
 			crf: 32.0,
-			film_grain: false,
+			film_grain: None,
 		},
 		expected_frames: None,
 		frame_tolerance: SOURCE_FRAME_TOLERANCE,
@@ -395,6 +425,7 @@ mod tests {
 	const PROGRESSIVE_CLEAN: Analysis = Analysis {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,
+		noise_db: None,
 		detail: Vec::new(),
 	};
 
@@ -442,7 +473,7 @@ mod tests {
 			Encoder::SvtAv1 {
 				preset: 5,
 				crf: 29.0,
-				film_grain: false,
+				film_grain: None,
 			}
 		);
 		assert_eq!(plan.expected_frames, Some(250));
@@ -503,7 +534,7 @@ mod tests {
 			Encoder::SvtAv1 {
 				preset: 8,
 				crf: 35.0,
-				film_grain: false,
+				film_grain: None,
 			}
 		);
 		assert_eq!(
@@ -511,7 +542,7 @@ mod tests {
 			Encoder::SvtAv1 {
 				preset: 3,
 				crf: 25.0,
-				film_grain: false,
+				film_grain: None,
 			}
 		);
 	}
@@ -537,13 +568,11 @@ mod tests {
 	fn scan_type_picks_the_deinterlacer_and_frame_count() {
 		let tff = Analysis {
 			scan: ScanType::Interlaced { top_first: true },
-			noise: NoiseClass::Clean,
-			detail: Vec::new(),
+			..PROGRESSIVE_CLEAN
 		};
 		let telecined = Analysis {
 			scan: ScanType::Telecined,
-			noise: NoiseClass::Clean,
-			detail: Vec::new(),
+			..PROGRESSIVE_CLEAN
 		};
 
 		let deinterlaced = plan(&h264(""), &[], tff, Speed::Moderate);
@@ -564,9 +593,9 @@ mod tests {
 	#[test]
 	fn natural_noise_adds_film_grain_except_at_fast() {
 		let grainy = Analysis {
-			scan: ScanType::Progressive,
 			noise: NoiseClass::Light,
-			detail: Vec::new(),
+			noise_db: Some(42.8),
+			..PROGRESSIVE_CLEAN
 		};
 
 		let moderate = plan(&h264(""), &[], grainy.clone(), Speed::Moderate);
@@ -578,7 +607,7 @@ mod tests {
 			Encoder::SvtAv1 {
 				preset: 5,
 				crf: 29.0,
-				film_grain: true,
+				film_grain: Some(20),
 			}
 		);
 		assert_eq!(
@@ -586,10 +615,69 @@ mod tests {
 			Encoder::SvtAv1 {
 				preset: 3,
 				crf: 25.0,
-				film_grain: true,
+				film_grain: Some(20),
 			}
 		);
+		assert!(moderate.encoder.film_grain());
+		assert_eq!(moderate.encoder.grain_level(), Some(20));
 		assert!(!fast.encoder.film_grain());
+		assert_eq!(fast.encoder.grain_level(), None);
+	}
+
+	#[test]
+	fn the_scaled_class_decides_grain_and_the_native_measure_its_level() {
+		let light = |noise_db: Option<f64>| Analysis {
+			noise: NoiseClass::Light,
+			noise_db,
+			..PROGRESSIVE_CLEAN
+		};
+		let clean_but_noisy_natively = Analysis {
+			noise_db: Some(42.8),
+			..PROGRESSIVE_CLEAN
+		};
+
+		assert_eq!(source_grain(&light(Some(46.0))), Some(14));
+		assert_eq!(source_grain(&light(Some(51.0))), Some(8));
+		assert_eq!(source_grain(&light(None)), Some(8));
+		assert_eq!(source_grain(&clean_but_noisy_natively), None);
+		assert_eq!(
+			plan(&h264(""), &[], clean_but_noisy_natively, Speed::Moderate)
+				.encoder
+				.grain_level(),
+			None
+		);
+	}
+
+	#[test]
+	fn clean_sources_get_no_grain_at_any_speed() {
+		for speed in [Speed::Slow, Speed::Moderate, Speed::Fast] {
+			let plan = plan(&h264(""), &[], PROGRESSIVE_CLEAN, speed);
+
+			assert_eq!(plan.encoder.grain_level(), None, "{speed:?}");
+			assert!(!plan.encoder.film_grain(), "{speed:?}");
+		}
+	}
+
+	#[test]
+	fn grain_strength_follows_the_measured_noise() {
+		assert_eq!(grain_level(None), None);
+		assert_eq!(grain_level(Some(57.2)), None);
+		assert_eq!(grain_level(Some(50.0)), None);
+		assert_eq!(grain_level(Some(49.99)), Some(8));
+		assert_eq!(grain_level(Some(47.0)), Some(8));
+		assert_eq!(grain_level(Some(46.99)), Some(14));
+		assert_eq!(grain_level(Some(44.0)), Some(14));
+		assert_eq!(grain_level(Some(43.99)), Some(20));
+		assert_eq!(grain_level(Some(42.8)), Some(20));
+	}
+
+	#[test]
+	fn svt_parameters_carry_the_grain_level() {
+		assert_eq!(
+			svt_params(30.0, Some(14)),
+			"tune=0:keyint=5s:crf=30:film-grain=14:film-grain-denoise=1"
+		);
+		assert_eq!(svt_params(30.0, None), "tune=0:keyint=5s:crf=30");
 	}
 
 	#[test]
@@ -747,7 +835,7 @@ mod tests {
 		let svt = Encoder::SvtAv1 {
 			preset: 5,
 			crf: 29.0,
-			film_grain: true,
+			film_grain: Some(14),
 		};
 		let vp9 = Encoder::Vp9Alpha { cpu_used: 2, crf: 33 };
 
@@ -756,7 +844,7 @@ mod tests {
 			Encoder::SvtAv1 {
 				preset: 5,
 				crf: 26.25,
-				film_grain: true,
+				film_grain: Some(14),
 			}
 		);
 		assert_eq!(vp9.with_crf(30.6), Encoder::Vp9Alpha { cpu_used: 2, crf: 31 });
@@ -766,10 +854,10 @@ mod tests {
 		);
 		assert_eq!((svt.preset(), vp9.preset()), (5, 2));
 		assert_eq!(
-			svt_params(29.25, true),
+			svt_params(29.25, Some(8)),
 			"tune=0:keyint=5s:crf=29.25:film-grain=8:film-grain-denoise=1"
 		);
-		assert_eq!(svt_params(29.0, false), "tune=0:keyint=5s:crf=29");
+		assert_eq!(svt_params(29.0, None), "tune=0:keyint=5s:crf=29");
 	}
 
 	#[test]

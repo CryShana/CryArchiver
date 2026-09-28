@@ -3,8 +3,8 @@ use std::fmt;
 use crate::images::decode::deep_pix_fmt;
 use crate::metadata::ImageFormat;
 use crate::probe::Stream;
-use crate::video::analyze::{Analysis, NoiseClass, ScanType};
-use crate::video::plan::{Resolution, VideoPlan};
+use crate::video::analyze::{Analysis, ScanType};
+use crate::video::plan::{Resolution, VideoPlan, source_grain};
 
 const MPEG4: &[&str] = &["mpeg4", "msmpeg4v2", "msmpeg4v3", "h263", "flv1"];
 const INTERMEDIATE: &[&str] = &["prores", "dnxhd", "cfhd", "hqx", "hap"];
@@ -129,7 +129,7 @@ pub struct VideoGroup {
 	pub fps: FpsBucket,
 	pub range: DynamicRange,
 	pub scan: ScanType,
-	pub noise: NoiseClass,
+	pub grain: Option<u8>,
 	pub alpha: bool,
 }
 
@@ -147,7 +147,7 @@ impl VideoGroup {
 			fps: FpsBucket::of(output_fps),
 			range: DynamicRange::of(&plan.colour.transfer, main.pix_fmt.as_deref()),
 			scan: analysis.scan,
-			noise: analysis.noise,
+			grain: source_grain(analysis),
 			alpha: plan.alpha,
 		}
 	}
@@ -234,7 +234,7 @@ impl fmt::Display for CacheKey {
 				group.fps.name(),
 				group.range.name(),
 				scan_name(group.scan),
-				noise_name(group.noise),
+				grain_name(group.grain),
 				alpha_name(group.alpha)
 			)?,
 			Group::Image(group) => write!(
@@ -275,11 +275,8 @@ fn scan_name(scan: ScanType) -> &'static str {
 	}
 }
 
-fn noise_name(noise: NoiseClass) -> &'static str {
-	match noise {
-		NoiseClass::Clean => "clean",
-		NoiseClass::Light => "light",
-	}
+fn grain_name(grain: Option<u8>) -> String {
+	grain.map_or_else(|| "clean".to_owned(), |level| format!("grain{level}"))
 }
 
 fn alpha_name(alpha: bool) -> &'static str {
@@ -303,18 +300,31 @@ fn format_name(format: ImageFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::video::analyze::NoiseClass;
 	use crate::video::plan::test_plan;
 
 	fn stream(json: &str) -> Stream {
 		serde_json::from_str(json).unwrap()
 	}
 
-	fn progressive(noise: NoiseClass) -> Analysis {
+	fn progressive(noise_db: Option<f64>) -> Analysis {
 		Analysis {
 			scan: ScanType::Progressive,
-			noise,
+			noise: if noise_db.is_some_and(|db| db < 50.0) {
+				NoiseClass::Light
+			} else {
+				NoiseClass::Clean
+			},
+			noise_db,
 			detail: Vec::new(),
 		}
+	}
+
+	fn h264_25() -> Stream {
+		stream(
+			r#"{"index":0,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p",
+			"r_frame_rate":"25/1","avg_frame_rate":"25/1"}"#,
+		)
 	}
 
 	#[test]
@@ -356,8 +366,7 @@ mod tests {
 		);
 		let interlaced = Analysis {
 			scan: ScanType::Interlaced { top_first: true },
-			noise: NoiseClass::Clean,
-			detail: Vec::new(),
+			..progressive(None)
 		};
 		let plan = VideoPlan {
 			width: 1920,
@@ -374,11 +383,8 @@ mod tests {
 
 	#[test]
 	fn cache_keys_name_the_encoder_version_preset_and_target() {
-		let main = stream(
-			r#"{"index":0,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p",
-			"r_frame_rate":"25/1","avg_frame_rate":"25/1"}"#,
-		);
-		let analysis = progressive(NoiseClass::Light);
+		let main = h264_25();
+		let analysis = progressive(Some(45.4));
 		let key = |encoder: &str, preset: u8, target: f64| {
 			CacheKey {
 				group: Group::Video(VideoGroup::of(&main, &analysis, &test_plan())),
@@ -394,7 +400,7 @@ mod tests {
 
 		assert_eq!(
 			base,
-			"video/h264/sd/fps25/sdr8/progressive/light/opaque|svt-av1-4.2|p5|t93.0/89.0"
+			"video/h264/sd/fps25/sdr8/progressive/grain14/opaque|svt-av1-4.2|p5|t93.0/89.0"
 		);
 		for other in [
 			key("svt-av1-4.3", 5, 93.0),
@@ -403,6 +409,30 @@ mod tests {
 		] {
 			assert_ne!(other, base);
 		}
+	}
+
+	#[test]
+	fn groups_of_different_grain_strength_never_share_a_key() {
+		let main = h264_25();
+		let key = |noise_db: Option<f64>| {
+			CacheKey {
+				group: Group::Video(VideoGroup::of(&main, &progressive(noise_db), &test_plan())),
+				encoder: "svt-av1-4.2".to_owned(),
+				preset: 5,
+				target: 91.0,
+				floor: Some(86.5),
+			}
+			.to_string()
+		};
+
+		let [clean, grain8, grain14, grain20] = [None, Some(48.0), Some(45.0), Some(42.8)].map(key);
+
+		assert!(clean.contains("/progressive/clean/"), "{clean}");
+		assert!(grain8.contains("/progressive/grain8/"), "{grain8}");
+		assert!(grain14.contains("/progressive/grain14/"), "{grain14}");
+		assert!(grain20.contains("/progressive/grain20/"), "{grain20}");
+		assert_ne!(grain8, grain20);
+		assert_eq!(key(Some(43.1)), grain20);
 	}
 
 	#[test]
