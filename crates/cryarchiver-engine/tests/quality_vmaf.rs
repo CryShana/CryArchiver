@@ -3,6 +3,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::outcome::ErrorKind;
+use cryarchiver_engine::process::{STALL_TIMEOUT, ToolCommand};
 use cryarchiver_engine::quality::vmaf::{
 	FrameWindow, Reference, Scoring, frames, pool, sample_command, window_command,
 };
@@ -125,6 +126,33 @@ async fn a_failed_scoring_run_is_an_encode_failure() {
 	};
 	let scoring = scoring(dir.path(), "broken.json");
 	let cmd = sample_command(&ffmpeg, &source, &broken, 0.0, 1.0, &scoring);
+
+	let err = frames(&cmd, &scoring, |_| {}, &CancellationToken::new())
+		.await
+		.unwrap_err();
+
+	assert!(matches!(err.kind, ErrorKind::EncodeFailed(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_missing_log_is_an_encode_failure_not_destination_gone() {
+	let dir = tempfile::tempdir().unwrap();
+	let ffmpeg = support::toolchain().await.ffmpeg;
+
+	let mut cmd = ToolCommand::new(&ffmpeg, STALL_TIMEOUT);
+	cmd.in_dir(dir.path());
+	cmd.args([
+		"-hide_banner",
+		"-nostdin",
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=size=64x64:rate=25:duration=0.1",
+		"-f",
+		"null",
+		"-",
+	]);
+	let scoring = scoring(dir.path(), "missing.json");
 
 	let err = frames(&cmd, &scoring, |_| {}, &CancellationToken::new())
 		.await

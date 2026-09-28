@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::outcome::{ErrorKind, IoSide, JobError};
+use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, Progress, STALL_TIMEOUT, ToolCommand};
 use crate::video::plan::Resolution;
 use crate::video::run_ffmpeg;
@@ -160,7 +160,12 @@ pub async fn frames(
 	let out = run_ffmpeg(cmd, on_progress, cancel).await?;
 
 	let log = scoring.dir.join(scoring.log);
-	let json = fs::read(&log).map_err(|err| JobError::io(IoSide::Destination(&log), &err))?;
+	let json = fs::read(&log).map_err(|err| {
+		JobError::with_log(
+			ErrorKind::EncodeFailed(format!("unreadable VMAF log: {err}")),
+			out.stderr_tail.clone(),
+		)
+	})?;
 	let _ = fs::remove_file(&log);
 
 	parse_log(&json).map_err(|reason| JobError::with_log(ErrorKind::EncodeFailed(reason), out.stderr_tail))
