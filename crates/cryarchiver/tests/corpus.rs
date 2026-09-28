@@ -34,7 +34,9 @@ fn corpus_audio_outcomes() {
 		copy_into(dir.path(), file);
 	}
 
+	let cache = tempfile::tempdir().unwrap();
 	let out = Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
+		.env("CRYARCHIVER_CACHE_DIR", cache.path())
 		.current_dir(dir.path())
 		.arg(".")
 		.output()
@@ -242,7 +244,9 @@ fn corpus_video_outcomes() {
 	let sources: Vec<PathBuf> = relative.iter().map(|file| corpus.join(file)).collect();
 	let before = snapshot(&sources);
 
+	let cache = tempfile::tempdir().unwrap();
 	let out = Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
+		.env("CRYARCHIVER_CACHE_DIR", cache.path())
 		.args(["-s", "fast", "--min-savings", "0", "-o"])
 		.arg(out_dir.path())
 		.args(&sources)
@@ -276,6 +280,40 @@ fn corpus_video_outcomes() {
 	}
 
 	assert_video_outputs(out_dir.path(), &stdout);
+}
+
+#[test]
+#[ignore = "needs the local sample corpus (set CRY_CORPUS, default C:\\media-corpus); takes about 30 minutes"]
+fn corpus_quality_search_outcomes() {
+	let out_dir = tempfile::tempdir().unwrap();
+	let cache = tempfile::tempdir().unwrap();
+	let corpus = corpus();
+	let sources: Vec<PathBuf> = ["short-film.mp4", "already-compressed/action-clip.webm"]
+		.iter()
+		.map(|file| corpus.join(file))
+		.collect();
+	let before = snapshot(&sources);
+
+	let out = Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
+		.env("CRYARCHIVER_CACHE_DIR", cache.path())
+		.arg("-o")
+		.arg(out_dir.path())
+		.args(&sources)
+		.output()
+		.unwrap();
+	let stdout = String::from_utf8_lossy(&out.stdout);
+
+	assert_eq!(snapshot(&sources), before, "the corpus changed");
+	assert!(!out_dir.path().join(".cry-work").exists());
+	assert!(stdout.contains("✓ short-film.mp4 → short-film.cry.mkv"), "{stdout}");
+	assert!(
+		stdout.contains("✓ action-clip.webm → action-clip.cry.mkv"),
+		"{stdout}"
+	);
+	assert!(out_dir.path().join("action-clip.cry.mkv").exists());
+
+	let cached = fs::read_to_string(cache.path().join("quality-cache.json")).unwrap();
+	assert!(cached.contains("video/h264/720/fps31/sdr8/progressive/"), "{cached}");
 }
 
 const IMAGE_FILES: &[&str] = &[
@@ -332,7 +370,9 @@ fn corpus_image_outcomes() {
 	let sources: Vec<PathBuf> = IMAGE_FILES.iter().map(|file| corpus.join(file)).collect();
 	let before = snapshot(&sources);
 
+	let cache = tempfile::tempdir().unwrap();
 	let out = Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
+		.env("CRYARCHIVER_CACHE_DIR", cache.path())
 		.args(["-s", "fast", "--min-savings", "0", "-o"])
 		.arg(out_dir.path())
 		.args(&sources)

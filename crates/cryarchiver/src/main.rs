@@ -618,6 +618,7 @@ async fn compress(args: CompressArgs) -> u8 {
 	let report = Report::new(args.quiet);
 
 	let totals = run_all(&Arc::new(engine), &sink, jobs, parallel, &report, &cancel).await;
+
 	if let Some(path) = &quality_cache
 		&& let Err(err) = memory::save(&quality, path)
 	{

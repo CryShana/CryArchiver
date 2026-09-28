@@ -11,6 +11,7 @@ Audio, video and images are supported:
 ## Requirements
 
 - ffmpeg **8.1 or newer** with libopus, the soxr resampler, libsvtav1 (SVT-AV1 4.0 or newer) and libdav1d. libvpx-vp9 is needed for transparent video, libaom-av1 for animated images, and libjxl for JPEG XL.
+  libvmaf (part of most full builds) measures video quality at the moderate and slow speeds.
   - Windows: the gyan.dev "full" build or a BtbN GPL build.
   - Linux: a BtbN static build or your distribution's ffmpeg.
 - Run `cryarchiver doctor` to check what your ffmpeg supports.
@@ -38,7 +39,12 @@ cryarchiver album/ --speed slow        # slower, higher quality
 - Video is deinterlaced (or inverse-telecined), rotated upright, and keeps its colour, HDR10/HLG, every audio track, subtitles, chapters and fonts.
   - Personal metadata (GPS, camera and dates) and telemetry streams are dropped unless you pass `--keep-metadata`.
   - Dolby Vision is saved as its HDR10- or HLG-compatible base layer. Profile 5, which has none, keeps the original.
+- At `--speed moderate` (the default) and `slow`, each video's quality setting is chosen before the full encode: a few seconds of samples are encoded and measured with VMAF, and the finished video is measured again before it is kept. What each kind of video needed is remembered in the user cache folder (`quality-cache.json`; archive projects keep it in the project file), so similar videos skip the samples at moderate. `--speed fast` uses fixed settings and doesn't measure video.
+  - When no setting reaches the quality target, or the samples show the output wouldn't be meaningfully smaller, the original is kept before the full encode. A finished video that misses the target is encoded once more with more quality.
+  - Noisy sources at moderate and slow are denoised and get AV1 film grain back, with a strength that follows the measured noise.
+  - The cache folder is `%LOCALAPPDATA%\cryarchiver\cache` on Windows and `~/.cache/cryarchiver` on Linux (`$XDG_CACHE_HOME/cryarchiver`); `CRYARCHIVER_CACHE_DIR` points it elsewhere.
 - Images are rotated upright and keep their colour profile. Each encode is checked with SSIMULACRA2 and kept only if it reaches the quality target for the chosen speed.
+  - A photo that misses its quality target is encoded again with more quality, at most twice; photos of the same kind then start from what worked.
   - Personal metadata (EXIF, XMP, GPS, IPTC) is dropped unless you pass `--keep-metadata`, which carries it over with the orientation and size corrected.
   - Photos with HDR gain maps or depth maps keep the original; `--drop-aux` converts them without the extra images.
   - RAW camera files, layered files (PSD, XCF), CMYK JPEGs and multi-page TIFFs are never converted.
@@ -94,9 +100,11 @@ cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashbo
 - A file that fails stays an open issue until you retry it, copy the original or exclude it in the dashboard (`i`). Files in the destination that the project didn't write are reported as issues until you acknowledge them; they are never deleted.
 - With watch mode on, the run keeps going once everything is archived and picks up new files as they appear.
 - The performance limit runs in the background: low priority, one job at a time, and at most the chosen share of the CPU.
-- `project create` takes the custom quality flags (`--video-vmaf`, `--image-target`, `--audio-kbps`) and stores them in the project. Like a speed change, a change to them applies to files archived from then on; files already archived are not redone. `run` names the custom profile in its summary, and `project dump` shows the stored values.
+- `project create` takes the custom quality flags (`--video-vmaf`, `--image-target`, `--audio-kbps`) and stores them in the project. Like a speed change, a change to them applies to files archived from then on; files already archived are not redone. `run` names the custom profile in its summary, and `project dump` shows the stored values. The dashboard's settings (`s`) change them too, and reset them to the preset.
 
 **Deleting originals** is off by default. It can only be turned on in the dashboard's settings (`s`), by typing `DELETE`. An original is then deleted permanently, with no Recycle Bin, once its archived copy has been read back from disk and matches its BLAKE3. A headless run of such a project also needs `--delete-originals`, or it refuses to start. When the dashboard opens such a project, it archives as usual but deletes nothing until you type `DELETE` again in its settings, once per session.
+
+An original is kept, not deleted, when its archived copy is a link, has a second name (a hard link, for example into a backup tree), or is a reparse point such as a OneDrive cloud placeholder.
 
 On Linux, the check that an original is still open in another program is best effort: it isn't available on network or FUSE file systems (NFS, CIFS/SMB, FUSE), or for files you don't own. Close programs that write to the source before deleting originals.
 
