@@ -5,10 +5,8 @@ pub mod validate;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::text::display_path;
@@ -29,6 +27,8 @@ use crate::view::{NoticeLevel, Notification};
 
 const NOTICE_LIFETIME: Duration = Duration::from_secs(8);
 const PAGE: usize = 5;
+/// How long an open waits for the menu's own read of that same project to end.
+const OPEN_WAIT: Duration = Duration::from_secs(2);
 
 pub struct RecentEntry {
 	pub recent: Recent,
@@ -85,15 +85,26 @@ pub enum Dialog {
 /// The worker that reads the recent projects, one after another.
 struct Checks {
 	results: Receiver<(u64, usize, EntryState)>,
-	stop: Arc<AtomicBool>,
-	worker: JoinHandle<()>,
+	worker: Arc<Mutex<Worker>>,
+}
+
+/// Shared with the worker thread. The worker looks at `stop` and sets `reading` under the same lock, so once `stop`
+/// is set, `reading` names the only project it may still be reading.
+#[derive(Default)]
+struct Worker {
+	stop: bool,
+	reading: Option<PathBuf>,
 }
 
 impl Checks {
-	fn halt(self) -> JoinHandle<()> {
-		self.stop.store(true, Ordering::Relaxed);
+	fn halt(self) -> Arc<Mutex<Worker>> {
+		lock(&self.worker).stop = true;
 		self.worker
 	}
+}
+
+fn lock(worker: &Mutex<Worker>) -> MutexGuard<'_, Worker> {
+	worker.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub struct StartMenu {
@@ -114,7 +125,7 @@ pub struct StartMenu {
 	generation: u64,
 	checks: Option<Checks>,
 	/// Workers told to stop that may still be finishing their current project.
-	halted: Vec<JoinHandle<()>>,
+	halted: Vec<Arc<Mutex<Worker>>>,
 }
 
 impl StartMenu {
@@ -242,22 +253,34 @@ impl StartMenu {
 		true
 	}
 
-	/// Stops reading the recent projects and waits for the project being read, so none is left locked by this menu:
-	/// called before a project opens, which then keeps the worker stopped for the whole session.
-	pub fn stop_checks(&mut self) {
+	/// Stops reading the recent projects before `opening` opens, and keeps them stopped for the session. A worker still
+	/// reading another project is left to finish on its own; one reading `opening` itself is waited for, briefly, so
+	/// the open doesn't find the project held by this menu.
+	pub fn stop_checks(&mut self, opening: &Path) {
 		if let Some(checks) = self.checks.take() {
 			self.halted.push(checks.halt());
 		}
 
+		let deadline = Instant::now() + OPEN_WAIT;
 		for worker in self.halted.drain(..) {
-			let _ = worker.join();
+			while lock(&worker).reading.as_deref() == Some(opening) && Instant::now() < deadline {
+				std::thread::sleep(Duration::from_millis(5));
+			}
 		}
 	}
 
-	/// Whether a worker reading the recent projects may still hold one of them.
+	/// Whether the recent projects are still being read for the menu.
 	pub fn checks_running(&self) -> bool {
-		self.checks.as_ref().is_some_and(|checks| !checks.worker.is_finished())
-			|| self.halted.iter().any(|worker| !worker.is_finished())
+		self.checks.is_some()
+	}
+
+	/// Whether a worker of this menu, stopped or not, is reading `project` right now.
+	pub fn reading(&self, project: &Path) -> bool {
+		self.checks
+			.iter()
+			.map(|checks| &checks.worker)
+			.chain(&self.halted)
+			.any(|worker| lock(worker).reading.as_deref() == Some(project))
 	}
 
 	fn apply_peek(&mut self, (generation, index, state): (u64, usize, EntryState)) -> bool {
@@ -563,7 +586,7 @@ impl StartMenu {
 		self.request_open(path);
 	}
 
-	/// The worker is told to stop at once; [`Self::stop_checks`] waits for it before the open.
+	/// The worker is told to stop at once; [`Self::stop_checks`] runs right before the open.
 	fn request_open(&mut self, path: PathBuf) {
 		if let Some(checks) = self.checks.take() {
 			self.halted.push(checks.halt());
@@ -623,7 +646,7 @@ impl StartMenu {
 		if let Some(checks) = self.checks.take() {
 			self.halted.push(checks.halt());
 		}
-		self.halted.retain(|worker| !worker.is_finished());
+		self.halted.retain(|worker| lock(worker).reading.is_some());
 
 		self.generation += 1;
 		self.checks = (!paths.is_empty()).then(|| spawn_checks(self.generation, paths));
@@ -634,19 +657,30 @@ impl StartMenu {
 	}
 }
 
+/// The thread is never joined: a stopped worker finishes the project it is on and returns.
 fn spawn_checks(generation: u64, paths: Vec<PathBuf>) -> Checks {
 	let (sender, results) = mpsc::channel();
-	let stop = Arc::new(AtomicBool::new(false));
-	let stopped = stop.clone();
-	let worker = std::thread::spawn(move || {
-		for (index, path) in paths.iter().enumerate() {
-			if stopped.load(Ordering::Relaxed) || sender.send((generation, index, peek(path))).is_err() {
+	let worker = Arc::new(Mutex::new(Worker::default()));
+	let shared = worker.clone();
+	std::thread::spawn(move || {
+		for (index, path) in paths.into_iter().enumerate() {
+			{
+				let mut state = lock(&shared);
+				if state.stop {
+					return;
+				}
+				state.reading = Some(path.clone());
+			}
+
+			let state = peek(&path);
+			lock(&shared).reading = None;
+			if sender.send((generation, index, state)).is_err() {
 				return;
 			}
 		}
 	});
 
-	Checks { results, stop, worker }
+	Checks { results, worker }
 }
 
 fn peek(path: &Path) -> EntryState {
@@ -756,6 +790,40 @@ mod tests {
 		assert_eq!(pasted("\"D:\\My Photos\"\r\n"), "D:\\My Photos");
 		assert_eq!(pasted("D:\\Photos\n"), "D:\\Photos");
 		assert_eq!(pasted("a \"b\" c"), "a \"b\" c");
+	}
+
+	fn halted_worker(reading: &Path) -> Arc<Mutex<Worker>> {
+		Arc::new(Mutex::new(Worker {
+			stop: true,
+			reading: Some(reading.to_path_buf()),
+		}))
+	}
+
+	#[test]
+	fn an_open_waits_only_for_a_read_of_the_same_project() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut menu = StartMenu::new(RecentStore::at(dir.path().join("recent.bin")), ColorDepth::TrueColor);
+		let (opening, other) = (dir.path().join("a.cryarchive"), dir.path().join("b.cryarchive"));
+
+		menu.halted.push(halted_worker(&other));
+		let started = Instant::now();
+		menu.stop_checks(&opening);
+		assert!(started.elapsed() < Duration::from_millis(500));
+
+		let same = halted_worker(&opening);
+		menu.halted.push(same.clone());
+		let finisher = std::thread::spawn(move || {
+			std::thread::sleep(Duration::from_millis(100));
+			lock(&same).reading = None;
+		});
+		let started = Instant::now();
+		menu.stop_checks(&opening);
+		let waited = started.elapsed();
+		finisher.join().unwrap();
+
+		assert!(waited >= Duration::from_millis(50), "{waited:?}");
+		assert!(waited < OPEN_WAIT, "{waited:?}");
+		assert!(!menu.reading(&opening));
 	}
 
 	#[test]

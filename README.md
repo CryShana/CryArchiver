@@ -74,6 +74,7 @@ cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashbo
 ```
 
 - The source is never modified, unless you turn on deleting originals (below).
+- Don't point the destination at another name for a folder inside the source, such as a bind mount, a drive mounted inside it, or an overlapping network share; those can't always be detected.
 - Archived files keep their metadata and timestamps; each folder gets its timestamps once everything in it is archived. Empty folders are mirrored too.
 - A file that is still being written waits until it has been still for 30 seconds, and on Windows until no other program holds it open for writing.
 - Duplicates are confirmed with a full BLAKE3 before anything is replaced, then become `placeholder_<name>.txt` files that point to the archived copy in the shallowest folder. Files under 64 KiB are always archived normally.

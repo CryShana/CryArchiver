@@ -165,10 +165,27 @@ impl RootConflict {
 	}
 }
 
+const PLANNING_PASSES: usize = 16;
+
 /// Where `path` will be once it exists: its nearest existing ancestor, canonical, followed by the missing names with
 /// `.` and `..` resolved on the names alone. A path with no existing ancestor at all is resolved the same way and made
 /// absolute.
+///
+/// One pass can leave a link behind: on Linux `missing/..` doesn't exist, so in `d/missing/../link/x` the part after
+/// `d` is resolved on names alone and `d/link` is never canonicalized. Passes repeat until the path stops changing.
 pub fn planned_path(path: &Path) -> io::Result<PathBuf> {
+	let mut planned = plan_once(path)?;
+	for _ in 0..PLANNING_PASSES {
+		let next = plan_once(&planned)?;
+		if next == planned {
+			break;
+		}
+		planned = next;
+	}
+	Ok(planned)
+}
+
+fn plan_once(path: &Path) -> io::Result<PathBuf> {
 	let components: Vec<Component> = path.components().collect();
 	let mut existing = components.len();
 	let ancestor = loop {
@@ -239,13 +256,15 @@ pub fn identity_conflict(source: &Path, destination: &Path) -> Option<RootConfli
 		});
 	}
 
-	if existing.ancestors().skip(1).any(is(source_id)) {
+	let walked = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
+	if walked.ancestors().skip(1).any(is(source_id)) {
 		return Some(RootConflict::DestinationInsideSource);
 	}
 
 	if complete && source.ancestors().skip(1).any(is(existing_id)) {
 		return Some(RootConflict::SourceInsideDestination);
 	}
+
 	None
 }
 
@@ -541,6 +560,26 @@ mod tests {
 			Some(RootConflict::DestinationInsideSource)
 		);
 		assert_eq!(root_conflict(&source, &typed(r"new\deep\..\..\archive")).unwrap(), None);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_link_reached_after_dot_dot_is_resolved_too() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(source.join("sub")).unwrap();
+		fs::create_dir(dir.path().join("d")).unwrap();
+		std::os::unix::fs::symlink(source.join("sub"), dir.path().join("d").join("lnk")).unwrap();
+		let typed = PathBuf::from(format!("{}/d/missing/../lnk/archive", dir.path().display()));
+
+		assert_eq!(
+			planned_path(&typed).unwrap(),
+			fs::canonicalize(source.join("sub")).unwrap().join("archive")
+		);
+		assert_eq!(
+			root_conflict(&source, &typed).unwrap(),
+			Some(RootConflict::DestinationInsideSource)
+		);
 	}
 
 	#[cfg(unix)]

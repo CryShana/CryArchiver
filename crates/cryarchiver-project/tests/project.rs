@@ -637,7 +637,6 @@ fn dot_dot_in_a_destination_cannot_reach_into_the_source() {
 	assert!(!dir.path().join("missing").exists());
 }
 
-/// Only the checked path is created: `create_dir_all` on the typed text would create `<source>/new` on the way.
 fn assert_only_the_planned_folder_is_created(destination: &Path, source: &Path, archive: &Path) {
 	let created = cryarchiver_project::create(source, destination, OsStr::new("a"), |_| {});
 
@@ -678,6 +677,23 @@ fn a_typed_unix_destination_that_climbs_out_of_the_source_creates_nothing_in_it(
 	let destination = PathBuf::from(format!("{}/source/new/deeper/../../../archive", dir.path().display()));
 
 	assert_only_the_planned_folder_is_created(&destination, &source, &dir.path().join("archive"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_reached_after_dot_dot_cannot_lead_into_the_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	fs::create_dir_all(source.join("sub")).unwrap();
+	fs::create_dir(dir.path().join("d")).unwrap();
+	std::os::unix::fs::symlink(source.join("sub"), dir.path().join("d").join("lnk")).unwrap();
+	let destination = PathBuf::from(format!("{}/d/missing/../lnk/archive", dir.path().display()));
+
+	let created = cryarchiver_project::create(&source, &destination, OsStr::new("a"), |_| {});
+
+	assert!(matches!(created, Err(ProjectError::Settings(_))), "{created:?}");
+	assert_eq!(fs::read_dir(source.join("sub")).unwrap().count(), 0);
+	assert!(!dir.path().join("d").join("missing").exists());
 }
 
 #[cfg(windows)]

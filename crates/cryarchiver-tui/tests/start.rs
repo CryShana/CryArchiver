@@ -163,9 +163,10 @@ fn opening_a_project_stops_the_checks_for_the_whole_session() {
 
 	press(&mut menu, KeyCode::Enter);
 	let project = menu.take_request().unwrap();
-	menu.stop_checks();
+	menu.stop_checks(&project);
 
 	assert!(!menu.checks_running());
+	assert!(!menu.reading(&project));
 	let states: Vec<EntryState> = menu.entries().iter().map(|entry| entry.state.clone()).collect();
 	let opened = cryarchiver_project::store::Store::open(&project);
 	assert!(opened.is_ok(), "the menu still holds the project");

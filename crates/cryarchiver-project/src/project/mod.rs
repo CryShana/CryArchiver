@@ -19,7 +19,7 @@ mod watching;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -176,8 +176,8 @@ pub fn create(
 	name: &OsStr,
 	configure: impl FnOnce(&mut Settings),
 ) -> Result<PathBuf, ProjectError> {
-	let planned = approved_destination(source, destination)?;
-	fs::create_dir_all(&planned).map_err(|err| naming(destination, &err))?;
+	let (canonical_source, planned) = approved_destination(source, destination)?;
+	create_folders(&planned, |folder| outside_source(&canonical_source, folder))?;
 	let (source, destination) = check_roots(source, &planned)?;
 
 	let path = project_file(&destination, name)?;
@@ -195,11 +195,11 @@ pub fn project_file(destination: &Path, name: &OsStr) -> io::Result<PathBuf> {
 	Ok(plain_path(planned_path(destination)?).join(file_name))
 }
 
-/// Runs before anything is created, and returns the only path that may be created: the destination's planned path,
-/// with no `.` or `..` left. `create_dir_all` walks the typed text literally, so `<source>/new/../../archive` would
-/// create `<source>/new` on the way. The source must already be a folder: creating a destination against a missing
-/// source could create the source's own folders.
-fn approved_destination(source: &Path, destination: &Path) -> Result<PathBuf, ProjectError> {
+/// Runs before anything is created, and returns the canonical source and the only path that may be created: the
+/// destination's planned path, with no `.` or `..` left. `create_dir_all` walks the typed text literally, so
+/// `<source>/new/../../archive` would create `<source>/new` on the way. The source must already be a folder: creating a
+/// destination against a missing source could create the source's own folders.
+fn approved_destination(source: &Path, destination: &Path) -> Result<(PathBuf, PathBuf), ProjectError> {
 	let meta = fs::metadata(source).map_err(|err| naming(source, &err))?;
 	if !meta.is_dir() {
 		return Err(SettingsError::Roots(format!("{}: the source is not a folder", display_path(source))).into());
@@ -210,7 +210,61 @@ fn approved_destination(source: &Path, destination: &Path) -> Result<PathBuf, Pr
 	let conflict = RootConflict::between(&source, &planned).or_else(|| identity_conflict(&source, &planned));
 	match conflict {
 		Some(conflict) => Err(SettingsError::Roots(conflict.message().into()).into()),
-		None => Ok(planned),
+		None => Ok((source, planned)),
+	}
+}
+
+/// Creates the missing folders of `planned` one name at a time. The folder each new one goes into is checked first,
+/// and the last one after it is made; when a check fails nothing more is created, and the folders made so far are
+/// removed again, each only while it is empty.
+fn create_folders(planned: &Path, check: impl Fn(&Path) -> Result<(), ProjectError>) -> Result<(), ProjectError> {
+	let Some(existing) = planned.ancestors().find(|dir| dir.exists()) else {
+		let missing = io::Error::new(io::ErrorKind::NotFound, "no part of the path exists");
+		return Err(naming(planned, &missing).into());
+	};
+	let names: Vec<Component> = planned
+		.strip_prefix(existing)
+		.map_or_else(|_| Vec::new(), |tail| tail.components().collect());
+
+	let mut created: Vec<PathBuf> = Vec::new();
+	let mut folder = existing.to_path_buf();
+	let undo = |created: &[PathBuf]| {
+		for made in created.iter().rev() {
+			let _ = fs::remove_dir(made);
+		}
+	};
+
+	for name in names {
+		if let Err(err) = check(&folder) {
+			undo(&created);
+			return Err(err);
+		}
+
+		folder.push(name);
+		match fs::create_dir(&folder) {
+			Ok(()) => created.push(folder.clone()),
+			Err(err) if err.kind() == io::ErrorKind::AlreadyExists && folder.is_dir() => {}
+			Err(err) => {
+				undo(&created);
+				return Err(naming(&folder, &err).into());
+			}
+		}
+	}
+
+	check(&folder).inspect_err(|_| undo(&created))
+}
+
+/// A folder about to receive a new one must be neither the source nor inside it, by its canonical path and by folder
+/// identity.
+fn outside_source(source: &Path, folder: &Path) -> Result<(), ProjectError> {
+	let canonical = fs::canonicalize(folder).map_err(|err| naming(folder, &err))?;
+	let conflict = RootConflict::between(source, &canonical).or_else(|| identity_conflict(source, &canonical));
+
+	match conflict {
+		Some(conflict @ (RootConflict::Same | RootConflict::DestinationInsideSource)) => {
+			Err(SettingsError::Roots(conflict.message().into()).into())
+		}
+		_ => Ok(()),
 	}
 }
 
@@ -319,5 +373,73 @@ impl Project {
 impl Drop for Project {
 	fn drop(&mut self) {
 		self.shutdown();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A second name for `target`: a junction on Windows, a symbolic link elsewhere. `None` when one can't be made.
+	fn alias(target: &Path, alias: &Path) -> Option<PathBuf> {
+		#[cfg(windows)]
+		let made = std::process::Command::new("cmd")
+			.args(["/C", "mklink", "/J"])
+			.arg(alias)
+			.arg(target)
+			.stdout(std::process::Stdio::null())
+			.status()
+			.is_ok_and(|status| status.success());
+		#[cfg(unix)]
+		let made = std::os::unix::fs::symlink(target, alias).is_ok();
+
+		made.then(|| alias.to_path_buf())
+	}
+
+	#[test]
+	fn folders_are_created_one_at_a_time_and_stop_at_the_first_inside_the_source() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(source.join("sub")).unwrap();
+		let Some(link) = alias(&source.join("sub"), &dir.path().join("link")) else {
+			eprintln!("skipped: no junction or link can be made here");
+			return;
+		};
+		let canonical = fs::canonicalize(&source).unwrap();
+
+		let created = create_folders(&link.join("new").join("deeper"), |folder| {
+			outside_source(&canonical, folder)
+		});
+
+		assert!(matches!(created, Err(ProjectError::Settings(_))), "{created:?}");
+		assert_eq!(fs::read_dir(source.join("sub")).unwrap().count(), 0);
+		fs::remove_dir(&link).or_else(|_| fs::remove_file(&link)).unwrap();
+	}
+
+	#[test]
+	fn a_refused_step_removes_only_the_empty_folders_this_call_made() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::create_dir(dir.path().join("kept")).unwrap();
+		fs::write(dir.path().join("kept").join("file.txt"), b"x").unwrap();
+		let refuse_at = |name: &'static str| {
+			move |folder: &Path| {
+				if folder.ends_with(name) {
+					Err(ProjectError::Settings(SettingsError::Roots("refused".into())))
+				} else {
+					Ok(())
+				}
+			}
+		};
+
+		let refused = create_folders(&dir.path().join("kept").join("a").join("b").join("c"), refuse_at("b"));
+
+		assert!(refused.is_err());
+		assert!(dir.path().join("kept").join("file.txt").is_file());
+		assert_eq!(fs::read_dir(dir.path().join("kept")).unwrap().count(), 1);
+
+		let made = create_folders(&dir.path().join("new").join("x"), refuse_at("nothing"));
+
+		assert!(made.is_ok());
+		assert!(dir.path().join("new").join("x").is_dir());
 	}
 }
