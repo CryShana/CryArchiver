@@ -32,6 +32,7 @@ pub struct ToolCommand {
 	pub stall_timeout: Duration,
 	pub counted: &'static [&'static str],
 	pub capture_limit: Option<usize>,
+	pub current_dir: Option<PathBuf>,
 }
 
 impl ToolCommand {
@@ -42,7 +43,13 @@ impl ToolCommand {
 			stall_timeout,
 			counted: &[],
 			capture_limit: None,
+			current_dir: None,
 		}
+	}
+
+	pub fn in_dir(&mut self, dir: &Path) -> &mut Self {
+		self.current_dir = Some(dir.to_path_buf());
+		self
 	}
 
 	pub fn arg(&mut self, arg: impl Into<OsString>) -> &mut Self {
@@ -191,6 +198,9 @@ fn spawn(cmd: &ToolCommand, mode: StdoutMode) -> io::Result<Box<dyn ChildWrapper
 			.stdin(Stdio::null())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped());
+		if let Some(dir) = &cmd.current_dir {
+			command.current_dir(dir);
+		}
 
 		#[cfg(target_os = "linux")]
 		die_with_parent(command, limits::current().low_priority);

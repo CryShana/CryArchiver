@@ -222,6 +222,34 @@ async fn counts_matching_stderr_lines_beyond_the_tail() {
 }
 
 #[tokio::test]
+async fn tools_run_in_their_working_directory() {
+	let dir = tempfile::tempdir().unwrap();
+	let mut cmd = tool(
+		"ffmpeg",
+		&[
+			"-hide_banner",
+			"-nostdin",
+			"-v",
+			"error",
+			"-f",
+			"lavfi",
+			"-i",
+			"sine=duration=0.1",
+			"tone.wav",
+		],
+		PATIENT,
+	);
+	cmd.in_dir(dir.path());
+
+	let out = run(&cmd, StdoutMode::Progress, |_| {}, &CancellationToken::new())
+		.await
+		.unwrap();
+
+	assert!(out.completed());
+	assert!(dir.path().join("tone.wav").is_file());
+}
+
+#[tokio::test]
 async fn counts_nothing_without_patterns() {
 	let cmd = tool(
 		"ffmpeg",
