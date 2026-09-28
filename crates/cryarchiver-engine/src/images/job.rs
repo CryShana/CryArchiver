@@ -101,6 +101,7 @@ struct Env<'a> {
 struct Slot {
 	index: usize,
 	best: Option<u64>,
+	table: Option<Candidate>,
 }
 
 #[derive(Debug)]
@@ -284,6 +285,7 @@ async fn encode_and_choose(
 		reference: eight_bit_reference(cx, &still).await?,
 	};
 	let mut choice = Choice::default();
+	let mut learned = Vec::new();
 
 	for (index, planned) in still.plan.candidates.iter().copied().enumerate() {
 		let key = candidate_key(input, &still, planned);
@@ -294,6 +296,7 @@ async fn encode_and_choose(
 		let slot = Slot {
 			index,
 			best: choice.best.as_ref().map(|(_, size)| *size),
+			table: candidate.finer_than(planned).then_some(planned),
 		};
 
 		match Box::pin(try_candidate(cx, input, workspace, &still, &env, candidate, slot)).await? {
@@ -305,17 +308,17 @@ async fn encode_and_choose(
 			} => {
 				choice.note(size);
 				choice.best = Some((path, size));
-				if let Some(key) = &key
+				if let Some(key) = key
 					&& let Some(setting) = candidate.needed_setting(score, still.plan.target, cx.speed)
 				{
-					cx.memory.record(
+					learned.push((
 						key,
 						Observation {
 							setting,
 							slope: None,
 							bpp: None,
 						},
-					);
+					));
 				}
 			}
 			Tried::Rejected { size, score } => {
@@ -332,7 +335,14 @@ async fn encode_and_choose(
 		}
 	}
 
-	finish_choice(cx, workspace, choice, still.plan.target, still.warnings)
+	let outcome = finish_choice(cx, workspace, choice, still.plan.target, still.warnings)?;
+
+	if matches!(outcome, ImageOutcome::Output { .. }) {
+		for (key, observation) in &learned {
+			cx.memory.record(key, *observation);
+		}
+	}
+	Ok(outcome)
 }
 
 async fn try_candidate(
@@ -346,6 +356,7 @@ async fn try_candidate(
 ) -> Result<Tried, JobError> {
 	let mut retries = 0;
 	let mut last_score = None;
+	let mut table = slot.table;
 
 	loop {
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
@@ -363,7 +374,16 @@ async fn try_candidate(
 		fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
 
 		let size = bytes.len() as u64;
-		if !saves_enough(cx.source_bytes, size, cx.min_savings) || slot.best.is_some_and(|best| best <= size) {
+		let too_large = !saves_enough(cx.source_bytes, size, cx.min_savings);
+		if too_large
+			&& last_score.is_none()
+			&& let Some(fallback) = table.take()
+		{
+			candidate = fallback;
+			continue;
+		}
+
+		if too_large || slot.best.is_some_and(|best| best <= size) {
 			return Ok(Tried::TooLarge {
 				size,
 				score: last_score,

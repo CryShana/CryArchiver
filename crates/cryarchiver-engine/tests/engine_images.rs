@@ -2,6 +2,7 @@ mod support;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -84,22 +85,18 @@ async fn the_next_photo_of_a_group_starts_from_the_learned_quality() {
 	let generous = Arc::new(SharedMemory::with_entries([(
 		PHOTO_GROUP_AT_FAST.to_owned(),
 		GroupStats {
-			setting: 96.0,
+			setting: 92.0,
 			slope: None,
 			bpp: None,
 			observations: 5,
 		},
 	)]));
-	let any_size = Job {
-		min_savings: 0.0,
-		..job(&photo)
-	};
 
 	let plain = encoded(
 		Engine::new(tools.clone())
 			.with_image_threads(4)
 			.run(
-				&any_size,
+				&job(&photo),
 				&sink(&dir.path().join("plain")),
 				&|_| {},
 				&CancellationToken::new(),
@@ -111,7 +108,7 @@ async fn the_next_photo_of_a_group_starts_from_the_learned_quality() {
 			.with_image_threads(4)
 			.with_quality_memory(generous)
 			.run(
-				&any_size,
+				&job(&photo),
 				&sink(&dir.path().join("learned")),
 				&|_| {},
 				&CancellationToken::new(),
@@ -121,8 +118,103 @@ async fn the_next_photo_of_a_group_starts_from_the_learned_quality() {
 
 	assert!(
 		std::fs::metadata(&learned).unwrap().len() > std::fs::metadata(&plain).unwrap().len(),
-		"quality 96 must produce a larger AVIF than FAST's 88"
+		"quality 92 must produce a larger AVIF than FAST's 88"
 	);
+}
+
+#[tokio::test]
+async fn a_group_that_learned_too_high_a_quality_falls_back_to_the_table_and_learns_lower() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
+	let memory = Arc::new(SharedMemory::with_entries([(
+		PHOTO_GROUP_AT_FAST.to_owned(),
+		GroupStats {
+			setting: 100.0,
+			slope: None,
+			bpp: None,
+			observations: 5,
+		},
+	)]));
+	let engine = Engine::new(support::toolchain().await)
+		.with_image_threads(4)
+		.with_quality_memory(memory.clone());
+
+	let outcome = engine
+		.run(&job(&photo), &sink(dir.path()), &|_| {}, &CancellationToken::new())
+		.await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	let entries = memory.entries();
+	assert_eq!(entries.len(), 1, "{entries:?}");
+	assert!(entries[0].1.setting < 100.0, "{entries:?}");
+	assert_eq!(entries[0].1.observations, 6, "{entries:?}");
+}
+
+const GRAPHIC_GROUP_AT_FAST: &str = "image/png/graphic/opaque/8bit/mp1|ravif-0.13|p9|t80.0";
+
+fn palette_png(dir: &Path, name: &str) -> PathBuf {
+	let path = dir.join(name);
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"gradients=s=320x240:c0=0x3060a0:c1=0xe0b070:nb_colors=2:x0=0:y0=0:x1=319:y1=239:speed=0,\
+		 noise=alls=3:allf=u:all_seed=1",
+		"-vf",
+		"trim=end_frame=1,split[a][b];[a]palettegen=max_colors=256[p];[b][p]paletteuse=dither=none,format=rgb24",
+		"-frames:v",
+		"1",
+		path.to_str().unwrap(),
+	]);
+	path
+}
+
+#[tokio::test]
+async fn a_job_cancelled_after_a_candidate_passed_learns_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let graphic = palette_png(dir.path(), "graphic.png");
+	let tools = support::toolchain().await;
+	let finished = Arc::new(SharedMemory::default());
+	let cancelled = Arc::new(SharedMemory::default());
+	let cancel = CancellationToken::new();
+	let encodes = AtomicUsize::new(0);
+	let cancel_the_second_encode = |event: JobEvent| {
+		if event == JobEvent::Stage(Stage::Encode) && encodes.fetch_add(1, Ordering::SeqCst) == 1 {
+			cancel.cancel();
+		}
+	};
+
+	let completed = Engine::new(tools.clone())
+		.with_image_threads(4)
+		.with_quality_memory(finished.clone())
+		.run(
+			&job(&graphic),
+			&sink(&dir.path().join("finished")),
+			&|_| {},
+			&CancellationToken::new(),
+		)
+		.await;
+	let stopped = Engine::new(tools)
+		.with_image_threads(4)
+		.with_quality_memory(cancelled.clone())
+		.run(
+			&job(&graphic),
+			&sink(&dir.path().join("cancelled")),
+			&cancel_the_second_encode,
+			&cancel,
+		)
+		.await;
+
+	assert!(matches!(completed, JobOutcome::Encoded { .. }), "{completed:?}");
+	assert_eq!(
+		finished.entries().first().map(|(key, _)| key.as_str()),
+		Some(GRAPHIC_GROUP_AT_FAST)
+	);
+	assert!(
+		matches!(&stopped, JobOutcome::Failed(err) if err.kind == ErrorKind::Cancelled),
+		"{stopped:?}"
+	);
+	assert!(cancelled.entries().is_empty(), "{:?}", cancelled.entries());
 }
 
 fn rotated_png(dir: &Path, name: &str) -> PathBuf {

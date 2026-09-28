@@ -157,6 +157,14 @@ impl Candidate {
 		self.with_setting(speed, needed).setting()
 	}
 
+	pub fn finer_than(self, other: Self) -> bool {
+		match (self, other) {
+			(Self::Ravif(this), Self::Ravif(other)) => this.quality > other.quality,
+			(Self::JxlLossy(this), Self::JxlLossy(other)) => this.distance < other.distance,
+			_ => false,
+		}
+	}
+
 	pub fn encoder_id(self) -> &'static str {
 		match self {
 			Self::Ravif(_) => "ravif-0.13",
@@ -552,6 +560,19 @@ mod tests {
 			None
 		);
 		assert_eq!((ravif.encoder_id(), ravif.preset()), ("ravif-0.13", 6));
+	}
+
+	#[test]
+	fn only_a_finer_setting_of_the_same_encoder_is_finer() {
+		let ravif = Candidate::Ravif(ravif_settings(Speed::Fast));
+		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Fast));
+
+		assert!(ravif.with_setting(Speed::Fast, 96.0).finer_than(ravif));
+		assert!(!ravif.with_setting(Speed::Fast, 84.0).finer_than(ravif));
+		assert!(!ravif.finer_than(ravif));
+		assert!(jxl.with_setting(Speed::Fast, 1.0).finer_than(jxl));
+		assert!(!jxl.with_setting(Speed::Fast, 2.0).finer_than(jxl));
+		assert!(!Candidate::JxlLossless(JXL_LOSSLESS).finer_than(jxl));
 	}
 
 	fn input<'a>(structure: &'a Structure, metadata: &'a SourceMetadata) -> PrecheckInput<'a> {
