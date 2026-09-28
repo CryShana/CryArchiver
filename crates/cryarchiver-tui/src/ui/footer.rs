@@ -8,7 +8,7 @@ use tui_input::Input;
 
 use super::log::toast_color;
 use super::widgets::{VERB_KEYS, bold, fg, put, to_u16};
-use crate::app::{Hit, HitMap, Overlay, Ui, ViewMode};
+use crate::app::{Hit, HitMap, Overlay, SETTINGS_ROWS, SettingsRow, Ui, ViewMode};
 use crate::format::{fit, width};
 use crate::theme::Theme;
 use crate::view::{ArchiveView, Duplicates, FileDetails, IssueVerbs, Notification, RunState};
@@ -135,13 +135,17 @@ fn chips(view: &ArchiveView, details: Option<&FileDetails>, ui: &Ui) -> Vec<Chip
 			chip("⏎", "choose", Some(KeyCode::Enter)),
 			chip("Esc", "close", Some(KeyCode::Esc)),
 		],
-		(Some(Overlay::Settings(_)), _) => vec![
-			chip("↑↓", "move", None),
-			chip("←→", "change", None),
-			chip("⏎", "toggle", Some(KeyCode::Enter)),
-			chip("r", "reset to preset", Some(KeyCode::Char('r'))),
-			chip("Esc", "close", Some(KeyCode::Esc)),
-		],
+		(Some(Overlay::Settings(selected)), _) => {
+			let on_quality_row = matches!(SETTINGS_ROWS.get(*selected), Some(SettingsRow::Quality(_)));
+			let enter = if on_quality_row { "edit" } else { "toggle" };
+			vec![
+				chip("↑↓", "move", None),
+				chip("←→", "change", None),
+				chip("⏎", enter, Some(KeyCode::Enter)),
+				chip("r", "reset to preset", Some(KeyCode::Char('r'))),
+				chip("Esc", "close", Some(KeyCode::Esc)),
+			]
+		}
 		(Some(Overlay::EditQuality { .. }), _) => vec![
 			chip("⏎", "apply", Some(KeyCode::Enter)),
 			chip("Esc", "cancel", Some(KeyCode::Esc)),

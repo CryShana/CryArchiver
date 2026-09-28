@@ -13,6 +13,7 @@ use crate::source::{Action, ArchiveSource, SettingsChange};
 use crate::view::{ArchiveView, Settings, Speed};
 
 pub const FAST_NEVER_MEASURES_VIDEO: &str = "FAST never measures video quality";
+const GRAIN_ALLOWANCE_NOTE: &str = "noisy sources: −2 / −2.5";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
@@ -207,6 +208,9 @@ fn quality_value(field: QualityField, settings: &Settings) -> String {
 		(None, Some(stored)) => format!("{stored} · not used: {FAST_NEVER_MEASURES_VIDEO}"),
 		(None, None) => FAST_NEVER_MEASURES_VIDEO.to_owned(),
 		(Some(_), Some(stored)) => format!("custom · {stored}"),
+		(Some(preset), None) if field == QualityField::Video => {
+			format!("preset · {} · {GRAIN_ALLOWANCE_NOTE}", field.shown(&preset))
+		}
 		(Some(preset), None) => format!("preset · {}", field.shown(&preset)),
 	}
 }
@@ -288,6 +292,7 @@ impl Ui {
 	fn reset_quality(&mut self, source: &dyn ArchiveSource, row: SettingsRow) {
 		let settings = &source.view().settings;
 		let SettingsRow::Quality(field) = row else { return };
+
 		if !field.applies(settings.speed.preset()) || field.text(&settings.overrides).is_none() {
 			return;
 		}

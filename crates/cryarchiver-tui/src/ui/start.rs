@@ -11,7 +11,7 @@ use super::footer::{Chip, chip, draw_chips, render_toast};
 use super::settings::delete_prompt;
 use super::widgets::{Chrome, bold, fg, modal, panel, put, to_u16, wrap};
 use super::{MIN_HEIGHT, MIN_WIDTH, small};
-use crate::app::{FAST_NEVER_MEASURES_VIDEO, HitMap, QUALITY_FIELDS, QualityField};
+use crate::app::{FAST_NEVER_MEASURES_VIDEO, HitMap};
 use crate::format::{bytes, fit, fit_middle, width};
 use crate::recent::{CAPACITY, now_unix_ms};
 use crate::start::form::{FormField, NewProjectForm, QualityCheck};
@@ -539,7 +539,7 @@ impl FormLayout<'_> {
 		let theme = self.theme;
 		let (text, style) = match check {
 			QualityCheck::Preset(preset) => (format!("{preset} · leave empty to keep it"), fg(theme.dim)),
-			QualityCheck::Custom => ("✓ custom".to_owned(), fg(theme.done)),
+			QualityCheck::Custom(stored) => (format!("✓ custom · stored as {stored}"), fg(theme.done)),
 			QualityCheck::NotUsed => (
 				format!("{FAST_NEVER_MEASURES_VIDEO}; a value here isn't stored"),
 				fg(theme.dim),
@@ -615,18 +615,7 @@ impl FormLayout<'_> {
 
 /// `custom: video VMAF 90/85, image 80, audio 160 kbps`, as the project will store them.
 fn custom_values(overrides: &Overrides) -> String {
-	let values: Vec<String> = QUALITY_FIELDS
-		.into_iter()
-		.filter_map(|field| {
-			let value = field.shown(&field.text(overrides)?);
-			Some(match field {
-				QualityField::Video => format!("video VMAF {value}"),
-				QualityField::Image => format!("image {value}"),
-				QualityField::Audio => format!("audio {value}"),
-			})
-		})
-		.collect();
-	format!("custom: {}", values.join(", "))
+	format!("custom: {}", overrides.describe().join(", "))
 }
 
 /// The value, scrolled so the cursor stays in view while focused; the cursor is the reversed cell.

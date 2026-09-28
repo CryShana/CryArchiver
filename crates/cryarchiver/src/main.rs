@@ -242,22 +242,10 @@ fn quality_label(speed: Speed, overrides: &Overrides) -> Option<String> {
 		Speed::Moderate => "MODERATE",
 		Speed::Fast => "FAST",
 	};
-	let unused_video = overrides
-		.normalized()
-		.video
-		.filter(|_| effective.video.is_none())
-		.map(|video| format!("video VMAF {}/{} not used at FAST", video.mean, video.floor));
-	let values: Vec<String> = [
-		effective
-			.video
-			.map(|video| format!("video VMAF {}/{}", video.mean, video.floor)),
-		effective.image.map(|image| format!("image {image}")),
-		effective.audio_stereo_kbps.map(|kbps| format!("audio {kbps} kbps")),
-		unused_video,
-	]
-	.into_iter()
-	.flatten()
-	.collect();
+	let mut values = effective.describe();
+	if let Some(video) = overrides.normalized().video.filter(|_| effective.video.is_none()) {
+		values.push(format!("video VMAF {}/{} not used at FAST", video.mean, video.floor));
+	}
 
 	Some(format!("{preset} · custom: {}", values.join(", ")))
 }

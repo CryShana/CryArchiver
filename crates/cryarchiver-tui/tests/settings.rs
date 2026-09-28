@@ -6,8 +6,9 @@ use cryarchiver_engine::preset::{Overrides, VmafOverride};
 use cryarchiver_tui::view::{Limit, Speed};
 use cryarchiver_tui::{App, ArchiveSource, MockSource, OverlayKind, ViewMode};
 use ratatui::crossterm::event::{Event, KeyCode};
+use ratatui::style::Modifier;
 
-use support::{app, draw, find_on_row, find_row, press, row_text, type_text};
+use support::{app, click, draw, find_on_row, find_row, press, row_text, type_text};
 
 const SPEED: usize = 0;
 const VIDEO: usize = 1;
@@ -55,7 +56,11 @@ fn quality_rows_show_the_preset_dimmed_until_edited() {
 	let terminal = draw(&mut app, 120, 36);
 	let row = find_row(&terminal, "Image SSIMULACRA2").unwrap();
 	assert!(row_text(&terminal, row).contains("preset · 85"));
-	let preset_color = terminal.backend().buffer()[(find_on_row(&terminal, row, "preset").unwrap(), row)].fg;
+	let preset_cell = &terminal.backend().buffer()[(find_on_row(&terminal, row, "preset").unwrap(), row)];
+	assert!(
+		!preset_cell.modifier.contains(Modifier::BOLD),
+		"the preset value is drawn dim, not bold"
+	);
 
 	press(&mut app, KeyCode::Esc);
 	enter_quality(&mut app, IMAGE, "80");
@@ -67,8 +72,12 @@ fn quality_rows_show_the_preset_dimmed_until_edited() {
 	let text = row_text(&terminal, row);
 	assert!(text.contains("custom · 80"), "{text}");
 	assert!(!text.contains("preset"), "{text}");
-	let custom_color = terminal.backend().buffer()[(find_on_row(&terminal, row, "custom").unwrap(), row)].fg;
-	assert_ne!(preset_color, custom_color);
+	let custom_cell = &terminal.backend().buffer()[(find_on_row(&terminal, row, "custom").unwrap(), row)];
+	assert_ne!(preset_cell.fg, custom_cell.fg);
+	assert!(
+		custom_cell.modifier.contains(Modifier::BOLD),
+		"a custom value is drawn bold, unlike the dimmed preset"
+	);
 	assert!(shown_row(&mut app, "Video VMAF").contains("preset · 93/89"));
 }
 
@@ -137,6 +146,48 @@ fn reset_returns_one_row_or_every_row_to_the_preset() {
 	press(&mut app, KeyCode::Enter);
 	assert_eq!(overrides(&app), Overrides::default());
 	assert!(shown_row(&mut app, "Reset quality").contains("nothing to reset"));
+}
+
+#[test]
+fn the_editor_draws_the_cursor_at_its_real_position_not_always_the_end() {
+	let mut app = app();
+	open_row(&mut app, AUDIO);
+	press(&mut app, KeyCode::Enter);
+	assert_eq!(app.overlay(), Some(OverlayKind::EditQuality));
+	type_text(&mut app, "160");
+	press(&mut app, KeyCode::Left);
+	press(&mut app, KeyCode::Left);
+
+	let terminal = draw(&mut app, 120, 36);
+	let row = find_row(&terminal, "Audio stereo").unwrap();
+	let text = row_text(&terminal, row);
+	assert!(text.contains("160"), "{text}");
+
+	let cursor_x = find_on_row(&terminal, row, "6").unwrap();
+	let cell = &terminal.backend().buffer()[(cursor_x, row)];
+	assert_eq!(cell.symbol(), "6");
+	assert!(
+		cell.modifier.contains(Modifier::REVERSED),
+		"the cursor sits mid-text, not at the end"
+	);
+}
+
+#[test]
+fn clicking_the_reset_chip_resets_the_row_without_closing_settings() {
+	let mut app = app();
+	enter_quality(&mut app, IMAGE, "80");
+	assert_eq!(overrides(&app).image, Some(80.0));
+
+	let terminal = draw(&mut app, 120, 36);
+	let chip = find_on_row(&terminal, 35, " r ").unwrap();
+	click(&mut app, chip + 1, 35, Instant::now());
+
+	assert_eq!(
+		app.overlay(),
+		Some(OverlayKind::Settings),
+		"the chip must not close settings"
+	);
+	assert_eq!(overrides(&app).image, None);
 }
 
 #[test]

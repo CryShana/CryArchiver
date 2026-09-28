@@ -64,7 +64,8 @@ impl FormField {
 pub enum QualityCheck {
 	/// Left empty, so the project uses the preset's value, shown as `preset 93/89`.
 	Preset(String),
-	Custom,
+	/// The value the project will store, normalized: `80` for a field typed as `80.04`.
+	Custom(String),
 	/// FAST never measures video quality, so the value isn't stored.
 	NotUsed,
 	Invalid(String),
@@ -77,7 +78,7 @@ pub struct NewProjectForm {
 	name_edited: bool,
 	speed: Speed,
 	/// In the order of [`QUALITY_FIELDS`].
-	quality: [Input; 3],
+	quality: [Input; QUALITY_FIELDS.len()],
 	custom_quality_open: bool,
 	/// The typed confirmation that turned deleting originals on.
 	delete_confirmation: Option<String>,
@@ -218,10 +219,16 @@ impl NewProjectForm {
 		let Some(preset) = quality.preset_text(speed) else {
 			return Some(QualityCheck::NotUsed);
 		};
+
 		Some(match quality.with(Overrides::default(), typed) {
 			Err(reason) => QualityCheck::Invalid(reason),
 			Ok(overrides) if overrides.is_empty() => QualityCheck::Preset(format!("preset {}", quality.shown(&preset))),
-			Ok(_) => QualityCheck::Custom,
+			Ok(overrides) => {
+				let stored = quality
+					.text(&overrides.normalized())
+					.map_or_else(String::new, |text| quality.shown(&text));
+				QualityCheck::Custom(stored)
+			}
 		})
 	}
 
@@ -343,10 +350,11 @@ impl Default for NewProjectForm {
 }
 
 fn quality_index(field: QualityField) -> usize {
-	QUALITY_FIELDS
-		.iter()
-		.position(|&candidate| candidate == field)
-		.unwrap_or(0)
+	match field {
+		QualityField::Video => 0,
+		QualityField::Image => 1,
+		QualityField::Audio => 2,
+	}
 }
 
 #[cfg(test)]
@@ -595,6 +603,20 @@ mod tests {
 	}
 
 	#[test]
+	fn the_quality_check_shows_the_value_that_will_be_stored_not_the_typed_one() {
+		let setup = setup();
+		let mut form = filled(&setup);
+		form.toggle_custom_quality();
+
+		replace(&mut form, FormField::ImageTarget, "80.04");
+		assert_eq!(
+			form.quality_check(FormField::ImageTarget),
+			Some(QualityCheck::Custom("80".to_owned())),
+			"the project stores the normalized value, not 80.04"
+		);
+	}
+
+	#[test]
 	fn quality_fields_are_checked_as_they_are_typed() {
 		let setup = setup();
 		let mut form = filled(&setup);
@@ -609,7 +631,10 @@ mod tests {
 		assert!(!setup.dir.path().join("archive").exists());
 
 		replace(&mut form, FormField::ImageTarget, "80");
-		assert_eq!(form.quality_check(FormField::ImageTarget), Some(QualityCheck::Custom));
+		assert_eq!(
+			form.quality_check(FormField::ImageTarget),
+			Some(QualityCheck::Custom("80".to_owned()))
+		);
 		typed(&mut form, FormField::VideoVmaf, "93");
 		assert!(
 			matches!(form.quality_check(FormField::VideoVmaf), Some(QualityCheck::Invalid(reason)) if reason.contains("MEAN/FLOOR"))

@@ -560,6 +560,10 @@ fn custom_quality_is_collapsed_until_opened_and_shows_what_the_project_gets() {
 	press(&mut menu, KeyCode::Backspace);
 	paste(&mut menu, "80.04");
 	assert!(shows(&mut menu, "custom"));
+	assert!(
+		shows(&mut menu, "✓ custom · stored as 80"),
+		"the open field shows the value that will be stored, not 80.04"
+	);
 
 	press(&mut menu, KeyCode::BackTab);
 	press(&mut menu, KeyCode::BackTab);

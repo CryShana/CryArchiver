@@ -112,6 +112,7 @@ impl Ui {
 						self.overlay = Some(Overlay::Settings(index));
 						Outcome::Done
 					}
+					Some(Hit::Footer(code)) => self.on_key(source, KeyEvent::new(code, KeyModifiers::NONE), false),
 					Some(Hit::Modal) => Outcome::Ignored,
 					_ => {
 						self.overlay = None;

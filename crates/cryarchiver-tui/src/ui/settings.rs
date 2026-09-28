@@ -1,6 +1,6 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use tui_input::Input;
 
 use super::widgets::{bold, fg, modal, put, to_u16};
@@ -40,15 +40,7 @@ pub fn render(
 		put(buf, inner.x + 2, y, row.label(), label_style, inner.x + LABEL);
 
 		if let (SettingsRow::Quality(field), Some(input)) = (row, editing.filter(|_| hot)) {
-			let typed = format!("{}█", input.value());
-			let end = put(
-				buf,
-				inner.x + LABEL,
-				y,
-				&fit(&typed, cells),
-				bold(theme.bright),
-				inner.right(),
-			);
+			let end = draw_editor(buf, inner.x + LABEL, y, input, bold(theme.bright), inner.right());
 			if let Some(preset) = field.preset_text(settings.speed.preset()) {
 				let hint = format!("preset {}", field.shown(&preset));
 				put(buf, end + 2, y, &hint, fg(theme.dim), inner.right());
@@ -85,6 +77,26 @@ pub fn render(
 		style,
 		inner.right(),
 	);
+}
+
+/// Draws the input's value with the cursor at `tui_input`'s real position: a reversed cell mid-text, or a block
+/// cursor past the end. Returns where the value ended.
+fn draw_editor(buf: &mut Buffer, x: u16, y: u16, input: &Input, style: Style, right: u16) -> u16 {
+	let chars: Vec<char> = input.value().chars().collect();
+	let cursor = input.cursor().min(chars.len());
+
+	let before: String = chars[..cursor].iter().collect();
+	let after: String = chars.get(cursor + 1..).unwrap_or_default().iter().collect();
+	let under = chars.get(cursor).map_or_else(|| "█".to_owned(), char::to_string);
+	let cursor_style = if cursor < chars.len() {
+		style.add_modifier(Modifier::REVERSED)
+	} else {
+		style
+	};
+
+	let end = put(buf, x, y, &before, style, right);
+	let end = put(buf, end, y, &under, cursor_style, right);
+	put(buf, end, y, &after, style, right)
 }
 
 /// While a quality value is typed, the reason it can't be applied, as it is typed.

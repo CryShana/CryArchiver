@@ -77,6 +77,20 @@ impl Overrides {
 		effective
 	}
 
+	/// One entry per field that is set: `video VMAF 90/85`, `image 80`, `audio 160 kbps`.
+	#[must_use]
+	pub fn describe(&self) -> Vec<String> {
+		[
+			self.video
+				.map(|video| format!("video VMAF {}/{}", video.mean, video.floor)),
+			self.image.map(|image| format!("image {image}")),
+			self.audio_stereo_kbps.map(|kbps| format!("audio {kbps} kbps")),
+		]
+		.into_iter()
+		.flatten()
+		.collect()
+	}
+
 	pub fn validate(&self) -> Result<(), String> {
 		if let Some(video) = self.video {
 			if !VIDEO_MEAN_RANGE.contains(&video.mean) {
@@ -249,6 +263,25 @@ mod tests {
 		assert!(video(90.0, 85.0).effective(Speed::Fast).is_empty());
 		assert!(!video(90.0, 85.0).effective(Speed::Moderate).is_empty());
 		assert!(image(f64::NAN).effective(Speed::Moderate).is_empty());
+	}
+
+	#[test]
+	fn describing_lists_only_the_fields_that_are_set() {
+		assert_eq!(Overrides::default().describe(), Vec::<String>::new());
+		assert_eq!(video(90.0, 85.0).describe(), vec!["video VMAF 90/85".to_owned()]);
+		assert_eq!(
+			Overrides {
+				image: Some(80.0),
+				audio_stereo_kbps: Some(160),
+				..video(90.0, 85.0)
+			}
+			.describe(),
+			vec![
+				"video VMAF 90/85".to_owned(),
+				"image 80".to_owned(),
+				"audio 160 kbps".to_owned(),
+			]
+		);
 	}
 
 	#[test]
