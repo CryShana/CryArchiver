@@ -178,6 +178,17 @@ async fn a_transparent_gif_keeps_its_alpha_track() {
 	assert!(score >= 80.0, "{score}");
 }
 
+#[tokio::test]
+async fn a_transparent_apng_keeps_its_alpha_track() {
+	let dir = tempfile::tempdir().unwrap();
+	let apng = animation_file(dir.path(), "t.apng", TRANSPARENT_SOURCE, &["-plays", "3", "-f", "apng"]);
+
+	let (animation, score) = encode_and_verify(dir.path(), &apng).await;
+
+	assert!(animation.alpha);
+	assert!(score >= 80.0, "{score}");
+}
+
 #[test]
 fn a_gif_without_a_loop_extension_plays_once() {
 	let dir = tempfile::tempdir().unwrap();

@@ -46,19 +46,16 @@ impl MockSource {
 		let entries = [
 			(
 				FileState::Done,
-				"02. 試験曲.mp3 → Opus 1.71 MB (−53 %) · cover + tags kept",
+				"02. 夜明け.mp3 → Opus 1.71 MB (−53 %) · cover + tags kept",
 			),
 			(
 				FileState::Waiting,
 				"GOPR0107.MP4 waits for GOPR0042.MP4 to finish (same size group)",
 			),
-			(
-				FileState::KeptOriginal,
-				"action-clip.webm kept · predicted saving 3 %",
-			),
+			(FileState::KeptOriginal, "short-film.webm kept · predicted saving 3 %"),
 			(
 				FileState::Warning,
-				"garbage_64k_in_middle.mp4: 212 decoder errors concealed · output kept",
+				"glitched-recording.mp4: 212 decoder errors concealed · output kept",
 			),
 			(
 				FileState::QualitySearch,
@@ -66,11 +63,11 @@ impl MockSource {
 			),
 			(
 				FileState::SourceDamaged,
-				"truncated_half.jpg source damaged (no EOI) · waiting for your decision",
+				"half-copied.jpg source damaged (no EOI) · waiting for your decision",
 			),
 			(
 				FileState::Done,
-				"DSC_0001.JPG → AVIF 2.10 MB (−83 %) · SSIMULACRA2 86.4",
+				"beach_0142.jpg → AVIF 2.10 MB (−83 %) · SSIMULACRA2 86.4",
 			),
 		];
 

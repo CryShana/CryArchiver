@@ -54,7 +54,7 @@ fn collapsing_the_selected_parent_of_the_top_row_keeps_the_viewport_at_it() {
 	mouse(&mut app, MouseEventKind::ScrollDown, 40, 20, Instant::now());
 	let before = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
 	assert!(
-		before.contains(".JPG") || before.contains(".MOV"),
+		before.contains(".jpg") || before.contains(".mov"),
 		"a Bled file is at the top: {before}"
 	);
 
@@ -83,7 +83,7 @@ fn released_rows_anchor_on_their_folder_not_on_a_distant_selection() {
 	mouse(&mut app, MouseEventKind::ScrollDown, 40, 20, Instant::now());
 	let before = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
 	assert!(
-		before.contains(".JPG") || before.contains(".MOV"),
+		before.contains(".jpg") || before.contains(".mov"),
 		"a Bled file is at the top: {before}"
 	);
 
@@ -163,10 +163,10 @@ fn a_paste_into_search_keeps_its_newline_out() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('/'));
 
-	app.handle_batch(&keys_at(Instant::now(), "over\nlord", Duration::from_millis(1)));
+	app.handle_batch(&keys_at(Instant::now(), "battle\n-theme", Duration::from_millis(1)));
 
 	assert!(app.searching(), "a pasted newline doesn't close the search");
-	assert_eq!(app.filter(), "fanfares");
+	assert_eq!(app.filter(), "battle-theme");
 }
 
 #[test]
@@ -220,15 +220,15 @@ fn the_toast_moves_to_the_footer_while_the_log_is_hidden() {
 fn clearing_the_filter_keeps_the_selected_file() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('/'));
-	type_text(&mut app, "テスト");
+	type_text(&mut app, "さくら");
 	press(&mut app, KeyCode::Enter);
 	press(&mut app, KeyCode::End);
-	assert_eq!(app.selected_name().as_deref(), Some("01.テスト.mp3"));
+	assert_eq!(app.selected_name().as_deref(), Some("01.さくら.mp3"));
 
 	press(&mut app, KeyCode::Esc);
 
 	assert_eq!(app.filter(), "");
-	assert_eq!(app.selected_name().as_deref(), Some("01.テスト.mp3"));
+	assert_eq!(app.selected_name().as_deref(), Some("01.さくら.mp3"));
 	assert!(find_row(&draw(&mut app, 120, 36), "✓ 01.").is_some());
 }
 
@@ -236,7 +236,7 @@ fn clearing_the_filter_keeps_the_selected_file() {
 fn enter_on_a_folder_does_nothing_while_filtered() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('/'));
-	type_text(&mut app, "fanfares");
+	type_text(&mut app, "battle-theme");
 	press(&mut app, KeyCode::Enter);
 	press(&mut app, KeyCode::Home);
 	let rows = app.visible_rows();
@@ -254,14 +254,14 @@ fn statuses_update_in_place_without_a_new_rows_version() {
 		library.ids().find(|&id| library.node(id).name == "Bled").unwrap()
 	};
 	source.perform(Action::Expanded(bled, true));
-	source.perform(Action::SetFilter("IMG_0001".to_owned()));
+	source.perform(Action::SetFilter("birthday clip".to_owned()));
 	let version = source.rows_version();
 	let progress = |source: &MockSource| {
 		source
 			.files(bled)
 			.unwrap()
 			.iter()
-			.find(|row| row.name == "IMG_0001 2.MOV")
+			.find(|row| row.name == "birthday clip 2.mov")
 			.unwrap()
 			.status
 			.progress

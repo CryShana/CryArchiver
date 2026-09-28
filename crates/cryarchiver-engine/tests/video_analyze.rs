@@ -81,37 +81,39 @@ async fn detects_telecine_and_progressive() {
 }
 
 #[tokio::test]
-#[ignore = "needs the local sample corpus (set CRY_CORPUS, default C:\\media-corpus)"]
-async fn corpus_scan_types() {
-	let corpus = std::env::var_os("CRY_CORPUS").map_or_else(|| PathBuf::from(r"C:\media-corpus"), PathBuf::from);
-	let valid = corpus.join("generated-valid");
+async fn interlaced_h264_high_frame_rates_and_very_short_clips_are_detected() {
+	let dir = tempfile::tempdir().unwrap();
+	let h264 = encode(
+		dir.path(),
+		"tff_480i.mkv",
+		"testsrc2=s=720x480:r=60000/1001:d=4,interlace=scan=tff,setfield=tff",
+		&[
+			"-c:v",
+			"libx264",
+			"-crf",
+			"18",
+			"-flags",
+			"+ilme+ildct",
+			"-x264opts",
+			"tff=1",
+		],
+	);
+	let high_rate = encode(
+		dir.path(),
+		"hfr.mp4",
+		"testsrc2=s=320x240:r=120:d=3",
+		&["-c:v", "mpeg4", "-q:v", "2"],
+	);
+	let very_short = encode(
+		dir.path(),
+		"short.mp4",
+		"testsrc2=s=320x240:r=25:d=0.4",
+		&["-c:v", "mpeg4", "-q:v", "2"],
+	);
 
-	assert_eq!(
-		scan_and_noise(&valid.join("interlaced_tff_480i_h264.mkv")).await.0,
-		ScanType::Interlaced { top_first: true }
-	);
-	assert_eq!(
-		scan_and_noise(&valid.join("interlaced_bff_576i_mpeg2.mpg")).await.0,
-		ScanType::Interlaced { top_first: false }
-	);
-	assert_eq!(
-		scan_and_noise(&valid.join("telecined_480i_mpeg2.mpg")).await.0,
-		ScanType::Telecined
-	);
-	assert_eq!(
-		scan_and_noise(&valid.join("hfr_120fps.mp4")).await.0,
-		ScanType::Progressive
-	);
-	assert_eq!(
-		scan_and_noise(&valid.join("very_short_0.4s.mp4")).await.0,
-		ScanType::Progressive
-	);
-	assert_eq!(
-		scan_and_noise(&corpus.join("concert-MPEG2_1080-interlaced_sample.mkv"))
-			.await
-			.0,
-		ScanType::Interlaced { top_first: true }
-	);
+	assert_eq!(scan_and_noise(&h264).await.0, ScanType::Interlaced { top_first: true });
+	assert_eq!(scan_and_noise(&high_rate).await.0, ScanType::Progressive);
+	assert_eq!(scan_and_noise(&very_short).await.0, ScanType::Progressive);
 }
 
 #[tokio::test]

@@ -1,5 +1,7 @@
+mod support;
+
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::integrity::find_damage;
 
@@ -148,28 +150,109 @@ fn other_containers_are_not_checked() {
 	assert!(find_damage(&dir.path().join("missing.mp4")).is_err());
 }
 
-#[test]
-#[ignore = "needs the local sample corpus (set CRY_CORPUS, default C:\\media-corpus)"]
-fn corpus_structures() {
-	let corpus =
-		std::env::var_os("CRY_CORPUS").map_or_else(|| Path::new(r"C:\media-corpus").to_path_buf(), Into::into);
+fn truncated(path: &Path, tenths: usize) -> PathBuf {
+	let bytes = fs::read(path).unwrap();
+	let cut = path.with_extension(format!("cut.{}", path.extension().unwrap().to_str().unwrap()));
+	fs::write(&cut, &bytes[..bytes.len() * tenths / 10]).unwrap();
+	cut
+}
 
-	for healthy in [
-		"generated-valid/rotation_90.mp4",
-		"generated-valid/subs_mov_text_chapters.mp4",
-		"generated-valid/mov_timecode_tmcd.mov",
-		"generated-valid/chapters_unicode.mkv",
-		"transparent_video.webm",
-		"short-film.mp4",
-	] {
-		assert_eq!(find_damage(&corpus.join(healthy)).unwrap(), None, "{healthy}");
+#[test]
+fn ffmpeg_made_videos_pass_and_their_truncations_are_damage() {
+	let dir = tempfile::tempdir().unwrap();
+	let subs = write(dir.path(), "subs.srt", b"1\n00:00:00,000 --> 00:00:01,000\nHello\n");
+	let chapters = write(
+		dir.path(),
+		"chapters.txt",
+		";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle=Začetek\n\
+		 [CHAPTER]\nTIMEBASE=1/1000\nSTART=1000\nEND=2000\ntitle=終わり\n"
+			.as_bytes(),
+	);
+	let (subs, chapters) = (subs.to_str().unwrap(), chapters.to_str().unwrap());
+	let with_subs_and_chapters = [
+		"-i",
+		subs,
+		"-f",
+		"ffmetadata",
+		"-i",
+		chapters,
+		"-map",
+		"0:v",
+		"-map",
+		"1:a",
+		"-map",
+		"2:s",
+		"-map_chapters",
+		"3",
+	];
+	let mpeg4_aac = ["-c:v", "mpeg4", "-c:a", "aac"];
+
+	let faststart = support::video(
+		dir.path(),
+		"faststart.mp4",
+		2,
+		&[
+			with_subs_and_chapters.as_slice(),
+			&mpeg4_aac,
+			&["-c:s", "mov_text", "-movflags", "+faststart"],
+		]
+		.concat(),
+	);
+	let moov_at_end = support::video(
+		dir.path(),
+		"moov-at-end.mp4",
+		2,
+		&[["-map", "0:v", "-map", "1:a"].as_slice(), &mpeg4_aac].concat(),
+	);
+	let timecode = support::video(
+		dir.path(),
+		"timecode.mov",
+		2,
+		&[
+			["-map", "0:v", "-map", "1:a", "-timecode", "01:00:00:00"].as_slice(),
+			&mpeg4_aac,
+		]
+		.concat(),
+	);
+	let matroska = support::video(
+		dir.path(),
+		"chapters.mkv",
+		2,
+		&[
+			with_subs_and_chapters.as_slice(),
+			&["-c:v", "mpeg4", "-c:a", "flac", "-c:s", "srt"],
+		]
+		.concat(),
+	);
+	let webm = support::video(
+		dir.path(),
+		"clip.webm",
+		2,
+		&[
+			"-map",
+			"0:v",
+			"-map",
+			"1:a",
+			"-c:v",
+			"libvpx-vp9",
+			"-deadline",
+			"realtime",
+			"-cpu-used",
+			"8",
+			"-c:a",
+			"libopus",
+		],
+	);
+
+	for healthy in [&faststart, &moov_at_end, &timecode, &matroska, &webm] {
+		assert_eq!(find_damage(healthy).unwrap(), None, "{}", healthy.display());
 	}
 	for damaged in [
-		"generated-corrupted/truncated_50pct_faststart.mp4",
-		"generated-corrupted/truncated_30pct_moov-at-end.mp4",
-		"generated-corrupted/truncated_60pct.mkv",
-		"generated-corrupted/truncated_50pct_alpha.webm",
+		truncated(&faststart, 5),
+		truncated(&moov_at_end, 3),
+		truncated(&matroska, 6),
+		truncated(&webm, 5),
 	] {
-		assert!(find_damage(&corpus.join(damaged)).unwrap().is_some(), "{damaged}");
+		assert!(find_damage(&damaged).unwrap().is_some(), "{}", damaged.display());
 	}
 }

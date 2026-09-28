@@ -673,7 +673,6 @@ dependencies = [
  "globset",
  "image",
  "indicatif",
- "lofty",
  "serde_json",
  "tempfile",
  "tokio",

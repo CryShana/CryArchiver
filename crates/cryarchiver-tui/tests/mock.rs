@@ -97,12 +97,12 @@ fn folders_roll_up_their_whole_subtree() {
 #[test]
 fn filter_returns_matches_with_their_ancestors() {
 	let mut source = MockSource::new(3);
-	source.perform(Action::SetFilter("テスト".to_owned()));
+	source.perform(Action::SetFilter("さくら".to_owned()));
 	let result = source.filter().unwrap();
 
 	assert_eq!(result.matching_files, 1);
 	assert_eq!(result.rows.len(), 4);
-	assert!(matches!(&result.rows[3].entry, FilterEntry::File { row, .. } if row.name == "01.テスト.mp3"));
+	assert!(matches!(&result.rows[3].entry, FilterEntry::File { row, .. } if row.name == "01.さくら.mp3"));
 
 	source.perform(Action::SetFilter(String::new()));
 	assert!(source.filter().is_none());

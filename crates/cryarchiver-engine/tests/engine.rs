@@ -14,6 +14,9 @@ use cryarchiver_engine::probe::{Stream, probe};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
+use lofty::config::ParseOptions;
+use lofty::file::AudioFile;
+use lofty::ogg::{OggPictureStorage, OpusFile};
 use tokio_util::sync::CancellationToken;
 
 fn job(source: &Path) -> Job {
@@ -262,6 +265,107 @@ async fn efficient_and_unsupported_audio_keep_the_original() {
 			reason: KeepReason::Unsupported(_)
 		}
 	));
+}
+
+#[tokio::test]
+async fn hi_res_hexagonal_and_junk_prefixed_audio_is_encoded() {
+	let dir = tempfile::tempdir().unwrap();
+	let hi_res = support::tone(
+		dir.path(),
+		"hi-res.flac",
+		"stereo",
+		2,
+		3,
+		&[
+			"-ar",
+			"96000",
+			"-c:a",
+			"flac",
+			"-sample_fmt",
+			"s32",
+			"-bits_per_raw_sample",
+			"24",
+		],
+	);
+	// FLAC itself can't flag a hexagonal layout and ffmpeg says so at error level; Matroska still carries it.
+	let hexagonal = support::tone(
+		dir.path(),
+		"hexagonal.mka",
+		"hexagonal",
+		6,
+		3,
+		&["-loglevel", "fatal", "-c:a", "flac"],
+	);
+	let mp3 = support::tone(
+		dir.path(),
+		"song.mp3",
+		"stereo",
+		2,
+		3,
+		&["-c:a", "libmp3lame", "-b:a", "320k"],
+	);
+	let junk: Vec<u8> = (0..4096u32).map(|i| u8::try_from(i * 7919 % 251).unwrap()).collect();
+	let prefixed = dir.path().join("prefixed.mp3");
+	fs::write(&prefixed, [junk, fs::read(&mp3).unwrap()].concat()).unwrap();
+
+	for source in [&hi_res, &hexagonal, &prefixed] {
+		let outcome = run(&job(source), dir.path()).await;
+		assert!(
+			matches!(&outcome, JobOutcome::Encoded { output, .. } if output.extension().unwrap() == "opus"),
+			"{}: {outcome:?}",
+			source.display()
+		);
+	}
+}
+
+#[tokio::test]
+async fn covers_of_mp3_and_alac_sources_are_carried_into_the_opus() {
+	let dir = tempfile::tempdir().unwrap();
+	let mp3 = support::mp3_with_cover(dir.path(), "song.mp3", "Title");
+	let cover = dir.path().join("cover.png");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=red:s=64x64",
+		"-frames:v",
+		"1",
+		"-update",
+		"1",
+		cover.to_str().unwrap(),
+	]);
+	let alac = dir.path().join("lossless.m4a");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"anoisesrc=d=3:c=pink:a=0.3",
+		"-i",
+		cover.to_str().unwrap(),
+		"-map",
+		"0:a",
+		"-map",
+		"1:v",
+		"-ac",
+		"2",
+		"-c:a",
+		"alac",
+		"-c:v",
+		"copy",
+		"-disposition:v",
+		"attached_pic",
+		alac.to_str().unwrap(),
+	]);
+
+	for source in [&mp3, &alac] {
+		let outcome = run(&job(source), dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{}: {outcome:?}", source.display())
+		};
+		let opus = OpusFile::read_from(&mut File::open(&output).unwrap(), ParseOptions::new()).unwrap();
+		assert_eq!(opus.vorbis_comments().pictures().len(), 1, "{}", source.display());
+	}
 }
 
 #[tokio::test]
@@ -635,6 +739,391 @@ async fn truncated_mp4_fails_before_encoding() {
 	);
 	assert!(!stages.lock().unwrap().contains(&JobEvent::Stage(Stage::Encode)));
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+async fn encoded_info(outcome: JobOutcome) -> cryarchiver_engine::probe::MediaInfo {
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap()
+}
+
+#[tokio::test]
+async fn a_rotated_hlg_phone_clip_is_encoded_upright_and_stays_hlg() {
+	let dir = tempfile::tempdir().unwrap();
+	let upright = support::video(
+		dir.path(),
+		"upright.mp4",
+		2,
+		&[
+			"-map",
+			"0:v",
+			"-map",
+			"1:a",
+			"-vf",
+			"setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+			"-c:v",
+			"libx265",
+			"-pix_fmt",
+			"yuv420p10le",
+			"-crf",
+			"4",
+			"-x265-params",
+			"colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:log-level=error",
+			"-c:a",
+			"aac",
+		],
+	);
+	let rotated = dir.path().join("phone clip.mov");
+	support::ffmpeg(&[
+		"-display_rotation:v:0",
+		"90",
+		"-i",
+		upright.to_str().unwrap(),
+		"-c",
+		"copy",
+		rotated.to_str().unwrap(),
+	]);
+
+	let info = encoded_info(run(&fast_keeping_any_saving(&rotated), dir.path()).await).await;
+
+	let video = &info.streams[0];
+	assert_eq!((video.width, video.height), (Some(240), Some(320)), "{video:?}");
+	assert_eq!(video.color_transfer.as_deref(), Some("arib-std-b67"));
+	assert!(video.side_data("Display Matrix").is_none(), "{video:?}");
+}
+
+#[tokio::test]
+async fn full_range_and_bt2020_sdr_colour_is_kept() {
+	let dir = tempfile::tempdir().unwrap();
+	let full_range = support::video(
+		dir.path(),
+		"full-range.mp4",
+		2,
+		&[
+			"-map",
+			"0:v",
+			"-map",
+			"1:a",
+			"-vf",
+			"scale=out_range=pc,format=yuv420p",
+			"-color_range",
+			"pc",
+			"-c:v",
+			"libx264",
+			"-crf",
+			"12",
+			"-c:a",
+			"aac",
+		],
+	);
+	let wide_gamut = support::video(
+		dir.path(),
+		"bt2020.mkv",
+		2,
+		&[
+			"-map",
+			"0:v",
+			"-map",
+			"1:a",
+			"-vf",
+			"setparams=color_primaries=bt2020:color_trc=bt2020-10:colorspace=bt2020nc",
+			"-c:v",
+			"libx265",
+			"-pix_fmt",
+			"yuv420p10le",
+			"-crf",
+			"8",
+			"-x265-params",
+			"colorprim=bt2020:transfer=bt2020-10:colormatrix=bt2020nc:log-level=error",
+			"-c:a",
+			"flac",
+		],
+	);
+
+	let full = encoded_info(run(&fast_keeping_any_saving(&full_range), dir.path()).await).await;
+	let wide = encoded_info(run(&fast_keeping_any_saving(&wide_gamut), dir.path()).await).await;
+
+	assert_eq!(
+		full.streams[0].color_range.as_deref(),
+		Some("pc"),
+		"{:?}",
+		full.streams[0]
+	);
+	assert_eq!(
+		wide.streams[0].color_transfer.as_deref(),
+		Some("bt2020-10"),
+		"{:?}",
+		wide.streams[0]
+	);
+}
+
+#[tokio::test]
+async fn mp4_subtitles_chapters_cover_and_timecode_are_carried_over() {
+	let dir = tempfile::tempdir().unwrap();
+	let subs = dir.path().join("subs.srt");
+	fs::write(&subs, "1\n00:00:00,000 --> 00:00:01,000\nHello\n").unwrap();
+	let chapters = dir.path().join("chapters.txt");
+	fs::write(
+		&chapters,
+		";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle=One\n\
+		 [CHAPTER]\nTIMEBASE=1/1000\nSTART=1000\nEND=2000\ntitle=Two\n\
+		 [CHAPTER]\nTIMEBASE=1/1000\nSTART=2000\nEND=3000\ntitle=Three\n",
+	)
+	.unwrap();
+	let cover = dir.path().join("cover.jpg");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=64x64",
+		"-frames:v",
+		"1",
+		cover.to_str().unwrap(),
+	]);
+	let clip = support::video(
+		dir.path(),
+		"everything.mp4",
+		3,
+		&[
+			"-i",
+			subs.to_str().unwrap(),
+			"-f",
+			"ffmetadata",
+			"-i",
+			chapters.to_str().unwrap(),
+			"-i",
+			cover.to_str().unwrap(),
+			"-map",
+			"0:v",
+			"-map",
+			"1:a",
+			"-map",
+			"2:s",
+			"-map",
+			"4:v",
+			"-map_chapters",
+			"3",
+			"-c:v:0",
+			"mpeg4",
+			"-q:v",
+			"2",
+			"-c:v:1",
+			"copy",
+			"-disposition:v:1",
+			"attached_pic",
+			"-c:a",
+			"aac",
+			"-c:s",
+			"mov_text",
+			"-timecode",
+			"00:00:10:00",
+			"-write_tmcd",
+			"1",
+		],
+	);
+
+	let info = encoded_info(run(&fast_keeping_any_saving(&clip), dir.path()).await).await;
+
+	let codecs: Vec<&str> = info.streams.iter().map(|stream| stream.codec_name.as_str()).collect();
+	assert!(codecs.contains(&"subrip"), "{codecs:?}");
+	assert!(!codecs.contains(&"bin_data"), "{codecs:?}");
+	assert_eq!(info.chapters.len(), 3);
+	assert!(
+		info.streams
+			.iter()
+			.any(|stream| stream.tag("filename") == Some("cover.jpg")),
+		"{info:?}"
+	);
+}
+
+#[tokio::test]
+async fn silent_variable_rate_and_misnamed_videos_are_encoded() {
+	let dir = tempfile::tempdir().unwrap();
+	let silent = dir.path().join("silent.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=2",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		silent.to_str().unwrap(),
+	]);
+	let variable = dir.path().join("variable.mkv");
+	support::ffmpeg(&[
+		"-filter_complex",
+		"testsrc2=s=320x240:r=25:d=1[a];testsrc2=s=320x240:r=50:d=1[b];[a][b]concat=n=2:v=1",
+		"-fps_mode",
+		"passthrough",
+		"-c:v",
+		"libx264",
+		"-crf",
+		"12",
+		variable.to_str().unwrap(),
+	]);
+	let misnamed = dir.path().join("actually-video.mp3");
+	fs::rename(support::mpeg4(dir.path(), "clip.mp4", 2), &misnamed).unwrap();
+
+	for source in [&silent, &variable, &misnamed] {
+		let outcome = run(&fast_keeping_any_saving(source), dir.path()).await;
+		assert!(
+			matches!(&outcome, JobOutcome::Encoded { output, .. } if output.extension().unwrap() == "mkv"),
+			"{}: {outcome:?}",
+			source.display()
+		);
+	}
+}
+
+#[tokio::test]
+async fn truncated_matroska_and_webm_fail_before_encoding() {
+	let dir = tempfile::tempdir().unwrap();
+	let matroska = support::video(
+		dir.path(),
+		"cut.mkv",
+		4,
+		&["-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-c:a", "flac"],
+	);
+	let webm = support::video(
+		dir.path(),
+		"cut.webm",
+		4,
+		&[
+			"-map",
+			"0:v",
+			"-map",
+			"1:a",
+			"-c:v",
+			"libvpx-vp9",
+			"-deadline",
+			"realtime",
+			"-cpu-used",
+			"8",
+			"-c:a",
+			"libopus",
+		],
+	);
+
+	for (source, tenths) in [(&matroska, 6), (&webm, 5)] {
+		let bytes = fs::read(source).unwrap();
+		fs::write(source, &bytes[..bytes.len() * tenths / 10]).unwrap();
+
+		let outcome = run(&fast(source), dir.path()).await;
+
+		assert!(
+			matches!(&outcome, JobOutcome::Failed(err) if matches!(err.kind, ErrorKind::SourceDamaged(_))),
+			"{}: {outcome:?}",
+			source.display()
+		);
+	}
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn garbage_in_the_middle_of_an_mp4_is_carried_over_with_a_warning() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "glitched.mp4", 6);
+	let mut bytes = fs::read(&clip).unwrap();
+	let middle = bytes.len() / 2;
+	bytes[middle..middle + 16 * 1024].fill(0x55);
+	fs::write(&clip, bytes).unwrap();
+
+	let outcome = run(&fast_keeping_any_saving(&clip), dir.path()).await;
+
+	let JobOutcome::Encoded { warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings.iter().any(|warning| warning.contains("decoding errors")),
+		"{warnings:?}"
+	);
+}
+
+#[tokio::test]
+async fn interlaced_ntsc_with_surround_keeps_double_rate_and_5_1() {
+	let dir = tempfile::tempdir().unwrap();
+	let interlaced = dir.path().join("ntsc.mpg");
+	let surround = (0..6)
+		.map(|i| format!("0.3*sin(2*PI*{}*t)", 220 + i * 110))
+		.collect::<Vec<_>>()
+		.join("|");
+	let surround = format!("aevalsrc={surround}:c=5.1(side):s=48000:d=3");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=720x480:r=60000/1001:d=3,interlace=scan=tff,setfield=tff",
+		"-f",
+		"lavfi",
+		"-i",
+		surround.as_str(),
+		"-c:v",
+		"mpeg2video",
+		"-b:v",
+		"12M",
+		"-flags",
+		"+ilme+ildct",
+		"-c:a",
+		"ac3",
+		"-b:a",
+		"448k",
+		interlaced.to_str().unwrap(),
+	]);
+
+	let info = encoded_info(run(&fast(&interlaced), dir.path()).await).await;
+
+	assert!(
+		(info.streams[0].fps().unwrap() - 60_000.0 / 1001.0).abs() < 0.01,
+		"{:?}",
+		info.streams[0]
+	);
+	assert_eq!(
+		info.streams[1].channel_layout.as_deref(),
+		Some("5.1"),
+		"{:?}",
+		info.streams[1]
+	);
+}
+
+#[tokio::test]
+async fn an_efficient_transparent_webm_is_kept() {
+	let dir = tempfile::tempdir().unwrap();
+	let webm = dir.path().join("transparent.webm");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=2,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(lt(X,160),255,0)'",
+		"-c:v",
+		"libvpx-vp9",
+		"-pix_fmt",
+		"yuva420p",
+		"-crf",
+		"63",
+		"-b:v",
+		"0",
+		"-deadline",
+		"realtime",
+		"-cpu-used",
+		"8",
+		webm.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast(&webm), dir.path()).await;
+
+	assert!(
+		matches!(
+			&outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::AlreadyEfficient(reason)
+			} if reason.contains("VP9")
+		),
+		"{outcome:?}"
+	);
 }
 
 #[tokio::test]

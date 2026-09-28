@@ -277,31 +277,112 @@ fn header_dimensions_come_without_decoding() {
 	assert_eq!(header_dimensions(b"unknown", Some((0, 0))), None);
 }
 
+fn saved(dir: &Path, name: &str, image: impl Into<image::DynamicImage>) -> PathBuf {
+	let path = dir.join(name);
+	image.into().save(&path).unwrap();
+	path
+}
+
+fn ffmpeg_still(dir: &Path, name: &str, codec_args: &[&str]) -> PathBuf {
+	let path = dir.join(name);
+	let mut args = vec!["-f", "lavfi", "-i", "testsrc2=s=64x48", "-frames:v", "1"];
+	args.extend_from_slice(codec_args);
+	args.push(path.to_str().unwrap());
+	support::ffmpeg(&args);
+	path
+}
+
 #[tokio::test]
-#[ignore = "needs the local sample corpus (set CRY_CORPUS, default C:\\media-corpus)"]
-async fn corpus_images_decode_with_the_expected_properties() {
-	let corpus = std::env::var_os("CRY_CORPUS").map_or_else(|| PathBuf::from(r"C:\media-corpus"), PathBuf::from);
+async fn generated_images_decode_with_their_effective_properties() {
+	let dir = tempfile::tempdir().unwrap();
+	let deep = |x: u32, y: u32| {
+		image::Rgb([
+			u16::try_from(x * 1021 + y * 7).unwrap(),
+			u16::try_from(y * 1297).unwrap(),
+			12_345,
+		])
+	};
+	let padded = |x: u32, y: u32| {
+		image::Rgb([
+			u16::try_from(x * 4).unwrap() * 257,
+			u16::try_from(y * 5).unwrap() * 257,
+			0,
+		])
+	};
 	let cases = [
 		(
-			"generated-valid/jpeg_exif_orientation6_gps.jpg",
-			(800, 1200),
+			support::jpeg_with_exif(dir.path(), "o6.jpg", 64, 48, 6),
+			(48, 64),
 			false,
 			false,
 		),
-		("generated-valid/tiff_16bit_rgb.tif", (800, 600), false, false),
-		("generated-valid/png16_real_gradient.png", (512, 256), true, false),
-		("generated-valid/png_alpha_all-opaque.png", (800, 600), false, false),
-		("generated-valid/png_alpha_real.png", (800, 600), false, true),
-		("generated-valid/jpeg2000.jp2", (800, 600), false, false),
-		("generated-valid/avif_existing_aom.avif", (800, 600), false, false),
-		("generated-valid/jxl_lossless_existing.jxl", (800, 600), false, false),
-		("screenshot_with_ICC.avif", (1637, 954), false, false),
+		(
+			saved(dir.path(), "deep.png", image::ImageBuffer::from_fn(64, 48, deep)),
+			(64, 48),
+			true,
+			false,
+		),
+		(
+			saved(dir.path(), "padded.png", image::ImageBuffer::from_fn(64, 48, padded)),
+			(64, 48),
+			false,
+			false,
+		),
+		(
+			saved(dir.path(), "deep.tif", image::ImageBuffer::from_fn(64, 48, deep)),
+			(64, 48),
+			true,
+			false,
+		),
+		(
+			saved(
+				dir.path(),
+				"opaque.png",
+				image::ImageBuffer::from_fn(64, 48, |x, _| image::Rgba([u8::try_from(x).unwrap(), 90, 30, 255])),
+			),
+			(64, 48),
+			false,
+			false,
+		),
+		(
+			saved(
+				dir.path(),
+				"alpha.png",
+				image::ImageBuffer::from_fn(64, 48, |x, _| {
+					image::Rgba([200u8, 90, 30, if x < 32 { 255 } else { 0 }])
+				}),
+			),
+			(64, 48),
+			false,
+			true,
+		),
+		(
+			ffmpeg_still(dir.path(), "still.jp2", &["-c:v", "jpeg2000"]),
+			(64, 48),
+			false,
+			false,
+		),
+		(
+			ffmpeg_still(
+				dir.path(),
+				"aom.avif",
+				&["-c:v", "libaom-av1", "-still-picture", "1", "-cpu-used", "8"],
+			),
+			(64, 48),
+			false,
+			false,
+		),
 	];
 
-	for (name, dimensions, high_depth, alpha) in cases {
-		let decoded = decoded(&corpus.join(name)).await.unwrap();
+	for (path, dimensions, high_depth, alpha) in cases {
+		let decoded = decoded(&path).await.unwrap();
 		let properties = effective(&decoded.image);
-		assert_eq!(decoded.image.dimensions(), dimensions, "{name}");
-		assert_eq!((properties.high_depth, properties.alpha), (high_depth, alpha), "{name}");
+		assert_eq!(decoded.image.dimensions(), dimensions, "{}", path.display());
+		assert_eq!(
+			(properties.high_depth, properties.alpha),
+			(high_depth, alpha),
+			"{}",
+			path.display()
+		);
 	}
 }

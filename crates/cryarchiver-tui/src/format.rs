@@ -203,8 +203,8 @@ mod tests {
 
 	#[test]
 	fn case_insensitive_find_returns_the_original_byte_range() {
-		assert_eq!(find_ignore_case("IMG_0001 2.MOV", "mov"), Some(11..14));
-		assert_eq!(find_ignore_case("01.テスト.mp3", "テスト"), Some(3..12));
+		assert_eq!(find_ignore_case("birthday clip 2.MOV", "mov"), Some(16..19));
+		assert_eq!(find_ignore_case("01.さくら.mp3", "さくら"), Some(3..12));
 		assert_eq!(find_ignore_case("abc", "abcd"), None);
 		assert_eq!(find_ignore_case("abc", ""), None);
 	}

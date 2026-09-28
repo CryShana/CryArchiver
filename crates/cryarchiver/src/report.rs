@@ -201,9 +201,9 @@ mod tests {
 
 	#[test]
 	fn describes_each_outcome_on_one_line() {
-		let source = Path::new("music/02. 試験曲.flac");
+		let source = Path::new("music/02. 夜明け.flac");
 		let encoded = JobOutcome::Encoded {
-			output: PathBuf::from("music/02. 試験曲.cry.opus"),
+			output: PathBuf::from("music/02. 夜明け.cry.opus"),
 			src_bytes: 20_000_000,
 			out_bytes: 2_000_000,
 			warnings: Vec::new(),
@@ -223,14 +223,14 @@ mod tests {
 
 		assert_eq!(
 			outcome_line(source, &encoded),
-			"✓ 02. 試験曲.flac → 02. 試験曲.cry.opus  20.00 MB → 2.00 MB (−90 %)"
+			"✓ 02. 夜明け.flac → 02. 夜明け.cry.opus  20.00 MB → 2.00 MB (−90 %)"
 		);
-		assert_eq!(outcome_line(source, &kept), "= 02. 試験曲.flac  kept: already Opus");
+		assert_eq!(outcome_line(source, &kept), "= 02. 夜明け.flac  kept: already Opus");
 		assert_eq!(
 			outcome_line(source, &predicted),
-			"= 02. 試験曲.flac  kept: encoding would save too little (5.80 MB → predicted 7.10 MB)"
+			"= 02. 夜明け.flac  kept: encoding would save too little (5.80 MB → predicted 7.10 MB)"
 		);
-		assert!(outcome_line(source, &failed).starts_with("✗ 02. 試験曲.flac  failed: source damaged"));
+		assert!(outcome_line(source, &failed).starts_with("✗ 02. 夜明け.flac  failed: source damaged"));
 	}
 
 	#[test]

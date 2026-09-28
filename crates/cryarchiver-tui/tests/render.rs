@@ -92,7 +92,7 @@ fn help_at_120x36() {
 fn search_at_120x36() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('/'));
-	type_text(&mut app, "fanfares");
+	type_text(&mut app, "battle-theme");
 
 	assert_snapshot!(draw(&mut app, 120, 36).backend());
 }
@@ -187,7 +187,7 @@ fn loading_rows_show_until_the_source_answers() {
 	let terminal = draw(&mut app, 120, 36);
 	assert!(find_row(&terminal, "loading…").is_none());
 	assert!(
-		find_row(&terminal, "● IMG_0001 2.MOV").is_some(),
+		find_row(&terminal, "● birthday clip 2.mov").is_some(),
 		"the pending selection lands once rows load"
 	);
 }
@@ -247,7 +247,7 @@ fn unicode_width(symbol: &str) -> usize {
 fn selected_row_uses_the_selection_background() {
 	let terminal = draw(&mut app(), 120, 36);
 	let buffer = terminal.backend().buffer();
-	let row = find_row(&terminal, "● IMG_0001 2.MOV").expect("the first worker's file is selected");
+	let row = find_row(&terminal, "● birthday clip 2.mov").expect("the first worker's file is selected");
 
 	assert_eq!(buffer[(5, row)].bg, Color::Rgb(0x1B, 0x2B, 0x3B));
 	assert_eq!(
@@ -261,7 +261,7 @@ fn selected_row_uses_the_selection_background() {
 fn state_glyphs_carry_their_colour() {
 	let terminal = draw(&mut app(), 160, 45);
 	let buffer = terminal.backend().buffer();
-	let row = find_row(&terminal, "● IMG_0001 2.MOV").unwrap();
+	let row = find_row(&terminal, "● birthday clip 2.mov").unwrap();
 	let glyph_x = (0..buffer.area.width)
 		.find(|&x| buffer[(x, row)].symbol() == "●")
 		.unwrap();

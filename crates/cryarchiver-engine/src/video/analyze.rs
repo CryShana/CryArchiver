@@ -426,12 +426,12 @@ mod tests {
 	}
 
 	#[test]
-	fn classifies_the_corpus_samples() {
+	fn classifies_measured_field_statistics() {
 		let ntsc = Some(30_000.0 / 1001.0);
 		let tff_480i = [stats([90, 0, 0], [90, 0])];
 		let bff_576i = [stats([75, 0, 0], [0, 75])];
 		let telecined = [stats([54, 18, 18], [72, 0])];
-		let concertos = [stats([81, 5, 4], [81, 1]), stats([85, 3, 2], [84, 2])];
+		let broadcast_1080i = [stats([81, 5, 4], [81, 1]), stats([85, 3, 2], [84, 2])];
 		let testsrc = [stats([91, 0, 0], [0, 0])];
 		let hfr = [stats([240, 0, 0], [24, 0])];
 
@@ -445,7 +445,7 @@ mod tests {
 		);
 		assert_eq!(classify(&telecined, ntsc, None).scan, ScanType::Telecined);
 		assert_eq!(
-			classify(&concertos, ntsc, None).scan,
+			classify(&broadcast_1080i, ntsc, None).scan,
 			ScanType::Interlaced { top_first: true }
 		);
 		assert_eq!(classify(&testsrc, Some(30.0), None).scan, ScanType::Progressive);

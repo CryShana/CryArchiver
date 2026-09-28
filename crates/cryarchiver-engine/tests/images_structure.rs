@@ -111,39 +111,55 @@ fn an_image_sequence_without_a_movie_box_is_damaged() {
 }
 
 #[test]
-#[ignore = "needs the local sample corpus (set CRY_CORPUS, default C:\\media-corpus)"]
-fn corpus_structures() {
-	let corpus =
-		std::env::var_os("CRY_CORPUS").map_or_else(|| Path::new(r"C:\media-corpus").to_path_buf(), Into::into);
-	let read = |name: &str| std::fs::read(corpus.join(name)).unwrap();
+fn damaged_metadata_scrambled_pixels_and_odd_shapes_are_not_structural_damage() {
+	let dir = tempfile::tempdir().unwrap();
+	let jpeg = generated(dir.path(), "a.jpg", &["-frames:v", "1"]);
+	let apng = generated(dir.path(), "a.apng", &["-plays", "3", "-f", "apng"]);
+	let tall = dir.path().join("tall.jpg");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=64x17000",
+		"-frames:v",
+		"1",
+		tall.to_str().unwrap(),
+	]);
+	let tall = std::fs::read(tall).unwrap();
 
-	for healthy in [
-		"DSC_0001.JPG",
-		"large-map.jpg",
-		"comic-veryTallImage.jpg",
-		"company-logo.png",
-		"animatedImage.gif",
-		"screenshot_with_ICC.avif",
-		"generated-valid/apng_alpha_anim.apng",
-		"generated-valid/gif_loop3_variable-delays.gif",
-		"generated-valid/avif_existing_aom.avif",
-		"generated-corrupted/exif_broken_ifd0-offset.jpg",
-		"generated-corrupted/bitflips_entropy-data.jpg",
-		"generated-corrupted/icc_broken_profile-size.jpg",
-		"generated-corrupted/png_bomb_header-100000x100000.png",
+	let mut scrambled = jpeg.clone();
+	let middle = scrambled.len() / 2;
+	scrambled[middle..middle + 64].fill(0x55);
+	let mut broken_ifd = support::exif_block(1, 64, 48);
+	broken_ifd[4..8].copy_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+	let broken_exif = support::with_jpeg_segment(&jpeg, 0xE1, &[b"Exif\0\0".as_slice(), &broken_ifd].concat());
+	let mut icc = b"ICC_PROFILE\0\x01\x01".to_vec();
+	icc.extend_from_slice(&u32::MAX.to_be_bytes());
+	icc.extend_from_slice(&[0; 124]);
+	let broken_icc = support::with_jpeg_segment(&jpeg, 0xE2, &icc);
+	let header = [
+		100_000u32.to_be_bytes().as_slice(),
+		&100_000u32.to_be_bytes(),
+		&[8, 2, 0, 0, 0],
+	]
+	.concat();
+	let bomb = [
+		b"\x89PNG\r\n\x1a\n".as_slice(),
+		&support::png_chunk(*b"IHDR", &header),
+		&support::png_chunk(*b"IDAT", &[0; 8]),
+		&support::png_chunk(*b"IEND", &[]),
+	]
+	.concat();
+
+	for (name, bytes) in [
+		("apng", &apng),
+		("tall", &tall),
+		("scrambled", &scrambled),
+		("broken exif", &broken_exif),
+		("broken icc", &broken_icc),
+		("bomb", &bomb),
 	] {
-		assert_eq!(check(&read(healthy)).damage, None, "{healthy}");
+		assert_eq!(check(bytes).damage, None, "{name}");
 	}
-	for damaged in [
-		"generated-corrupted/truncated_half.jpg",
-		"generated-corrupted/truncated_70pct.png",
-		"generated-corrupted/truncated_50pct_anim.gif",
-		"generated-corrupted/truncated_60pct.avif",
-	] {
-		assert!(check(&read(damaged)).damage.is_some(), "{damaged}");
-	}
-	assert_eq!(
-		check(&read("generated-corrupted/bad_crc_only_data-intact.png")).warnings,
-		["CRC mismatch in the IDAT chunk"]
-	);
+	assert!(check(&apng[..apng.len() * 7 / 10]).damage.is_some());
 }

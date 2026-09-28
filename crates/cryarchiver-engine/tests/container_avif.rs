@@ -220,18 +220,25 @@ fn check_names_what_does_not_match() {
 }
 
 #[test]
-#[ignore = "needs the local sample corpus (set CRY_CORPUS, default C:\\media-corpus)"]
-fn matches_the_libavif_reference_file() {
-	let corpus = std::env::var_os("CRY_CORPUS").map_or_else(|| PathBuf::from(r"C:\media-corpus"), PathBuf::from);
-	let reference = std::fs::read(corpus.join("screenshot_with_ICC.avif")).unwrap();
-	let reference_meta = parse_meta(&reference).unwrap();
-	let icc = reference_meta.primary_icc().unwrap().to_vec();
-
-	let rewrapped = rewrite(
-		&reference,
+fn rewrapping_a_profiled_avif_with_its_own_profile_keeps_its_colour_boxes() {
+	let dir = tempfile::tempdir().unwrap();
+	let icc = ColorProfile::new_display_p3().encode().unwrap();
+	let profiled = rewrite(
+		&libaom_still(dir.path(), false),
 		Cicp::UNSPECIFIED,
 		&AvifMetadata {
 			icc: Some(&icc),
+			..AvifMetadata::default()
+		},
+	)
+	.unwrap();
+	let embedded = parse_meta(&profiled).unwrap().primary_icc().unwrap().to_vec();
+
+	let rewrapped = rewrite(
+		&profiled,
+		Cicp::UNSPECIFIED,
+		&AvifMetadata {
+			icc: Some(&embedded),
 			..AvifMetadata::default()
 		},
 	)
@@ -244,5 +251,10 @@ fn matches_the_libavif_reference_file() {
 			.cloned()
 			.collect::<Vec<_>>()
 	};
-	assert_eq!(colour_boxes(&rewrapped), colour_boxes(&reference));
+	assert_eq!(embedded, icc);
+	assert_eq!(colour_boxes(&rewrapped), colour_boxes(&profiled));
+	assert!(ffmpeg_decodes(
+		&written(dir.path(), "rewrapped.avif", &rewrapped),
+		false
+	));
 }

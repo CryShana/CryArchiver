@@ -260,25 +260,25 @@ impl Builder {
 	}
 
 	fn bled(&mut self, bled: NodeId) {
-		let done = self.file(bled, "DSC_0001.JPG", MediaKind::Photo, FileState::Done, 12_300_000);
+		let done = self.file(bled, "beach_0142.jpg", MediaKind::Photo, FileState::Done, 12_300_000);
 		self.show(
 			done,
-			"JPEG 6000×4000 · Nikon D7100 · EXIF + GPS",
+			"JPEG 6000×4000 · EXIF + GPS",
 			&[("Plan", "AVIF 10-bit 4:4:4 · ravif speed 5")],
 		);
 		self.quality(done, "SSIMULACRA2 86.4 (target 85)");
 
 		let photo = Phase::Encode { fraction: 0.64 };
-		let encoding = self.active(bled, "DSC_0002.JPG", MediaKind::Photo, 11_900_000, photo);
+		let encoding = self.active(bled, "beach_0143.jpg", MediaKind::Photo, 11_900_000, photo);
 		self.show(
 			encoding,
-			"JPEG 6000×4000 · Nikon D7100 · MPF preview dropped",
+			"JPEG 6000×4000 · MPF preview dropped",
 			&[("Plan", "AVIF 10-bit 4:4:4 · ravif speed 5")],
 		);
 
 		let movie = self.active(
 			bled,
-			"IMG_0001 2.MOV",
+			"birthday clip 2.mov",
 			MediaKind::Video,
 			56_800_000,
 			Phase::Encode { fraction: 0.38 },
@@ -296,7 +296,7 @@ impl Builder {
 
 		let tall = self.file(
 			bled,
-			"comic-veryTallImage.jpg",
+			"comic-strip-tall.jpg",
 			MediaKind::TallPhoto,
 			FileState::Done,
 			34_900_000,
@@ -308,7 +308,13 @@ impl Builder {
 		);
 		self.quality(tall, "SSIMULACRA2 87.1");
 
-		let big = self.file(bled, "large-map.jpg", MediaKind::Photo, FileState::Queued, 14_500_000);
+		let big = self.file(
+			bled,
+			"city-map-large.jpg",
+			MediaKind::Photo,
+			FileState::Queued,
+			14_500_000,
+		);
 		self.show(
 			big,
 			"JPEG 10800×5400 · 58 MP",
@@ -317,17 +323,17 @@ impl Builder {
 
 		let kept = self.file(
 			bled,
-			"screenshot_with_ICC.avif",
+			"screenshot-profiled.avif",
 			MediaKind::Photo,
 			FileState::KeptOriginal,
 			890_000,
 		);
-		self.show(kept, "AVIF 1637×954 · ICC AW3423DWF", &[]);
+		self.show(kept, "AVIF 1920×1080 · display ICC profile", &[]);
 		self.note(kept, "saving 4 % is below the 10 % minimum");
 
 		let damaged = self.file(
 			bled,
-			"truncated_half.jpg",
+			"half-copied.jpg",
 			MediaKind::Photo,
 			FileState::SourceDamaged,
 			1_260_000,
@@ -352,7 +358,7 @@ impl Builder {
 				count: 24,
 				done: 0.5,
 				kind: MediaKind::Photo,
-				name: |i| format!("DSC_{:04}.JPG", 4690 + i),
+				name: |i| format!("beach_{:04}.jpg", 144 + i),
 			},
 		);
 	}
@@ -362,9 +368,9 @@ impl Builder {
 		let concerts = self.library.add_folder(videos, "Concerts");
 		let compressed = self.library.add_folder(videos, "already-compressed");
 
-		let holiday = self.library.add_folder(gopro, "2018 Holiday");
+		let mountains = self.library.add_folder(gopro, "2018 Mountains");
 		let raw = self.library.add_folder(gopro, "Raw");
-		self.holiday(holiday);
+		self.mountains(mountains);
 		self.generate(
 			raw,
 			&Generated {
@@ -390,10 +396,10 @@ impl Builder {
 		});
 	}
 
-	fn holiday(&mut self, holiday: NodeId) {
-		let name = "2018 - Holiday - GoPro clip.mkv";
+	fn mountains(&mut self, mountains: NodeId) {
+		let name = "2018 - mountain trail - GoPro.mkv";
 		let encoding = self.active(
-			holiday,
+			mountains,
 			name,
 			MediaKind::Video,
 			1_810_000_000,
@@ -410,7 +416,7 @@ impl Builder {
 		);
 
 		let queued = self.file(
-			holiday,
+			mountains,
 			"GOPR0042.MP4",
 			MediaKind::Video,
 			FileState::Queued,
@@ -423,7 +429,7 @@ impl Builder {
 		);
 
 		self.generate(
-			holiday,
+			mountains,
 			&Generated {
 				count: 5,
 				done: 1.0,
@@ -434,7 +440,7 @@ impl Builder {
 	}
 
 	fn concerts(&mut self, concerts: NodeId) {
-		let name = "concert-MPEG2_1080-interlaced_sample.mkv";
+		let name = "concert_1080i.mkv";
 		let searching = self.active(
 			concerts,
 			name,
@@ -497,7 +503,7 @@ impl Builder {
 	}
 
 	fn already_compressed(&mut self, compressed: NodeId) {
-		let name = "action-clip.webm";
+		let name = "short-film.webm";
 		let kept = self.file(compressed, name, MediaKind::Video, FileState::KeptOriginal, 502_000_000);
 		self.show(kept, "AV1 1920×960 24 fps · 4.4 Mbps", &[]);
 		self.note(kept, "already efficient: predicted saving 3 %");
@@ -510,7 +516,7 @@ impl Builder {
 	}
 
 	fn concealed_errors(&mut self, videos: NodeId) {
-		let name = "garbage_64k_in_middle.mp4";
+		let name = "glitched-recording.mp4";
 		let warned = self.file(videos, name, MediaKind::Video, FileState::Warning, 18_400_000);
 		self.files.status_mut(warned).bytes_out = Some(6_100_000);
 		self.show(
@@ -526,21 +532,21 @@ impl Builder {
 		let ost = self.library.add_folder(music, "Anime OST");
 		let live = self.library.add_folder(music, "Live");
 
-		let first = self.file(ost, "01.テスト.mp3", MediaKind::Audio, FileState::Done, 1_470_000);
+		let first = self.file(ost, "01.さくら.mp3", MediaKind::Audio, FileState::Done, 1_470_000);
 		self.show(
 			first,
 			"MP3 342 kbps · cover 492×704",
 			&[("Plan", "Opus 128k · cover + ID3 tags kept")],
 		);
 
-		let second = self.file(ost, "02. 試験曲.mp3", MediaKind::Audio, FileState::Done, 3_670_000);
+		let second = self.file(ost, "02. 夜明け.mp3", MediaKind::Audio, FileState::Done, 3_670_000);
 		self.show(
 			second,
 			"MP3 384 kbps · cover 849×1200",
 			&[("Plan", "Opus 128k · cover + ID3 tags kept")],
 		);
 
-		let name = "battle-music.mp3";
+		let name = "battle-theme-11.mp3";
 		let duplicate = self.file(ost, name, MediaKind::Audio, FileState::Duplicate, 1_150_000);
 		self.generate(
 			ost,
@@ -561,7 +567,7 @@ impl Builder {
 			},
 		);
 
-		let copy = "battle-music (copy).mp3";
+		let copy = "battle-theme-11 (copy).mp3";
 		let second = self.file(ost, copy, MediaKind::Audio, FileState::Duplicate, 1_150_000);
 
 		let canonical = self.file(music, name, MediaKind::Audio, FileState::Done, 1_150_000);
@@ -575,7 +581,7 @@ impl Builder {
 
 		let done = self.file(
 			game,
-			"game-screenshot.png",
+			"game-preview.png",
 			MediaKind::Screenshot,
 			FileState::Done,
 			4_500_000,
@@ -588,7 +594,7 @@ impl Builder {
 		self.quality(done, "SSIMULACRA2 88.0");
 
 		let verify = Phase::Verify { fraction: 0.9 };
-		let name = "photomode_01012020_120000.png";
+		let name = "photo-mode-001.png";
 		let verifying = self.active(game, name, MediaKind::Screenshot, 4_500_000, verify);
 		self.show(verifying, "PNG 2560×1440 RGBA", &[("Plan", "AVIF 10-bit with alpha")]);
 
@@ -598,13 +604,7 @@ impl Builder {
 				count: 38,
 				done: 0.6,
 				kind: MediaKind::Screenshot,
-				name: |i| {
-					format!(
-						"photomode_{:02}122020_{:06}.png",
-						1 + i % 28,
-						100_000 + i * 7919 % 800_000
-					)
-				},
+				name: |i| format!("photo-mode-{:03}.png", 2 + i),
 			},
 		);
 		self.generate(

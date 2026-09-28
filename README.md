@@ -104,7 +104,7 @@ cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashbo
 
 **Deleting originals** is off by default. It can only be turned on in the dashboard's settings (`s`), by typing `DELETE`. An original is then deleted permanently, with no Recycle Bin, once its archived copy has been read back from disk and matches its BLAKE3. A headless run of such a project also needs `--delete-originals`, or it refuses to start. When the dashboard opens such a project, it archives as usual but deletes nothing until you type `DELETE` again in its settings, once per session.
 
-An original is kept, not deleted, when its archived copy is a link, has a second name (a hard link, for example into a backup tree), or is a reparse point such as a OneDrive cloud placeholder.
+An original is kept, not deleted, when its archived copy is the original itself or a hard link to it, is a link, has a second name (a hard link, for example into a backup tree), or is a reparse point such as a OneDrive cloud placeholder.
 
 On Linux, the check that an original is still open in another program is best effort: it isn't available on network or FUSE file systems (NFS, CIFS/SMB, FUSE), or for files you don't own. Close programs that write to the source before deleting originals.
 

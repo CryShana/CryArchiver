@@ -284,6 +284,34 @@ async fn sixteen_bit_images_become_jxl() {
 }
 
 #[tokio::test]
+async fn a_sixteen_bit_png_holding_eight_bit_data_becomes_avif() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = image::open(support::photo_png(dir.path(), "photo.png", 320, 240))
+		.unwrap()
+		.to_rgb8();
+	let source = dir.path().join("padded.png");
+	image::ImageBuffer::from_fn(320, 240, |x, y| {
+		image::Rgb(photo.get_pixel(x, y).0.map(|sample| u16::from(sample) * 257))
+	})
+	.save(&source)
+	.unwrap();
+
+	let output = encoded(run(&job(&source), dir.path()).await);
+
+	assert_eq!(output, dir.path().join("padded.cry.avif"));
+}
+
+#[tokio::test]
+async fn an_image_too_tall_for_avif_becomes_jxl() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = support::smooth_png(dir.path(), "tall.png", 256, 16_500);
+
+	let output = encoded(run(&job(&source), dir.path()).await);
+
+	assert_eq!(output, dir.path().join("tall.cry.jxl"));
+}
+
+#[tokio::test]
 async fn grey_profiled_photos_become_grey_jxl() {
 	let dir = tempfile::tempdir().unwrap();
 	let source = dir.path().join("scan.png");

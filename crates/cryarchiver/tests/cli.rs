@@ -529,13 +529,13 @@ fn folders_wildcards_and_output_dir() {
 #[test]
 fn unicode_names_round_trip() {
 	let dir = tempfile::tempdir().unwrap();
-	flac(dir.path(), "02. 試験曲.flac", 5);
+	flac(dir.path(), "02. 夜明け.flac", 5);
 
-	let out = cryarchiver(dir.path(), &["02. 試験曲.flac"]);
+	let out = cryarchiver(dir.path(), &["02. 夜明け.flac"]);
 
 	assert!(out.status.success(), "{}", stdout(&out));
-	assert!(dir.path().join("02. 試験曲.cry.opus").is_file());
-	assert!(stdout(&out).contains("02. 試験曲.flac"));
+	assert!(dir.path().join("02. 夜明け.cry.opus").is_file());
+	assert!(stdout(&out).contains("02. 夜明け.flac"));
 }
 
 #[test]

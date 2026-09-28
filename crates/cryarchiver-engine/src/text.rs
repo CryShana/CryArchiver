@@ -154,8 +154,8 @@ mod tests {
 	#[test]
 	fn fit_middle_keeps_extension() {
 		assert_eq!(
-			fit_middle("2018 - Holiday - GoPro clip.mkv", 24),
-			"2018 - HOLIDAY …oPro.mkv"
+			fit_middle("2018 - mountain trail - GoPro.mkv", 24),
+			"2018 - mountain…oPro.mkv"
 		);
 	}
 
@@ -171,7 +171,7 @@ mod tests {
 	#[test]
 	fn display_name_escapes_controls() {
 		assert_eq!(display_name(OsStr::new("a\nb\u{1b}c\td")), "a\\nb\\x1bc\\td");
-		assert_eq!(display_name(OsStr::new("02. 試験曲.mp3")), "02. 試験曲.mp3");
+		assert_eq!(display_name(OsStr::new("02. 夜明け.mp3")), "02. 夜明け.mp3");
 		assert_eq!(display_path(Path::new("dir/a\u{7}.flac")), "dir/a\\x07.flac");
 	}
 

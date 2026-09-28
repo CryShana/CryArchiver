@@ -28,7 +28,7 @@ fn esc_unwinds_overlay_then_details_then_filter_then_maximize() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('z'));
 	press(&mut app, KeyCode::Char('/'));
-	type_text(&mut app, "fanfares");
+	type_text(&mut app, "battle-theme");
 	press(&mut app, KeyCode::Enter);
 	press(&mut app, KeyCode::End);
 	press(&mut app, KeyCode::Enter);
@@ -36,7 +36,7 @@ fn esc_unwinds_overlay_then_details_then_filter_then_maximize() {
 
 	assert_eq!(app.overlay(), Some(OverlayKind::Help));
 	assert_eq!(app.mode(), ViewMode::Details);
-	assert_eq!(app.filter(), "fanfares");
+	assert_eq!(app.filter(), "battle-theme");
 
 	press(&mut app, KeyCode::Esc);
 	assert_eq!(app.overlay(), None);
@@ -44,7 +44,7 @@ fn esc_unwinds_overlay_then_details_then_filter_then_maximize() {
 
 	press(&mut app, KeyCode::Esc);
 	assert_eq!(app.mode(), ViewMode::Library);
-	assert_eq!(app.filter(), "fanfares");
+	assert_eq!(app.filter(), "battle-theme");
 
 	press(&mut app, KeyCode::Esc);
 	assert_eq!(app.filter(), "");
@@ -123,13 +123,13 @@ fn search_filters_live_enter_keeps_and_esc_clears() {
 
 	press(&mut app, KeyCode::Char('/'));
 	assert!(app.searching());
-	type_text(&mut app, "テスト");
-	assert_eq!(app.filter(), "テスト");
+	type_text(&mut app, "さくら");
+	assert_eq!(app.filter(), "さくら");
 	assert_eq!(app.visible_rows(), 4, "the match plus Family, Music and Anime OST");
 
 	press(&mut app, KeyCode::Enter);
 	assert!(!app.searching());
-	assert_eq!(app.filter(), "テスト");
+	assert_eq!(app.filter(), "さくら");
 
 	press(&mut app, KeyCode::Char('/'));
 	press(&mut app, KeyCode::Esc);
@@ -195,9 +195,9 @@ fn details_step_through_files_and_skip_folders() {
 	assert_eq!(app.selected(), Some(second));
 }
 
-fn open_fanfares_original(app: &mut cryarchiver_tui::App<cryarchiver_tui::MockSource>) -> Selection {
+fn open_battle_theme_original(app: &mut cryarchiver_tui::App<cryarchiver_tui::MockSource>) -> Selection {
 	press(app, KeyCode::Char('/'));
-	type_text(app, "fanfares");
+	type_text(app, "battle-theme");
 	press(app, KeyCode::Enter);
 	press(app, KeyCode::End);
 	press(app, KeyCode::Enter);
@@ -207,7 +207,7 @@ fn open_fanfares_original(app: &mut cryarchiver_tui::App<cryarchiver_tui::MockSo
 #[test]
 fn g_cycles_through_the_duplicates_of_an_original() {
 	let mut app = app();
-	let original = open_fanfares_original(&mut app);
+	let original = open_battle_theme_original(&mut app);
 
 	press(&mut app, KeyCode::Char('g'));
 	let first = app.selected().unwrap();
@@ -230,7 +230,7 @@ fn g_cycles_through_the_duplicates_of_an_original() {
 #[test]
 fn g_starts_over_once_the_selection_moves_elsewhere() {
 	let mut app = app();
-	let original = open_fanfares_original(&mut app);
+	let original = open_battle_theme_original(&mut app);
 	press(&mut app, KeyCode::Char('g'));
 	let first = app.selected().unwrap();
 	press(&mut app, KeyCode::Char('g'));
@@ -324,7 +324,7 @@ fn clicking_the_maximize_toggle_and_double_clicking_the_title() {
 fn right_click_selects_the_row_and_opens_the_menu() {
 	let mut app = app();
 	let terminal = draw(&mut app, 120, 36);
-	let row = find_row(&terminal, "comicPage").unwrap();
+	let row = find_row(&terminal, "comic-strip").unwrap();
 
 	mouse(
 		&mut app,
@@ -334,7 +334,7 @@ fn right_click_selects_the_row_and_opens_the_menu() {
 		Instant::now(),
 	);
 
-	assert_eq!(app.selected_name().as_deref(), Some("comic-veryTallImage.jpg"));
+	assert_eq!(app.selected_name().as_deref(), Some("comic-strip-tall.jpg"));
 	assert_eq!(app.overlay(), Some(OverlayKind::Menu));
 
 	draw(&mut app, 120, 36);
@@ -354,14 +354,14 @@ fn clicking_the_arrow_folds_and_double_click_opens_details() {
 	assert!(app.visible_rows() < rows);
 
 	let terminal = draw(&mut app, 120, 36);
-	let file_row = find_row(&terminal, "● 2018 - HOLIDAY").unwrap();
+	let file_row = find_row(&terminal, "● 2018 - mountain").unwrap();
 	let now = Instant::now();
 	click(&mut app, 30, file_row, now);
 	assert_eq!(app.mode(), ViewMode::Library, "a single click only selects");
 
 	click(&mut app, 30, file_row, now + Duration::from_millis(150));
 	assert_eq!(app.mode(), ViewMode::Details);
-	assert!(app.selected_name().unwrap().starts_with("2018 - HOLIDAY"));
+	assert!(app.selected_name().unwrap().starts_with("2018 - mountain"));
 }
 
 #[test]

@@ -345,7 +345,7 @@ mod tests {
 			  "disposition": { "default": 0, "attached_pic": 1 }, "tags": { "comment": "Cover (front)" } }
 		],
 		"format": { "format_name": "mp3", "duration": "34.360000", "size": "1469712", "bit_rate": "342191",
-		            "tags": { "title": "テスト" } }
+		            "tags": { "title": "さくら" } }
 	}"#;
 
 	#[test]

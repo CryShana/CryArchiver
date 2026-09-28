@@ -1,6 +1,6 @@
 mod support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cryarchiver_engine::metadata::exif::{
@@ -134,48 +134,82 @@ fn every_full_resolution_page_counts() {
 	assert_eq!(tiff_pages(&file), Some(2));
 }
 
+fn nikon_jpeg(dir: &Path) -> (PathBuf, Vec<u8>) {
+	let maker_note = [
+		b"Nikon\0\x02\x10\0\0".as_slice(),
+		&tiff(
+			true,
+			&[
+				undefined(0x0001, b"0210"),
+				ascii(0x0004, "FINE   "),
+				short(true, 0x0012, 7),
+			],
+			&[],
+			&[],
+		),
+	]
+	.concat();
+	let block = tiff(
+		true,
+		&[
+			ascii(0x010F, "NIKON CORPORATION"),
+			ascii(0x0110, "NIKON TEST"),
+			short(true, 0x0112, 6),
+		],
+		&[
+			short(true, 0xA002, 1200),
+			short(true, 0xA003, 800),
+			undefined(0x927C, &maker_note),
+		],
+		&[],
+	);
+
+	let path = dir.join("nikon.jpg");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=64x48",
+		"-frames:v",
+		"1",
+		path.to_str().unwrap(),
+	]);
+	let jpeg = std::fs::read(&path).unwrap();
+	let exif = [b"Exif\0\0".as_slice(), &block].concat();
+	std::fs::write(&path, support::with_jpeg_segment(&jpeg, 0xE1, &exif)).unwrap();
+	(path, maker_note)
+}
+
 #[test]
-#[ignore = "needs the local sample corpus (set CRY_CORPUS, default C:\\media-corpus) and exiftool"]
-fn nikon_maker_notes_survive_the_patch() {
-	let corpus = std::env::var_os("CRY_CORPUS").map_or_else(|| PathBuf::from(r"C:\media-corpus"), PathBuf::from);
+fn nikon_style_maker_notes_survive_the_patch_of_a_jpeg() {
+	let dir = tempfile::tempdir().unwrap();
+	let (source, maker_note) = nikon_jpeg(dir.path());
+	let original = std::fs::read(&source).unwrap();
+	let start = original.windows(6).position(|w| w == b"Exif\0\0").unwrap() + 6;
+	let len = usize::from(u16::from_be_bytes([original[start - 8], original[start - 7]])) - 8;
+	let mut patched = original.clone();
+
+	let result = patch(&mut patched[start..start + len], 800, 1200).unwrap();
+
+	let out = dir.path().join("patched.jpg");
+	std::fs::write(&out, &patched).unwrap();
+	assert_eq!(result.orientation, Some(6));
+	assert_eq!(patched.len(), original.len());
+	assert!(patched.windows(maker_note.len()).any(|window| window == maker_note));
+
 	if Command::new("exiftool").arg("-ver").output().is_err() {
-		eprintln!("exiftool is not installed; skipping");
+		eprintln!("exiftool is not installed; skipping its read-back");
 		return;
 	}
 
-	let dir = tempfile::tempdir().unwrap();
-	for name in ["DSC_0001.JPG", "DSC_0002.JPG"] {
-		let original = std::fs::read(corpus.join(name)).unwrap();
-		let start = original.windows(6).position(|w| w == b"Exif\0\0").unwrap() + 6;
-		let len = usize::from(u16::from_be_bytes([original[start - 8], original[start - 7]])) - 8;
-		let mut patched = original.clone();
-
-		patch(&mut patched[start..start + len], 4000, 6000).unwrap();
-
-		let out = dir.path().join(name);
-		std::fs::write(&out, &patched).unwrap();
-		let maker_notes = |path: &std::path::Path| {
-			Command::new("exiftool")
-				.args(["-b", "-MakerNotes"])
-				.arg(path)
-				.output()
-				.unwrap()
-				.stdout
-		};
-		assert_eq!(maker_notes(&corpus.join(name)), maker_notes(&out), "{name}");
-		let tags = String::from_utf8(
-			Command::new("exiftool")
-				.args(["-s", "-s", "-s", "-Orientation#", "-ExifImageWidth", "-ExifImageHeight"])
-				.arg(&out)
-				.output()
-				.unwrap()
-				.stdout,
-		)
-		.unwrap();
-		assert_eq!(
-			tags.split_whitespace().collect::<Vec<_>>(),
-			["1", "4000", "6000"],
-			"{name}"
-		);
-	}
+	let exiftool = |args: &[&str], path: &Path| Command::new("exiftool").args(args).arg(path).output().unwrap().stdout;
+	let maker_notes = exiftool(&["-b", "-MakerNotes"], &source);
+	assert!(!maker_notes.is_empty());
+	assert_eq!(exiftool(&["-b", "-MakerNotes"], &out), maker_notes);
+	let tags = String::from_utf8(exiftool(
+		&["-s", "-s", "-s", "-Orientation#", "-ExifImageWidth", "-ExifImageHeight"],
+		&out,
+	))
+	.unwrap();
+	assert_eq!(tags.split_whitespace().collect::<Vec<_>>(), ["1", "800", "1200"]);
 }

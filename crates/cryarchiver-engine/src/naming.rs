@@ -145,8 +145,8 @@ mod tests {
 	#[test]
 	fn outputs_go_next_to_the_source_or_into_the_output_dir() {
 		assert_eq!(
-			cli_output_path(Path::new("music/01.テスト.mp3"), None, "opus"),
-			Path::new("music/01.テスト.cry.opus")
+			cli_output_path(Path::new("music/01.さくら.mp3"), None, "opus"),
+			Path::new("music/01.さくら.cry.opus")
 		);
 		assert_eq!(
 			cli_output_path(Path::new("music/a.flac"), Some(Path::new("out")), "opus"),
