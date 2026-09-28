@@ -253,6 +253,63 @@ fn project_create_refuses_a_unix_name_through_a_link() {
 	assert_name_refused(dir.path(), dir.path(), "../lnk/evil");
 }
 
+#[test]
+fn project_create_refuses_a_dangling_link_where_the_project_file_goes() {
+	let dir = name_setup();
+	let (source, destination) = (dir.path().join("src"), dir.path().join("d").join("archive"));
+	fs::create_dir(&destination).unwrap();
+	let target = source.join("linked.cryarchive");
+	if !project::link_file(&destination.join("sevil.cryarchive"), &target) {
+		eprintln!("skipped: no file link can be made here");
+		return;
+	}
+
+	let out = cryarchiver(
+		dir.path(),
+		&[
+			"project",
+			"create",
+			source.to_str().unwrap(),
+			destination.to_str().unwrap(),
+			"--name",
+			"sevil",
+		],
+	);
+
+	assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+	assert!(fs::symlink_metadata(&target).is_err());
+	assert_eq!(project::names_in(&source), ["sub"]);
+}
+
+#[test]
+fn run_refuses_a_project_whose_work_folder_is_a_link_into_the_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let project = project_with(dir.path(), false);
+	let source = dir.path().join("source");
+	for (path, content) in [
+		("victim/keep.txt", "keep"),
+		("victim2/data.txt", "data"),
+		("top.txt", "top"),
+	] {
+		project::write(&source, path, content.as_bytes());
+	}
+	let work = dir.path().join("archive").join(".cryarchiver").join("work");
+	fs::create_dir_all(work.parent().unwrap()).unwrap();
+	if !project::link_folder(&work, &source) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+
+	let out = cryarchiver(dir.path(), &["run", project.to_str().unwrap()]);
+
+	assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+	assert!(stderr(&out).contains("link"), "{}", stderr(&out));
+	assert_eq!(project::names_in(&source), ["top.txt", "victim", "victim2"]);
+	assert_eq!(fs::read(source.join("victim").join("keep.txt")).unwrap(), b"keep");
+	assert_eq!(fs::read(source.join("victim2").join("data.txt")).unwrap(), b"data");
+	assert!(fs::symlink_metadata(&work).is_ok());
+}
+
 fn project_with(dir: &Path, delete_originals: bool) -> PathBuf {
 	fs::create_dir_all(dir.join("source")).unwrap();
 	cryarchiver_project::create(

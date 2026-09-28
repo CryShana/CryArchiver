@@ -312,6 +312,51 @@ pub fn write(root: &Path, relative: &str, content: &[u8]) -> PathBuf {
 	path
 }
 
+/// A second name for the folder `target`: a junction on Windows, a symbolic link elsewhere. False when one can't be
+/// made here.
+pub fn link_folder(link: &Path, target: &Path) -> bool {
+	#[cfg(windows)]
+	return std::process::Command::new("cmd")
+		.args(["/C", "mklink", "/J"])
+		.arg(link)
+		.arg(target)
+		.output()
+		.is_ok_and(|out| out.status.success());
+
+	#[cfg(unix)]
+	return std::os::unix::fs::symlink(target, link).is_ok();
+}
+
+/// A symbolic link to the file `target`, which need not exist. False when one can't be made here, as on Windows
+/// without Developer Mode.
+pub fn link_file(link: &Path, target: &Path) -> bool {
+	#[cfg(windows)]
+	return std::process::Command::new("cmd")
+		.args(["/C", "mklink"])
+		.arg(link)
+		.arg(target)
+		.output()
+		.is_ok_and(|out| out.status.success());
+
+	#[cfg(unix)]
+	return std::os::unix::fs::symlink(target, link).is_ok();
+}
+
+/// `path` as the project's messages name it: stored paths are plain, while [`setup`] hands out canonical ones.
+pub fn shown(path: &Path) -> String {
+	cryarchiver_engine::text::display_path(&cryarchiver_project::settings::plain_path(path.to_path_buf()))
+}
+
+/// The names in `folder`, sorted.
+pub fn names_in(folder: &Path) -> Vec<String> {
+	let mut names: Vec<String> = fs::read_dir(folder)
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+	names.sort();
+	names
+}
+
 /// A folder no one may list until this is dropped: an ACL denying everyone on Windows, mode 000 on Unix.
 pub struct Unlistable(PathBuf);
 

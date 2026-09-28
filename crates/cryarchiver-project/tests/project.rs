@@ -815,6 +815,118 @@ fn a_unix_name_through_a_link_is_refused() {
 }
 
 #[test]
+fn a_dangling_link_where_the_project_file_goes_is_refused_and_nothing_appears_where_it_leads() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("src");
+	let destination = dir.path().join("d").join("archive");
+	fs::create_dir(&source).unwrap();
+	fs::create_dir_all(&destination).unwrap();
+	let target = source.join("linked.cryarchive");
+	let link = destination.join("evil.cryarchive");
+	if !support::link_file(&link, &target) {
+		eprintln!("skipped: no file link can be made here");
+		return;
+	}
+
+	let created = cryarchiver_project::create(&source, &destination, OsStr::new("evil"), |_| {});
+
+	assert!(
+		matches!(created, Err(ProjectError::Store(StoreError::Exists(_)))),
+		"{created:?}"
+	);
+	assert!(fs::symlink_metadata(&target).is_err());
+	assert!(support::names_in(&source).is_empty());
+	assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+}
+
+fn try_open(project: &Path) -> Result<Project, ProjectError> {
+	Project::open(
+		project,
+		ProjectOptions {
+			backend: Arc::new(FakeBackend {
+				encoder: FakeEncoder::new(),
+			}),
+			tuning: support::tuning(),
+			fault: None,
+		},
+	)
+}
+
+/// What a sweep of the source would find to remove: folders without a `job.lock`, at the top and in `work`.
+fn fill_as_a_work_area(source: &Path) -> Vec<String> {
+	write(source, "victim/keep.txt", b"keep");
+	write(source, "victim2/data.txt", b"data");
+	write(source, "work/victim3/more.txt", b"more");
+	write(source, "top.txt", b"top");
+	support::names_in(source)
+}
+
+fn remove_link(link: &Path) {
+	fs::remove_dir(link).or_else(|_| fs::remove_file(link)).unwrap();
+}
+
+#[test]
+fn a_project_whose_work_area_is_a_link_is_refused_and_nothing_in_the_source_is_removed() {
+	for linked in [
+		&[".cryarchiver"][..],
+		&[".cryarchiver", "work"],
+		&[".cryarchiver", "work", "staged"],
+	] {
+		let setup = setup(|_| {});
+		let before = fill_as_a_work_area(&setup.source);
+		let link = linked
+			.iter()
+			.fold(setup.destination.clone(), |path, name| path.join(name));
+		fs::create_dir_all(link.parent().unwrap()).unwrap();
+		if !link_folder(&link, &setup.source) {
+			eprintln!("skipped: no folder link can be made here");
+			return;
+		}
+
+		let refused = try_open(&setup.project);
+
+		let Err(err @ ProjectError::Link { .. }) = refused else {
+			panic!("{linked:?}: the project opened");
+		};
+		assert!(err.to_string().contains(&support::shown(&link)), "{err}");
+		assert_eq!(support::names_in(&setup.source), before, "{linked:?}");
+		assert_eq!(fs::read(setup.source.join("victim").join("keep.txt")).unwrap(), b"keep");
+		assert_eq!(
+			fs::read(setup.source.join("work").join("victim3").join("more.txt")).unwrap(),
+			b"more"
+		);
+
+		remove_link(&link);
+		assert!(try_open(&setup.project).is_ok(), "{linked:?}");
+		assert_eq!(support::names_in(&setup.source), before, "{linked:?}");
+	}
+}
+
+#[test]
+fn a_project_file_that_is_a_link_is_refused() {
+	let setup = setup(|_| {});
+	let elsewhere = setup.dir.path().join("elsewhere");
+	fs::create_dir(&elsewhere).unwrap();
+	let real = elsewhere.join("archive.cryarchive");
+	fs::rename(&setup.project, &real).unwrap();
+	if !support::link_file(&setup.project, &real) {
+		eprintln!("skipped: no file link can be made here");
+		return;
+	}
+
+	let refused = try_open(&setup.project);
+
+	let Err(err @ ProjectError::Link { .. }) = refused else {
+		panic!("the linked project file opened");
+	};
+	assert!(
+		err.to_string()
+			.contains(&cryarchiver_engine::text::display_path(&setup.project)),
+		"{err}"
+	);
+}
+
+#[test]
 fn the_project_file_is_named_before_the_destination_exists() {
 	let dir = tempfile::tempdir().unwrap();
 	let source = dir.path().join("source");

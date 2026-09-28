@@ -803,3 +803,28 @@ fn accepting_a_changed_canonical_output_leaves_the_duplicate_its_own_content() {
 	assert_eq!(archived_content(&setup, "Backup/a.bin"), data(1));
 	assert_eq!(archived_content(&setup, "a.bin"), b"changed");
 }
+
+#[test]
+fn a_placeholder_is_never_written_into_a_folder_that_is_a_link_into_the_source() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.bin", &data(1));
+	write(&setup.source, "Backup/a.bin", &data(1));
+	let link = setup.destination.join("Backup");
+	if !support::link_folder(&link, &setup.source.join("Backup")) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+	let encoder = FakeEncoder::new();
+
+	drop(run_to_completion(&setup, &encoder));
+
+	assert_eq!(support::names_in(&setup.source.join("Backup")), ["a.bin"]);
+	assert_eq!(fs::read(setup.destination.join("a.bin")).unwrap(), data(1));
+	let FileState::Issue { reason, .. } = record(&setup, "Backup/a.bin").state else {
+		panic!("not an issue: {:?}", record(&setup, "Backup/a.bin").state);
+	};
+	assert!(
+		reason.contains(&support::shown(&link)) && reason.contains("link"),
+		"{reason}"
+	);
+}

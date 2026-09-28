@@ -3,7 +3,6 @@
 //! and compared with the source.
 
 use std::collections::HashSet;
-use std::fs;
 
 use super::owner::{Message, Owner};
 use crate::complete::{self, ParityReport};
@@ -72,10 +71,11 @@ impl Owner {
 			self.finish.applying.insert(folder);
 			let source = self.source_path(&entry.key);
 			let destination = self.destination_path(&self.destination_folder(folder));
-			let messages = self.messages.clone();
+			let (folders, messages) = (self.pipeline.folders.clone(), self.messages.clone());
 			tokio::task::spawn_blocking(move || {
-				let result = fs::create_dir_all(&destination)
-					.and_then(|()| apply_folder_times(&source, &destination))
+				let result = folders
+					.prepare(&destination)
+					.and_then(|_| apply_folder_times(&source, &destination))
 					.map_err(|err| err.to_string());
 				let _ = messages.send(Message::FolderFinished(folder, result));
 			});
@@ -187,8 +187,7 @@ impl Owner {
 			);
 		}
 
-		let _ = fs::remove_dir(self.pipeline.sink.staged_dir());
-		let _ = fs::remove_dir(self.pipeline.sink.archive_work_root());
+		self.remove_empty_work_folders();
 		self.finish.completion = Completion::Done(report);
 		self.view.status_dirty = true;
 	}
@@ -210,6 +209,8 @@ fn files_without_an_archive(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use crate::project::scanning::tests::{key, list, owner};
 
 	use super::*;

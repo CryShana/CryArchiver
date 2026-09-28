@@ -1,6 +1,151 @@
 use std::fs;
+use std::io;
+use std::path::Path;
 
-use cryarchiver_engine::workspace::{CLI_WORK_DIR, Workspace, sweep};
+use cryarchiver_engine::workspace::{
+	CLI_WORK_DIR, UnsafeFolder, Workspace, check_real_folders, create_real_folders, sweep,
+};
+
+/// A second name for the folder `target`: a junction on Windows, a symbolic link elsewhere. False when one can't be
+/// made here.
+fn link_folder(link: &Path, target: &Path) -> bool {
+	#[cfg(windows)]
+	return std::process::Command::new("cmd")
+		.args(["/C", "mklink", "/J"])
+		.arg(link)
+		.arg(target)
+		.output()
+		.is_ok_and(|out| out.status.success());
+
+	#[cfg(unix)]
+	return std::os::unix::fs::symlink(target, link).is_ok();
+}
+
+fn link_file(link: &Path, target: &Path) -> bool {
+	#[cfg(windows)]
+	return std::os::windows::fs::symlink_file(target, link).is_ok();
+
+	#[cfg(unix)]
+	return std::os::unix::fs::symlink(target, link).is_ok();
+}
+
+/// A folder outside every work area, holding a folder with no `job.lock` and a file.
+fn outside(dir: &Path) -> std::path::PathBuf {
+	let outside = dir.join("outside");
+	fs::create_dir_all(outside.join("victim")).unwrap();
+	fs::write(outside.join("victim").join("keep.txt"), b"keep").unwrap();
+	fs::write(outside.join("top.txt"), b"top").unwrap();
+	outside
+}
+
+fn assert_untouched(outside: &Path) {
+	assert_eq!(fs::read(outside.join("victim").join("keep.txt")).unwrap(), b"keep");
+	assert_eq!(fs::read(outside.join("top.txt")).unwrap(), b"top");
+	assert_eq!(fs::read_dir(outside).unwrap().count(), 2);
+}
+
+#[test]
+fn sweep_never_lists_through_a_root_that_is_a_link() {
+	let out = tempfile::tempdir().unwrap();
+	let outside = outside(out.path());
+	let root = out.path().join(CLI_WORK_DIR);
+	if !link_folder(&root, &outside) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+
+	assert_eq!(sweep(&root), 0);
+
+	assert_untouched(&outside);
+	assert!(fs::symlink_metadata(&root).is_ok());
+}
+
+#[test]
+fn sweep_removes_links_in_the_work_area_but_never_what_they_lead_to() {
+	let out = tempfile::tempdir().unwrap();
+	let outside = outside(out.path());
+	let root = out.path().join(CLI_WORK_DIR);
+	fs::create_dir(&root).unwrap();
+	let linked = root.join("01J9Z3K8QXLINKEDFOLDER0000");
+	if !link_folder(&linked, &outside.join("victim")) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+	let file_link = root.join("file-link");
+	let file_linked = link_file(&file_link, &outside.join("top.txt"));
+
+	sweep(&root);
+
+	assert!(fs::symlink_metadata(&linked).is_err());
+	if file_linked {
+		assert!(fs::symlink_metadata(&file_link).is_err());
+	} else {
+		eprintln!("skipped the file link: can't create one here");
+	}
+	assert_untouched(&outside);
+}
+
+#[test]
+fn folders_are_made_one_name_at_a_time_and_never_through_a_link() {
+	let out = tempfile::tempdir().unwrap();
+	let outside = outside(out.path());
+	let base = out.path().join("archive");
+	fs::create_dir(&base).unwrap();
+
+	let mut checked = Vec::new();
+	let made = create_real_folders(&base, &base.join("a").join("b"), |folder| {
+		checked.push(folder.to_path_buf());
+		Ok(())
+	})
+	.unwrap();
+
+	assert_eq!(made, [base.join("a"), base.join("a").join("b")]);
+	assert_eq!(checked, [base.clone(), base.join("a")]);
+	assert!(check_real_folders(&base, &base.join("a").join("b")).is_ok());
+	assert!(check_real_folders(&base, &base.join("missing")).is_err());
+	assert!(!base.join("missing").exists());
+
+	let refused = create_real_folders(&base, &base.join("a").join("c"), |_| Err(io::Error::other("refused")));
+	assert!(refused.is_err());
+	assert!(!base.join("a").join("c").exists());
+
+	fs::write(base.join("file.txt"), b"x").unwrap();
+	let in_the_way = create_real_folders(&base, &base.join("file.txt").join("x"), |_| Ok(())).unwrap_err();
+	assert_eq!(in_the_way.kind(), io::ErrorKind::NotADirectory);
+	assert!(create_real_folders(&base, &base.join("..").join("x"), |_| Ok(())).is_err());
+	assert!(!out.path().join("x").exists());
+
+	let link = base.join("link");
+	if !link_folder(&link, &outside) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+	for folder in [link.clone(), link.join("new"), link.join("victim")] {
+		let refused = create_real_folders(&base, &folder, |_| Ok(())).unwrap_err();
+		assert_eq!(
+			UnsafeFolder::of(&refused).map(|unsafe_folder| &unsafe_folder.path),
+			Some(&link)
+		);
+		assert!(check_real_folders(&base, &folder).is_err());
+	}
+	assert!(create_real_folders(&link, &link.join("new"), |_| Ok(())).is_err());
+	assert_untouched(&outside);
+}
+
+#[test]
+fn a_workspace_is_never_made_through_a_link() {
+	let out = tempfile::tempdir().unwrap();
+	let outside = outside(out.path());
+	let root = out.path().join(CLI_WORK_DIR);
+	if !link_folder(&root, &outside) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+
+	assert!(Workspace::create(&root, "a.flac".as_ref()).is_err());
+
+	assert_untouched(&outside);
+}
 
 #[test]
 fn creates_locked_job_folder_and_removes_it_on_drop() {

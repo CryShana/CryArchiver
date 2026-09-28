@@ -29,6 +29,9 @@ pub enum ErrorKind {
 	PermissionDenied(PathBuf),
 	#[error("destination unavailable: {}", display_path(.0))]
 	DestinationGone(PathBuf),
+	/// A folder in the destination that leads elsewhere; nothing was written through it.
+	#[error("not written: {0}")]
+	UnsafeDestination(String),
 	#[error("toolchain problem: {0}")]
 	Toolchain(String),
 	#[error("source unreadable: {0}")]
@@ -50,9 +53,11 @@ impl ErrorKind {
 			| Self::Stalled(_)
 			| Self::ToolCrashed(_)
 			| Self::DestinationIo(_) => ErrorClass::AutoRetry,
-			Self::PermissionDenied(_) | Self::DestinationGone(_) | Self::Toolchain(_) | Self::Cancelled => {
-				ErrorClass::ManualRetry
-			}
+			Self::PermissionDenied(_)
+			| Self::DestinationGone(_)
+			| Self::UnsafeDestination(_)
+			| Self::Toolchain(_)
+			| Self::Cancelled => ErrorClass::ManualRetry,
 			Self::SourceUnreadable(_) | Self::SourceDamaged(_) | Self::EncodeFailed(_) => ErrorClass::Unrecoverable,
 		}
 	}
@@ -83,6 +88,10 @@ impl JobError {
 	}
 
 	pub fn io(side: IoSide<'_>, err: &io::Error) -> Self {
+		if let Some(refused) = crate::workspace::UnsafeFolder::of(err) {
+			return ErrorKind::UnsafeDestination(refused.to_string()).into();
+		}
+
 		let kind = match (side, err.kind()) {
 			_ if is_sharing_violation(err) => ErrorKind::Locked,
 			(IoSide::Source(path) | IoSide::Destination(path), io::ErrorKind::PermissionDenied) => {
@@ -220,6 +229,19 @@ mod tests {
 			ErrorKind::DestinationGone(PathBuf::from("out"))
 		);
 		assert_eq!(JobError::io(destination, &other).kind.class(), ErrorClass::AutoRetry);
+	}
+
+	#[test]
+	fn a_folder_that_leads_elsewhere_is_named_and_never_retried_on_its_own() {
+		let refused = crate::workspace::UnsafeFolder::error(Path::new("out"), crate::workspace::IS_A_LINK);
+
+		let kind = JobError::io(IoSide::Destination(Path::new("out/a.avif")), &refused).kind;
+
+		assert_eq!(
+			kind,
+			ErrorKind::UnsafeDestination(format!("out {}", crate::workspace::IS_A_LINK))
+		);
+		assert_eq!(kind.class(), ErrorClass::ManualRetry);
 	}
 
 	#[cfg(windows)]

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::text::display_name;
+use cryarchiver_engine::workspace::check_real_folders;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 
@@ -324,8 +325,7 @@ impl Owner {
 			Ok(()) => self.after_flush(),
 			Err(err) => self.fail(err),
 		}
-		let _ = std::fs::remove_dir(self.pipeline.sink.staged_dir());
-		let _ = std::fs::remove_dir(self.pipeline.sink.archive_work_root());
+		self.remove_empty_work_folders();
 		self.publish();
 
 		if let Some(err) = self.failure.take() {
@@ -431,13 +431,35 @@ impl Owner {
 			return;
 		}
 
+		let target = self.destination_path(path);
+		match target.parent().map(|folder| self.pipeline.folders.check(folder)) {
+			Some(Err(err)) if err.kind() != io::ErrorKind::NotFound => {
+				self.notice(
+					NoticeLevel::Warning,
+					format!("{} can't be removed: {err}", path.display()),
+				);
+				return;
+			}
+			_ => {}
+		}
+
 		self.output_vacated_during_walk(path);
-		match fs::remove_file(self.destination_path(path)) {
+		match fs::remove_file(&target) {
 			Err(err) if err.kind() != io::ErrorKind::NotFound => self.notice(
 				NoticeLevel::Warning,
 				format!("{} can't be removed: {err}", path.display()),
 			),
 			_ => {}
+		}
+	}
+
+	/// The staging folder, then the work folder, each only while empty and only while it and the folders above it
+	/// are real folders: through a link, the folder removed would be wherever it leads.
+	pub(super) fn remove_empty_work_folders(&self) {
+		for folder in [self.pipeline.sink.staged_dir(), self.pipeline.sink.archive_work_root()] {
+			if check_real_folders(&self.settings.destination, &folder).is_ok() {
+				let _ = fs::remove_dir(&folder);
+			}
 		}
 	}
 }

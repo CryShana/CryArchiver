@@ -90,6 +90,7 @@ cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashbo
 - Cue sheets and playlists wait for the files they name, and are copied with the new names written in. Subtitles and other sidecars keep matching their video's name.
 - A source folder that can't be read, or a source drive that isn't there, is an open issue: nothing below it is forgotten or archived again, and the run isn't complete until it can be read.
 - A project file opens only from its own archive folder; a copy of it elsewhere is refused.
+- Nothing is written or removed through a link (a symbolic link or a junction) in the destination. A project whose file or `.cryarchiver` folder, or a folder in it, is a link doesn't open. A mirrored folder that is a link gets nothing written into it: the files that belong there are open issues until it is a real folder.
 - A file that fails stays an open issue until you retry it, copy the original or exclude it in the dashboard (`i`). Files in the destination that the project didn't write are reported as issues until you acknowledge them; they are never deleted.
 - With watch mode on, the run keeps going once everything is archived and picks up new files as they appear.
 - The performance limit runs in the background: low priority, one job at a time, and at most the chosen share of the CPU.

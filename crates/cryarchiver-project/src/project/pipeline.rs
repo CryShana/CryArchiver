@@ -24,7 +24,7 @@ use crate::keys::RelPath;
 use crate::memory::MemoryBudget;
 use crate::record::{CopyReason, FailureLog, FileRecord, FileState, How, IssueKind, MediaClass, Output};
 use crate::references::{self, RefKind};
-use crate::run::Staged;
+use crate::run::{ArchiveFolders, Staged};
 use crate::schedule::{DiskGuard, Governor, GovernorConfig, Queue, Waits, Work, retry_delay};
 use crate::tree::{FileId, FolderId};
 use crate::view::{LogKind, NoticeLevel, size_text};
@@ -78,6 +78,9 @@ pub(crate) struct Pipeline {
 	pub(super) memory: Arc<MemoryBudget>,
 	pub(super) quality: Arc<SharedMemory>,
 	pub(super) sink: ArchivalSink,
+	pub(super) folders: ArchiveFolders,
+	/// The destination folders that refused an output this session, each announced once.
+	refused_folders: HashSet<String>,
 	pub(super) disk: DiskGuard,
 	last_disk_check: Option<Instant>,
 	pub(super) chosen_copies: HashSet<FileId>,
@@ -106,6 +109,7 @@ impl RunningJob {
 
 impl Pipeline {
 	pub(crate) fn new(
+		source: &Path,
 		destination: &Path,
 		config: GovernorConfig,
 		encoder: Arc<dyn Encode>,
@@ -131,6 +135,8 @@ impl Pipeline {
 			memory,
 			quality,
 			sink: ArchivalSink::new(destination),
+			folders: ArchiveFolders::new(source, destination),
+			refused_folders: HashSet::new(),
 			disk: DiskGuard::default(),
 			last_disk_check: None,
 			chosen_copies: HashSet::new(),
@@ -352,6 +358,7 @@ impl Owner {
 			mtime_ns: entry.record.mtime_ns,
 			identity: entry.record.identity,
 			sink: self.pipeline.sink.clone(),
+			folders: self.pipeline.folders.clone(),
 			encoder: self.pipeline.encoder.clone(),
 			messages: self.messages.clone(),
 			cancel: cancel.clone(),
@@ -869,6 +876,15 @@ impl Owner {
 			LogKind::Row(self.row_state(file)),
 			format!("{}: {}", key.display(), err.kind),
 		);
+
+		if let ErrorKind::UnsafeDestination(folder) = &err.kind
+			&& self.pipeline.refused_folders.insert(folder.clone())
+		{
+			self.notice(
+				NoticeLevel::Warning,
+				format!("{folder}; the files archived there stay open issues until that changes"),
+			);
+		}
 	}
 
 	pub(super) fn retry_due(&mut self, now: Instant) {

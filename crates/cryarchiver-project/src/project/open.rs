@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -10,7 +11,7 @@ use cryarchiver_engine::commit::file_id;
 use cryarchiver_engine::quality::memory::SharedMemory;
 use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::text::display_path;
-use cryarchiver_engine::workspace::sweep;
+use cryarchiver_engine::workspace::{ARCHIVE_DIR, is_link, sweep};
 use tokio::sync::mpsc::unbounded_channel;
 
 use super::dangerous::DangerState;
@@ -31,27 +32,63 @@ use crate::keys::RelPath;
 use crate::memory::MemoryBudget;
 use crate::record::{FileState, Identity, Output};
 use crate::schedule::GovernorConfig;
-use crate::settings::Settings;
+use crate::settings::{RootConflict, Settings, SettingsError, identity_conflict};
 use crate::store::{Loaded, Store};
 use crate::tree::{FileId, FolderId, Tree};
 use crate::view::Update;
 use crate::watch::Debouncer;
 
 /// Every destination path is the stored one, so a project file copied or moved elsewhere would drive the archive it
-/// came from; it is opened only from its own archive's folder.
+/// came from; it is opened only from its own archive's folder, found from the file's real path.
 fn refuse_a_moved_project(project_file: &Path, destination: &Path) -> Result<(), ProjectError> {
-	let folder = match project_file.parent() {
-		Some(parent) if !parent.as_os_str().is_empty() => parent,
-		_ => Path::new("."),
-	};
-
-	let here = fs::canonicalize(folder)?;
+	let real = fs::canonicalize(project_file)?;
+	let here = real.parent().unwrap_or(&real);
 	if fs::canonicalize(destination).is_ok_and(|stored| stored == here) {
 		return Ok(());
 	}
 	Err(ProjectError::Moved {
 		destination: display_path(destination),
 	})
+}
+
+/// A link where the project writes, stages or sweeps would lead those writes and deletes wherever it points: the
+/// destination, its work area and the staging folder must each be a real folder, or not there yet.
+fn refuse_a_linked_work_area(destination: &Path) -> Result<(), ProjectError> {
+	let sink = ArchivalSink::new(destination);
+	let folders = [
+		destination.to_path_buf(),
+		destination.join(ARCHIVE_DIR),
+		sink.archive_work_root(),
+		sink.staged_dir(),
+	];
+
+	for folder in folders {
+		match fs::symlink_metadata(&folder) {
+			Ok(meta) if is_link(&meta) => {
+				return Err(ProjectError::Link {
+					path: display_path(&folder),
+				});
+			}
+			Ok(_) => {}
+			Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+			Err(err) => return Err(err.into()),
+		}
+	}
+	Ok(())
+}
+
+/// The roots were checked when the project was made; a source that can be reached is checked again, since a folder
+/// moved or mounted since could put the destination inside it.
+fn refuse_overlapping_roots(settings: &Settings) -> Result<(), ProjectError> {
+	let Ok(source) = fs::canonicalize(&settings.source) else {
+		return Ok(());
+	};
+	let destination = fs::canonicalize(&settings.destination)?;
+
+	match RootConflict::between(&source, &destination).or_else(|| identity_conflict(&source, &destination)) {
+		Some(conflict) => Err(SettingsError::Roots(conflict.message().into()).into()),
+		None => Ok(()),
+	}
 }
 
 impl Owner {
@@ -64,6 +101,8 @@ impl Owner {
 		updates: Sender<Update>,
 	) -> Result<Self, ProjectError> {
 		refuse_a_moved_project(project_file, &settings.destination)?;
+		refuse_a_linked_work_area(&settings.destination)?;
+		refuse_overlapping_roots(&settings)?;
 		fs::create_dir_all(&settings.destination)?;
 		let (messages, inbox) = unbounded_channel();
 		let unknown = loaded
@@ -77,6 +116,7 @@ impl Owner {
 		let applied = live::apply_limit(settings.performance_limit);
 		let image_threads = live::image_threads(settings.performance_limit, applied);
 		let mut pipeline = Pipeline::new(
+			&settings.source,
 			&settings.destination,
 			GovernorConfig {
 				ramp: options.tuning.ramp,

@@ -80,6 +80,7 @@ impl Owner {
 	}
 
 	pub(super) fn on_hint(&mut self, hint: Hint) {
+		self.pipeline.folders.forget();
 		match hint {
 			Hint::Folder(folder) => self.watching.debouncer.hint(folder, Instant::now()),
 			Hint::Rescan => self.request_rescan(),
@@ -144,6 +145,7 @@ impl Owner {
 	/// back online changes nothing the pass compares.
 	pub(super) fn on_folders_changed(&mut self, folders: Vec<RelPath>) {
 		self.watching.safety_pass_running = false;
+		self.pipeline.folders.forget();
 		for folder in folders {
 			if self.tree.folder_id(&folder).is_some() {
 				self.relist(folder);
@@ -163,6 +165,7 @@ impl Owner {
 
 	/// Compares the destination with the outputs the project wrote: missing or changed outputs and unknown files.
 	pub(super) fn reconcile_destination(&mut self) {
+		self.pipeline.folders.forget();
 		if self.watching.destination_walk {
 			self.watching.walk_pending = true;
 			return;

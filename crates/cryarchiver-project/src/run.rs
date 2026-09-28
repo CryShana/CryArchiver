@@ -2,11 +2,14 @@
 //! BLAKE3, moving staged files into the mirrored tree through the engine's no-replace rename, reading outputs back,
 //! deleting originals, and folder timestamps. All of them block; jobs run them on blocking threads.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use cryarchiver_engine::commit::{SourceTimes, rename_no_replace, retry_transient};
+use cryarchiver_engine::commit::{FileIdentity, SourceTimes, file_id, rename_no_replace, retry_transient};
+use cryarchiver_engine::workspace::{OUTSIDE_THE_DESTINATION, UnsafeFolder, check_real_folders, create_real_folders};
 
 use crate::dedup::full_hash;
 use crate::record::{Hash, Identity, mtime_ns};
@@ -14,6 +17,8 @@ use native::open_folder_for_times;
 
 const COPY_BUFFER: usize = 1 << 20;
 const READ_BACK_BUFFER: usize = 4 << 20;
+
+pub const INSIDE_THE_SOURCE: &str = "leads into the source";
 
 const NOT_A_REGULAR_FILE: &str = "not a regular file";
 const OUTSIDE_THE_SOURCE: &str = "its real path is outside the source folder";
@@ -66,11 +71,110 @@ pub fn hash_staged(path: &Path) -> io::Result<Staged> {
 	})
 }
 
+/// The destination's folders, as outputs go into them and come out of them: never reached through a link, and inside
+/// the destination and outside the source by real path and by folder identity. The walk that refuses links runs on
+/// every use; the full check runs once per folder, until [`ArchiveFolders::forget`].
+#[derive(Debug, Clone)]
+pub struct ArchiveFolders {
+	source: PathBuf,
+	destination: PathBuf,
+	destination_identity: Option<FileIdentity>,
+	checked: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+impl ArchiveFolders {
+	pub fn new(source: &Path, destination: &Path) -> Self {
+		Self {
+			source: source.to_path_buf(),
+			destination: destination.to_path_buf(),
+			destination_identity: file_id(destination).ok(),
+			checked: Arc::default(),
+		}
+	}
+
+	/// Creates what `folder` lacks, one name at a time; each folder a new name goes into is checked first, and
+	/// `folder` itself last. Returns the folders made.
+	pub fn prepare(&self, folder: &Path) -> io::Result<Vec<PathBuf>> {
+		let made = create_real_folders(&self.destination, folder, |parent| self.verify(parent))?;
+		self.verify(folder)?;
+
+		Ok(made)
+	}
+
+	/// Checks a folder that must already be there, creating nothing.
+	pub fn check(&self, folder: &Path) -> io::Result<()> {
+		check_real_folders(&self.destination, folder)?;
+		self.verify(folder)
+	}
+
+	/// Every folder gets its full check again before its next use.
+	pub fn forget(&self) {
+		self.checked().clear();
+	}
+
+	fn verify(&self, folder: &Path) -> io::Result<()> {
+		if self.checked().contains(folder) {
+			return Ok(());
+		}
+
+		let refused = |reason| Err(UnsafeFolder::error(folder, reason));
+		let real = fs::canonicalize(folder)?;
+		let destination = fs::canonicalize(&self.destination)?;
+		if !real.starts_with(&destination) {
+			return refused(OUTSIDE_THE_DESTINATION);
+		}
+
+		// A source that can't be reached can't be written through either.
+		let source = fs::canonicalize(&self.source).ok();
+		if source.as_ref().is_some_and(|source| real.starts_with(source)) {
+			return refused(INSIDE_THE_SOURCE);
+		}
+
+		// A folder identity that can't be read proves nothing either way, as in `identity_conflict`; the paths above
+		// still decide.
+		let source_identity = source.and_then(|source| file_id(&source).ok());
+		for ancestor in real.ancestors() {
+			let identity = file_id(ancestor).ok();
+			if identity.is_some() && identity == source_identity {
+				return refused(INSIDE_THE_SOURCE);
+			}
+
+			if ancestor == destination {
+				// An unmounted drive leaves its empty mount folder at the same path.
+				if identity
+					.zip(self.destination_identity)
+					.is_some_and(|(now, then)| now != then)
+				{
+					return refused(OUTSIDE_THE_DESTINATION);
+				}
+				break;
+			}
+		}
+
+		self.checked().insert(folder.to_path_buf());
+		Ok(())
+	}
+
+	fn checked(&self) -> MutexGuard<'_, HashSet<PathBuf>> {
+		self.checked.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+}
+
 /// Renames a staged file to its final path. It never replaces anything, except the output this same source file
-/// had before (a re-archive after the source changed, or a rewritten placeholder).
-pub fn move_into_place(staged: &Path, target: &Path, own_previous: Option<&Path>) -> io::Result<()> {
+/// had before (a re-archive after the source changed, or a rewritten placeholder). Both folders must pass
+/// [`ArchiveFolders`]: the staged file's may be another output's, taken over.
+pub fn move_into_place(
+	staged: &Path,
+	target: &Path,
+	own_previous: Option<&Path>,
+	folders: &ArchiveFolders,
+) -> io::Result<()> {
+	if let Some(from) = staged.parent() {
+		folders.check(from)?;
+	}
+
 	let created = match target.parent() {
-		Some(parent) => create_folders(parent)?,
+		Some(parent) => folders.prepare(parent)?,
 		None => Vec::new(),
 	};
 
@@ -233,17 +337,6 @@ fn hash_through(
 	}
 
 	Ok((size, Hash(*hasher.finalize().as_bytes())))
-}
-
-fn create_folders(folder: &Path) -> io::Result<Vec<PathBuf>> {
-	let missing = folder
-		.ancestors()
-		.take_while(|dir| !dir.as_os_str().is_empty() && fs::symlink_metadata(dir).is_err())
-		.map(Path::to_path_buf)
-		.collect();
-	fs::create_dir_all(folder)?;
-
-	Ok(missing)
 }
 
 #[cfg(unix)]
@@ -847,6 +940,26 @@ mod tests {
 		);
 	}
 
+	/// The folders of a destination at `dir`, for a source beside it.
+	fn archive_folders(dir: &Path) -> ArchiveFolders {
+		ArchiveFolders::new(&dir.with_extension("source"), dir)
+	}
+
+	fn names_in(folder: &Path) -> Vec<String> {
+		let mut names: Vec<String> = fs::read_dir(folder)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+			.collect();
+		names.sort();
+		names
+	}
+
+	/// A symbolic link, where Windows makes a junction.
+	#[cfg(unix)]
+	fn junction(link: &Path, target: &Path) -> bool {
+		std::os::unix::fs::symlink(target, link).is_ok()
+	}
+
 	#[test]
 	fn moving_into_place_never_replaces_another_file() {
 		let dir = tempfile::tempdir().unwrap();
@@ -855,13 +968,14 @@ mod tests {
 		fs::create_dir_all(target.parent().unwrap()).unwrap();
 		fs::write(&target, b"precious").unwrap();
 		fs::write(&staged, b"new").unwrap();
+		let folders = archive_folders(dir.path());
 
-		let err = move_into_place(&staged, &target, None).unwrap_err();
+		let err = move_into_place(&staged, &target, None, &folders).unwrap_err();
 
 		assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 		assert_eq!(fs::read(&target).unwrap(), b"precious");
 
-		move_into_place(&staged, &target, Some(&target)).unwrap();
+		move_into_place(&staged, &target, Some(&target), &folders).unwrap();
 		assert_eq!(fs::read(&target).unwrap(), b"new");
 		assert!(!staged.exists());
 	}
@@ -873,9 +987,80 @@ mod tests {
 		fs::write(&staged, b"new").unwrap();
 		let target = dir.path().join("a").join("b").join("c.txt");
 
-		move_into_place(&staged, &target, None).unwrap();
+		move_into_place(&staged, &target, None, &archive_folders(dir.path())).unwrap();
 
 		assert_eq!(fs::read(&target).unwrap(), b"new");
+	}
+
+	#[test]
+	fn nothing_is_moved_into_or_out_of_a_folder_that_is_a_link() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		let destination = dir.path().join("archive");
+		fs::create_dir_all(source.join("Photos")).unwrap();
+		fs::write(source.join("Photos").join("a.jpg"), b"original").unwrap();
+		fs::create_dir(&destination).unwrap();
+		let staged = destination.join("staged.avif");
+		fs::write(&staged, b"encoded").unwrap();
+		let folders = ArchiveFolders::new(&source, &destination);
+		let link = destination.join("Photos");
+		if !junction(&link, &source.join("Photos")) {
+			eprintln!("skipped: no folder link can be made here");
+			return;
+		}
+
+		for target in [link.join("a.avif"), link.join("Deeper").join("a.avif")] {
+			let refused = move_into_place(&staged, &target, None, &folders).unwrap_err();
+
+			assert_eq!(
+				UnsafeFolder::of(&refused).map(|folder| folder.path.clone()),
+				Some(link.clone())
+			);
+			assert!(staged.exists());
+		}
+
+		let taken_over = move_into_place(&link.join("a.jpg"), &destination.join("a.jpg"), None, &folders);
+		assert!(taken_over.is_err());
+		assert_eq!(names_in(&source.join("Photos")), ["a.jpg"]);
+		assert_eq!(fs::read(source.join("Photos").join("a.jpg")).unwrap(), b"original");
+		assert!(folders.check(&link).is_err());
+	}
+
+	#[test]
+	fn a_folder_that_leads_into_the_source_or_out_of_the_destination_gets_nothing_made_in_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let destination = dir.path().join("archive");
+		fs::create_dir(&destination).unwrap();
+		let reason = |refused: io::Error| UnsafeFolder::of(&refused).map(|folder| folder.reason);
+
+		let inside_the_source = ArchiveFolders::new(dir.path(), &destination);
+		assert_eq!(
+			reason(inside_the_source.prepare(&destination.join("new")).unwrap_err()),
+			Some(INSIDE_THE_SOURCE)
+		);
+		assert_eq!(
+			reason(inside_the_source.check(&destination).unwrap_err()),
+			Some(INSIDE_THE_SOURCE)
+		);
+		assert!(!destination.join("new").exists());
+
+		let folders = archive_folders(&destination);
+		assert_eq!(
+			reason(folders.prepare(&dir.path().join("elsewhere")).unwrap_err()),
+			Some(OUTSIDE_THE_DESTINATION)
+		);
+		assert_eq!(
+			reason(folders.prepare(&destination.join("..").join("elsewhere")).unwrap_err()),
+			Some(OUTSIDE_THE_DESTINATION)
+		);
+		assert!(!dir.path().join("elsewhere").exists());
+
+		assert_eq!(
+			folders.prepare(&destination.join("new")).unwrap(),
+			[destination.join("new")]
+		);
+		folders.forget();
+		assert!(folders.check(&destination.join("new")).is_ok());
 	}
 
 	#[test]

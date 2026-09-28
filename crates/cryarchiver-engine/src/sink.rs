@@ -7,7 +7,7 @@ use ulid::Ulid;
 use crate::commit::{Artifact, CommitError, OutputSink, Replace, commit_file};
 use crate::container::OUTPUT_EXTENSIONS;
 use crate::naming::{cli_output_dir, cli_output_path};
-use crate::workspace::{ARCHIVE_DIR, ARCHIVE_WORK_DIR, CLI_WORK_DIR, STAGED_DIR};
+use crate::workspace::{ARCHIVE_DIR, ARCHIVE_WORK_DIR, CLI_WORK_DIR, STAGED_DIR, create_real_folders};
 
 #[derive(Debug, Clone)]
 pub struct CliSink {
@@ -92,7 +92,7 @@ impl OutputSink for ArchivalSink {
 	fn commit(&self, artifact: &Artifact) -> Result<PathBuf, CommitError> {
 		let extension = artifact.path.extension().unwrap_or_default().to_string_lossy();
 		let staged = self.staged_path(&extension);
-		fs::create_dir_all(self.staged_dir())?;
+		create_real_folders(&self.destination, &self.staged_dir(), |_| Ok(()))?;
 
 		commit_file(artifact, &staged, Replace::Never)?;
 		Ok(staged)
@@ -120,6 +120,7 @@ mod tests {
 		fs::write(&source, b"src").unwrap();
 		fs::write(&work, b"encoded").unwrap();
 		let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+		fs::create_dir(dir.path().join("archive")).unwrap();
 		let sink = ArchivalSink::new(&dir.path().join("archive"));
 
 		let staged = sink
@@ -143,6 +144,36 @@ mod tests {
 		assert_eq!(fs::read(&staged).unwrap(), b"encoded");
 		assert_eq!(fs::metadata(&staged).unwrap().modified().unwrap(), modified);
 		assert!(!work.exists());
+	}
+
+	#[test]
+	fn the_archival_sink_never_stages_through_a_link() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("a.flac");
+		fs::write(&source, b"src").unwrap();
+		let outside = dir.path().join("outside");
+		let destination = dir.path().join("archive");
+		fs::create_dir_all(&outside).unwrap();
+		fs::create_dir_all(&destination).unwrap();
+
+		#[cfg(windows)]
+		let linked = std::process::Command::new("cmd")
+			.args(["/C", "mklink", "/J"])
+			.arg(destination.join(".cryarchiver"))
+			.arg(&outside)
+			.output()
+			.is_ok_and(|out| out.status.success());
+		#[cfg(unix)]
+		let linked = std::os::unix::fs::symlink(&outside, destination.join(".cryarchiver")).is_ok();
+		if !linked {
+			eprintln!("skipped: no folder link can be made here");
+			return;
+		}
+
+		let staged = ArchivalSink::new(&destination).commit(&staged(dir.path(), &source));
+
+		assert!(matches!(staged, Err(CommitError::Io(_))), "{staged:?}");
+		assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
 	}
 
 	fn staged(dir: &Path, source: &Path) -> Artifact {

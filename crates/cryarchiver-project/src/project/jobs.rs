@@ -10,6 +10,7 @@ use cryarchiver_engine::commit::{SourceTimes, check_space, file_id, free_space};
 use cryarchiver_engine::engine::{Encode, Job, JobEvent};
 use cryarchiver_engine::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use cryarchiver_engine::sink::ArchivalSink;
+use cryarchiver_engine::workspace::UnsafeFolder;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::owner::Message;
 use crate::keys::RelPath;
 use crate::record::{CopyReason, Hash, How, Identity, mtime_ns};
-use crate::run::{self, Deletion, Expected, Staged};
+use crate::run::{self, ArchiveFolders, Deletion, Expected, Staged};
 use crate::tree::FileId;
 
 /// How an output was made, before the project names it.
@@ -179,6 +180,7 @@ pub(crate) struct JobContext {
 	/// its dedup hash; a copy or an encode reads its own before it reads the content.
 	pub(crate) identity: Option<Identity>,
 	pub(crate) sink: ArchivalSink,
+	pub(crate) folders: ArchiveFolders,
 	pub(crate) encoder: Arc<dyn Encode>,
 	pub(crate) messages: UnboundedSender<Message>,
 	pub(crate) cancel: CancellationToken,
@@ -242,6 +244,7 @@ impl JobContext {
 	async fn copy(&self, reason: CopyReason) -> Result<(), JobError> {
 		let destination = self.sink.staged_dir();
 		check_space(&destination, self.size)?;
+		self.prepare_staging().await?;
 
 		let (source, staged_path) = (self.source.clone(), self.sink.staged_path(""));
 		let staged = blocking(move || run::copy_to_staged(&source, &staged_path))
@@ -261,6 +264,8 @@ impl JobContext {
 	}
 
 	async fn write(&self, content: Vec<u8>, made: Made, same_file: Option<SameFile>) -> Result<(), JobError> {
+		self.prepare_staging().await?;
+
 		let (source, staged_path) = (self.source.clone(), self.sink.staged_path(""));
 		let staged = blocking(move || {
 			let times = fs::metadata(&source)
@@ -331,9 +336,22 @@ impl JobContext {
 		self.commit(Staged { path: from, size, hash }, made).await
 	}
 
+	/// The staging folder is written like any other destination folder: never through a link.
+	async fn prepare_staging(&self) -> Result<(), JobError> {
+		let (folders, staged) = (self.folders.clone(), self.sink.staged_dir());
+		blocking(move || folders.prepare(&staged).map(drop))
+			.await?
+			.map_err(|err| JobError::io(IoSide::Destination(&self.sink.staged_dir()), &err))
+	}
+
 	/// Checks the archive and the original, asks the project for its durable intent, and only then deletes. Nothing is
 	/// retried here: the project decides what comes next.
 	async fn delete(&self, check: DeleteCheck) -> Result<(), JobError> {
+		if let Some(refused) = self.archive_elsewhere(&check).await? {
+			self.send(JobMessage::DeleteRefused(Refusal::Kept(refused)));
+			return Ok(());
+		}
+
 		let (source, size, mtime_ns) = (self.source.clone(), self.size, self.mtime_ns);
 		let verify = check.clone();
 		let verdict = blocking(move || verify_before_delete(&verify, &source, size, mtime_ns)).await??;
@@ -369,6 +387,24 @@ impl JobContext {
 		};
 		self.send(message);
 		Ok(())
+	}
+
+	/// An archived copy reached through a link isn't proven to be in the archive at all: it may be the source itself.
+	/// Any other error finding its folder is left to the read-back.
+	async fn archive_elsewhere(&self, check: &DeleteCheck) -> Result<Option<String>, JobError> {
+		let folders = self.folders.clone();
+		let outputs: Vec<PathBuf> = std::iter::once(&check.output)
+			.chain(check.placeholder.as_ref().map(|placeholder| &placeholder.output))
+			.filter_map(|output| output.parent().map(Path::to_path_buf))
+			.collect();
+
+		blocking(move || {
+			outputs.iter().find_map(|folder| {
+				let err = folders.check(folder).err()?;
+				UnsafeFolder::of(&err).map(|refused| format!("the archived copy's folder {refused}"))
+			})
+		})
+		.await
 	}
 
 	/// The source no longer has the size and time its record keeps: the project archives it again as it is now.
@@ -429,7 +465,8 @@ impl JobContext {
 			};
 
 			let (from, to, replaces) = (staged.path.clone(), target.path.clone(), target.replaces.clone());
-			match blocking(move || run::move_into_place(&from, &to, replaces.as_deref())).await? {
+			let folders = self.folders.clone();
+			match blocking(move || run::move_into_place(&from, &to, replaces.as_deref(), &folders)).await? {
 				Ok(()) => {
 					self.send(JobMessage::Placed);
 					return Ok(());
@@ -634,6 +671,7 @@ mod tests {
 		task: Task,
 	) -> Vec<JobMessage> {
 		let meta = fs::metadata(source).unwrap();
+		fs::create_dir_all(destination).unwrap();
 		let (messages, mut inbox): (_, UnboundedReceiver<Message>) = unbounded_channel();
 		let context = JobContext {
 			file: FileId(0),
@@ -642,6 +680,7 @@ mod tests {
 			mtime_ns: mtime_ns(meta.modified().unwrap()),
 			identity: None,
 			sink: ArchivalSink::new(destination),
+			folders: ArchiveFolders::new(&destination.with_extension("source"), destination),
 			encoder,
 			messages,
 			cancel: CancellationToken::new(),
@@ -938,6 +977,47 @@ mod tests {
 			}
 			fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
 		}
+	}
+
+	#[test]
+	fn an_original_is_never_deleted_for_an_archived_copy_reached_through_a_link() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("a.txt");
+		fs::write(&source, b"notes").unwrap();
+		let destination = dir.path().join("archive");
+		let elsewhere = dir.path().join("elsewhere");
+		fs::create_dir_all(&destination).unwrap();
+		fs::create_dir_all(&elsewhere).unwrap();
+		fs::write(elsewhere.join("a.txt"), b"notes").unwrap();
+		let link = destination.join("Linked");
+
+		#[cfg(windows)]
+		let linked = std::process::Command::new("cmd")
+			.args(["/C", "mklink", "/J"])
+			.arg(&link)
+			.arg(&elsewhere)
+			.output()
+			.is_ok_and(|out| out.status.success());
+		#[cfg(unix)]
+		let linked = std::os::unix::fs::symlink(&elsewhere, &link).is_ok();
+		if !linked {
+			eprintln!("skipped: no folder link can be made here");
+			return;
+		}
+
+		let check = delete_check(&link.join("a.txt"), b"notes");
+		let sent = run_job(&source, &destination, b"notes", Task::Delete(check));
+
+		assert!(sent.iter().any(|message| matches!(
+			message,
+			JobMessage::DeleteRefused(Refusal::Kept(reason)) if reason.contains("link")
+		)));
+		assert!(
+			!sent
+				.iter()
+				.any(|message| matches!(message, JobMessage::DeleteIntent { .. }))
+		);
+		assert_eq!(fs::read(&source).unwrap(), b"notes");
 	}
 
 	#[test]

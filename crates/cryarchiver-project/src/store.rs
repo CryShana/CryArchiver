@@ -2,6 +2,7 @@
 //! runs; every other change waits in a batch that commits every 1000 changes or 250 ms, whichever comes first.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -140,12 +141,18 @@ pub struct Store {
 }
 
 impl Store {
+	/// Refuses anything already at `path`, a dangling link too, and creates the file itself, never a link's target.
 	pub fn create(path: &Path, settings: &Settings) -> Result<Self, StoreError> {
-		if path.exists() {
-			return Err(StoreError::Exists(cryarchiver_engine::text::display_path(path)));
+		let exists = || StoreError::Exists(cryarchiver_engine::text::display_path(path));
+		if fs::symlink_metadata(path).is_ok() {
+			return Err(exists());
 		}
 
-		let db = Database::create(path)?;
+		let file = match create_new_file(path) {
+			Err(err) if err.kind() == io::ErrorKind::AlreadyExists => return Err(exists()),
+			result => result?,
+		};
+		let db = Database::builder().create_file(file)?;
 		write_new(&db, settings)?;
 
 		Ok(Self {
@@ -382,6 +389,38 @@ impl Store {
 		self.oldest_pending.get_or_insert_with(Instant::now);
 		self.pending.push(change);
 	}
+}
+
+/// Creating through a dangling link would create its target, and on Windows `create_new` alone still does: the link is
+/// opened in its own place, and the handle must show a plain file.
+#[cfg(windows)]
+fn create_new_file(path: &Path) -> io::Result<fs::File> {
+	use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+	use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
+
+	let file = fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create_new(true)
+		.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+		.open(path)?;
+	if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+		return Err(io::ErrorKind::AlreadyExists.into());
+	}
+	Ok(file)
+}
+
+#[cfg(unix)]
+fn create_new_file(path: &Path) -> io::Result<fs::File> {
+	use std::os::unix::fs::OpenOptionsExt;
+
+	fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create_new(true)
+		.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+		.open(path)
 }
 
 fn write_new(db: &Database, settings: &Settings) -> Result<(), StoreError> {

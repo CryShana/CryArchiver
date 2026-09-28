@@ -28,6 +28,7 @@ use cryarchiver_engine::commit::file_id;
 use cryarchiver_engine::engine::{Encode, MemoryGate};
 use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::text::display_path;
+use cryarchiver_engine::workspace::is_link;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -170,6 +171,10 @@ pub enum ProjectError {
 	Moved { destination: String },
 	#[error("the project name {name:?} can't be used: {reason}")]
 	Name { name: String, reason: String },
+	#[error(
+		"{path} is a link or a junction, which could lead the project's writes and deletes elsewhere; the project doesn't open while it is one"
+	)]
+	Link { path: String },
 }
 
 pub const MAX_NAME_CHARS: usize = 100;
@@ -204,11 +209,17 @@ pub fn check_name(name: &OsStr) -> Result<(), String> {
 		return Err(format!("{stem} is reserved by Windows for a device"));
 	}
 
-	let mut components = Path::new(name).components();
-	match (components.next(), components.next()) {
-		(Some(Component::Normal(only)), None) if only == name => Ok(()),
-		_ => Err("must be a plain file name".into()),
+	if one_plain_component(name) {
+		Ok(())
+	} else {
+		Err("must be a plain file name".into())
 	}
+}
+
+/// Checked on the real `OsStr`, not the lossy text the other rules read.
+fn one_plain_component(name: &OsStr) -> bool {
+	let mut components = Path::new(name).components();
+	matches!((components.next(), components.next()), (Some(Component::Normal(only)), None) if only == name)
 }
 
 fn checked_name(name: &OsStr) -> Result<(), ProjectError> {
@@ -378,6 +389,12 @@ impl Project {
 	/// Opens the project file, recovers from an earlier crash and starts the project task. Work starts only with
 	/// [`Command::Start`]; the source is scanned and reconciled right away.
 	pub fn open(path: &Path, options: ProjectOptions) -> Result<Self, ProjectError> {
+		if fs::symlink_metadata(path).is_ok_and(|meta| is_link(&meta)) {
+			return Err(ProjectError::Link {
+				path: display_path(path),
+			});
+		}
+
 		let (store, meta, loaded) = Store::open(path)?;
 		let runtime = tokio::runtime::Builder::new_multi_thread()
 			.enable_all()
@@ -501,6 +518,30 @@ mod tests {
 		assert!(refused("con.backup").contains("reserved"));
 		assert!(refused(&"x".repeat(MAX_NAME_CHARS + 1)).contains("at most"));
 		assert!(check_name(OsStr::new(&"é".repeat(MAX_NAME_CHARS))).is_ok());
+	}
+
+	#[test]
+	fn the_last_rule_takes_only_one_plain_component() {
+		assert!(one_plain_component(OsStr::new("Photos 2026")));
+		for name in ["", ".", "..", "a/b", "/a", "a/", "../a"] {
+			assert!(!one_plain_component(OsStr::new(name)), "{name:?}");
+		}
+
+		#[cfg(windows)]
+		for name in [r"a\b", r"C:\a", "C:a", r"\\?\C:\a"] {
+			assert!(!one_plain_component(OsStr::new(name)), "{name:?}");
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_name_that_is_not_utf8_reaches_the_last_rule_on_its_real_bytes() {
+		use std::os::unix::ffi::OsStrExt;
+
+		assert!(check_name(OsStr::from_bytes(b"a\xff")).is_ok());
+		assert!(one_plain_component(OsStr::from_bytes(b"a\xff")));
+		assert!(!one_plain_component(OsStr::from_bytes(b"\xff/..")));
+		assert!(check_name(OsStr::from_bytes(b"\xff/..")).is_err());
 	}
 
 	#[test]

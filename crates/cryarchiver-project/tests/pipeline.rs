@@ -510,3 +510,48 @@ fn the_low_disk_pause_names_its_sizes_in_readable_units() {
 			.any(|notice| notice.text == "paused: low disk space (1.20 MB free, 5.00 GB needed)")
 	});
 }
+
+#[test]
+fn a_mirrored_folder_that_is_a_link_into_the_source_gets_nothing_written_through_it() {
+	let setup = setup(|_| {});
+	write(&setup.source, "Photos/a.jpg", &jpeg(1, 5000));
+	write(&setup.source, "Photos/b.txt", b"notes");
+	write(&setup.source, "Photos/Deeper/c.txt", b"deeper notes");
+	write(&setup.source, "Other/d.txt", b"other notes");
+	let link = setup.destination.join("Photos");
+	if !support::link_folder(&link, &setup.source.join("Photos")) {
+		eprintln!("skipped: no folder link can be made here");
+		return;
+	}
+	let encoder = FakeEncoder::new();
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "the run to finish", |s| {
+		s.overall.as_ref().is_some_and(|overall| overall.parity.is_some())
+	});
+	drop(project);
+
+	assert_eq!(
+		support::names_in(&setup.source.join("Photos")),
+		["Deeper", "a.jpg", "b.txt"]
+	);
+	assert_eq!(
+		support::names_in(&setup.source.join("Photos").join("Deeper")),
+		["c.txt"]
+	);
+	assert_eq!(
+		fs::read(setup.destination.join("Other").join("d.txt")).unwrap(),
+		b"other notes"
+	);
+	for name in ["Photos/a.jpg", "Photos/b.txt", "Photos/Deeper/c.txt"] {
+		let FileState::Issue { reason, .. } = record(&setup, name).state else {
+			panic!("{name} is not an issue: {:?}", record(&setup, name).state);
+		};
+		assert!(
+			reason.contains(&support::shown(&link)) && reason.contains("link"),
+			"{name}: {reason}"
+		);
+	}
+}
