@@ -58,10 +58,11 @@ pub enum Next {
 
 pub fn next(probes: &[Probe], target: Target, bounds: Bounds, prior_slope: f64) -> Next {
 	let margin = |index: usize| target.margin(probes[index].score);
+	let crf = |index: usize| bounds.quantize(probes[index].crf);
 	let passing = highest_pass(probes, target);
 	let failing = lowest_miss(probes, target, passing);
 
-	let slope = slope(probes, target, passing, failing)
+	let slope = slope(probes, target, bounds, passing, failing)
 		.unwrap_or(prior_slope)
 		.clamp(MIN_SLOPE, MAX_SLOPE);
 	let done = Next::Done(match passing {
@@ -77,25 +78,21 @@ pub fn next(probes: &[Probe], target: Target, bounds: Bounds, prior_slope: f64) 
 
 	let candidate = match (passing, failing) {
 		(Some(low), Some(high)) => {
-			let (low_crf, high_crf) = (probes[low].crf, probes[high].crf);
+			let (low_crf, high_crf) = (crf(low), crf(high));
 			if high_crf - low_crf <= bounds.step {
 				return done;
 			}
 
 			let root = low_crf + margin(low) * (high_crf - low_crf) / (margin(low) - margin(high));
-			bounds
-				.quantize(root)
-				.clamp(low_crf + bounds.step, high_crf - bounds.step)
+			let (lo, hi) = (low_crf + bounds.step, high_crf - bounds.step);
+			bounds.quantize(root).clamp(lo.min(hi), lo.max(hi))
 		}
-		(Some(low), None) => bounds.quantize(probes[low].crf + (margin(low) / slope).min(MAX_STEP)),
-		(None, Some(high)) => bounds.quantize(probes[high].crf - (-margin(high) / slope + DOWN_MARGIN).min(MAX_STEP)),
+		(Some(low), None) => bounds.quantize(crf(low) + (margin(low) / slope).min(MAX_STEP)),
+		(None, Some(high)) => bounds.quantize(crf(high) - (-margin(high) / slope + DOWN_MARGIN).min(MAX_STEP)),
 		(None, None) => return done,
 	};
 
-	if probes
-		.iter()
-		.any(|probe| (probe.crf - candidate).abs() < bounds.step / 2.0)
-	{
+	if (0..probes.len()).any(|index| (crf(index) - candidate).abs() < bounds.step / 2.0) {
 		return done;
 	}
 
@@ -103,6 +100,7 @@ pub fn next(probes: &[Probe], target: Target, bounds: Bounds, prior_slope: f64) 
 }
 
 pub fn retry_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bounds) -> Option<f64> {
+	let crf = bounds.quantize(crf);
 	let deficit = -target.margin(score);
 	if deficit <= 0.0 {
 		return None;
@@ -132,14 +130,20 @@ fn lowest_miss(probes: &[Probe], target: Target, passing: Option<usize>) -> Opti
 		.map(|(index, _)| index)
 }
 
-fn slope(probes: &[Probe], target: Target, passing: Option<usize>, failing: Option<usize>) -> Option<f64> {
+fn slope(
+	probes: &[Probe],
+	target: Target,
+	bounds: Bounds,
+	passing: Option<usize>,
+	failing: Option<usize>,
+) -> Option<f64> {
 	let (a, b) = match (passing, failing) {
 		(Some(low), Some(high)) => (low, high),
 		_ if probes.len() >= 2 => (probes.len() - 2, probes.len() - 1),
 		_ => return None,
 	};
 
-	let run = probes[b].crf - probes[a].crf;
+	let run = bounds.quantize(probes[b].crf) - bounds.quantize(probes[a].crf);
 
 	(run.abs() > f64::EPSILON).then(|| ((target.margin(probes[a].score) - target.margin(probes[b].score)) / run).abs())
 }
@@ -313,5 +317,78 @@ mod tests {
 		assert_eq!(retry_crf(30.0, missed, TARGET, 0.25, SVT), Some(23.5));
 		assert_eq!(retry_crf(30.0, linear(10.0), TARGET, 0.5, SVT), None);
 		assert_eq!(retry_crf(10.0, missed, TARGET, 0.5, SVT), None);
+	}
+
+	fn is_on_grid(crf: f64, bounds: Bounds) -> bool {
+		let steps = (crf - bounds.min) / bounds.step;
+		(steps - steps.round()).abs() < 1e-6
+	}
+
+	#[test]
+	fn a_narrow_off_grid_bracket_does_not_panic() {
+		let probes = [
+			Probe {
+				crf: 16.6,
+				score: Score {
+					mean: 95.6,
+					p5: 90.6,
+					frames: 100,
+				},
+			},
+			Probe {
+				crf: 17.0,
+				score: Score {
+					mean: 94.9,
+					p5: 89.9,
+					frames: 100,
+				},
+			},
+		];
+
+		match next(&probes, TARGET, SVT, DEFAULT_SLOPE) {
+			Next::Probe(crf) => assert!(is_on_grid(crf, SVT), "{crf} is off the grid"),
+			Next::Done(_) => {}
+		}
+	}
+
+	#[test]
+	fn an_off_grid_bracket_on_both_sides_returns_a_grid_aligned_candidate() {
+		let probes = [
+			Probe {
+				crf: 16.6,
+				score: Score {
+					mean: 95.6,
+					p5: 90.6,
+					frames: 100,
+				},
+			},
+			Probe {
+				crf: 17.4,
+				score: Score {
+					mean: 94.9,
+					p5: 89.9,
+					frames: 100,
+				},
+			},
+		];
+
+		let next = next(&probes, TARGET, SVT, DEFAULT_SLOPE);
+
+		assert!(
+			matches!(next, Next::Probe(crf) if (crf - 17.0).abs() < 1e-9),
+			"{next:?}"
+		);
+	}
+
+	#[test]
+	fn an_unaligned_single_probe_seed_steps_to_a_grid_aligned_crf() {
+		let probes = [Probe {
+			crf: 29.13,
+			score: linear(29.13),
+		}];
+
+		let next = next(&probes, TARGET, SVT, DEFAULT_SLOPE);
+
+		assert!(matches!(next, Next::Probe(crf) if is_on_grid(crf, SVT)), "{next:?}");
 	}
 }
