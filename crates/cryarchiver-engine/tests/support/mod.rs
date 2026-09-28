@@ -10,11 +10,7 @@ use cryarchiver_engine::toolchain::{ToolConfig, Toolchain};
 use tokio_util::sync::CancellationToken;
 
 pub async fn toolchain() -> Toolchain {
-	let config = ToolConfig {
-		ffmpeg: None,
-		cache_dir: Some(std::env::temp_dir().join("cryarchiver-test-cache")),
-		refresh: false,
-	};
+	let config = ToolConfig { ffmpeg: None };
 	Toolchain::detect(&config, &CancellationToken::new())
 		.await
 		.expect("ffmpeg and ffprobe on PATH")

@@ -39,10 +39,10 @@ cryarchiver album/ --speed slow        # slower, higher quality
 - Video is deinterlaced (or inverse-telecined), rotated upright, and keeps its colour, HDR10/HLG, every audio track, subtitles, chapters and fonts.
   - Personal metadata (GPS, camera and dates) and telemetry streams are dropped unless you pass `--keep-metadata`.
   - Dolby Vision is saved as its HDR10- or HLG-compatible base layer. Profile 5, which has none, keeps the original.
-- At `--speed moderate` (the default) and `slow`, each video's quality setting is chosen before the full encode: a few seconds of samples are encoded and measured with VMAF, and the finished video is measured again before it is kept. What each kind of video needed is remembered in the user cache folder (`quality-cache.json`; archive projects keep it in the project file), so similar videos skip the samples at moderate. `--speed fast` uses fixed settings and doesn't measure video.
+- At `--speed moderate` (the default) and `slow`, each video's quality setting is chosen before the full encode: a few seconds of samples are encoded and measured with VMAF, and the finished video is measured again before it is kept. What each kind of video needed is remembered, so similar videos skip the samples at moderate. `--speed fast` uses fixed settings and doesn't measure video.
+  - A plain run remembers this only for its own files; an archive project remembers it across runs inside the project file.
   - When no setting reaches the quality target, or the samples show the output wouldn't be meaningfully smaller, the original is kept before the full encode. A finished video that misses the target is encoded once more with more quality.
   - Noisy sources at moderate and slow are denoised and get AV1 film grain back, with a strength that follows the measured noise.
-  - The cache folder is `%LOCALAPPDATA%\cryarchiver\cache` on Windows and `~/.cache/cryarchiver` on Linux (`$XDG_CACHE_HOME/cryarchiver`); `CRYARCHIVER_CACHE_DIR` points it elsewhere.
 - Images are rotated upright and keep their colour profile. Each encode is checked with SSIMULACRA2 and kept only if it reaches the quality target for the chosen speed.
   - A photo that misses its quality target is encoded again with more quality, at most twice; photos of the same kind then start from what worked.
   - Personal metadata (EXIF, XMP, GPS, IPTC) is dropped unless you pass `--keep-metadata`, which carries it over with the orientation and size corrected.

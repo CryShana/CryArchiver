@@ -144,3 +144,22 @@ fn a_deleting_run_removes_only_verified_originals() {
 	assert!(destination.join("song.opus").is_file());
 	assert_eq!(fs::read(destination.join("notes.txt")).unwrap(), b"plain notes");
 }
+
+#[test]
+fn a_fast_project_run_writes_no_quality_entries() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("source");
+	let destination = dir.path().join("archive");
+	fs::create_dir_all(&source).unwrap();
+	support::mpeg4(&source, "clip.mp4", 1);
+	let project = project(&source, &destination, |_| {});
+
+	let out = run(&[OsStr::new("run"), project.as_os_str()]);
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	let mut dumped = Vec::new();
+	cryarchiver_project::store::dump(&project, &mut dumped).unwrap();
+	let dumped = String::from_utf8(dumped).unwrap();
+	let quality = dumped.split("[quality]").nth(1).unwrap();
+	assert!(quality.trim().is_empty(), "{dumped}");
+}

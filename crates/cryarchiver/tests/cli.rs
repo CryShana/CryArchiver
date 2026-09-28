@@ -10,10 +10,6 @@ use std::process::{Command, Output};
 fn cryarchiver(dir: &Path, args: &[&str]) -> Output {
 	Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
 		.current_dir(dir)
-		.env(
-			"CRYARCHIVER_CACHE_DIR",
-			std::env::temp_dir().join("cryarchiver-cli-test-cache"),
-		)
 		.args(args)
 		.output()
 		.unwrap()
@@ -625,51 +621,34 @@ fn rerun_skips_existing_video_outputs() {
 }
 
 #[test]
-fn moderate_runs_teach_the_quality_cache() {
+fn plain_runs_write_nothing_outside_the_outputs() {
 	let dir = tempfile::tempdir().unwrap();
-	let cache = tempfile::tempdir().unwrap();
-	support::mpeg4(dir.path(), "clip.mp4", 3);
+	let home = tempfile::tempdir().unwrap();
+	support::mpeg4(dir.path(), "first.mp4", 3);
+	support::mpeg4(dir.path(), "second.mp4", 3);
 
 	let out = Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
 		.current_dir(dir.path())
-		.env("CRYARCHIVER_CACHE_DIR", cache.path())
-		.arg("clip.mp4")
+		.env("HOME", home.path())
+		.env("LOCALAPPDATA", home.path())
+		.env("XDG_CACHE_HOME", home.path())
+		.args(["first.mp4", "second.mp4", "-o", "out"])
 		.output()
 		.unwrap();
 
-	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-	let saved: serde_json::Value =
-		serde_json::from_slice(&fs::read(cache.path().join("quality-cache.json")).unwrap()).unwrap();
-	let keys: Vec<&String> = saved["entries"].as_object().unwrap().keys().collect();
-	assert!(keys.iter().any(|key| key.starts_with("video/mpeg4/")), "{keys:?}");
-}
-
-#[test]
-fn a_video_override_keys_what_the_quality_cache_learns() {
-	let dir = tempfile::tempdir().unwrap();
-	let cache = tempfile::tempdir().unwrap();
-	support::mpeg4(dir.path(), "clip.mp4", 3);
-
-	let out = Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
-		.current_dir(dir.path())
-		.env("CRYARCHIVER_CACHE_DIR", cache.path())
-		.args(["clip.mp4", "--video-vmaf", "90.04/85"])
-		.output()
-		.unwrap();
-
-	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
 	assert!(
-		stdout(&out).contains("MODERATE · custom: video VMAF 90/85\n"),
-		"{}",
-		stdout(&out)
+		fs::read_dir(home.path()).unwrap().next().is_none(),
+		"the cache dir gained files"
 	);
-	let saved: serde_json::Value =
-		serde_json::from_slice(&fs::read(cache.path().join("quality-cache.json")).unwrap()).unwrap();
-	let keys: Vec<&String> = saved["entries"].as_object().unwrap().keys().collect();
+	let produced: Vec<_> = fs::read_dir(dir.path().join("out"))
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name())
+		.collect();
+	assert_eq!(produced.len(), 2, "{produced:?}");
 	assert!(
-		keys.iter()
-			.any(|key| key.starts_with("video/mpeg4/") && key.ends_with("|t90.0/85.0")),
-		"{keys:?}"
+		produced.iter().all(|name| name.to_str().unwrap().ends_with(".cry.mkv")),
+		"{produced:?}"
 	);
 }
 

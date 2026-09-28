@@ -15,7 +15,6 @@ use crate::text::display_path;
 const MIN_FFMPEG: Version = Version { major: 8, minor: 1 };
 const MIN_SVT_AV1: Version = Version { major: 4, minor: 0 };
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-const CACHE_FORMAT: u32 = 2;
 const VMAF_PROBE_INPUT: &str = "testsrc2=s=64x64:d=0.2";
 const FULL_BUILD_HINT: &str = "install a full ffmpeg build (Windows: gyan.dev \"full\" or BtbN GPL builds; Linux: BtbN static builds or a distro ffmpeg with libsvtav1)";
 const SOXR_PROBE: &[&str] = &[
@@ -174,8 +173,6 @@ pub enum FfmpegBuild {
 #[derive(Debug, Clone, Default)]
 pub struct ToolConfig {
 	pub ffmpeg: Option<PathBuf>,
-	pub cache_dir: Option<PathBuf>,
-	pub refresh: bool,
 }
 
 #[allow(clippy::unsafe_derive_deserialize, clippy::struct_excessive_bools)]
@@ -220,29 +217,10 @@ pub enum ToolchainError {
 	Unusable(PathBuf, String),
 }
 
-#[derive(Serialize, Deserialize)]
-struct CacheEntry {
-	fingerprint: String,
-	toolchain: Toolchain,
-}
-
 impl Toolchain {
 	pub async fn detect(config: &ToolConfig, cancel: &CancellationToken) -> Result<Self, ToolchainError> {
 		let (ffmpeg, ffprobe) = locate(config.ffmpeg.as_deref())?;
-		let cache = cache_file(config);
-		let fingerprint = fingerprint(&ffmpeg);
-
-		if !config.refresh
-			&& let Some(cached) = read_cache(cache.as_deref(), fingerprint.as_deref())
-		{
-			return Ok(Self { ffprobe, ..cached });
-		}
-
-		let toolchain = Box::pin(Self::probe(ffmpeg, ffprobe, cancel)).await?;
-		if let (Some(cache), Some(fingerprint)) = (cache, fingerprint) {
-			write_cache(&cache, fingerprint, &toolchain);
-		}
-		Ok(toolchain)
+		Box::pin(Self::probe(ffmpeg, ffprobe, cancel)).await
 	}
 
 	async fn probe(ffmpeg: PathBuf, ffprobe: PathBuf, cancel: &CancellationToken) -> Result<Self, ToolchainError> {
@@ -576,48 +554,6 @@ fn find_on_path(file: &str) -> Option<PathBuf> {
 	std::env::split_paths(&std::env::var_os("PATH")?)
 		.map(|dir| dir.join(file))
 		.find(|candidate| candidate.is_file())
-}
-
-fn cache_file(config: &ToolConfig) -> Option<PathBuf> {
-	let dir = match &config.cache_dir {
-		Some(dir) => dir.clone(),
-		None => directories::ProjectDirs::from("", "", "cryarchiver")?
-			.cache_dir()
-			.to_path_buf(),
-	};
-	Some(dir.join("toolchain.json"))
-}
-
-fn fingerprint(ffmpeg: &Path) -> Option<String> {
-	let meta = fs::metadata(ffmpeg).ok()?;
-	let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
-	Some(format!(
-		"{CACHE_FORMAT}|{}|{}|{}|{modified}",
-		crate::VERSION,
-		ffmpeg.display(),
-		meta.len()
-	))
-}
-
-fn read_cache(cache: Option<&Path>, fingerprint: Option<&str>) -> Option<Toolchain> {
-	let entry: CacheEntry = serde_json::from_slice(&fs::read(cache?).ok()?).ok()?;
-	(Some(entry.fingerprint.as_str()) == fingerprint).then_some(entry.toolchain)
-}
-
-fn write_cache(cache: &Path, fingerprint: String, toolchain: &Toolchain) {
-	let entry = CacheEntry {
-		fingerprint,
-		toolchain: toolchain.clone(),
-	};
-	let Ok(json) = serde_json::to_vec_pretty(&entry) else {
-		return;
-	};
-
-	let temp = cache.with_extension("json.tmp");
-	let written = cache.parent().is_some_and(|dir| fs::create_dir_all(dir).is_ok()) && fs::write(&temp, json).is_ok();
-	if written {
-		let _ = fs::rename(&temp, cache);
-	}
 }
 
 async fn run_ffmpeg(ffmpeg: &Path, args: &[&str], cancel: &CancellationToken) -> Result<ToolOutput, ToolchainError> {
@@ -979,56 +915,6 @@ mod tests {
 		assert!(line.detail.contains("bwdif, idet"), "{}", line.detail);
 	}
 
-	fn cached_fake_ffmpeg(dir: &Path) -> (ToolConfig, PathBuf) {
-		let exe_suffix = std::env::consts::EXE_SUFFIX;
-		let ffmpeg = dir.join(format!("ffmpeg{exe_suffix}"));
-		let ffprobe = dir.join(format!("ffprobe{exe_suffix}"));
-		fs::write(&ffmpeg, b"").unwrap();
-		fs::write(&ffprobe, b"").unwrap();
-
-		let stale = Toolchain {
-			ffmpeg: ffmpeg.clone(),
-			ffprobe: PathBuf::from("/nonexistent/ffprobe"),
-			..complete_toolchain()
-		};
-		let entry = CacheEntry {
-			fingerprint: fingerprint(&ffmpeg).unwrap(),
-			toolchain: stale,
-		};
-		fs::write(dir.join("toolchain.json"), serde_json::to_vec(&entry).unwrap()).unwrap();
-
-		let config = ToolConfig {
-			ffmpeg: Some(ffmpeg),
-			cache_dir: Some(dir.to_path_buf()),
-			refresh: false,
-		};
-		(config, ffprobe)
-	}
-
-	#[tokio::test]
-	async fn cache_hit_returns_the_freshly_located_ffprobe() {
-		let dir = tempfile::tempdir().unwrap();
-		let (config, ffprobe) = cached_fake_ffmpeg(dir.path());
-
-		let tools = Toolchain::detect(&config, &CancellationToken::new()).await.unwrap();
-
-		assert_eq!(tools.ffprobe, ffprobe);
-	}
-
-	#[tokio::test]
-	async fn refresh_probes_instead_of_reading_the_cache() {
-		let dir = tempfile::tempdir().unwrap();
-		let (config, _) = cached_fake_ffmpeg(dir.path());
-		let config = ToolConfig {
-			refresh: true,
-			..config
-		};
-
-		let result = Toolchain::detect(&config, &CancellationToken::new()).await;
-
-		assert!(result.is_err(), "{result:?}");
-	}
-
 	#[test]
 	fn a_missing_vmaf_model_only_warns() {
 		let tools = Toolchain {
@@ -1042,14 +928,5 @@ mod tests {
 		assert!(line.detail.contains("not available"), "{}", line.detail);
 		assert!(tools.problems(MediaKind::Video).is_empty());
 		assert!(!tools.has_vmaf());
-	}
-
-	#[test]
-	fn fingerprints_name_the_cache_format() {
-		let dir = tempfile::tempdir().unwrap();
-		let ffmpeg = dir.path().join("ffmpeg");
-		fs::write(&ffmpeg, b"").unwrap();
-
-		assert!(fingerprint(&ffmpeg).unwrap().starts_with("2|"));
 	}
 }

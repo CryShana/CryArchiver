@@ -1,16 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
 use crate::quality::keys::CacheKey;
 
-pub const CACHE_FILE: &str = "quality-cache.json";
-
-const CACHE_VERSION: u32 = 1;
 const HISTORY: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -126,56 +120,6 @@ impl QualityMemory for SharedMemory {
 	}
 }
 
-#[derive(Serialize, Deserialize)]
-struct CacheFile {
-	version: u32,
-	entries: BTreeMap<String, GroupStats>,
-}
-
-pub fn default_path() -> Option<PathBuf> {
-	Some(
-		directories::ProjectDirs::from("", "", "cryarchiver")?
-			.cache_dir()
-			.join(CACHE_FILE),
-	)
-}
-
-pub fn load(path: &Path) -> SharedMemory {
-	SharedMemory::with_entries(read(path))
-}
-
-pub fn save(memory: &SharedMemory, path: &Path) -> io::Result<()> {
-	let changed = memory.take_changed();
-	if changed.is_empty() {
-		return Ok(());
-	}
-
-	let mut entries = read(path);
-	entries.extend(changed);
-	let json = serde_json::to_vec_pretty(&CacheFile {
-		version: CACHE_VERSION,
-		entries,
-	})
-	.map_err(io::Error::other)?;
-
-	if let Some(dir) = path.parent() {
-		fs::create_dir_all(dir)?;
-	}
-
-	let temp = path.with_extension("json.tmp");
-	fs::write(&temp, json)?;
-	fs::rename(&temp, path)
-}
-
-fn read(path: &Path) -> BTreeMap<String, GroupStats> {
-	fs::read(path)
-		.ok()
-		.and_then(|bytes| serde_json::from_slice::<CacheFile>(&bytes).ok())
-		.filter(|file| file.version == CACHE_VERSION)
-		.map(|file| file.entries)
-		.unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -234,53 +178,5 @@ mod tests {
 		assert_eq!(memory.take_changed().len(), 1);
 		assert!(memory.take_changed().is_empty());
 		assert_eq!(memory.entries().len(), 1);
-	}
-
-	#[test]
-	fn the_cache_file_round_trips() {
-		let dir = tempfile::tempdir().unwrap();
-		let path = dir.path().join("nested").join(CACHE_FILE);
-		let memory = SharedMemory::default();
-		memory.record(&key(ImageFormat::Jpeg), observation(90.0));
-
-		save(&memory, &path).unwrap();
-
-		assert_eq!(
-			load(&path)
-				.lookup(&key(ImageFormat::Jpeg))
-				.map(|stats| stats.observations),
-			Some(1)
-		);
-		assert!(!path.with_extension("json.tmp").exists());
-	}
-
-	#[test]
-	fn saving_keeps_entries_another_run_saved_meanwhile() {
-		let dir = tempfile::tempdir().unwrap();
-		let path = dir.path().join(CACHE_FILE);
-		let first = load(&path);
-		let second = load(&path);
-		first.record(&key(ImageFormat::Jpeg), observation(90.0));
-		second.record(&key(ImageFormat::Png), observation(70.0));
-
-		save(&first, &path).unwrap();
-		save(&second, &path).unwrap();
-
-		let merged = load(&path);
-		assert!(merged.lookup(&key(ImageFormat::Jpeg)).is_some());
-		assert!(merged.lookup(&key(ImageFormat::Png)).is_some());
-	}
-
-	#[test]
-	fn an_unreadable_or_foreign_cache_starts_empty() {
-		let dir = tempfile::tempdir().unwrap();
-		let corrupt = dir.path().join("corrupt.json");
-		let future = dir.path().join("future.json");
-		fs::write(&corrupt, b"{not json").unwrap();
-		fs::write(&future, br#"{"version":99,"entries":{}}"#).unwrap();
-
-		assert!(load(&corrupt).entries().is_empty());
-		assert!(load(&future).entries().is_empty());
-		assert!(load(&dir.path().join("missing.json")).entries().is_empty());
 	}
 }

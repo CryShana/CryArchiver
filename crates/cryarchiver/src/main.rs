@@ -18,7 +18,6 @@ use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::cli_output_path;
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
-use cryarchiver_engine::quality::memory;
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::toolchain::{Status, ToolConfig, Toolchain};
@@ -30,8 +29,6 @@ use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::report::{Report, Totals, outcome_line};
-
-const CACHE_DIR_VARIABLE: &str = "CRYARCHIVER_CACHE_DIR";
 
 #[derive(Parser)]
 #[command(
@@ -503,16 +500,7 @@ fn run_project(path: &Path, delete_originals: bool, ffmpeg: Option<PathBuf>) -> 
 }
 
 async fn doctor(ffmpeg: Option<PathBuf>) -> u8 {
-	let tools = match Toolchain::detect(
-		&ToolConfig {
-			ffmpeg,
-			cache_dir: None,
-			refresh: true,
-		},
-		&CancellationToken::new(),
-	)
-	.await
-	{
+	let tools = match Toolchain::detect(&ToolConfig { ffmpeg }, &CancellationToken::new()).await {
 		Ok(tools) => tools,
 		Err(err) => {
 			eprintln!("✗ {err}");
@@ -545,16 +533,7 @@ async fn compress(args: CompressArgs) -> u8 {
 	}
 
 	let cancel = CancellationToken::new();
-	let tools = match Toolchain::detect(
-		&ToolConfig {
-			ffmpeg: args.ffmpeg,
-			cache_dir: None,
-			refresh: false,
-		},
-		&cancel,
-	)
-	.await
-	{
+	let tools = match Toolchain::detect(&ToolConfig { ffmpeg: args.ffmpeg }, &cancel).await {
 		Ok(tools) => tools,
 		Err(err) => {
 			eprintln!("error: {err}");
@@ -609,21 +588,12 @@ async fn compress(args: CompressArgs) -> u8 {
 		})
 		.collect();
 	let parallel = args.jobs.unwrap_or_else(default_jobs).max(1);
-	let quality_cache = quality_cache_path();
-	let quality = Arc::new(quality_cache.as_deref().map(memory::load).unwrap_or_default());
 	let engine = Engine::new(tools)
 		.with_video_jobs(args.jobs.unwrap_or(1))
-		.with_image_threads(image_threads(parallel))
-		.with_quality_memory(quality.clone());
+		.with_image_threads(image_threads(parallel));
 	let report = Report::new(args.quiet);
 
 	let totals = run_all(&Arc::new(engine), &sink, jobs, parallel, &report, &cancel).await;
-
-	if let Some(path) = &quality_cache
-		&& let Err(err) = memory::save(&quality, path)
-	{
-		eprintln!("warning: the quality cache was not saved: {err}");
-	}
 
 	let _ = writeln!(io::stdout(), "{}", totals.line());
 	totals.exit_code().max(u8::from(inputs.problems > 0))
@@ -706,13 +676,6 @@ fn output_key(source: &Path, output_dir: Option<&Path>) -> OsString {
 
 fn absolute(path: PathBuf) -> PathBuf {
 	std::path::absolute(&path).unwrap_or(path)
-}
-
-fn quality_cache_path() -> Option<PathBuf> {
-	match std::env::var_os(CACHE_DIR_VARIABLE) {
-		Some(dir) => Some(PathBuf::from(dir).join(memory::CACHE_FILE)),
-		None => memory::default_path(),
-	}
 }
 
 fn record(report: &Report, totals: &mut Totals, source: &Path, outcome: &JobOutcome) {

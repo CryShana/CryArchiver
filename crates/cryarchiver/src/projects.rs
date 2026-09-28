@@ -25,15 +25,8 @@ pub fn open(path: &Path, ffmpeg: Option<PathBuf>) -> Result<Project, String> {
 	// that carries the project's limit.
 	limits::apply(Limits::default());
 
-	let tools = block_on(Toolchain::detect(
-		&ToolConfig {
-			ffmpeg,
-			cache_dir: None,
-			refresh: false,
-		},
-		&CancellationToken::new(),
-	))
-	.map_err(|err| err.to_string())?;
+	let tools = block_on(Toolchain::detect(&ToolConfig { ffmpeg }, &CancellationToken::new()))
+		.map_err(|err| err.to_string())?;
 
 	let universal = tools.universal_problems();
 	if !universal.is_empty() {
