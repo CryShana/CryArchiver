@@ -121,9 +121,11 @@ pub const VIDEO_FILTERS: &[&str] = &[
 pub const ALPHA_FILTERS: &[&str] = &["alphaextract", "ssim"];
 pub const IMAGE_FILTERS: &[&str] = &["alphaextract", "alphamerge", "signalstats", "metadata", "sidedata"];
 const PAM: &str = "pam";
-const LIBJXL: &str = "libjxl";
+pub const LIBJXL: &str = "libjxl";
 const AV1_DECODERS: &[&str] = &["libdav1d", "libaom-av1"];
-const LIBAOM: &str = "libaom-av1";
+pub const LIBAOM: &str = "libaom-av1";
+pub const LIBVPX_VP9: &str = "libvpx-vp9";
+pub const SVT_AV1: &str = "svt-av1";
 const EVERY_KIND: &[MediaKind] = MediaKind::ALL;
 const AUDIO_AND_VIDEO: &[MediaKind] = &[MediaKind::Audio, MediaKind::Video];
 const VIDEO_ONLY: &[MediaKind] = &[MediaKind::Video];
@@ -181,10 +183,19 @@ pub struct Toolchain {
 	pub ffmpeg: PathBuf,
 	pub ffprobe: PathBuf,
 	pub build: FfmpegBuild,
+	/// The version exactly as `ffmpeg -version` prints it, such as `n9.0.1-6-g9d4ca21220-20260821`.
+	#[serde(default)]
+	pub build_id: String,
 	pub encoders: BTreeSet<String>,
 	pub decoders: BTreeSet<String>,
 	pub filters: BTreeSet<String>,
 	pub svt_av1: Option<Version>,
+	/// Every number of the SVT-AV1 version its log shows, such as `4.2.0`.
+	#[serde(default)]
+	pub svt_av1_release: Option<String>,
+	/// The libvpx version the VP9 encoder reports, such as `1.16.0`.
+	#[serde(default)]
+	pub libvpx_release: Option<String>,
 	pub svt_settings: bool,
 	pub colour_tags: bool,
 	pub vp9_alpha: bool,
@@ -240,17 +251,22 @@ impl Toolchain {
 		let build = parse_ffmpeg_version(&first_line).ok_or_else(|| {
 			ToolchainError::Unusable(ffmpeg.clone(), format!("unrecognised version line: {first_line}"))
 		})?;
+		let build_id = build_id(&first_line);
 		let encoders = parse_codecs(&stdout_text(&encoders?));
 		let decoders = parse_codecs(&stdout_text(&decoders?));
 		let filters = parse_filters(&stdout_text(&filters?));
 
 		let soxr = soxr?;
 		let opus_surround = opus_surround? && encoders.contains("libopus");
-		let svt_av1 = svt_av1?.filter(|_| encoders.contains("libsvtav1"));
+		let (svt_av1, svt_av1_release) = match svt_av1? {
+			Some(found) if encoders.contains("libsvtav1") => (Some(found.version), found.release),
+			_ => (None, None),
+		};
 		let VideoProbes {
 			svt_settings,
 			colour_tags,
 			vp9_alpha,
+			libvpx_release,
 		} = video?;
 		let vp9_alpha = vp9_alpha && ALPHA_FILTERS.iter().all(|name| filters.contains(*name));
 		let vmaf = vmaf? && filters.contains(vmaf::FILTER);
@@ -259,10 +275,13 @@ impl Toolchain {
 			ffmpeg,
 			ffprobe,
 			build,
+			build_id,
 			encoders,
 			decoders,
 			filters,
 			svt_av1,
+			svt_av1_release,
+			libvpx_release,
 			svt_settings,
 			colour_tags,
 			vp9_alpha,
@@ -270,6 +289,22 @@ impl Toolchain {
 			opus_surround,
 			vmaf,
 		})
+	}
+
+	/// The encoder part of a learned-quality key, which changes whenever the encoder may: SVT-AV1 by its full version,
+	/// libvpx by the version it reports, and every other library, whose version ffmpeg doesn't report, by the ffmpeg
+	/// build it came with.
+	pub fn encoder_id(&self, library: &str) -> String {
+		let own = match library {
+			SVT_AV1 => self.svt_av1_release.as_deref(),
+			LIBVPX_VP9 => self.libvpx_release.as_deref(),
+			_ => None,
+		};
+
+		match own {
+			Some(release) => format!("{library}-{release}"),
+			None => format!("{library}-ffmpeg-{}", self.build_id),
+		}
 	}
 
 	pub fn problems(&self, kind: MediaKind) -> Vec<String> {
@@ -491,15 +526,44 @@ fn parse_ffmpeg_version(line: &str) -> Option<FfmpegBuild> {
 	(token.starts_with('N') || token.contains("git")).then(|| FfmpegBuild::Git(token.to_owned()))
 }
 
-fn parse_svt_version(line: &str) -> Option<Version> {
+struct SvtVersion {
+	version: Version,
+	release: Option<String>,
+}
+
+fn parse_svt_version(line: &str) -> Option<SvtVersion> {
 	const MARKER: &str = "Encoder Lib v";
 
 	let rest = &line[line.find(MARKER)? + MARKER.len()..];
 	let mut numbers = rest.split(|c: char| !c.is_ascii_digit());
-	Some(Version {
+	let version = Version {
 		major: numbers.next()?.parse().ok()?,
 		minor: numbers.next()?.parse().ok()?,
+	};
+	Some(SvtVersion {
+		version,
+		release: dotted_release(rest),
 	})
+}
+
+/// libvpx prints its version on a line of its own when it starts encoding: `[libvpx-vp9 @ 0000…] v1.16.0`.
+fn parse_libvpx_release(line: &str) -> Option<String> {
+	let rest = line.strip_prefix("[libvpx-vp9 @ ")?;
+	dotted_release(rest.split_once("] v")?.1)
+}
+
+fn dotted_release(text: &str) -> Option<String> {
+	let release: String = text.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+	let release = release.trim_end_matches('.');
+	(release.contains('.') && release.starts_with(|c: char| c.is_ascii_digit())).then(|| release.to_owned())
+}
+
+fn build_id(version_line: &str) -> String {
+	version_line
+		.strip_prefix("ffmpeg version ")
+		.and_then(|rest| rest.split_whitespace().next())
+		.unwrap_or("unknown")
+		.to_owned()
 }
 
 fn parse_codecs(text: &str) -> BTreeSet<String> {
@@ -573,7 +637,7 @@ async fn succeeds(ffmpeg: &Path, args: &[&str], cancel: &CancellationToken) -> R
 	Ok(out.status.success())
 }
 
-async fn svt_version(ffmpeg: &Path, cancel: &CancellationToken) -> Result<Option<Version>, ToolchainError> {
+async fn svt_version(ffmpeg: &Path, cancel: &CancellationToken) -> Result<Option<SvtVersion>, ToolchainError> {
 	let out = run_ffmpeg(ffmpeg, SVT_PROBE, cancel).await?;
 	Ok(out.stderr_tail.iter().find_map(|line| parse_svt_version(line)))
 }
@@ -614,6 +678,7 @@ struct VideoProbes {
 	svt_settings: bool,
 	colour_tags: bool,
 	vp9_alpha: bool,
+	libvpx_release: Option<String>,
 }
 
 async fn video_probes(
@@ -626,18 +691,21 @@ async fn video_probes(
 			svt_settings: false,
 			colour_tags: false,
 			vp9_alpha: false,
+			libvpx_release: None,
 		});
 	};
 
-	let (svt, vp9_alpha) = tokio::join!(
+	let (svt, vp9) = tokio::join!(
 		svt_settings(ffmpeg, ffprobe, &scratch.0, cancel),
 		vp9_alpha(ffmpeg, &scratch.0, cancel),
 	);
 	let (svt_settings, colour_tags) = svt?;
+	let (vp9_alpha, libvpx_release) = vp9?;
 	Ok(VideoProbes {
 		svt_settings,
 		colour_tags,
-		vp9_alpha: vp9_alpha?,
+		vp9_alpha,
+		libvpx_release,
 	})
 }
 
@@ -685,20 +753,26 @@ async fn svt_settings(
 	))
 }
 
-async fn vp9_alpha(ffmpeg: &Path, dir: &Path, cancel: &CancellationToken) -> Result<bool, ToolchainError> {
+async fn vp9_alpha(
+	ffmpeg: &Path,
+	dir: &Path,
+	cancel: &CancellationToken,
+) -> Result<(bool, Option<String>), ToolchainError> {
 	let clip = dir.join("alpha.webm");
 	let mut encode = ToolCommand::new(ffmpeg, PROBE_TIMEOUT);
 	encode.args(VP9_ALPHA_PROBE).arg(&clip);
-	if !run_command(&encode, cancel).await?.status.success() {
-		return Ok(false);
+	let encoded = run_command(&encode, cancel).await?;
+	let release = encoded.stderr_tail.iter().find_map(|line| parse_libvpx_release(line));
+	if !encoded.status.success() {
+		return Ok((false, release));
 	}
 
 	let mut decode = ToolCommand::new(ffmpeg, PROBE_TIMEOUT);
 	decode
-		.args(["-hide_banner", "-nostdin", "-c:v", "libvpx-vp9", "-i"])
+		.args(["-hide_banner", "-nostdin", "-c:v", LIBVPX_VP9, "-i"])
 		.arg(&clip)
 		.args(["-vf", "alphaextract", "-f", "null", "-"]);
-	Ok(run_command(&decode, cancel).await?.status.success())
+	Ok((run_command(&decode, cancel).await?.status.success(), release))
 }
 
 struct ScratchDir(PathBuf);
@@ -750,11 +824,63 @@ mod tests {
 
 	#[test]
 	fn parses_svt_version_line() {
+		let found = parse_svt_version("Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v4.2.0-73-gfb0ed7e59").unwrap();
+		let short = parse_svt_version("Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v4.1").unwrap();
+
+		assert_eq!(found.version, Version { major: 4, minor: 2 });
+		assert_eq!(found.release.as_deref(), Some("4.2.0"));
+		assert_eq!(short.release.as_deref(), Some("4.1"));
+		assert!(parse_svt_version("Svt[info]: Level of Parallelism: 6").is_none());
+	}
+
+	#[test]
+	fn parses_the_libvpx_version_and_the_build_id() {
 		assert_eq!(
-			parse_svt_version("Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v4.2.0-73-gfb0ed7e59"),
-			Some(Version { major: 4, minor: 2 })
+			parse_libvpx_release("[libvpx-vp9 @ 0000021215f89280] v1.16.0").as_deref(),
+			Some("1.16.0")
 		);
-		assert_eq!(parse_svt_version("Svt[info]: Level of Parallelism: 6"), None);
+		assert_eq!(
+			parse_libvpx_release("[libvpx-vp9 @ 0000021215f89280] Neither bitrate nor constrained quality specified"),
+			None
+		);
+		assert_eq!(
+			build_id("ffmpeg version n9.0.1-6-g9d4ca21220-20260821 Copyright (c) 2000-2026"),
+			"n9.0.1-6-g9d4ca21220-20260821"
+		);
+	}
+
+	#[test]
+	fn encoder_ids_carry_the_library_version_or_else_the_ffmpeg_build() {
+		let tools = complete_toolchain();
+		let unreported = Toolchain {
+			svt_av1_release: None,
+			libvpx_release: None,
+			..complete_toolchain()
+		};
+
+		assert_eq!(tools.encoder_id(SVT_AV1), "svt-av1-4.2.0");
+		assert_eq!(tools.encoder_id(LIBVPX_VP9), "libvpx-vp9-1.16.0");
+		assert_eq!(
+			tools.encoder_id(LIBAOM),
+			"libaom-av1-ffmpeg-n9.0.1-6-g9d4ca21220-20260821"
+		);
+		assert_eq!(tools.encoder_id(LIBJXL), "libjxl-ffmpeg-n9.0.1-6-g9d4ca21220-20260821");
+		assert_eq!(
+			unreported.encoder_id(SVT_AV1),
+			"svt-av1-ffmpeg-n9.0.1-6-g9d4ca21220-20260821"
+		);
+		assert_eq!(
+			unreported.encoder_id(LIBVPX_VP9),
+			"libvpx-vp9-ffmpeg-n9.0.1-6-g9d4ca21220-20260821"
+		);
+		assert_ne!(
+			Toolchain {
+				build_id: "n9.0.2".into(),
+				..complete_toolchain()
+			}
+			.encoder_id(LIBJXL),
+			tools.encoder_id(LIBJXL)
+		);
 	}
 
 	#[test]
@@ -777,6 +903,7 @@ mod tests {
 			ffmpeg: PathBuf::from("ffmpeg"),
 			ffprobe: PathBuf::from("ffprobe"),
 			build: FfmpegBuild::Release(Version { major: 9, minor: 0 }),
+			build_id: "n9.0.1-6-g9d4ca21220-20260821".into(),
 			encoders: ["libopus", "libsvtav1", "libvpx-vp9", "libaom-av1", "libjxl", "pam"]
 				.into_iter()
 				.map(String::from)
@@ -790,6 +917,8 @@ mod tests {
 				.map(|name| (*name).to_owned())
 				.collect(),
 			svt_av1: Some(Version { major: 4, minor: 2 }),
+			svt_av1_release: Some("4.2.0".into()),
+			libvpx_release: Some("1.16.0".into()),
 			svt_settings: true,
 			colour_tags: true,
 			vp9_alpha: true,

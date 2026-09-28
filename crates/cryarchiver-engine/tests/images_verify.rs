@@ -56,6 +56,51 @@ fn identical_images_score_100_and_damage_lowers_the_score() {
 	assert!(score(&original, &photo_like(64, 96)).unwrap_err().contains("output is"));
 }
 
+fn noisy(width: u32, height: u32, seed: u32) -> image::RgbImage {
+	let mut state = seed;
+	ImageBuffer::from_fn(width, height, |x, y| {
+		state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+		let noise = i32::try_from((state >> 16) % 13).unwrap() - 6;
+		let level = |base: u32| u8::try_from((i32::try_from(base % 200 + 20).unwrap() + noise).clamp(0, 255)).unwrap();
+		Rgb([level(x + y / 4), level(y / 3), level(x * 2)])
+	})
+}
+
+/// Copies side by side, every other one mirrored so that no seam adds an edge.
+fn side_by_side(image: &image::RgbImage, copies: u32) -> DynamicImage {
+	let (width, height) = image.dimensions();
+	DynamicImage::ImageRgb8(ImageBuffer::from_fn(width * copies, height, |x, y| {
+		let within = x % width;
+		let column = if (x / width) % 2 == 0 {
+			within
+		} else {
+			width - 1 - within
+		};
+		*image.get_pixel(column, y)
+	}))
+}
+
+#[test]
+fn a_narrow_tall_noisy_image_scores_like_the_same_content_at_full_width() {
+	let reference = noisy(48, 16_500, 7);
+	let mut distorted = reference.clone();
+	for pixel in distorted.pixels_mut() {
+		pixel.0 = pixel.0.map(|value| value & 0xF0 | 0x08);
+	}
+
+	let narrow = score(
+		&DynamicImage::ImageRgb8(reference.clone()),
+		&DynamicImage::ImageRgb8(distorted.clone()),
+	)
+	.unwrap();
+	let wide = score(&side_by_side(&reference, 6), &side_by_side(&distorted, 6)).unwrap();
+
+	assert!(
+		(narrow - wide).abs() < 2.0,
+		"48 px wide: {narrow:.2}, 288 px wide: {wide:.2}"
+	);
+}
+
 #[test]
 fn tiny_images_are_scored_too() {
 	let tiny = photo_like(3, 3);

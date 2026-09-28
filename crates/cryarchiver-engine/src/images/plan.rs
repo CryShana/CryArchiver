@@ -1,9 +1,15 @@
+use std::ops::RangeInclusive;
+
 use crate::images::props::Effective;
+use crate::images::ssim::padded_size;
 use crate::images::structure::Structure;
 use crate::metadata::{MetadataMode, SourceMetadata, exif, icc};
 use crate::outcome::KeepReason;
 use crate::preset::{Overrides, Speed};
+use crate::toolchain::{LIBJXL, Toolchain};
 
+/// The ravif version in `Cargo.lock`; a test keeps the two equal.
+pub const RAVIF_ID: &str = "ravif-0.13.0";
 pub const MAX_AVIF_SIDE: u32 = 16_384;
 pub const MAX_AVIF_PIXELS: u64 = 64_000_000;
 pub const BOMB_PIXELS: u64 = 500_000_000;
@@ -17,6 +23,9 @@ const RAISE_QUALITY_MARGIN: f64 = 1.0;
 const RAISE_DISTANCE_MARGIN: f64 = 0.1;
 const MAX_QUALITY: f64 = 100.0;
 const MIN_DISTANCE: f64 = 0.1;
+const MAX_DISTANCE: f64 = 25.0;
+pub const RAVIF_QUALITY_RANGE: RangeInclusive<f64> = 1.0..=MAX_QUALITY;
+pub const JXL_DISTANCE_RANGE: RangeInclusive<f64> = MIN_DISTANCE..=MAX_DISTANCE;
 const LEARNED_QUALITY_BELOW_TABLE: f64 = 8.0;
 const LEARNED_DISTANCE_ABOVE_TABLE: f64 = 1.0;
 
@@ -165,11 +174,11 @@ impl Candidate {
 		}
 	}
 
-	pub fn encoder_id(self) -> &'static str {
+	pub fn encoder_id(self, tools: &Toolchain) -> String {
 		match self {
-			Self::Ravif(_) => "ravif-0.13",
-			Self::JxlLossy(_) => "libjxl",
-			Self::JxlLossless(_) => "libjxl-lossless",
+			Self::Ravif(_) => RAVIF_ID.to_owned(),
+			Self::JxlLossy(_) => tools.encoder_id(LIBJXL),
+			Self::JxlLossless(_) => tools.encoder_id("libjxl-lossless"),
 		}
 	}
 
@@ -332,7 +341,10 @@ pub fn memory_estimate(width: u32, height: u32, candidates: &[Candidate]) -> u64
 		})
 		.max()
 		.unwrap_or(0);
-	pixels * (DECODE_BYTES_PER_PIXEL + VERIFY_BYTES_PER_PIXEL) + encoder
+	let (verify_width, verify_height) = padded_size((width, height));
+	let verify_pixels = u64::from(verify_width) * u64::from(verify_height);
+
+	pixels * DECODE_BYTES_PER_PIXEL + verify_pixels * VERIFY_BYTES_PER_PIXEL + encoder
 }
 
 #[cfg(test)]
@@ -545,7 +557,14 @@ mod tests {
 	#[test]
 	fn the_worst_case_covers_both_encoders() {
 		assert_eq!(worst_case_memory(4000, 3000), 12_000_000 * (8 + 36 + 34));
-		assert_eq!(worst_case_memory(100, 100), 10_000 * (8 + 36 + 7) + (250 << 20));
+		assert_eq!(
+			worst_case_memory(100, 100),
+			10_000 * (8 + 7) + 256 * 256 * 36 + (250 << 20)
+		);
+		assert_eq!(
+			worst_case_memory(48, 16_500),
+			48 * 16_500 * (8 + 7) + 256 * 16_500 * 36 + (250 << 20)
+		);
 	}
 
 	#[test]
@@ -607,7 +626,20 @@ mod tests {
 			Candidate::JxlLossless(JXL_LOSSLESS).needed_setting(99.0, 85.0, Speed::Moderate),
 			None
 		);
-		assert_eq!((ravif.encoder_id(), ravif.preset()), ("ravif-0.13", 6));
+		assert_eq!(ravif.preset(), 6);
+	}
+
+	#[test]
+	fn the_ravif_id_names_the_locked_ravif_version() {
+		let lock = include_str!("../../../../Cargo.lock");
+		let locked = lock
+			.split("[[package]]")
+			.find(|package| package.lines().any(|line| line.trim_end() == "name = \"ravif\""))
+			.and_then(|package| package.lines().find_map(|line| line.strip_prefix("version = ")))
+			.map(|version| version.trim_end().trim_matches('"'))
+			.unwrap();
+
+		assert_eq!(RAVIF_ID, format!("ravif-{locked}"));
 	}
 
 	#[test]

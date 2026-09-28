@@ -120,6 +120,8 @@ pub struct Loaded {
 	/// The highest attempt with a failure log, per file.
 	pub last_attempts: HashMap<RelPath, u32>,
 	pub quality: Vec<(String, GroupStats)>,
+	/// One line for each learned-quality entry that was left out.
+	pub ignored_quality: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,15 +234,27 @@ impl Store {
 			*last = (*last).max(attempt);
 		}
 
-		// Learned quality is only a cache: an entry this build can't read, damaged or from a later build, is skipped
-		// rather than keeping the project from opening.
+		// Learned quality is only a cache: an entry this build can't read or use, damaged, hand-edited or from a later
+		// build, is set aside on its own rather than keeping the project from opening.
 		for entry in txn.open_table(META)?.iter()? {
 			let (key, value) = entry?;
-			if let Some(quality_key) = key.value().strip_prefix(QUALITY_PREFIX)
-				&& let Ok(stats) = decode(value.value())
-			{
-				loaded.quality.push((quality_key.to_owned(), stats));
-			}
+			let Some(quality_key) = key.value().strip_prefix(QUALITY_PREFIX) else {
+				continue;
+			};
+
+			let problem = match decode::<GroupStats>(value.value()) {
+				Ok(stats) => match stats.problem(quality_key) {
+					None => {
+						loaded.quality.push((quality_key.to_owned(), stats));
+						continue;
+					}
+					Some(problem) => problem,
+				},
+				Err(err) => err.to_string(),
+			};
+			loaded
+				.ignored_quality
+				.push(format!("the learned quality for {quality_key} was ignored: {problem}"));
 		}
 		Ok(loaded)
 	}
@@ -275,6 +289,10 @@ impl Store {
 
 	pub fn set_quality(&mut self, key: &str, stats: &GroupStats) -> Result<(), StoreError> {
 		self.put(Table::Meta, format!("{QUALITY_PREFIX}{key}").into_bytes(), stats)
+	}
+
+	pub fn remove_quality(&mut self, key: &str) {
+		self.remove(Table::Meta, format!("{QUALITY_PREFIX}{key}").into_bytes());
 	}
 
 	/// A write-ahead intent: commits it together with everything batched so far, durably, before returning.
@@ -604,14 +622,15 @@ fn peek_within(path: &Path, recovery_limit: u64) -> Result<Peeked, StoreError> {
 	Ok(Peeked { meta, needs_recovery })
 }
 
-/// Copies the file into memory under a shared lock and lets redb recover the copy, so the settings of a project that
-/// wasn't closed cleanly can be read without opening it.
+/// Lets redb recover the file under a shared lock with every write kept in memory, so the settings of a project that
+/// wasn't closed cleanly can be read without opening it. The file is read once, only as far as the recovery reads it,
+/// and never copied whole.
 fn read_unclean(path: &Path, limit: u64) -> Result<Meta, StoreError> {
 	use std::fs::TryLockError;
-	use std::io::Read;
 
-	let mut file = std::fs::File::open(path)?;
-	if file.metadata()?.len() > limit {
+	let file = fs::File::open(path)?;
+	let len = file.metadata()?.len();
+	if len > limit {
 		return Err(StoreError::NeedsRecovery);
 	}
 
@@ -620,23 +639,151 @@ fn read_unclean(path: &Path, limit: u64) -> Result<Meta, StoreError> {
 		Err(TryLockError::WouldBlock) => return Err(StoreError::AlreadyOpen),
 		Err(TryLockError::Error(err)) => return Err(err.into()),
 	}
-	let mut bytes = Vec::new();
-	file.read_to_end(&mut bytes)?;
-	drop(file);
 
 	let db = redb::Builder::new()
-		.create_with_backend(memory_backend(&bytes)?)
+		.create_with_backend(Overlay::new(file, len))
 		.map_err(|_| StoreError::NeedsRecovery)?;
 	read_meta(&db)
 }
 
-fn memory_backend(bytes: &[u8]) -> io::Result<redb::backends::InMemoryBackend> {
-	use redb::StorageBackend;
+const OVERLAY_PAGE_BYTES: usize = 4096;
+const OVERLAY_PAGE: u64 = OVERLAY_PAGE_BYTES as u64;
 
-	let backend = redb::backends::InMemoryBackend::new();
-	backend.set_len(bytes.len() as u64)?;
-	backend.write(0, bytes)?;
-	Ok(backend)
+/// A file seen through a layer of written pages: reads come from the file wherever nothing was written, and writes
+/// never reach it.
+#[derive(Debug)]
+struct Overlay {
+	file: fs::File,
+	state: std::sync::Mutex<OverlayState>,
+}
+
+#[derive(Debug)]
+struct OverlayState {
+	len: u64,
+	/// Below this the file's own bytes show through; above it, unwritten bytes are zeros, as after a shrink and regrow.
+	file_len: u64,
+	pages: std::collections::BTreeMap<u64, Vec<u8>>,
+}
+
+impl Overlay {
+	fn new(file: fs::File, len: u64) -> Self {
+		Self {
+			file,
+			state: std::sync::Mutex::new(OverlayState {
+				len,
+				file_len: len,
+				pages: std::collections::BTreeMap::new(),
+			}),
+		}
+	}
+
+	fn lock(&self) -> std::sync::MutexGuard<'_, OverlayState> {
+		self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	/// Fills `out` with the file's bytes from `offset`, and zeros past `file_len`.
+	fn read_file(&self, offset: u64, out: &mut [u8], file_len: u64) -> io::Result<()> {
+		let readable = usize::try_from(file_len.saturating_sub(offset))
+			.unwrap_or(usize::MAX)
+			.min(out.len());
+		out[readable..].fill(0);
+		read_exact_at(&self.file, &mut out[..readable], offset)
+	}
+}
+
+impl redb::StorageBackend for Overlay {
+	fn len(&self) -> io::Result<u64> {
+		Ok(self.lock().len)
+	}
+
+	fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+		let state = self.lock();
+		if offset.saturating_add(out.len() as u64) > state.len {
+			return Err(io::ErrorKind::UnexpectedEof.into());
+		}
+
+		let mut done = 0;
+		while done < out.len() {
+			let at = offset + done as u64;
+			let (page, within) = page_of(at);
+			let take = (OVERLAY_PAGE_BYTES - within).min(out.len() - done);
+			let chunk = &mut out[done..done + take];
+			match state.pages.get(&page) {
+				Some(bytes) => chunk.copy_from_slice(&bytes[within..within + take]),
+				None => self.read_file(at, chunk, state.file_len)?,
+			}
+			done += take;
+		}
+		Ok(())
+	}
+
+	fn set_len(&self, len: u64) -> io::Result<()> {
+		let mut state = self.lock();
+		if len < state.len {
+			state.pages.retain(|page, _| page * OVERLAY_PAGE < len);
+			let (last, kept) = page_of(len);
+			if let Some(bytes) = state.pages.get_mut(&last) {
+				bytes[kept..].fill(0);
+			}
+			state.file_len = state.file_len.min(len);
+		}
+		state.len = len;
+		Ok(())
+	}
+
+	fn sync_data(&self) -> io::Result<()> {
+		Ok(())
+	}
+
+	fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+		let mut state = self.lock();
+		let mut done = 0;
+		while done < data.len() {
+			let at = offset + done as u64;
+			let (page, within) = page_of(at);
+			let take = (OVERLAY_PAGE_BYTES - within).min(data.len() - done);
+			if !state.pages.contains_key(&page) {
+				let mut bytes = vec![0; OVERLAY_PAGE_BYTES];
+				self.read_file(page * OVERLAY_PAGE, &mut bytes, state.file_len)?;
+				state.pages.insert(page, bytes);
+			}
+
+			let bytes = state.pages.get_mut(&page).expect("inserted above");
+			bytes[within..within + take].copy_from_slice(&data[done..done + take]);
+			done += take;
+		}
+		state.len = state.len.max(offset + data.len() as u64);
+		Ok(())
+	}
+}
+
+/// The page that holds byte `at`, and where in it the byte is.
+fn page_of(at: u64) -> (u64, usize) {
+	let within = usize::try_from(at % OVERLAY_PAGE).expect("smaller than a page");
+	(at / OVERLAY_PAGE, within)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &fs::File, mut out: &mut [u8], mut offset: u64) -> io::Result<()> {
+	use std::os::windows::fs::FileExt;
+
+	while !out.is_empty() {
+		match file.seek_read(out, offset)? {
+			0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+			read => {
+				out = &mut out[read..];
+				offset += read as u64;
+			}
+		}
+	}
+	Ok(())
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &fs::File, out: &mut [u8], offset: u64) -> io::Result<()> {
+	use std::os::unix::fs::FileExt;
+
+	file.read_exact_at(out, offset)
 }
 
 /// Prints every table as readable text, for debugging (`cryarchiver project dump`).
@@ -714,6 +861,8 @@ mod tests {
 	fn project(dir: &Path) -> std::path::PathBuf {
 		dir.join("archive.cryarchive")
 	}
+
+	const GOOD_PHOTO: &str = "image/jpeg/photo/opaque/8bit/mp12|ravif-0.13.0|p6|t85.0";
 
 	fn committing() -> FileRecord {
 		FileRecord {
@@ -948,6 +1097,35 @@ mod tests {
 	}
 
 	#[test]
+	fn the_recovery_overlay_reads_the_file_and_keeps_its_writes_to_itself() {
+		use redb::StorageBackend;
+
+		let dir = tempfile::tempdir().unwrap();
+		let original: Vec<u8> = (0..10_000_u32).map(|index| (index % 251) as u8).collect();
+		std::fs::write(project(dir.path()), &original).unwrap();
+		let overlay = Overlay::new(std::fs::File::open(project(dir.path())).unwrap(), original.len() as u64);
+		let read = |offset: u64, len: usize| {
+			let mut out = vec![0; len];
+			overlay.read(offset, &mut out).unwrap();
+			out
+		};
+
+		overlay.write(4090, &[7; 12]).unwrap();
+
+		assert_eq!(read(4080, 30)[..10], original[4080..4090]);
+		assert_eq!(read(4080, 30)[10..22], [7; 12]);
+		assert_eq!(read(4080, 30)[22..], original[4102..4110]);
+
+		overlay.set_len(5000).unwrap();
+		overlay.set_len(12_000).unwrap();
+
+		assert_eq!(read(4990, 10), original[4990..5000]);
+		assert!(read(5000, 7000).iter().all(|byte| *byte == 0));
+		assert!(overlay.read(11_999, &mut [0; 2]).is_err());
+		assert_eq!(std::fs::read(project(dir.path())).unwrap(), original);
+	}
+
+	#[test]
 	fn peek_refuses_a_file_that_is_not_a_project() {
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::write(project(dir.path()), b"not a database").unwrap();
@@ -1014,7 +1192,7 @@ mod tests {
 			observations: 1,
 		};
 		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
-		store.set_quality("good", &stats).unwrap();
+		store.set_quality(GOOD_PHOTO, &stats).unwrap();
 		store.push(Change {
 			table: Table::Meta,
 			key: format!("{QUALITY_PREFIX}x").into_bytes(),
@@ -1029,8 +1207,63 @@ mod tests {
 		dump(&project(dir.path()), &mut out).unwrap();
 		let text = String::from_utf8(out).unwrap();
 
-		assert_eq!(loaded.quality, vec![("good".to_owned(), stats)]);
-		assert!(text.contains("good = GroupStats"), "{text}");
+		assert_eq!(loaded.quality, vec![(GOOD_PHOTO.to_owned(), stats)]);
+		assert_eq!(loaded.ignored_quality.len(), 1, "{:?}", loaded.ignored_quality);
+		assert!(
+			loaded.ignored_quality[0].contains("for x was ignored"),
+			"{:?}",
+			loaded.ignored_quality
+		);
+		assert!(text.contains(&format!("{GOOD_PHOTO} = GroupStats")), "{text}");
 		assert!(text.contains("x = unreadable"), "{text}");
+	}
+
+	#[test]
+	fn learned_values_outside_their_encoders_range_are_ignored_one_by_one() {
+		let dir = tempfile::tempdir().unwrap();
+		let video = "video/h264/1080/fps31/sdr8/progressive/clean/opaque|svt-av1-4.2.0|p5|t93.0/89.0";
+		let good = GroupStats {
+			setting: 29.5,
+			slope: Some(0.4),
+			bpp: Some(0.03),
+			observations: 3,
+		};
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		store.set_quality(video, &good).unwrap();
+		store
+			.set_quality(&video.replace("h264", "hevc"), &GroupStats { setting: 70.0, ..good })
+			.unwrap();
+		store
+			.set_quality(
+				&video.replace("h264", "vp9"),
+				&GroupStats {
+					setting: f64::NAN,
+					..good
+				},
+			)
+			.unwrap();
+		store.flush().unwrap();
+		drop(store);
+
+		let (_, _, loaded) = Store::open(&project(dir.path())).unwrap();
+
+		assert_eq!(loaded.quality, vec![(video.to_owned(), good)]);
+		assert_eq!(loaded.ignored_quality.len(), 2, "{:?}", loaded.ignored_quality);
+		assert!(
+			loaded
+				.ignored_quality
+				.iter()
+				.any(|line| line.contains("video/hevc/") && line.contains("70")),
+			"{:?}",
+			loaded.ignored_quality
+		);
+		assert!(
+			loaded
+				.ignored_quality
+				.iter()
+				.any(|line| line.contains("video/vp9/") && line.contains("NaN")),
+			"{:?}",
+			loaded.ignored_quality
+		);
 	}
 }

@@ -41,29 +41,29 @@ fn different_seeds_or_steps_diverge() {
 #[test]
 fn file_rows_exist_only_for_expanded_folders() {
 	let mut source = MockSource::new(3);
-	let bled = find_folder(&source, "Bled");
-	assert!(source.files(bled).is_none());
+	let dune = find_folder(&source, "Dune");
+	assert!(source.files(dune).is_none());
 
 	let version = source.rows_version();
-	source.perform(Action::Expanded(bled, true));
-	assert!(source.files(bled).is_some_and(|rows| rows.len() == 31));
+	source.perform(Action::Expanded(dune, true));
+	assert!(source.files(dune).is_some_and(|rows| rows.len() == 31));
 	assert!(source.rows_version() > version);
 
-	source.perform(Action::Expanded(bled, false));
-	assert!(source.files(bled).is_none());
+	source.perform(Action::Expanded(dune, false));
+	assert!(source.files(dune).is_none());
 }
 
 #[test]
 fn a_slow_source_loads_rows_on_a_later_tick() {
 	let mut source = MockSource::new(3).with_load_latency(2);
-	let bled = find_folder(&source, "Bled");
+	let dune = find_folder(&source, "Dune");
 
-	source.perform(Action::Expanded(bled, true));
+	source.perform(Action::Expanded(dune, true));
 	source.step();
-	assert!(source.files(bled).is_none());
+	assert!(source.files(dune).is_none());
 
 	source.step();
-	assert!(source.files(bled).is_some());
+	assert!(source.files(dune).is_some());
 }
 
 #[test]

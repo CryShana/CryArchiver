@@ -212,7 +212,7 @@ async fn an_image_override_is_the_target_the_still_is_encoded_against() {
 	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
 	let entries = memory.entries();
 	assert_eq!(entries.len(), 1, "{entries:?}");
-	assert_eq!(entries[0].0, "image/png/photo/opaque/8bit/mp1|ravif-0.13|p9|t60.0");
+	assert_eq!(entries[0].0, "image/png/photo/opaque/8bit/mp1|ravif-0.13.0|p9|t60.0");
 }
 
 #[tokio::test]
@@ -1681,6 +1681,76 @@ async fn a_learned_crf_too_low_for_the_size_gate_is_searched_again() {
 	let group = hard_won.entries().remove(0).1;
 	assert_eq!(group.observations, 2, "{group:?}");
 	assert!(group.setting > 10.0, "{group:?}");
+}
+
+async fn learned_group(dir: &Path, setting: f64) -> SharedMemory {
+	let first = support::mpeg4(dir, "first.mp4", 3);
+	let learned = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(learned.clone());
+	run_recording(&engine, &job(&first), dir).await;
+
+	let (key, stats) = learned.entries().remove(0);
+	SharedMemory::with_entries([(key, GroupStats { setting, ..stats })])
+}
+
+#[tokio::test]
+async fn a_learned_crf_whose_output_is_not_smaller_is_forgotten() {
+	let dir = tempfile::tempdir().unwrap();
+	let short = support::mpeg4(dir.path(), "short.mp4", 3);
+	let next = support::mpeg4(dir.path(), "next.mp4", 3);
+	let memory = Arc::new(learned_group(dir.path(), 10.0).await);
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let demanding = |source: &Path| Job {
+		min_savings: 0.95,
+		..job(source)
+	};
+
+	let (outcome, events) = run_recording(&engine, &demanding(&short), dir.path()).await;
+
+	assert!(
+		matches!(
+			outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::NotSmaller { .. }
+			}
+		),
+		"{outcome:?}"
+	);
+	assert_eq!(
+		stages(&events, Stage::Sample),
+		0,
+		"the learned CRF was used: {events:?}"
+	);
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+
+	let (_, events) = run_recording(&engine, &demanding(&next), dir.path()).await;
+
+	assert_eq!(stages(&events, Stage::Sample), 1, "the next clip searches: {events:?}");
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn a_pass_with_room_to_spare_raises_the_learned_crf() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let memory = Arc::new(learned_group(dir.path(), 20.0).await);
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let keeping_any_saving = Job {
+		min_savings: 0.0,
+		..job(&clip)
+	};
+
+	let (outcome, events) = run_recording(&engine, &keeping_any_saving, dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	assert_eq!(
+		stages(&events, Stage::Sample),
+		0,
+		"the learned CRF was used: {events:?}"
+	);
+	let group = memory.entries().remove(0).1;
+	assert_eq!(group.observations, 2, "{group:?}");
+	assert!(group.setting > 20.0, "{group:?}");
 }
 
 #[tokio::test]

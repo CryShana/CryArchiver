@@ -57,7 +57,7 @@ fn encoded(outcome: JobOutcome) -> PathBuf {
 	}
 }
 
-const PHOTO_GROUP_AT_FAST: &str = "image/png/photo/opaque/8bit/mp1|ravif-0.13|p9|t80.0";
+const PHOTO_GROUP_AT_FAST: &str = "image/png/photo/opaque/8bit/mp1|ravif-0.13.0|p9|t80.0";
 
 #[tokio::test]
 async fn a_photo_teaches_its_group_the_quality_it_needs() {
@@ -151,7 +151,7 @@ async fn a_group_that_learned_too_high_a_quality_falls_back_to_the_table_and_lea
 	assert_eq!(entries[0].1.observations, 6, "{entries:?}");
 }
 
-const GRAPHIC_GROUP_AT_FAST: &str = "image/png/graphic/opaque/8bit/mp1|ravif-0.13|p9|t80.0";
+const GRAPHIC_GROUP_AT_FAST: &str = "image/png/graphic/opaque/8bit/mp1|ravif-0.13.0|p9|t80.0";
 
 fn palette_png(dir: &Path, name: &str) -> PathBuf {
 	let path = dir.join(name);

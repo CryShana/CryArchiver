@@ -346,11 +346,11 @@ fn right_click_selects_the_row_and_opens_the_menu() {
 fn clicking_the_arrow_folds_and_double_click_opens_details() {
 	let mut app = app();
 	let terminal = draw(&mut app, 120, 36);
-	let bled = find_row(&terminal, "▾ Bled").unwrap();
-	let arrow = find_on_row(&terminal, bled, "▾ Bled").unwrap();
+	let dune = find_row(&terminal, "▾ Dune").unwrap();
+	let arrow = find_on_row(&terminal, dune, "▾ Dune").unwrap();
 	let rows = app.visible_rows();
 
-	click(&mut app, arrow, bled, Instant::now());
+	click(&mut app, arrow, dune, Instant::now());
 	assert!(app.visible_rows() < rows);
 
 	let terminal = draw(&mut app, 120, 36);

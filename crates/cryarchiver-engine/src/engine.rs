@@ -22,7 +22,7 @@ use crate::quality::keys::{CacheKey, Group, VideoGroup};
 use crate::quality::memory::{GroupStats, Observation, QualityMemory, SharedMemory};
 use crate::quality::search::{self, DEFAULT_SLOPE, MAX_PROBES, Target};
 use crate::text::display_path;
-use crate::toolchain::{MediaKind, Toolchain};
+use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
 use crate::video::analyze::Analysis;
 use crate::video::encode::{EncodedVideo, Sample};
 use crate::video::mux::{self, Attachment, MuxInputs, MuxPlan};
@@ -121,6 +121,8 @@ struct Staged {
 	path: PathBuf,
 	bytes: u64,
 	warnings: Vec<String>,
+	/// Recorded only once the output is committed.
+	learned: Vec<(CacheKey, Observation)>,
 }
 
 enum Produced {
@@ -323,13 +325,21 @@ impl Engine {
 			Planned::Video => Box::pin(self.produce_video(&cx, &workspace)).await,
 			Planned::Image(input) => Box::pin(self.produce_image(&cx, input, &workspace)).await,
 		};
-		let staged = match produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes))? {
+		let mut staged = match produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes))? {
 			Produced::Output(staged) => staged,
 			Produced::Kept(reason) => return Ok(JobOutcome::KeptOriginal { reason }),
 		};
+		let learned = std::mem::take(&mut staged.learned);
 
 		on_event(JobEvent::Stage(Stage::Commit));
-		finish(job, sink, &work_root, &meta, before, staged)
+		let outcome = finish(job, sink, &work_root, &meta, before, staged)?;
+
+		if matches!(outcome, JobOutcome::Encoded { .. }) {
+			for (key, observation) in &learned {
+				self.quality.record(key, *observation);
+			}
+		}
+		Ok(outcome)
 	}
 
 	async fn reserve_memory(
@@ -394,7 +404,17 @@ impl Engine {
 			memory: self.quality.as_ref(),
 		};
 		Ok(match image_job::produce(&image, input, workspace).await? {
-			ImageOutcome::Output { path, bytes, warnings } => Produced::Output(Staged { path, bytes, warnings }),
+			ImageOutcome::Output {
+				path,
+				bytes,
+				warnings,
+				learned,
+			} => Produced::Output(Staged {
+				path,
+				bytes,
+				warnings,
+				learned,
+			}),
 			ImageOutcome::Kept(reason) => Produced::Kept(reason),
 		})
 	}
@@ -453,6 +473,7 @@ impl Engine {
 			path: output,
 			bytes,
 			warnings,
+			learned: Vec::new(),
 		}))
 	}
 
@@ -514,7 +535,7 @@ impl Engine {
 		};
 		let verify =
 			match Box::pin(self.choose_crf(cx, workspace, &inputs, &analysis, &mut video, &mut quality)).await? {
-				Tuning::Keep(reason) => return Ok(Produced::Kept(reason)),
+				Tuning::Keep(reason) => return Ok(self.kept_video(&quality, reason)),
 				Tuning::Encode { verify } => verify,
 			};
 
@@ -537,12 +558,25 @@ impl Engine {
 			video: &video,
 			streams: &streams,
 		};
-		let produced = Box::pin(self.mux_and_verify(cx, workspace, &job, temps)).await?;
+		Ok(match Box::pin(self.mux_and_verify(cx, workspace, &job, temps)).await? {
+			Produced::Output(staged) => Produced::Output(Staged {
+				learned: learned
+					.map(|observation| (quality.key, observation))
+					.into_iter()
+					.collect(),
+				..staged
+			}),
+			Produced::Kept(reason) => self.kept_video(&quality, reason),
+		})
+	}
 
-		if let Some(observation) = learned {
-			self.quality.record(&quality.key, observation);
+	/// A group whose learned setting led to an output that wasn't smaller forgets it, so that its next file searches
+	/// afresh instead of repeating the same encode.
+	fn kept_video(&self, quality: &VideoQuality, reason: KeepReason) -> Produced {
+		if quality.stats.is_some() && matches!(reason, KeepReason::NotSmaller { .. }) {
+			self.quality.forget(&quality.key);
 		}
-		Ok(produced)
+		Produced::Kept(reason)
 	}
 
 	fn video_quality(&self, job: &Job, main: &Stream, analysis: &Analysis, video: &VideoPlan) -> VideoQuality {
@@ -566,14 +600,11 @@ impl Engine {
 	}
 
 	fn encoder_id(&self, encoder: &Encoder) -> String {
-		match encoder {
-			Encoder::SvtAv1 { .. } => self
-				.tools
-				.svt_av1
-				.map_or_else(|| "svt-av1".to_owned(), |version| format!("svt-av1-{version}")),
-			Encoder::Aom { .. } => "libaom-av1".to_owned(),
-			Encoder::Vp9Alpha { .. } => "libvpx-vp9".to_owned(),
-		}
+		self.tools.encoder_id(match encoder {
+			Encoder::SvtAv1 { .. } => SVT_AV1,
+			Encoder::Aom { .. } => LIBAOM,
+			Encoder::Vp9Alpha { .. } => LIBVPX_VP9,
+		})
 	}
 
 	fn scorer<'a>(&'a self, cx: &'a Context<'_>, workspace: &'a Workspace, video: &'a VideoPlan) -> Scorer<'a> {
@@ -705,7 +736,7 @@ impl Engine {
 			let crf = video.encoder.crf();
 			if quality.target.met(score) {
 				return Ok(Checked::Passed(Observation {
-					setting: crf,
+					setting: search::implied_crf(crf, score, quality.target, quality.slope, bounds),
 					slope: Some(quality.slope),
 					bpp: output_bpp(&temps.video.path, video, temps.encoded.frames),
 				}));
@@ -890,6 +921,7 @@ impl Engine {
 			path: output,
 			bytes,
 			warnings,
+			learned: Vec::new(),
 		}))
 	}
 

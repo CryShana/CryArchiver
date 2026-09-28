@@ -292,6 +292,11 @@ impl Owner {
 
 	fn save_quality(&mut self) {
 		for (key, stats) in self.pipeline.quality.take_changed() {
+			let Some(stats) = stats else {
+				self.store.remove_quality(&key);
+				continue;
+			};
+
 			if let Err(err) = self.store.set_quality(&key, &stats) {
 				self.fail(err);
 				return;

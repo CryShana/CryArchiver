@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use cryarchiver_engine::commit::file_id;
+use cryarchiver_engine::commit::{FileIdentity, file_id};
 use cryarchiver_engine::engine::{Encode, MemoryGate};
 use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::text::display_path;
@@ -171,6 +171,8 @@ pub enum ProjectError {
 	Moved { destination: String },
 	#[error("the project name {name:?} can't be used: {reason}")]
 	Name { name: String, reason: String },
+	#[error("the new folder {name:?} can't be created: {reason}")]
+	FolderName { name: String, reason: String },
 	#[error(
 		"{path} is a link or a junction, which could lead the project's writes and deletes elsewhere; the project doesn't open while it is one"
 	)]
@@ -179,6 +181,12 @@ pub enum ProjectError {
 
 pub const MAX_NAME_CHARS: usize = 100;
 const INVALID_NAME_CHARS: &str = "<>:\"/\\|?*";
+/// Linux counts a file name in bytes and Windows in UTF-16 units; both hold 255.
+const MAX_FILE_NAME_UNITS: usize = 255;
+#[cfg(windows)]
+const FILE_NAME_UNIT: &str = "UTF-16 units";
+#[cfg(not(windows))]
+const FILE_NAME_UNIT: &str = "bytes";
 
 /// The rules for a project name, the same for every front end: one plain file name that every supported system can
 /// hold, so `<destination>/<name>.cryarchive` always stays in the destination. The reason reads after the name.
@@ -192,6 +200,24 @@ pub fn check_name(name: &OsStr) -> Result<(), String> {
 		return Err(format!("at most {MAX_NAME_CHARS} characters"));
 	}
 
+	let units = file_name_units(name) + 1 + PROJECT_EXTENSION.len();
+	if units > MAX_FILE_NAME_UNITS {
+		return Err(format!(
+			"too long: the project file's name would take {units} {FILE_NAME_UNIT}, and at most {MAX_FILE_NAME_UNITS} fit"
+		));
+	}
+
+	portable_name(&text)?;
+
+	if one_plain_component(name) {
+		Ok(())
+	} else {
+		Err("must be a plain file name".into())
+	}
+}
+
+/// The rules every name the project creates follows, so that every supported system can hold it.
+fn portable_name(text: &str) -> Result<(), String> {
 	if text.chars().any(char::is_control) {
 		return Err("can't contain control characters".into());
 	}
@@ -204,16 +230,45 @@ pub fn check_name(name: &OsStr) -> Result<(), String> {
 		return Err("can't end with a dot or a space".into());
 	}
 
-	let stem = text.split('.').next().unwrap_or(&text).trim_end();
+	let stem = text.split('.').next().unwrap_or(text).trim_end();
 	if cryarchiver_engine::naming::is_reserved_device_name(stem) {
 		return Err(format!("{stem} is reserved by Windows for a device"));
 	}
+	Ok(())
+}
 
-	if one_plain_component(name) {
-		Ok(())
-	} else {
-		Err("must be a plain file name".into())
+#[cfg(windows)]
+fn file_name_units(name: &OsStr) -> usize {
+	use std::os::windows::ffi::OsStrExt;
+
+	name.encode_wide().count()
+}
+
+#[cfg(not(windows))]
+fn file_name_units(name: &OsStr) -> usize {
+	name.as_encoded_bytes().len()
+}
+
+/// Every folder a destination still needs follows the rules of a project name, checked before any is created. The
+/// planned path is verbatim on Windows, where a reserved name or a trailing dot or space would otherwise be created
+/// literally, and no ordinary program could open or remove it again.
+pub fn check_new_folders(planned: &Path) -> Result<(), ProjectError> {
+	for name in missing_names(planned) {
+		portable_name(&name.to_string_lossy()).map_err(|reason| ProjectError::FolderName {
+			name: name.to_string_lossy().into_owned(),
+			reason,
+		})?;
 	}
+	Ok(())
+}
+
+fn missing_names(planned: &Path) -> Vec<&OsStr> {
+	let Some(existing) = planned.ancestors().find(|dir| dir.exists()) else {
+		return Vec::new();
+	};
+	planned
+		.strip_prefix(existing)
+		.map_or_else(|_| Vec::new(), |tail| tail.iter().collect())
 }
 
 /// Checked on the real `OsStr`, not the lossy text the other rules read.
@@ -243,16 +298,33 @@ pub fn create(
 
 	checked_name(name)?;
 	let (canonical_source, planned) = approved_destination(source, destination)?;
-	create_folders(&planned, |folder| outside_source(&canonical_source, folder))?;
-	let (source, destination) = check_roots(source, &planned)?;
+	check_new_folders(&planned)?;
 
-	let path = project_file(&destination, name)?;
-	refuse_outside(&path, &destination, name)?;
-	settings.source = source;
-	settings.destination = destination;
-	settings.overrides = settings.overrides.normalized();
-	Store::create(&path, &settings)?;
-	Ok(path)
+	in_new_folders(
+		&planned,
+		|folder| outside_source(&canonical_source, folder),
+		|| {
+			let (source, destination) = check_roots(source, &planned)?;
+			let path = project_file(&destination, name)?;
+			refuse_outside(&path, &destination, name)?;
+
+			settings.source = source;
+			settings.destination = destination;
+			settings.overrides = settings.overrides.normalized();
+			Store::create(&path, &settings)?;
+			Ok(path)
+		},
+	)
+}
+
+/// Runs `then` once the missing folders of `planned` exist; when it fails, the folders made for it are removed again.
+fn in_new_folders<T>(
+	planned: &Path,
+	check: impl Fn(&Path) -> Result<(), ProjectError>,
+	then: impl FnOnce() -> Result<T, ProjectError>,
+) -> Result<T, ProjectError> {
+	let made = create_folders(planned, check)?;
+	then().inspect_err(|_| remove_made(&made))
 }
 
 /// The project file must sit directly in the checked destination, by path and by folder identity.
@@ -300,10 +372,27 @@ fn approved_destination(source: &Path, destination: &Path) -> Result<(PathBuf, P
 	}
 }
 
+/// A folder [`create_folders`] made, and its identity at the time.
+#[derive(Debug)]
+struct MadeFolder {
+	path: PathBuf,
+	identity: FileIdentity,
+}
+
+impl MadeFolder {
+	fn is_intact(&self) -> bool {
+		let real = fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.is_dir() && !is_link(&meta));
+		real && file_id(&self.path).is_ok_and(|identity| identity == self.identity)
+	}
+}
+
 /// Creates the missing folders of `planned` one name at a time. The folder each new one goes into is checked first,
 /// and the last one after it is made; when a check fails nothing more is created, and the folders made so far are
-/// removed again, each only while it is empty.
-fn create_folders(planned: &Path, check: impl Fn(&Path) -> Result<(), ProjectError>) -> Result<(), ProjectError> {
+/// removed again.
+fn create_folders(
+	planned: &Path,
+	check: impl Fn(&Path) -> Result<(), ProjectError>,
+) -> Result<Vec<MadeFolder>, ProjectError> {
 	let Some(existing) = planned.ancestors().find(|dir| dir.exists()) else {
 		let missing = io::Error::new(io::ErrorKind::NotFound, "no part of the path exists");
 		return Err(naming(planned, &missing).into());
@@ -312,32 +401,46 @@ fn create_folders(planned: &Path, check: impl Fn(&Path) -> Result<(), ProjectErr
 		.strip_prefix(existing)
 		.map_or_else(|_| Vec::new(), |tail| tail.components().collect());
 
-	let mut created: Vec<PathBuf> = Vec::new();
+	let mut made: Vec<MadeFolder> = Vec::new();
 	let mut folder = existing.to_path_buf();
-	let undo = |created: &[PathBuf]| {
-		for made in created.iter().rev() {
-			let _ = fs::remove_dir(made);
-		}
-	};
 
 	for name in names {
 		if let Err(err) = check(&folder) {
-			undo(&created);
+			remove_made(&made);
 			return Err(err);
 		}
 
 		folder.push(name);
-		match fs::create_dir(&folder) {
-			Ok(()) => created.push(folder.clone()),
-			Err(err) if err.kind() == io::ErrorKind::AlreadyExists && folder.is_dir() => {}
+		let created = match fs::create_dir(&folder) {
+			Ok(()) => file_id(&folder).inspect_err(|_| {
+				let _ = fs::remove_dir(&folder);
+			}),
+			Err(err) if err.kind() == io::ErrorKind::AlreadyExists && folder.is_dir() => continue,
+			Err(err) => Err(err),
+		};
+		match created {
+			Ok(identity) => made.push(MadeFolder {
+				path: folder.clone(),
+				identity,
+			}),
 			Err(err) => {
-				undo(&created);
+				remove_made(&made);
 				return Err(naming(&folder, &err).into());
 			}
 		}
 	}
 
-	check(&folder).inspect_err(|_| undo(&created))
+	check(&folder).inspect_err(|_| remove_made(&made))?;
+	Ok(made)
+}
+
+/// Deepest first, and only while each is still empty and still the folder that was made: nothing is removed below a
+/// folder that became a link or another folder since.
+fn remove_made(made: &[MadeFolder]) {
+	let intact = made.iter().take_while(|folder| folder.is_intact()).count();
+	for folder in made[..intact].iter().rev() {
+		let _ = fs::remove_dir(&folder.path);
+	}
 }
 
 /// A folder about to receive a new one must be neither the source nor inside it, by its canonical path and by folder
@@ -593,5 +696,106 @@ mod tests {
 
 		assert!(made.is_ok());
 		assert!(dir.path().join("new").join("x").is_dir());
+	}
+
+	#[test]
+	fn a_long_name_is_measured_the_way_the_file_system_counts_it() {
+		let cjk = "写".repeat(MAX_NAME_CHARS);
+
+		#[cfg(windows)]
+		assert!(check_name(OsStr::new(&cjk)).is_ok());
+		#[cfg(not(windows))]
+		assert!(check_name(OsStr::new(&cjk)).unwrap_err().contains("too long"));
+		assert!(check_name(OsStr::new(&"写".repeat(81))).is_ok());
+		assert!(check_name(OsStr::new(&"x".repeat(MAX_NAME_CHARS))).is_ok());
+	}
+
+	fn refusal() -> ProjectError {
+		ProjectError::Store(StoreError::Unavailable)
+	}
+
+	#[test]
+	fn a_failed_create_removes_the_folders_it_made() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::create_dir(dir.path().join("kept")).unwrap();
+		let planned = dir.path().join("kept").join("a").join("b");
+
+		let failed = in_new_folders(&planned, |_| Ok(()), || Err::<(), _>(refusal()));
+
+		assert!(
+			matches!(failed, Err(ProjectError::Store(StoreError::Unavailable))),
+			"{failed:?}"
+		);
+		assert_eq!(fs::read_dir(dir.path().join("kept")).unwrap().count(), 0);
+
+		let written = in_new_folders(
+			&planned,
+			|_| Ok(()),
+			|| {
+				fs::write(dir.path().join("kept").join("a").join("note.txt"), b"x").unwrap();
+				Err::<(), _>(refusal())
+			},
+		);
+
+		assert!(written.is_err());
+		assert!(dir.path().join("kept").join("a").join("note.txt").is_file());
+		assert!(!planned.exists(), "the empty deeper folder is removed");
+	}
+
+	#[test]
+	fn a_failed_create_never_removes_through_a_folder_that_became_a_link() {
+		let dir = tempfile::tempdir().unwrap();
+		let elsewhere = dir.path().join("elsewhere");
+		fs::create_dir_all(elsewhere.join("b")).unwrap();
+		let planned = dir.path().join("a").join("b");
+
+		let failed = in_new_folders(
+			&planned,
+			|_| Ok(()),
+			|| {
+				fs::remove_dir(&planned).unwrap();
+				fs::remove_dir(dir.path().join("a")).unwrap();
+				if alias(&elsewhere, &dir.path().join("a")).is_none() {
+					fs::create_dir(dir.path().join("a")).unwrap();
+				}
+				Err::<(), _>(refusal())
+			},
+		);
+
+		assert!(failed.is_err());
+		assert!(elsewhere.join("b").is_dir(), "nothing was removed through the link");
+		let a = dir.path().join("a");
+		if fs::symlink_metadata(&a).is_ok_and(|meta| is_link(&meta)) {
+			fs::remove_dir(&a).or_else(|_| fs::remove_file(&a)).unwrap();
+		}
+	}
+
+	#[test]
+	fn new_destination_folders_follow_the_name_rules_before_anything_is_created() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir(&source).unwrap();
+
+		for bad in ["CON", "aux.backup", "Archive ", "Archive.", "a|b", "a?b"] {
+			let destination = dir.path().join("new").join(bad).join("deeper");
+
+			let refused = create(&source, &destination, OsStr::new("Photos"), |_| {});
+
+			let Err(err @ ProjectError::FolderName { .. }) = refused else {
+				panic!("{bad:?}: {refused:?}");
+			};
+			assert!(err.to_string().contains("can't be created"), "{err}");
+			assert!(!dir.path().join("new").exists(), "{bad:?}: a folder was created");
+		}
+
+		assert!(
+			create(
+				&source,
+				&dir.path().join("new").join("fine"),
+				OsStr::new("Photos"),
+				|_| {}
+			)
+			.is_ok()
+		);
 	}
 }

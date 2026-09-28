@@ -673,7 +673,6 @@ dependencies = [
  "globset",
  "image",
  "indicatif",
- "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

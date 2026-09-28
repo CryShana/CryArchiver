@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use fast_ssim2::{LinearRgbImage, compute_ssimulacra2, compute_ssimulacra2_strip, srgb_to_linear};
+use fast_ssim2::{LinearRgbImage, MAX_IMAGE_PIXELS, compute_ssimulacra2_strip, srgb_to_linear};
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
 use jxl_oxide::{EnumColourEncoding, JxlImage, Moxcms, RenderingIntent};
 use moxcms::{ColorProfile, Layout, TransformOptions};
@@ -8,7 +8,7 @@ use moxcms::{ColorProfile, Layout, TransformOptions};
 use crate::metadata::icc::{self, StandardSpace};
 
 const STRIP_HEIGHT: u32 = 256;
-const MIN_STRIP_SIDE: u32 = 8;
+const FULL_SCALES_SIDE: u32 = 256;
 const BLACK: f32 = 0.0;
 const WHITE: f32 = 65535.0;
 
@@ -32,29 +32,50 @@ pub fn score(reference: &DynamicImage, distorted: &DynamicImage) -> Result<f64, 
 }
 
 fn compare(reference: &Rgba16, distorted: &Rgba16, background: f32) -> Result<f64, String> {
-	let (width, height) = reference.dimensions();
-	let (reference, distorted) = (linear(reference, background), linear(distorted, background));
+	let (width, height) = padded_size(reference.dimensions());
+	if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS as u64 {
+		return Err(format!(
+			"SSIMULACRA2 failed: a {}×{} image is too narrow for its length to be measured",
+			reference.width(),
+			reference.height()
+		));
+	}
 
-	let result = if width < MIN_STRIP_SIDE || height < MIN_STRIP_SIDE {
-		compute_ssimulacra2(reference, distorted)
-	} else {
-		compute_ssimulacra2_strip(reference, distorted, STRIP_HEIGHT)
-	};
-	result.map_err(|err| format!("SSIMULACRA2 failed: {err}"))
+	let (reference, distorted) = (linear(reference, background), linear(distorted, background));
+	compute_ssimulacra2_strip(reference, distorted, STRIP_HEIGHT).map_err(|err| format!("SSIMULACRA2 failed: {err}"))
+}
+
+/// SSIMULACRA2 halves the image until a side drops below 8 pixels, and its weights assume all six scales: with fewer,
+/// the fixed weight order shifts onto the wrong channels and scales, and the score can fall far below or rise above
+/// what the same content scores at full size. A side shorter than 256 pixels is mirrored out to 256.
+pub fn padded_size((width, height): (u32, u32)) -> (u32, u32) {
+	(width.max(FULL_SCALES_SIDE), height.max(FULL_SCALES_SIDE))
 }
 
 fn linear(image: &Rgba16, background: f32) -> LinearRgbImage {
 	let (width, height) = image.dimensions();
-	let data = image
-		.pixels()
-		.map(|pixel| {
-			let alpha = f32::from(pixel[3]) / 65535.0;
-			let channel =
-				|value: u16| srgb_to_linear((f32::from(value) * alpha + background * (1.0 - alpha)) / 65535.0);
-			[channel(pixel[0]), channel(pixel[1]), channel(pixel[2])]
-		})
-		.collect();
-	LinearRgbImage::new(data, width as usize, height as usize)
+	let (padded_width, padded_height) = padded_size((width, height));
+	let convert = |pixel: &Rgba<u16>| {
+		let alpha = f32::from(pixel[3]) / 65535.0;
+		let channel = |value: u16| srgb_to_linear((f32::from(value) * alpha + background * (1.0 - alpha)) / 65535.0);
+		[channel(pixel[0]), channel(pixel[1]), channel(pixel[2])]
+	};
+
+	let data = if (padded_width, padded_height) == (width, height) {
+		image.pixels().map(convert).collect()
+	} else {
+		(0..padded_height)
+			.flat_map(|y| (0..padded_width).map(move |x| (x, y)))
+			.map(|(x, y)| convert(image.get_pixel(mirrored(x, width), mirrored(y, height))))
+			.collect()
+	};
+	LinearRgbImage::new(data, padded_width as usize, padded_height as usize)
+}
+
+fn mirrored(position: u32, size: u32) -> u32 {
+	let period = 2 * size;
+	let folded = position % period;
+	if folded < size { folded } else { period - 1 - folded }
 }
 
 pub fn to_srgb<'a>(image: &'a DynamicImage, icc: Option<&[u8]>) -> Result<Cow<'a, DynamicImage>, String> {

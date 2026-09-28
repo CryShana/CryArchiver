@@ -1,4 +1,5 @@
 use std::fs;
+use std::ops::RangeInclusive;
 use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
@@ -47,6 +48,7 @@ const WHOLE_STEP_BOUNDS: Bounds = Bounds {
 	max: 55.0,
 	step: 1.0,
 };
+pub const CRF_RANGE: RangeInclusive<f64> = SVT_BOUNDS.min..=SVT_BOUNDS.max;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Strategy {

@@ -41,8 +41,9 @@ cryarchiver album/ --speed slow        # slower, higher quality
   - Dolby Vision is saved as its HDR10- or HLG-compatible base layer. Profile 5, which has none, keeps the original.
 - At `--speed moderate` (the default) and `slow`, each video's quality setting is chosen before the full encode: a few seconds of samples are encoded and measured with VMAF, and the finished video is measured again before it is kept. What each kind of video needed is remembered, so similar videos skip the samples at moderate. `--speed fast` uses fixed settings and doesn't measure video.
   - A plain run remembers this only for its own files; an archive project remembers it across runs inside the project file.
-  - When no setting reaches the quality target, or the samples show the output wouldn't be meaningfully smaller, the original is kept before the full encode. A finished video that misses the target is encoded once more with more quality.
-  - Noisy sources at moderate and slow are denoised and get AV1 film grain back, with a strength that follows the measured noise.
+  - When no setting reaches the quality target, or the samples show the output wouldn't be meaningfully smaller, the original is kept before the full encode. A finished video that misses the target is encoded once more with more quality; if that misses too, the original is kept.
+  - If ffmpeg has no libvmaf, moderate and slow don't measure video: each video is encoded at the preset's setting (or one an archive project learned earlier), still kept as the original when samples show it wouldn't be meaningfully smaller, and gets a warning that its quality wasn't measured.
+  - Noisy sources at moderate and slow are denoised and get AV1 film grain back, with a strength that follows the measured noise. Transparent videos and videos too large for SVT-AV1 use other encoders and get no film grain.
 - Images are rotated upright and keep their colour profile. Each encode is checked with SSIMULACRA2 and kept only if it reaches the quality target for the chosen speed.
   - A photo that misses its quality target is encoded again with more quality, at most twice; photos of the same kind then start from what worked.
   - Personal metadata (EXIF, XMP, GPS, IPTC) is dropped unless you pass `--keep-metadata`, which carries it over with the orientation and size corrected.
@@ -58,8 +59,8 @@ cryarchiver album/ --speed slow        # slower, higher quality
 **Custom quality.** Three flags replace a speed preset's quality targets and keep the rest of the preset. The run then names the preset as custom, for example `MODERATE · custom: video VMAF 90/85, image 80`.
 - `--video-vmaf MEAN/FLOOR` is the VMAF mean and 5th-percentile floor each video must reach: mean 80–99, floor from 70 up to the mean. The presets use 93/89 at moderate and 95/91 at slow. Noisy sources encoded with film grain still get 2 off the mean and 2.5 off the floor. `fast` never measures video quality, so it refuses this flag.
 - `--image-target N` is the SSIMULACRA2 score each image must reach, 50–95. The presets use 80, 85 and 90 at fast, moderate and slow.
-- `--audio-kbps N` is the stereo Opus bitrate, 64–320 in steps of 8. Other channel layouts scale with it (mono gets half), and it applies to the audio tracks inside videos too. A lossy source is still not encoded above its own bitrate.
-- Video and image values are rounded to 0.1. What the quality cache learns is kept per target, so a custom run never reuses what a preset run learned.
+- `--audio-kbps N` is the stereo Opus bitrate, 64–320 in steps of 8. Other channel layouts scale with it (mono gets half), and it applies to the audio tracks inside videos too. A lossy source with a lower bitrate is encoded at its own bitrate instead, but never below the fast preset's rate for its layout (96 kbps for stereo), so a 64 kbps MP3 becomes 96 kbps Opus.
+- Video and image values are rounded to 0.1. What is learned about each kind of file is kept per target, so a custom run never reuses what a preset run learned.
 
 | Option | Meaning | Default |
 |---|---|---|
@@ -102,7 +103,7 @@ cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashbo
 - The performance limit runs in the background: low priority, one job at a time, and at most the chosen share of the CPU.
 - `project create` takes the custom quality flags (`--video-vmaf`, `--image-target`, `--audio-kbps`) and stores them in the project. Like a speed change, a change to them applies to files archived from then on; files already archived are not redone. `run` names the custom profile in its summary, and `project dump` shows the stored values. The dashboard's settings (`s`) change them too, and reset them to the preset.
 
-**Deleting originals** is off by default. It can only be turned on in the dashboard's settings (`s`), by typing `DELETE`. An original is then deleted permanently, with no Recycle Bin, once its archived copy has been read back from disk and matches its BLAKE3. A headless run of such a project also needs `--delete-originals`, or it refuses to start. When the dashboard opens such a project, it archives as usual but deletes nothing until you type `DELETE` again in its settings, once per session.
+**Deleting originals** is off by default. It can only be turned on by typing `DELETE`: in the dashboard's settings (`s`) or in the start menu's new-project form. An original is then deleted permanently, with no Recycle Bin, once its archived copy has been read back from disk and matches its BLAKE3. A headless run of such a project also needs `--delete-originals`, or it refuses to start. When the dashboard opens such a project, it archives as usual but deletes nothing until you type `DELETE` again in its settings, once per session.
 
 An original is kept, not deleted, when its archived copy is the original itself or a hard link to it, is a link, has a second name (a hard link, for example into a backup tree), or is a reparse point such as a OneDrive cloud placeholder.
 

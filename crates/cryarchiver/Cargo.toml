@@ -26,6 +26,5 @@ windows.workspace = true
 crc32fast.workspace = true
 cryarchiver-project = { path = "../cryarchiver-project" }
 image.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 ulid.workspace = true

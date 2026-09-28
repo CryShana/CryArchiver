@@ -35,7 +35,7 @@ use crate::schedule::GovernorConfig;
 use crate::settings::{RootConflict, Settings, SettingsError, identity_conflict};
 use crate::store::{Loaded, Store};
 use crate::tree::{FileId, FolderId, Tree};
-use crate::view::Update;
+use crate::view::{LogKind, Update};
 use crate::watch::Debouncer;
 
 /// Every refusal an open makes from the project file's place and settings alone. They run on the settings read
@@ -119,6 +119,7 @@ impl Owner {
 		let watching = WatchState::new(Debouncer::new(options.tuning.debounce), unknown);
 		let memory = Arc::new(MemoryBudget::default());
 		let quality = Arc::new(SharedMemory::with_entries(std::mem::take(&mut loaded.quality)));
+		let ignored_quality = std::mem::take(&mut loaded.ignored_quality);
 		let applied = live::apply_limit(settings.performance_limit);
 		let image_threads = live::image_threads(settings.performance_limit, applied);
 		let mut pipeline = Pipeline::new(
@@ -175,6 +176,9 @@ impl Owner {
 			failure: None,
 		};
 		owner.load(loaded);
+		for line in ignored_quality {
+			owner.log(LogKind::Action, line);
+		}
 		owner.recover();
 
 		sweep(&ArchivalSink::new(&owner.settings.destination).archive_work_root());

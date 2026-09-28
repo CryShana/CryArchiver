@@ -219,9 +219,9 @@ impl Builder {
 		);
 		self.output_missing(y2019);
 
-		let bled = self.library.add_folder(y2020, "Bled");
+		let dune_folder = self.library.add_folder(y2020, "Dune");
 		let everyday = self.library.add_folder(y2020, "Everyday");
-		self.bled(bled);
+		self.dune_folder(dune_folder);
 		self.generate(
 			everyday,
 			&Generated {
@@ -259,8 +259,14 @@ impl Builder {
 		);
 	}
 
-	fn bled(&mut self, bled: NodeId) {
-		let done = self.file(bled, "beach_0142.jpg", MediaKind::Photo, FileState::Done, 12_300_000);
+	fn dune_folder(&mut self, dune_folder: NodeId) {
+		let done = self.file(
+			dune_folder,
+			"beach_0142.jpg",
+			MediaKind::Photo,
+			FileState::Done,
+			12_300_000,
+		);
 		self.show(
 			done,
 			"JPEG 6000×4000 · EXIF + GPS",
@@ -269,7 +275,7 @@ impl Builder {
 		self.quality(done, "SSIMULACRA2 86.4 (target 85)");
 
 		let photo = Phase::Encode { fraction: 0.64 };
-		let encoding = self.active(bled, "beach_0143.jpg", MediaKind::Photo, 11_900_000, photo);
+		let encoding = self.active(dune_folder, "beach_0143.jpg", MediaKind::Photo, 11_900_000, photo);
 		self.show(
 			encoding,
 			"JPEG 6000×4000 · MPF preview dropped",
@@ -277,7 +283,7 @@ impl Builder {
 		);
 
 		let movie = self.active(
-			bled,
+			dune_folder,
 			"birthday clip 2.mov",
 			MediaKind::Video,
 			56_800_000,
@@ -295,7 +301,7 @@ impl Builder {
 		);
 
 		let tall = self.file(
-			bled,
+			dune_folder,
 			"comic-strip-tall.jpg",
 			MediaKind::TallPhoto,
 			FileState::Done,
@@ -309,7 +315,7 @@ impl Builder {
 		self.quality(tall, "SSIMULACRA2 87.1");
 
 		let big = self.file(
-			bled,
+			dune_folder,
 			"city-map-large.jpg",
 			MediaKind::Photo,
 			FileState::Queued,
@@ -322,7 +328,7 @@ impl Builder {
 		);
 
 		let kept = self.file(
-			bled,
+			dune_folder,
 			"screenshot-profiled.avif",
 			MediaKind::Photo,
 			FileState::KeptOriginal,
@@ -332,7 +338,7 @@ impl Builder {
 		self.note(kept, "saving 4 % is below the 10 % minimum");
 
 		let damaged = self.file(
-			bled,
+			dune_folder,
 			"half-copied.jpg",
 			MediaKind::Photo,
 			FileState::SourceDamaged,
@@ -353,7 +359,7 @@ impl Builder {
 		);
 
 		self.generate(
-			bled,
+			dune_folder,
 			&Generated {
 				count: 24,
 				done: 0.5,

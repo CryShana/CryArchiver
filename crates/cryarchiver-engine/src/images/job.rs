@@ -62,6 +62,8 @@ pub enum ImageOutcome {
 		path: PathBuf,
 		bytes: u64,
 		warnings: Vec<String>,
+		/// Settings the groups learn once the output is committed.
+		learned: Vec<(CacheKey, Observation)>,
 	},
 	Kept(KeepReason),
 }
@@ -289,7 +291,7 @@ async fn encode_and_choose(
 	let mut learned = Vec::new();
 
 	for (index, planned) in still.plan.candidates.iter().copied().enumerate() {
-		let key = candidate_key(input, &still, planned);
+		let key = candidate_key(cx.tools, input, &still, planned);
 		let candidate = key
 			.as_ref()
 			.and_then(|key| cx.memory.lookup(key))
@@ -336,14 +338,7 @@ async fn encode_and_choose(
 		}
 	}
 
-	let outcome = finish_choice(cx, workspace, choice, still.plan.target, still.warnings)?;
-
-	if matches!(outcome, ImageOutcome::Output { .. }) {
-		for (key, observation) in &learned {
-			cx.memory.record(key, *observation);
-		}
-	}
-	Ok(outcome)
+	finish_choice(cx, workspace, choice, still.plan.target, still.warnings, learned)
 }
 
 async fn try_candidate(
@@ -447,7 +442,7 @@ async fn verify_candidate(
 	}
 }
 
-fn candidate_key(input: &ImageInput, still: &Still, candidate: Candidate) -> Option<CacheKey> {
+fn candidate_key(tools: &Toolchain, input: &ImageInput, still: &Still, candidate: Candidate) -> Option<CacheKey> {
 	candidate.setting()?;
 	let (width, height) = still.image.dimensions();
 
@@ -460,7 +455,7 @@ fn candidate_key(input: &ImageInput, still: &Still, candidate: Candidate) -> Opt
 			width,
 			height,
 		)),
-		encoder: candidate.encoder_id().to_owned(),
+		encoder: candidate.encoder_id(tools),
 		preset: candidate.preset(),
 		target: still.plan.target,
 		floor: None,
@@ -541,6 +536,7 @@ fn finish_choice(
 	choice: Choice,
 	target: f64,
 	mut warnings: Vec<String>,
+	learned: Vec<(CacheKey, Observation)>,
 ) -> Result<ImageOutcome, JobError> {
 	for (candidate, err) in &choice.failures {
 		let reason = match &err.kind {
@@ -565,6 +561,7 @@ fn finish_choice(
 				path: output,
 				bytes,
 				warnings,
+				learned,
 			})
 		}
 		Verdict::Kept(reason) => Ok(ImageOutcome::Kept(reason)),
@@ -677,6 +674,7 @@ async fn produce_animation(
 		path: output,
 		bytes,
 		warnings,
+		learned: Vec::new(),
 	}))
 }
 

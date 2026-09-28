@@ -22,5 +22,17 @@ async fn detects_the_installed_toolchain_every_time() {
 	assert!(tools.svt_settings && tools.colour_tags && tools.vp9_alpha, "{tools:?}");
 	assert!(tools.has_av1_decoder());
 	assert!(tools.has_vmaf(), "{tools:?}");
+	assert!(
+		tools
+			.svt_av1_release
+			.as_deref()
+			.is_some_and(|release| release.split('.').count() == 3),
+		"{tools:?}"
+	);
+	assert!(tools.libvpx_release.is_some(), "{tools:?}");
+	assert!(
+		tools.build_id.starts_with(|c: char| c.is_ascii_alphanumeric()),
+		"{tools:?}"
+	);
 	assert_eq!(Toolchain::detect(&config, &cancel).await.unwrap(), tools);
 }

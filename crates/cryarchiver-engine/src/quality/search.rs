@@ -106,8 +106,18 @@ pub fn retry_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bou
 		return None;
 	}
 
-	let lowered = bounds.quantize(crf - (deficit / slope.clamp(MIN_SLOPE, MAX_SLOPE) + DOWN_MARGIN));
+	let drop = (deficit / slope.clamp(MIN_SLOPE, MAX_SLOPE) + DOWN_MARGIN).min(MAX_STEP);
+	let lowered = bounds.quantize(crf - drop);
 	(lowered < crf).then_some(lowered)
+}
+
+/// The CRF a passing score points to: the one used, raised by the margin beyond the search's own tolerance over the
+/// slope, by one full step at most. Aiming at the tolerance rather than at the target itself keeps the next file of
+/// the group from landing on the edge, where half of them would miss and be encoded again.
+pub fn implied_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bounds) -> f64 {
+	let spare = (target.margin(score) - CLOSE_ENOUGH).max(0.0);
+	let step = (spare / slope.clamp(MIN_SLOPE, MAX_SLOPE)).min(MAX_STEP);
+	(crf + step).clamp(bounds.min, bounds.max)
 }
 
 fn highest_pass(probes: &[Probe], target: Target) -> Option<usize> {
@@ -319,6 +329,34 @@ mod tests {
 		assert_eq!(retry_crf(10.0, missed, TARGET, 0.5, SVT), None);
 	}
 
+	#[test]
+	fn a_retry_on_a_flat_curve_drops_one_full_step_at_most() {
+		let missed_by_1 = Score {
+			mean: TARGET.mean - 1.0,
+			p5: TARGET.floor + 1.0,
+			frames: 300,
+		};
+
+		assert_eq!(retry_crf(30.0, missed_by_1, TARGET, 0.05, SVT), Some(22.0));
+		assert_eq!(retry_crf(30.0, missed_by_1, TARGET, 0.01, SVT), Some(22.0));
+	}
+
+	#[test]
+	fn a_measured_margin_moves_the_crf_it_implies() {
+		let passing_by = |margin: f64| Score {
+			mean: TARGET.mean + margin,
+			p5: TARGET.floor + margin,
+			frames: 300,
+		};
+
+		assert!((implied_crf(20.0, passing_by(3.0), TARGET, 0.5, SVT) - 25.0).abs() < 1e-9);
+		assert!((implied_crf(20.0, passing_by(10.0), TARGET, 0.5, SVT) - 28.0).abs() < 1e-9);
+		assert!((implied_crf(20.0, passing_by(10.0), TARGET, 0.05, SVT) - 28.0).abs() < 1e-9);
+		assert!((implied_crf(20.0, passing_by(0.3), TARGET, 0.5, SVT) - 20.0).abs() < 1e-9);
+		assert!((implied_crf(20.0, passing_by(0.0), TARGET, 0.5, SVT) - 20.0).abs() < 1e-9);
+		assert!((implied_crf(50.0, passing_by(10.0), TARGET, 0.5, SVT) - 55.0).abs() < 1e-9);
+	}
+
 	fn is_on_grid(crf: f64, bounds: Bounds) -> bool {
 		let steps = (crf - bounds.min) / bounds.step;
 		(steps - steps.round()).abs() < 1e-6
@@ -381,14 +419,22 @@ mod tests {
 	}
 
 	#[test]
-	fn an_unaligned_single_probe_seed_steps_to_a_grid_aligned_crf() {
+	fn an_unaligned_single_probe_seed_steps_from_its_grid_crf() {
+		let passing_by_2_1 = Score {
+			mean: TARGET.mean + 2.1,
+			p5: TARGET.floor + 2.1,
+			frames: 100,
+		};
 		let probes = [Probe {
-			crf: 29.13,
-			score: linear(29.13),
+			crf: 29.2,
+			score: passing_by_2_1,
 		}];
 
 		let next = next(&probes, TARGET, SVT, DEFAULT_SLOPE);
 
-		assert!(matches!(next, Next::Probe(crf) if is_on_grid(crf, SVT)), "{next:?}");
+		assert!(
+			matches!(next, Next::Probe(crf) if (crf - 33.0).abs() < 1e-9 && is_on_grid(crf, SVT)),
+			"{next:?}"
+		);
 	}
 }

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::text::display_path;
 pub use cryarchiver_project::project::MAX_NAME_CHARS;
+use cryarchiver_project::project::{ProjectError, check_new_folders};
 use cryarchiver_project::project_file;
 use cryarchiver_project::settings::{RootConflict, identity_conflict, may_create_in, planned_path, root_conflict};
 
@@ -100,7 +101,7 @@ fn check_destination(source: &str, destination: &str) -> Check {
 	let (exists, verb) = match fs::metadata(path) {
 		Ok(meta) if !meta.is_dir() => return Check::Invalid("is a file, not a folder".into()),
 		Ok(_) => (true, "written"),
-		Err(err) if err.kind() == io::ErrorKind::NotFound => (false, "created"),
+		Err(err) if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => (false, "created"),
 		Err(err) => return Check::Invalid(format!("can't be read: {err}")),
 	};
 
@@ -108,6 +109,12 @@ fn check_destination(source: &str, destination: &str) -> Check {
 		Ok(folder) => folder,
 		Err(reason) => return Check::Invalid(format!("can't be created: {reason}")),
 	};
+	if let Err(err) = planned_path(path)
+		.map_err(ProjectError::from)
+		.and_then(|planned| check_new_folders(&planned))
+	{
+		return Check::Invalid(err.to_string());
+	}
 	let Ok(meta) = fs::metadata(&folder) else {
 		return Check::Invalid(format!("can't be {verb}: {} can't be read", display_path(&folder)));
 	};
@@ -409,6 +416,19 @@ mod tests {
 		assert!(invalid(&folders.validate("photos", "file", "a").destination).contains("not a folder"));
 		assert!(invalid(&folders.validate("photos", "file/archive", "a").destination).contains("not a folder"));
 		assert!(!validate(&folders.path("photos"), "", "a").destination.is_valid());
+	}
+
+	#[test]
+	fn new_destination_folders_follow_the_name_rules() {
+		let folders = Folders::new();
+		let reason = |destination: &str| invalid(&folders.validate("photos", destination, "a").destination);
+
+		assert!(reason("new/CON/archive").contains("reserved"));
+		assert!(reason("new/Archive ").contains("end with"));
+		assert!(reason("new/Archive.").contains("end with"));
+		assert!(reason("new/a|b").contains("can't contain |"));
+		assert_eq!(folders.validate("photos", "new/Archive", "a").destination, Check::Valid);
+		assert_eq!(folders.entries(), ["photos"]);
 	}
 
 	#[test]

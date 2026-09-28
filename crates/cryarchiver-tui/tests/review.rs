@@ -48,24 +48,24 @@ fn folder_named(app: &App<MockSource>, name: &str) -> cryarchiver_tui::view::Nod
 fn collapsing_the_selected_parent_of_the_top_row_keeps_the_viewport_at_it() {
 	let mut app = app();
 	let terminal = draw(&mut app, 120, 36);
-	let bled = find_row(&terminal, "▾ Bled").unwrap();
-	support::click(&mut app, 30, bled, Instant::now());
+	let dune = find_row(&terminal, "▾ Dune").unwrap();
+	support::click(&mut app, 30, dune, Instant::now());
 	mouse(&mut app, MouseEventKind::ScrollDown, 40, 20, Instant::now());
 	mouse(&mut app, MouseEventKind::ScrollDown, 40, 20, Instant::now());
 	let before = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
 	assert!(
 		before.contains(".jpg") || before.contains(".mov"),
-		"a Bled file is at the top: {before}"
+		"a Dune file is at the top: {before}"
 	);
 
 	press(&mut app, KeyCode::Left);
 
 	let top = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
 	assert!(
-		top.contains("▸ Bled"),
+		top.contains("▸ Dune"),
 		"the collapsed parent took the file's place: {top}"
 	);
-	assert_eq!(app.selected_name().as_deref(), Some("Bled"));
+	assert_eq!(app.selected_name().as_deref(), Some("Dune"));
 }
 
 #[test]
@@ -84,15 +84,15 @@ fn released_rows_anchor_on_their_folder_not_on_a_distant_selection() {
 	let before = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
 	assert!(
 		before.contains(".jpg") || before.contains(".mov"),
-		"a Bled file is at the top: {before}"
+		"a Dune file is at the top: {before}"
 	);
 
-	let bled = folder_named(&app, "Bled");
-	app.source_mut().perform(Action::Expanded(bled, false));
+	let dune = folder_named(&app, "Dune");
+	app.source_mut().perform(Action::Expanded(dune, false));
 
 	let top = row_text(&draw(&mut app, 120, 36), FIRST_BODY_ROW);
 	assert!(
-		top.contains("▾ Bled"),
+		top.contains("▾ Dune"),
 		"the viewport stays at the folder that lost its rows: {top}"
 	);
 }
@@ -249,16 +249,16 @@ fn enter_on_a_folder_does_nothing_while_filtered() {
 #[test]
 fn statuses_update_in_place_without_a_new_rows_version() {
 	let mut source = MockSource::new(4);
-	let bled = {
+	let dune = {
 		let library = &source.view().library;
-		library.ids().find(|&id| library.node(id).name == "Bled").unwrap()
+		library.ids().find(|&id| library.node(id).name == "Dune").unwrap()
 	};
-	source.perform(Action::Expanded(bled, true));
+	source.perform(Action::Expanded(dune, true));
 	source.perform(Action::SetFilter("birthday clip".to_owned()));
 	let version = source.rows_version();
 	let progress = |source: &MockSource| {
 		source
-			.files(bled)
+			.files(dune)
 			.unwrap()
 			.iter()
 			.find(|row| row.name == "birthday clip 2.mov")

@@ -1304,6 +1304,45 @@ fn quality_learned_in_one_run_is_there_the_next_time() {
 }
 
 #[test]
+fn a_forgotten_group_is_gone_the_next_time() {
+	use cryarchiver_engine::metadata::ImageFormat;
+	use cryarchiver_engine::quality::keys::{CacheKey, Group, ImageGroup};
+	use cryarchiver_engine::quality::memory::Observation;
+
+	let setup = setup(|_| {});
+	let encoder = FakeEncoder::new();
+	let key = CacheKey {
+		group: Group::Image(ImageGroup::new(ImageFormat::Jpeg, false, false, false, 4000, 3000)),
+		encoder: "ravif-0.13.0".into(),
+		preset: 6,
+		target: 85.0,
+		floor: None,
+	};
+	let learned = Observation {
+		setting: 90.5,
+		slope: None,
+		bpp: None,
+	};
+	for forget in [false, true] {
+		let project = support::open(&setup, &encoder);
+		let quality = encoder.quality.lock().unwrap().clone().unwrap();
+		if forget {
+			assert!(quality.lookup(&key).is_some(), "the first run saved the group");
+			quality.forget(&key);
+		} else {
+			quality.record(&key, learned);
+		}
+		let mut snapshot = Snapshot::default();
+		wait_for(&project, &mut snapshot, "the scan", Snapshot::scan_complete);
+	}
+
+	let _project = support::open(&setup, &encoder);
+	let quality = encoder.quality.lock().unwrap().clone().unwrap();
+
+	assert_eq!(quality.lookup(&key), None);
+}
+
+#[test]
 fn a_project_file_from_before_quality_overrides_opens_without_them() {
 	#[derive(serde::Serialize)]
 	struct Previous {
