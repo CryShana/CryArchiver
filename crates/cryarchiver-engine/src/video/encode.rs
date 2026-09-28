@@ -141,6 +141,25 @@ pub fn samples(declared_s: Option<f64>) -> Vec<Sample> {
 		.unwrap_or_default()
 }
 
+pub async fn encode_sample(
+	ffmpeg: &Path,
+	source: &Path,
+	output: &Path,
+	plan: &VideoPlan,
+	sample: &Sample,
+	cancel: &CancellationToken,
+) -> Result<u64, JobError> {
+	let cmd = sample_command(ffmpeg, source, output, plan, sample);
+	let out = process::run(&cmd, StdoutMode::Progress, |_| {}, cancel).await?;
+	if !out.completed() {
+		return Err(failed_encode(out));
+	}
+
+	Ok(fs::metadata(output)
+		.map_err(|err| JobError::io(IoSide::Destination(output), &err))?
+		.len())
+}
+
 pub async fn encode_samples(
 	ffmpeg: &Path,
 	source: &Path,
@@ -152,20 +171,12 @@ pub async fn encode_samples(
 	let mut total = 0;
 	for (index, sample) in samples.iter().enumerate() {
 		let output = workspace.file(&format!("sample-{index}.mkv"));
-		let cmd = sample_command(ffmpeg, source, &output, plan, sample);
-		let out = process::run(&cmd, StdoutMode::Progress, |_| {}, cancel).await?;
-		if !out.completed() {
-			return Err(failed_encode(out));
-		}
-
-		total += fs::metadata(&output)
-			.map_err(|err| JobError::io(IoSide::Destination(&output), &err))?
-			.len();
+		total += encode_sample(ffmpeg, source, &output, plan, sample, cancel).await?;
 	}
 	Ok(total)
 }
 
-fn failed_encode(out: process::ToolOutput) -> JobError {
+pub(crate) fn failed_encode(out: process::ToolOutput) -> JobError {
 	let kind = if out.counted_lines > 0 {
 		ErrorKind::SourceDamaged(format!(
 			"the video cannot be decoded ({} decoding errors)",

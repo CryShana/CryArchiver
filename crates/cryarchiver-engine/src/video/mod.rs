@@ -3,6 +3,7 @@ pub mod colour;
 pub mod encode;
 pub mod mux;
 pub mod plan;
+pub mod quality;
 pub mod streams;
 pub mod verify;
 
