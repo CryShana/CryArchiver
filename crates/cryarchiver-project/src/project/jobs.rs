@@ -160,6 +160,9 @@ pub(crate) struct PlaceholderCheck {
 	/// A placeholder matched by file identity alone: the canonical copy's source, which must still be the same file,
 	/// as its record describes it.
 	pub(crate) same_file: Option<SameFile>,
+	/// The canonical copy's source, and its identity as its record keeps it: its archived file must not be that file.
+	pub(crate) canonical_source: PathBuf,
+	pub(crate) canonical_identity: Option<Identity>,
 }
 
 /// A canonical copy's source and the size and time its record keeps: its archived output holds that content.
@@ -499,10 +502,11 @@ fn verify_before_delete(
 	let originals: Vec<Identity> = std::iter::once(check.identity)
 		.chain(file_id(source).ok().map(Identity::from))
 		.collect();
-	let read_back =
-		|path: &Path, size, hash| read_back(path, size, hash, &originals).map_err(|err| destination_error(path, &err));
+	let read_back = |path: &Path, size, hash, identities: &[Identity]| {
+		read_back(path, size, hash, identities).map_err(|err| destination_error(path, &err))
+	};
 
-	match read_back(&check.output, check.size, check.hash)? {
+	match read_back(&check.output, check.size, check.hash, &originals)? {
 		ReadBack::Matches => {}
 		ReadBack::Differs => return Ok(Err(Refusal::OutputDamaged)),
 		ReadBack::NotACopy(what) => return Ok(Err(Refusal::Kept(format!("the archived copy {what}")))),
@@ -523,7 +527,13 @@ fn verify_before_delete(
 		)));
 	}
 
-	match read_back(&placeholder.output, placeholder.size, placeholder.hash)? {
+	let sources: Vec<Identity> = originals
+		.iter()
+		.copied()
+		.chain(placeholder.canonical_identity)
+		.chain(file_id(&placeholder.canonical_source).ok().map(Identity::from))
+		.collect();
+	match read_back(&placeholder.output, placeholder.size, placeholder.hash, &sources)? {
 		ReadBack::Matches => {}
 		ReadBack::Differs => {
 			return Ok(Err(Refusal::Kept(
@@ -1053,6 +1063,8 @@ mod tests {
 				size: 7,
 				hash: Hash(*blake3::hash(b"content").as_bytes()),
 				same_file: Some(same_file),
+				canonical_source: canonical.clone(),
+				canonical_identity: None,
 			}),
 			..delete_check(&placeholder, text.as_bytes())
 		};

@@ -166,6 +166,8 @@ impl Owner {
 				size: canonical_output.size,
 				hash: canonical_output.hash?,
 				same_file: entry.record.full_hash.is_none().then(|| self.same_file(*canonical)),
+				canonical_source: self.source_path(&self.tree.file(*canonical).key),
+				canonical_identity: self.tree.file(*canonical).record.identity,
 			}),
 			None => None,
 		};
@@ -822,6 +824,67 @@ mod tests {
 				"original kept: the archived copy it points to is the original itself, or a hard link to it"
 			)),
 			"{said:?}"
+		);
+	}
+
+	#[test]
+	fn a_placeholders_original_is_kept_while_its_canonical_copys_archived_file_is_the_canonicals_own_source() {
+		let content = vec![7; 1000];
+		let mut fixture = Fixture::new();
+		let canonical = fixture.copy("a.bin", &content);
+		let duplicate = fixture.placeholder("b.bin", &content, "a.bin");
+		fs::remove_file(fixture.destination("a.bin")).unwrap();
+		fs::hard_link(fixture.source("a.bin"), fixture.destination("a.bin")).unwrap();
+		fixture.owner.start(true);
+		fixture
+			.owner
+			.pipeline
+			.queues
+			.get_mut(&Work::Delete)
+			.unwrap()
+			.remove(canonical);
+
+		fixture.run_deletes();
+
+		assert_eq!(fs::read(fixture.source("b.bin")).unwrap(), content);
+		assert_eq!(fs::read(fixture.source("a.bin")).unwrap(), content);
+		assert!(matches!(fixture.state(duplicate), FileState::Done(_)));
+		let said = fixture.said();
+		assert!(
+			said.iter().any(|line| line.ends_with(
+				"original kept: the archived copy it points to is the original itself, or a hard link to it"
+			)),
+			"{said:?}"
+		);
+	}
+
+	#[test]
+	fn an_archived_copy_with_another_name_anywhere_never_lets_the_original_go() {
+		let mut fixture = Fixture::new();
+		let notes = fixture.copy("notes.txt", b"notes");
+		let elsewhere = fixture.owner.settings.source.with_file_name("elsewhere.txt");
+		fs::hard_link(fixture.destination("notes.txt"), &elsewhere).unwrap();
+		fixture.owner.start(true);
+
+		fixture.run_deletes();
+
+		assert_eq!(fs::read(fixture.source("notes.txt")).unwrap(), b"notes");
+		assert!(matches!(fixture.state(notes), FileState::Done(_)));
+		let said = fixture.said();
+		assert!(
+			said.contains(
+				&"notes.txt: original kept: the archived copy has another name elsewhere (a hard link)".into()
+			),
+			"{said:?}"
+		);
+
+		fs::remove_file(&elsewhere).unwrap();
+		fixture.owner.queue_all_deletes();
+		fixture.run_deletes();
+		assert!(!fixture.source("notes.txt").exists());
+		assert_eq!(
+			fixture.state(notes),
+			FileState::OriginalDeleted(copied("notes.txt", b"notes"))
 		);
 	}
 

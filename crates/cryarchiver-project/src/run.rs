@@ -23,6 +23,7 @@ const READ_BACK_BUFFER: usize = 4 << 20;
 pub const INSIDE_THE_SOURCE: &str = "leads into the source";
 pub const LINK_OR_NOT_A_FILE: &str = "is a link, a junction or not a regular file";
 pub const THE_ORIGINAL_ITSELF: &str = "is the original itself, or a hard link to it";
+pub const HAS_ANOTHER_NAME: &str = "has another name elsewhere (a hard link)";
 
 const NOT_A_REGULAR_FILE: &str = "not a regular file";
 const OUTSIDE_THE_SOURCE: &str = "its real path is outside the source folder";
@@ -229,8 +230,8 @@ pub enum ReadBack {
 
 /// Reads the file back from the medium, past the page cache, with large sequential reads, and checks its size and
 /// BLAKE3. Only a regular file of its own counts: it is opened without following a link, and a link or any other
-/// reparse point, or a file with the identity of one of `originals` (the original itself, or a hard link to it), is
-/// never read as the copy.
+/// reparse point, a file with the identity of one of `originals` (the original itself, or a hard link to it), or a file
+/// with more than one name is never read as the copy.
 pub fn read_back(path: &Path, size: u64, hash: Hash, originals: &[Identity]) -> io::Result<ReadBack> {
 	if native::not_a_plain_file(&fs::symlink_metadata(path)?) {
 		return Ok(ReadBack::NotACopy(LINK_OR_NOT_A_FILE));
@@ -247,6 +248,11 @@ pub fn read_back(path: &Path, size: u64, hash: Hash, originals: &[Identity]) -> 
 
 	if originals.contains(&native::identity(&file)?) {
 		return Ok(ReadBack::NotACopy(THE_ORIGINAL_ITSELF));
+	}
+
+	// Outputs are placed by rename and never get a second name: another one is someone else's file, a source maybe.
+	if native::link_count(&file)? > 1 {
+		return Ok(ReadBack::NotACopy(HAS_ANOTHER_NAME));
 	}
 
 	if held.len() != size {
@@ -547,16 +553,25 @@ mod native {
 	}
 
 	pub fn identity(file: &File) -> io::Result<Identity> {
-		let mut info = BY_HANDLE_FILE_INFORMATION::default();
-
-		// SAFETY: the handle is owned by `file` and valid for the call.
-		unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut info) }
-			.map_err(|err| to_io(&err))?;
+		let info = information(file)?;
 
 		Ok(Identity {
 			volume: u64::from(info.dwVolumeSerialNumber),
 			index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
 		})
+	}
+
+	pub fn link_count(file: &File) -> io::Result<u64> {
+		Ok(u64::from(information(file)?.nNumberOfLinks))
+	}
+
+	fn information(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+		let mut info = BY_HANDLE_FILE_INFORMATION::default();
+
+		// SAFETY: the handle is owned by `file` and valid for the call.
+		unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut info) }
+			.map_err(|err| to_io(&err))?;
+		Ok(info)
 	}
 
 	/// Normalised the way `fs::canonicalize` normalises the source root, so the two compare component-wise.
@@ -807,6 +822,10 @@ mod native {
 			volume: meta.dev(),
 			index: meta.ino(),
 		})
+	}
+
+	pub fn link_count(file: &File) -> io::Result<u64> {
+		Ok(file.metadata()?.nlink())
 	}
 
 	pub fn open_folder_for_times(path: &Path) -> io::Result<File> {
@@ -1195,6 +1214,10 @@ mod tests {
 		assert_eq!(
 			read_back(&original, 13, hash, &originals).unwrap(),
 			ReadBack::NotACopy(THE_ORIGINAL_ITSELF)
+		);
+		assert_eq!(
+			read_back(&output, 13, hash, &[]).unwrap(),
+			ReadBack::NotACopy(HAS_ANOTHER_NAME)
 		);
 		fs::remove_file(&output).unwrap();
 
