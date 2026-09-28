@@ -7,6 +7,7 @@ pub mod images;
 pub mod integrity;
 pub mod metadata;
 pub mod naming;
+pub mod options;
 pub mod outcome;
 pub mod preset;
 pub mod probe;

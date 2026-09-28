@@ -13,6 +13,7 @@ use cryarchiver_engine::images::animated;
 use cryarchiver_engine::images::decode::oriented;
 use cryarchiver_engine::images::ssim::score;
 use cryarchiver_engine::metadata::exif::orientation;
+use cryarchiver_engine::options::JobOptions;
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
@@ -33,6 +34,7 @@ fn job(source: &Path) -> Job {
 		drop_aux: false,
 		min_savings: 0.10,
 		overrides: Overrides::default(),
+		options: JobOptions::default(),
 	}
 }
 

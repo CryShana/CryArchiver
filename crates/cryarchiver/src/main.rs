@@ -16,6 +16,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use cryarchiver_engine::commit::{OutputSink, check_space};
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::cli_output_path;
+use cryarchiver_engine::options::JobOptions;
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::sink::CliSink;
@@ -585,6 +586,7 @@ async fn compress(args: CompressArgs) -> u8 {
 			drop_aux: args.drop_aux,
 			min_savings,
 			overrides,
+			options: JobOptions::default(),
 		})
 		.collect();
 	let parallel = args.jobs.unwrap_or_else(default_jobs).max(1);

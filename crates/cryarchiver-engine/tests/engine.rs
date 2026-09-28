@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::images::plan::worst_case_memory;
+use cryarchiver_engine::options::JobOptions;
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{Stream, probe};
@@ -27,6 +28,7 @@ fn job(source: &Path) -> Job {
 		drop_aux: false,
 		min_savings: 0.10,
 		overrides: Overrides::default(),
+		options: JobOptions::default(),
 	}
 }
 

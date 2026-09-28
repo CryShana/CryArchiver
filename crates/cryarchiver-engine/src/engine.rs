@@ -15,6 +15,7 @@ use crate::detect::{self, Detection, MediaClass};
 use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
 use crate::integrity;
 use crate::metadata::MetadataMode;
+use crate::options::JobOptions;
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -46,6 +47,7 @@ pub struct Job {
 	pub drop_aux: bool,
 	pub min_savings: f64,
 	pub overrides: Overrides,
+	pub options: JobOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

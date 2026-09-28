@@ -946,6 +946,7 @@ mod tests {
 			drop_aux: true,
 			min_savings: 0.0,
 			overrides: cryarchiver_engine::preset::Overrides::default(),
+			options: cryarchiver_engine::options::JobOptions::default(),
 		};
 
 		let sent = run_job_with(encoder, &source, &destination, b"tags v1", Task::Encode(job));
