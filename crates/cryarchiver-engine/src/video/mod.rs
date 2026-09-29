@@ -1,6 +1,7 @@
 pub mod analyze;
 pub mod chapters;
 pub mod colour;
+pub mod cues;
 pub mod encode;
 pub mod mux;
 pub mod plan;

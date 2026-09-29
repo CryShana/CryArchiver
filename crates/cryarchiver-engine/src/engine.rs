@@ -17,7 +17,7 @@ use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput,
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{JobOptions, TrimWindow, kept_as_requested};
+use crate::options::{JobOptions, TrimWindow, kept_as_requested, kept_as_requested_part};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -28,14 +28,14 @@ use crate::text::display_path;
 use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
 use crate::video::analyze::Analysis;
 use crate::video::encode::{EncodedVideo, Sample};
-use crate::video::mux::{self, Attachment, ChapterSource, MuxInputs, MuxPlan};
+use crate::video::mux::{self, Attachment, ChapterSource, CueFile, MuxInputs, MuxPlan};
 use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, usable_main};
 use crate::video::quality::{self as video_quality, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
 };
-use crate::video::{analyze, chapters, encode as video_encode};
+use crate::video::{analyze, chapters, cues, encode as video_encode};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
@@ -546,7 +546,8 @@ impl Engine {
 		let bytes = fs::metadata(&output)
 			.map_err(|err| JobError::io(IoSide::Destination(&output), &err))?
 			.len();
-		if !saves_enough(cx.source_bytes, bytes, cx.job.min_savings) {
+		let share = source_share(cx.source_bytes, plan.options.window, info.format.duration);
+		if !saves_enough(share.unwrap_or(cx.source_bytes), bytes, cx.job.min_savings) {
 			if !cx.job.options.forced() {
 				return Ok(Produced::Kept(KeepReason::NotSmaller {
 					src_bytes: cx.source_bytes,
@@ -554,7 +555,7 @@ impl Engine {
 				}));
 			}
 
-			let warning = kept_as_requested(cx.source_bytes, bytes);
+			let warning = not_smaller_warning(cx.source_bytes, share, bytes);
 			(cx.on_event)(JobEvent::Warning(warning.clone()));
 			warnings.push(warning);
 		}
@@ -1000,6 +1001,41 @@ impl Engine {
 		))
 	}
 
+	async fn cut_cues(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		job: &VideoJob<'_>,
+	) -> Result<Vec<CueFile>, JobError> {
+		let Some(window) = job.video.window else {
+			return Ok(Vec::new());
+		};
+
+		let window = window.on_source(job.info.format.start_time);
+		let mut cut = Vec::new();
+		for track in &job.streams.subtitles {
+			let Some(format) = track.clipped else {
+				continue;
+			};
+
+			let path = cues::cut(
+				&self.tools.ffmpeg,
+				&cx.job.source,
+				workspace,
+				track.stream_index,
+				format,
+				window,
+				cx.cancel,
+			);
+			cut.push(CueFile {
+				origin: track.stream_index,
+				path: Box::pin(path).await?,
+				format,
+			});
+		}
+		Ok(cut)
+	}
+
 	#[allow(clippy::too_many_lines)]
 	async fn mux_and_verify(
 		&self,
@@ -1033,19 +1069,8 @@ impl Engine {
 		let attachments = collect_attachments(workspace, &job.streams.extracted, metadata, &mut warnings)?;
 
 		let chapter_file = workspace.file(CHAPTER_FILE);
-		let (chapter_source, chapter_count) = match (strip, job.video.window) {
-			(true, _) => (ChapterSource::Dropped, 0),
-			(false, None) => (ChapterSource::Source, job.info.chapters.len()),
-			(false, Some(window)) => {
-				let clipped = chapters::clip(&job.info.chapters, window);
-				if clipped.is_empty() {
-					(ChapterSource::Dropped, 0)
-				} else {
-					write_chapter_file(&chapter_file, &clipped)?;
-					(ChapterSource::File, clipped.len())
-				}
-			}
-		};
+		let (chapter_source, chapter_count) = video_chapters(&chapter_file, job.info, strip, job.video.window)?;
+		let cues = Box::pin(self.cut_cues(cx, workspace, job)).await?;
 
 		let output = workspace.file(&format!("mux.{}", container.extension));
 		let cmd = mux::command(
@@ -1057,6 +1082,7 @@ impl Engine {
 				source_bytes: cx.source_bytes,
 				attachments: &attachments,
 				chapters: (chapter_source == ChapterSource::File).then_some(chapter_file.as_path()),
+				cues: &cues,
 			},
 			&MuxPlan {
 				info: job.info,
@@ -1074,7 +1100,9 @@ impl Engine {
 		let bytes = fs::metadata(&output)
 			.map_err(|err| JobError::io(IoSide::Destination(&output), &err))?
 			.len();
-		if !saves_enough(cx.source_bytes, bytes, cx.job.min_savings) {
+		let declared_s = job.main.declared_duration().or(job.info.format.duration);
+		let share = source_share(cx.source_bytes, job.video.window, declared_s);
+		if !saves_enough(share.unwrap_or(cx.source_bytes), bytes, cx.job.min_savings) {
 			if !cx.job.options.forced() {
 				return Ok(Produced::Kept(KeepReason::NotSmaller {
 					src_bytes: cx.source_bytes,
@@ -1082,7 +1110,7 @@ impl Engine {
 				}));
 			}
 
-			warnings.push(kept_as_requested(cx.source_bytes, bytes));
+			warnings.push(not_smaller_warning(cx.source_bytes, share, bytes));
 		}
 
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
@@ -1257,10 +1285,32 @@ fn with_clipped_chapters(plan: &FilePlan, info: &MediaInfo, workspace: &Workspac
 	let mut plan = plan.clone();
 	if let Some(window) = plan.options.window.filter(|_| !plan.options.strip) {
 		let path = workspace.file(CHAPTER_FILE);
-		write_chapter_file(&path, &chapters::clip(&info.chapters, window))?;
+		let clipped = chapters::clip(&info.chapters, window.on_source(info.format.start_time));
+		write_chapter_file(&path, &clipped)?;
 		plan.options.chapters = Some(path);
 	}
 	Ok(plan)
+}
+
+fn video_chapters(
+	path: &Path,
+	info: &MediaInfo,
+	strip: bool,
+	window: Option<TrimWindow>,
+) -> Result<(ChapterSource, usize), JobError> {
+	let window = match (strip, window) {
+		(true, _) => return Ok((ChapterSource::Dropped, 0)),
+		(false, None) => return Ok((ChapterSource::Source, info.chapters.len())),
+		(false, Some(window)) => window,
+	};
+
+	let clipped = chapters::clip(&info.chapters, window.on_source(info.format.start_time));
+	if clipped.is_empty() {
+		return Ok((ChapterSource::Dropped, 0));
+	}
+
+	write_chapter_file(path, &clipped)?;
+	Ok((ChapterSource::File, clipped.len()))
 }
 
 fn write_chapter_file(path: &Path, clipped: &[chapters::Chapter]) -> Result<(), JobError> {
@@ -1452,6 +1502,24 @@ fn output_bpp(path: &Path, video: &VideoPlan, frames: u64) -> Option<f64> {
 	let bytes = fs::metadata(path).ok()?.len();
 	let pixels = f64::from(video.width) * f64::from(video.height) * frames as f64;
 	(pixels > 0.0).then(|| bytes as f64 * 8.0 / pixels)
+}
+
+/// A trimmed output is weighed against the window's share of the source, not the whole file.
+#[allow(
+	clippy::cast_precision_loss,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss
+)]
+fn source_share(source_bytes: u64, window: Option<TrimWindow>, duration_s: Option<f64>) -> Option<u64> {
+	let (window, duration_s) = (window?, duration_s.filter(|duration| *duration > 0.0)?);
+	Some((source_bytes as f64 * (window.length_s / duration_s).min(1.0)).round() as u64)
+}
+
+fn not_smaller_warning(source_bytes: u64, share: Option<u64>, out_bytes: u64) -> String {
+	match share {
+		Some(part_bytes) => kept_as_requested_part(part_bytes, out_bytes),
+		None => kept_as_requested(source_bytes, out_bytes),
+	}
 }
 
 #[allow(clippy::cast_precision_loss)]

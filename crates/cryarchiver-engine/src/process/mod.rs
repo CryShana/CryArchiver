@@ -62,6 +62,14 @@ impl ToolCommand {
 		self
 	}
 
+	/// Input options: they apply to the next `-i`.
+	pub fn seek(&mut self, start_s: f64, length_s: f64) -> &mut Self {
+		self.arg("-ss")
+			.arg(format!("{start_s:.3}"))
+			.arg("-t")
+			.arg(format!("{length_s:.3}"))
+	}
+
 	pub fn count_lines_containing(&mut self, patterns: &'static [&'static str]) -> &mut Self {
 		self.counted = patterns;
 		self

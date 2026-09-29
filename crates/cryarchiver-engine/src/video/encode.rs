@@ -70,10 +70,7 @@ fn encode_command(
 		.map(|sample| (sample.start_s, sample.length_s))
 		.or(plan.window.map(|window| (window.start_s, window.length_s)));
 	if let Some((start_s, length_s)) = seek {
-		cmd.arg("-ss")
-			.arg(format!("{start_s:.3}"))
-			.arg("-t")
-			.arg(format!("{length_s:.3}"));
+		cmd.seek(start_s, length_s);
 	}
 
 	if let Some(decoder) = plan.decoder {
@@ -570,10 +567,12 @@ mod tests {
 				SubtitleTrack {
 					stream_index: 3,
 					codec: None,
+					clipped: None,
 				},
 				SubtitleTrack {
 					stream_index: 4,
 					codec: None,
+					clipped: None,
 				},
 			],
 			..StreamPlan::default()

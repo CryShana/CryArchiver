@@ -10,11 +10,12 @@ use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, ToolCommand};
 use crate::video::plan::VideoPlan;
 use crate::video::run_ffmpeg;
-use crate::video::streams::StreamPlan;
+use crate::video::streams::{CueFormat, StreamPlan};
 
 const BRAND_TAGS: &[&str] = &["major_brand", "minor_version", "compatible_brands"];
 const CLEAN_STREAM_TAGS: &[&str] = &["language", "title"];
 const ATTACHMENT_TAGS: &[&str] = &["filename", "mimetype"];
+const CUE_DISPOSITIONS: &[&str] = &["default", "forced", "hearing_impaired", "visual_impaired", "comment"];
 const STATISTICS_TAGS: &[&str] = &[
 	"BPS",
 	"DURATION",
@@ -39,6 +40,15 @@ pub struct MuxInputs<'a> {
 	pub source_bytes: u64,
 	pub attachments: &'a [Attachment],
 	pub chapters: Option<&'a Path>,
+	pub cues: &'a [CueFile],
+}
+
+/// A subtitle track cut to the trim, muxed in place of the source's stream `origin`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueFile {
+	pub origin: u32,
+	pub path: PathBuf,
+	pub format: CueFormat,
 }
 
 pub struct MuxPlan<'a> {
@@ -122,10 +132,7 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 		cmd.args(["-export_xmp", "1"]);
 	}
 	if let Some(window) = plan.window {
-		cmd.arg("-ss")
-			.arg(format!("{:.3}", window.start_s))
-			.arg("-t")
-			.arg(format!("{:.3}", window.length_s));
+		cmd.seek(window.start_s, window.length_s);
 	}
 
 	if let Some(offset) = source_offset(plan.info, plan.window) {
@@ -134,14 +141,23 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 	cmd.arg("-i").arg(process::tool_path(inputs.source));
 
 	let chapter_file = source + 1;
+	let mut next_input = chapter_file;
 	if plan.chapters == ChapterSource::File
 		&& let Some(chapters) = inputs.chapters
 	{
 		cmd.args(["-f", "ffmetadata", "-i"]).arg(process::tool_path(chapters));
+		next_input += 1;
+	}
+
+	let mut cue_inputs = Vec::new();
+	for (cue, input) in inputs.cues.iter().zip(next_input..) {
+		cmd.args(["-f", cue.format.extension(), "-i"])
+			.arg(process::tool_path(&cue.path));
+		cue_inputs.push((cue.origin, input));
 	}
 
 	let outputs = output_streams(plan.video, plan.streams);
-	push_maps(&mut cmd, &outputs, &plan.streams.attachments, source);
+	push_maps(&mut cmd, &outputs, &plan.streams.attachments, source, &cue_inputs);
 	cmd.args(["-c", "copy"]);
 	for (ordinal, codec) in plan
 		.streams
@@ -172,6 +188,7 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 	} else {
 		push_clean_metadata(&mut cmd, plan, &outputs);
 	}
+	push_cue_tags(&mut cmd, plan, &outputs, &cue_inputs);
 
 	match plan.chapters {
 		ChapterSource::Source => cmd.arg("-map_chapters").arg(source.to_string()),
@@ -184,7 +201,7 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 		cmd.args(["-cues_to_front", "1"]);
 	}
 
-	// The source's `-t` still passes a subtitle that starts exactly at the window's end.
+	// Under `-copyts` the source's `-t` doesn't end at the window's end, so the output is cut here.
 	if let Some(window) = plan.window {
 		cmd.arg("-t").arg(format!("{:.3}", window.length_s));
 	}
@@ -203,12 +220,20 @@ fn source_offset(info: &MediaInfo, window: Option<TrimWindow>) -> Option<String>
 	(shift.abs() > f64::EPSILON).then(|| format!("{:.6}", -shift))
 }
 
-fn push_maps(cmd: &mut ToolCommand, outputs: &[OutputStream], attachments: &[u32], source: usize) {
+fn push_maps(
+	cmd: &mut ToolCommand,
+	outputs: &[OutputStream],
+	attachments: &[u32],
+	source: usize,
+	cue_inputs: &[(u32, usize)],
+) {
 	for output in outputs {
-		let spec = match output.input {
-			MuxInput::VideoTemp(ordinal) => format!("0:v:{ordinal}"),
-			MuxInput::AudioTemp(ordinal) => format!("1:a:{ordinal}"),
-			MuxInput::Source => format!("{source}:{}", output.origin),
+		let cut = cue_inputs.iter().find(|(origin, _)| *origin == output.origin);
+		let spec = match (output.input, cut) {
+			(MuxInput::VideoTemp(ordinal), _) => format!("0:v:{ordinal}"),
+			(MuxInput::AudioTemp(ordinal), _) => format!("1:a:{ordinal}"),
+			(MuxInput::Source, Some((_, input))) => format!("{input}:0"),
+			(MuxInput::Source, None) => format!("{source}:{}", output.origin),
 		};
 		cmd.arg("-map").arg(spec);
 	}
@@ -276,6 +301,39 @@ fn push_clean_metadata(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, outputs: &[Out
 	}
 }
 
+/// A cut file has none of the source stream's tags or flags, so they are set from the source here. Clean mode has
+/// already set the tags it keeps.
+fn push_cue_tags(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, outputs: &[OutputStream], cue_inputs: &[(u32, usize)]) {
+	for (position, output) in outputs.iter().enumerate() {
+		if !cue_inputs.iter().any(|(origin, _)| *origin == output.origin) {
+			continue;
+		}
+		let Some(stream) = source_stream(plan.info, output.origin) else {
+			continue;
+		};
+
+		if plan.keep_metadata {
+			for key in CLEAN_STREAM_TAGS {
+				if let Some(value) = stream.tag(key) {
+					cmd.arg(format!("-metadata:s:{position}")).arg(format!("{key}={value}"));
+				}
+			}
+		}
+
+		let flags: Vec<&str> = CUE_DISPOSITIONS
+			.iter()
+			.copied()
+			.filter(|flag| stream.disposition.get(*flag).is_some_and(|set| *set != 0))
+			.collect();
+		let flags = if flags.is_empty() {
+			"0".to_owned()
+		} else {
+			flags.join("+")
+		};
+		cmd.arg(format!("-disposition:{position}")).arg(flags);
+	}
+}
+
 fn source_stream(info: &MediaInfo, index: u32) -> Option<&Stream> {
 	info.streams.iter().find(|stream| stream.index == index)
 }
@@ -318,10 +376,12 @@ mod tests {
 				SubtitleTrack {
 					stream_index: 3,
 					codec: None,
+					clipped: None,
 				},
 				SubtitleTrack {
 					stream_index: 4,
 					codec: Some("srt"),
+					clipped: None,
 				},
 			],
 			attachments: vec![5],
@@ -353,6 +413,7 @@ mod tests {
 			source_bytes: 0,
 			attachments,
 			chapters: None,
+			cues: &[],
 		};
 		let plan = MuxPlan {
 			info,
@@ -440,6 +501,7 @@ mod tests {
 			source_bytes: 0,
 			attachments: &[],
 			chapters: Some(Path::new("chapters.txt")),
+			cues: &[],
 		};
 		let plan = MuxPlan {
 			info: &delayed,
@@ -460,6 +522,80 @@ mod tests {
 		assert!(args.contains(" -f ffmetadata -i "), "{args}");
 		assert!(args.contains("-map_chapters 3 -cues_to_front 1"), "{args}");
 		assert!(args.contains(" -t 4.000 -f matroska "), "{args}");
+	}
+
+	#[test]
+	fn cut_cues_are_muxed_from_their_own_files_with_the_source_tags() {
+		let mut tagged = info();
+		tagged.streams[4].disposition.insert("forced".into(), 1);
+		tagged.streams[4].tags.insert("language".into(), "deu".into());
+		let video = test_plan();
+		let streams = StreamPlan {
+			subtitles: vec![
+				SubtitleTrack {
+					stream_index: 3,
+					codec: None,
+					clipped: None,
+				},
+				SubtitleTrack {
+					stream_index: 4,
+					codec: None,
+					clipped: Some(CueFormat::Ass),
+				},
+			],
+			..StreamPlan::default()
+		};
+		let cues = [CueFile {
+			origin: 4,
+			path: PathBuf::from("cues-4.ass"),
+			format: CueFormat::Ass,
+		}];
+		let inputs = MuxInputs {
+			video: Path::new("video.a1.mkv"),
+			audio: None,
+			source: Path::new("source.mkv"),
+			source_bytes: 0,
+			attachments: &[],
+			chapters: None,
+			cues: &cues,
+		};
+		let plan = |keep_metadata| MuxPlan {
+			info: &tagged,
+			video: &video,
+			streams: &streams,
+			keep_metadata,
+			container: MATROSKA_VIDEO,
+			chapters: ChapterSource::Dropped,
+			window: Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 4.0,
+			}),
+		};
+
+		let kept = joined(&command(
+			Path::new("ffmpeg"),
+			&inputs,
+			&plan(true),
+			Path::new("mux.mkv"),
+		));
+		let clean = joined(&command(
+			Path::new("ffmpeg"),
+			&inputs,
+			&plan(false),
+			Path::new("mux.mkv"),
+		));
+
+		let cue_input = format!(" -f ass -i {} ", process::tool_path(Path::new("cues-4.ass")).display());
+		assert!(kept.contains(&cue_input), "{kept}");
+		assert!(kept.contains("-map 0:v:0 -map 1:3 -map 2:0 -c copy"), "{kept}");
+		assert!(
+			kept.contains("-metadata:s:2 language=deu -disposition:2 forced"),
+			"{kept}"
+		);
+		assert!(!kept.contains("-disposition:1"), "{kept}");
+		assert!(clean.contains("-metadata:s:2 language=deu"), "{clean}");
+		assert_eq!(clean.matches("language=deu").count(), 1, "{clean}");
+		assert!(clean.contains("-disposition:2 forced"), "{clean}");
 	}
 
 	#[test]
@@ -553,6 +689,7 @@ mod tests {
 			source_bytes: 0,
 			attachments: &[],
 			chapters: None,
+			cues: &[],
 		};
 		let plan = MuxPlan {
 			info: &info,
@@ -580,6 +717,7 @@ mod tests {
 			source_bytes: 0,
 			attachments: &[],
 			chapters: None,
+			cues: &[],
 		};
 		let plan = MuxPlan {
 			info: &info,
@@ -603,6 +741,7 @@ mod tests {
 			subtitles: vec![SubtitleTrack {
 				stream_index: 3,
 				codec: Some("webvtt"),
+				clipped: None,
 			}],
 			..StreamPlan::default()
 		};
@@ -613,6 +752,7 @@ mod tests {
 			source_bytes: 0,
 			attachments: &[],
 			chapters: None,
+			cues: &[],
 		};
 		let muxed = |container| {
 			joined(&command(

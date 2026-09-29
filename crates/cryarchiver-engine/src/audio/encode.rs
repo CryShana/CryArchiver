@@ -21,10 +21,7 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 
 	cmd.args(["-hide_banner", "-nostdin", "-y"]);
 	if let Some(window) = plan.options.window {
-		cmd.arg("-ss")
-			.arg(format!("{:.3}", window.start_s))
-			.arg("-t")
-			.arg(format!("{:.3}", window.length_s));
+		cmd.seek(window.start_s, window.length_s);
 	}
 
 	cmd.arg("-i").arg(process::tool_path(source));

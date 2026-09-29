@@ -36,10 +36,27 @@ const MKV_TEXT: &[&str] = &["subrip", "srt", "ass", "ssa", "webvtt"];
 const WEBM_AUDIO: &[&str] = &["opus", "vorbis"];
 const MP4_AUDIO: &[&str] = &["aac", "ac3", "eac3", "mp3", "opus", "flac", "alac"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CueFormat {
+	Srt,
+	Ass,
+}
+
+impl CueFormat {
+	pub fn extension(self) -> &'static str {
+		match self {
+			Self::Srt => "srt",
+			Self::Ass => "ass",
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleTrack {
 	pub stream_index: u32,
 	pub codec: Option<&'static str>,
+	/// Under a trim, a text track is cut in this format and muxed from the cut file instead of the source.
+	pub clipped: Option<CueFormat>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -168,6 +185,10 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 				plan.audio.push(track);
 			}
 			"subtitle" => match subtitle_track(stream, target)? {
+				Some(track) if rules.trim => {
+					let track = trimmed_subtitle(track, stream, target, &mut plan.warnings);
+					plan.subtitles.push(track);
+				}
 				Some(track) => plan.subtitles.push(track),
 				None => plan.warnings.push(format!(
 					"subtitle stream {} ({}) dropped: {} holds only text subtitles; --burn-subs can draw it into the picture",
@@ -229,13 +250,18 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 	Ok(plan)
 }
 
+fn is_text(codec: &str) -> bool {
+	MKV_TEXT.contains(&codec) || TEXT_SUBTITLES.contains(&codec)
+}
+
 fn subtitle_track(stream: &Stream, target: Target) -> Result<Option<SubtitleTrack>, Refusal> {
 	let codec = stream.codec_name.as_str();
-	let text = MKV_TEXT.contains(&codec) || TEXT_SUBTITLES.contains(&codec);
+	let text = is_text(codec);
 	let track = |converted: Option<&'static str>| {
 		Ok(Some(SubtitleTrack {
 			stream_index: stream.index,
 			codec: converted,
+			clipped: None,
 		}))
 	};
 
@@ -251,9 +277,44 @@ fn subtitle_track(stream: &Stream, target: Target) -> Result<Option<SubtitleTrac
 	}
 }
 
+fn trimmed_subtitle(
+	track: SubtitleTrack,
+	stream: &Stream,
+	target: Target,
+	warnings: &mut Vec<String>,
+) -> SubtitleTrack {
+	if !is_text(&stream.codec_name) {
+		warnings.push(format!(
+			"subtitle stream {} ({}): a bitmap subtitle on screen at the cut isn't kept",
+			stream.index, stream.codec_name
+		));
+		return track;
+	}
+
+	let format = if matches!(stream.codec_name.as_str(), "ass" | "ssa") {
+		CueFormat::Ass
+	} else {
+		CueFormat::Srt
+	};
+	SubtitleTrack {
+		codec: match target {
+			Target::Matroska => None,
+			Target::Webm => Some("webvtt"),
+			Target::Mp4 => Some("mov_text"),
+		},
+		clipped: Some(format),
+		..track
+	}
+}
+
 fn audio_track(stream: &Stream, track: usize, rules: &StreamRules, warnings: &mut Vec<String>) -> TrackJob {
 	let copy = |warnings: &mut Vec<String>, reason: &str| {
-		warnings.push(format!("audio track {track} copied as-is: {reason}"));
+		let cut = if rules.trim {
+			" and is cut at the nearest packet"
+		} else {
+			""
+		};
+		warnings.push(format!("audio track {track} copied as-is: {reason}{cut}"));
 		TrackJob {
 			stream_index: stream.index,
 			sample_rate: stream.sample_rate.unwrap_or(0),
@@ -450,15 +511,18 @@ mod tests {
 			vec![
 				SubtitleTrack {
 					stream_index: 1,
-					codec: None
+					codec: None,
+					clipped: None
 				},
 				SubtitleTrack {
 					stream_index: 2,
-					codec: Some("srt")
+					codec: Some("srt"),
+					clipped: None
 				},
 				SubtitleTrack {
 					stream_index: 3,
-					codec: None
+					codec: None,
+					clipped: None
 				},
 			]
 		);
@@ -608,6 +672,86 @@ mod tests {
 		assert!(matches!(plan.audio[0].plan, TrackPlan::Encode(_)), "{:?}", plan.audio);
 		assert!(plan.extracted.is_empty());
 		assert_eq!(plan.warnings, ["1 data stream dropped: data streams can't be trimmed"]);
+	}
+
+	fn trimmed(container: Container) -> StreamRules {
+		StreamRules {
+			trim: true,
+			..into(container)
+		}
+	}
+
+	#[test]
+	fn a_trim_clips_text_subtitles_and_warns_about_bitmap_ones() {
+		let subtitles = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"subtitle","codec_name":"subrip"},
+			{"index":2,"codec_type":"subtitle","codec_name":"ass"},
+			{"index":3,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle"},
+			{"index":4,"codec_type":"subtitle","codec_name":"webvtt"}]}"#,
+		);
+		let tracks = |plan: &StreamPlan| {
+			plan.subtitles
+				.iter()
+				.map(|track| (track.stream_index, track.codec, track.clipped))
+				.collect::<Vec<_>>()
+		};
+
+		let mkv = plan_streams(&subtitles, &trimmed(MATROSKA_VIDEO)).unwrap();
+		let webm = plan_streams(&subtitles, &trimmed(WEBM_VIDEO)).unwrap();
+		let mp4 = plan_streams(&subtitles, &trimmed(MP4_VIDEO)).unwrap();
+
+		assert_eq!(
+			tracks(&mkv),
+			[
+				(1, None, Some(CueFormat::Srt)),
+				(2, None, Some(CueFormat::Ass)),
+				(3, None, None),
+				(4, None, Some(CueFormat::Srt)),
+			]
+		);
+		assert_eq!(
+			mkv.warnings,
+			["subtitle stream 3 (hdmv_pgs_subtitle): a bitmap subtitle on screen at the cut isn't kept"]
+		);
+		assert_eq!(
+			tracks(&webm),
+			[
+				(1, Some("webvtt"), Some(CueFormat::Srt)),
+				(2, Some("webvtt"), Some(CueFormat::Ass)),
+				(4, Some("webvtt"), Some(CueFormat::Srt)),
+			]
+		);
+		assert!(
+			tracks(&mp4)
+				.iter()
+				.all(|(_, codec, clipped)| *codec == Some("mov_text") && clipped.is_some())
+		);
+		assert!(
+			plan_streams(&subtitles, &into(MATROSKA_VIDEO))
+				.unwrap()
+				.subtitles
+				.iter()
+				.all(|track| track.clipped.is_none())
+		);
+	}
+
+	#[test]
+	fn a_trimmed_audio_track_that_must_be_copied_says_where_it_is_cut() {
+		let wide = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"audio","codec_name":"pcm_s16le","sample_rate":"48000","channels":10,"channel_layout":"5.1.4"}]}"#,
+		);
+
+		let plan = plan_streams(&wide, &trimmed(MATROSKA_VIDEO)).unwrap();
+
+		assert_eq!(plan.audio[0].plan, TrackPlan::Copy);
+		assert!(
+			plan.warnings[0].starts_with("audio track 1 copied as-is: 10 channels")
+				&& plan.warnings[0].ends_with(" and is cut at the nearest packet"),
+			"{:?}",
+			plan.warnings
+		);
 	}
 
 	#[test]

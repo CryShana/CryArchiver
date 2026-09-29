@@ -4,8 +4,6 @@ use serde_json::Value;
 
 use crate::options::TrimWindow;
 
-const SHORTEST_CHAPTER_S: f64 = 0.001;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chapter {
 	pub start_s: f64,
@@ -14,15 +12,13 @@ pub struct Chapter {
 }
 
 pub fn clip(chapters: &[Value], window: TrimWindow) -> Vec<Chapter> {
-	let end_of_window = window.start_s + window.length_s;
 	chapters
 		.iter()
 		.filter_map(|chapter| {
-			let start = seconds(&chapter["start_time"])?.max(window.start_s);
-			let end = seconds(&chapter["end_time"])?.min(end_of_window);
-			(end - start > SHORTEST_CHAPTER_S).then(|| Chapter {
-				start_s: start - window.start_s,
-				end_s: end - window.start_s,
+			let (start_s, end_s) = window.clip(seconds(&chapter["start_time"])?, seconds(&chapter["end_time"])?)?;
+			Some(Chapter {
+				start_s,
+				end_s,
 				title: chapter["tags"]["title"].as_str().map(str::to_owned),
 			})
 		})

@@ -164,10 +164,7 @@ pub async fn alpha_ssim(
 	cmd.args(["-hide_banner", "-nostdin", "-c:v", "libvpx-vp9", "-i"])
 		.arg(process::tool_path(output));
 	if let Some(window) = video.window {
-		cmd.arg("-ss")
-			.arg(format!("{:.3}", window.start_s))
-			.arg("-t")
-			.arg(format!("{:.3}", window.length_s));
+		cmd.seek(window.start_s, window.length_s);
 	}
 	if let Some(decoder) = video.decoder {
 		cmd.arg("-c:v").arg(decoder);

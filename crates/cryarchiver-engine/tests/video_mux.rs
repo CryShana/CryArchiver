@@ -139,6 +139,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 			source_bytes: fs::metadata(&source).unwrap().len(),
 			attachments: &attachments,
 			chapters: None,
+			cues: &[],
 		},
 		&MuxPlan {
 			info: &info,

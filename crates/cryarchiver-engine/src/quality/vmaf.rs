@@ -109,10 +109,7 @@ pub fn sample_command(
 	scoring: &Scoring<'_>,
 ) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
-	cmd.arg("-ss")
-		.arg(format!("{start_s:.3}"))
-		.arg("-t")
-		.arg(format!("{length_s:.3}"));
+	cmd.seek(start_s, length_s);
 	push_reference(&mut cmd, reference);
 
 	let distorted_chain = chain(&[SCORED_FORMAT, BY_POSITION]);
@@ -135,10 +132,7 @@ pub fn window_command(
 ) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
 	if let Some(window) = reference.window {
-		cmd.arg("-ss")
-			.arg(format!("{:.3}", window.start_s))
-			.arg("-t")
-			.arg(format!("{:.3}", window.length_s));
+		cmd.seek(window.start_s, window.length_s);
 	}
 	push_reference(&mut cmd, reference);
 

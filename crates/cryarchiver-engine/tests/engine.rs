@@ -2492,6 +2492,226 @@ fn subtitle_times(path: &Path) -> Vec<f64> {
 		.collect()
 }
 
+fn subtitle_spans(path: &Path) -> Vec<(f64, f64)> {
+	let out = std::process::Command::new("ffprobe")
+		.args([
+			"-v",
+			"error",
+			"-select_streams",
+			"s",
+			"-show_entries",
+			"packet=pts_time,duration_time",
+			"-of",
+			"csv=p=0",
+		])
+		.arg(path)
+		.output()
+		.unwrap();
+	String::from_utf8_lossy(&out.stdout)
+		.lines()
+		.filter_map(|line| {
+			let (start, length) = line.trim().trim_end_matches(',').split_once(',')?;
+			let start: f64 = start.parse().ok()?;
+			Some((start, start + length.parse::<f64>().ok()?))
+		})
+		.collect()
+}
+
+fn chapter_spans(info: &cryarchiver_engine::probe::MediaInfo) -> Vec<(String, f64, f64)> {
+	info.chapters
+		.iter()
+		.map(|chapter| {
+			let time = |key: &str| chapter[key].as_str().unwrap().parse::<f64>().unwrap();
+			(
+				chapter["tags"]["title"].as_str().unwrap_or_default().to_owned(),
+				time("start_time"),
+				time("end_time"),
+			)
+		})
+		.collect()
+}
+
+fn near(actual: (f64, f64), expected: (f64, f64)) -> bool {
+	(actual.0 - expected.0).abs() < 0.02 && (actual.1 - expected.1).abs() < 0.02
+}
+
+#[tokio::test]
+async fn cues_and_chapters_across_the_cuts_are_clipped_to_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::clip_with_extras(dir.path());
+
+	let outcome = run(&trimmed(fast(&clip), 5.5, 8.5), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let cues = subtitle_spans(&output);
+	assert_eq!(cues.len(), 2, "{cues:?}");
+	assert!(near(cues[0], (0.0, 0.5)), "{cues:?}");
+	assert!(near(cues[1], (2.5, 3.0)), "{cues:?}");
+	let chapters = chapter_spans(&info);
+	assert_eq!(chapters.len(), 2, "{chapters:?}");
+	assert!(
+		chapters[0].0 == "B" && near((chapters[0].1, chapters[0].2), (0.0, 1.5)),
+		"{chapters:?}"
+	);
+	assert!(
+		chapters[1].0 == "C" && near((chapters[1].1, chapters[1].2), (1.5, 3.0)),
+		"{chapters:?}"
+	);
+	assert!((info.format.duration.unwrap() - 3.0).abs() < 0.05, "{:?}", info.format);
+}
+
+#[tokio::test]
+async fn cut_ass_subtitles_keep_their_styles() {
+	let dir = tempfile::tempdir().unwrap();
+	let ass = dir.path().join("signs.ass");
+	fs::write(
+		&ass,
+		"[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 240\n\n[V4+ Styles]\n\
+		 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, \
+		 Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, \
+		 MarginR, MarginV, Encoding\n\
+		 Style: Sign,Arial,24,&H0000FFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1\n\n\
+		 [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+		 Dialogue: 0,0:00:01.00,0:00:03.00,Sign,,0,0,0,,{\\b1}across the start\n\
+		 Dialogue: 0,0:00:03.50,0:00:04.00,Sign,,0,0,0,,inside\n",
+	)
+	.unwrap();
+	let clip = dir.path().join("signs.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=5",
+		"-i",
+		ass.to_str().unwrap(),
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-c:v",
+		"mpeg4",
+		"-c:s",
+		"copy",
+		clip.to_str().unwrap(),
+	]);
+
+	let outcome = run(&trimmed(fast(&clip), 2.0, 4.5), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let script = std::process::Command::new("ffmpeg")
+		.args(["-v", "error", "-i"])
+		.arg(&output)
+		.args(["-map", "0:s", "-c", "copy", "-f", "ass", "-"])
+		.output()
+		.unwrap();
+	let script = String::from_utf8_lossy(&script.stdout);
+	assert!(script.contains("Style: Sign,Arial,24,"), "{script}");
+	assert!(
+		script.contains("Dialogue: 0,0:00:00.00,0:00:01.00,Sign,,0,0,0,,{\\b1}across the start"),
+		"{script}"
+	);
+	assert!(script.contains("0:00:01.50,0:00:02.00,Sign"), "{script}");
+}
+
+#[tokio::test]
+async fn cut_cues_become_mov_text_in_mp4() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::clip_with_extras(dir.path());
+	let options = JobOptions {
+		trim: Some(Trim {
+			start_s: 5.5,
+			end_s: Some(8.5),
+		}),
+		format: Some(OutputFormat::Mp4),
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(fast(&clip), options), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!(
+		info.streams.iter().any(|stream| stream.codec_name == "mov_text"),
+		"{:?}",
+		info.streams
+	);
+	let cues = subtitle_spans(&output);
+	assert!(cues.first().is_some_and(|cue| near(*cue, (0.0, 0.5))), "{cues:?}");
+}
+
+#[tokio::test]
+async fn trimmed_audio_starts_at_the_cut() {
+	let dir = tempfile::tempdir().unwrap();
+	let late_tone = dir.path().join("late-tone.flac");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"aevalsrc='if(lt(t,3),0,0.5*sin(2*PI*440*t))':s=48000:d=6",
+		"-c:a",
+		"flac",
+		late_tone.to_str().unwrap(),
+	]);
+
+	let from_the_tone = run(&trimmed(job(&late_tone), 3.0, 5.0), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = from_the_tone else {
+		panic!("{from_the_tone:?}")
+	};
+	let first_quarter = std::process::Command::new("ffmpeg")
+		.args(["-hide_banner", "-t", "0.25", "-i"])
+		.arg(&output)
+		.args(["-af", "volumedetect", "-f", "null", "-"])
+		.output()
+		.unwrap();
+	let log = String::from_utf8_lossy(&first_quarter.stderr);
+	let peak: f64 = log
+		.split("max_volume:")
+		.nth(1)
+		.and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+		.unwrap_or_else(|| panic!("{log}"));
+	assert!(
+		peak > -20.0,
+		"the output starts silent, so it didn't start at --ss: {peak} dB"
+	);
+}
+
+#[tokio::test]
+async fn a_trimmed_output_is_compared_with_the_same_part_of_the_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let thin = support::tone(
+		dir.path(),
+		"thin.opus",
+		"stereo",
+		2,
+		20,
+		&["-c:a", "libopus", "-b:a", "32k"],
+	);
+
+	let outcome = run(&trimmed(job(&thin), 2.0, 5.0), dir.path()).await;
+
+	let JobOutcome::Encoded { warnings, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings
+			.iter()
+			.any(|warning| warning.starts_with("the output is not smaller than the same part of the source (")),
+		"{warnings:?}"
+	);
+}
+
 #[tokio::test]
 async fn trimmed_video_keeps_subtitles_and_chapters_in_the_window() {
 	let dir = tempfile::tempdir().unwrap();
@@ -2643,11 +2863,21 @@ async fn trims_outside_the_file_and_trimmed_images_fail() {
 	let photo = support::photo_png(dir.path(), "photo.png", 64, 48);
 
 	let late = run(&trimmed(job(&flac), 20.0, 25.0), dir.path()).await;
+	let backwards = run(&trimmed(job(&flac), 2.0, 1.0), dir.path()).await;
+	let instant = run(&trimmed(job(&flac), 1.0, 1.05), dir.path()).await;
 	let image = run(&trimmed(job(&photo), 1.0, 2.0), dir.path()).await;
 
 	assert!(
 		matches!(&late, JobOutcome::Failed(err) if err.to_string().contains("past the end")),
 		"{late:?}"
+	);
+	assert!(
+		matches!(&backwards, JobOutcome::Failed(err) if err.to_string().contains("must be later than --ss")),
+		"{backwards:?}"
+	);
+	assert!(
+		matches!(&instant, JobOutcome::Failed(err) if err.to_string().contains("at least 0.1 s")),
+		"{instant:?}"
 	);
 	assert!(
 		matches!(&image, JobOutcome::Failed(err) if err.to_string().contains("not images")),

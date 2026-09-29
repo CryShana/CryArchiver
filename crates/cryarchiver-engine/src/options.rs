@@ -1,6 +1,8 @@
 use crate::format::OutputFormat;
 
 const DURATION_SLACK_S: f64 = 0.05;
+const SHORTEST_TRIM_S: f64 = 0.1;
+const SHORTEST_SPAN_S: f64 = 0.001;
 const SIXTY: f64 = 60.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,6 +31,22 @@ impl JobOptions {
 }
 
 impl TrimWindow {
+	/// The same range on the source's own timestamps, which begin at its start time rather than at 0.
+	#[must_use]
+	pub fn on_source(self, start_time: Option<f64>) -> Self {
+		Self {
+			start_s: self.start_s + start_time.unwrap_or(0.0),
+			..self
+		}
+	}
+
+	/// A span's part inside the window, on the window's timeline; `None` when nothing of it is left.
+	pub fn clip(self, start_s: f64, end_s: f64) -> Option<(f64, f64)> {
+		let start = start_s.max(self.start_s) - self.start_s;
+		let end = end_s.min(self.start_s + self.length_s) - self.start_s;
+		(end - start > SHORTEST_SPAN_S).then_some((start, end))
+	}
+
 	pub fn shortfall(self, decoded_s: f64) -> Option<String> {
 		(self.length_s - decoded_s > (self.length_s * 0.02).max(1.0)).then(|| {
 			format!(
@@ -51,13 +69,10 @@ impl Trim {
 		}
 
 		let Some(duration_s) = duration_s else {
-			return self
+			let end_s = self
 				.end_s
-				.map(|end_s| TrimWindow {
-					start_s: self.start_s,
-					length_s: end_s - self.start_s,
-				})
-				.ok_or_else(|| "the file's duration is unknown, so --to is needed".to_owned());
+				.ok_or_else(|| "the file's duration is unknown, so --to is needed".to_owned())?;
+			return self.lasting(end_s - self.start_s);
 		};
 
 		if self.start_s >= duration_s {
@@ -73,9 +88,19 @@ impl Trim {
 				"--to ({end_s:.3} s) is past the end of the file ({duration_s:.3} s)"
 			));
 		}
+		self.lasting(end_s.min(duration_s) - self.start_s)
+	}
+
+	fn lasting(self, length_s: f64) -> Result<TrimWindow, String> {
+		if length_s < SHORTEST_TRIM_S {
+			return Err(format!(
+				"the trimmed range lasts {length_s:.3} s; it must last at least {SHORTEST_TRIM_S} s"
+			));
+		}
+
 		Ok(TrimWindow {
 			start_s: self.start_s,
-			length_s: end_s.min(duration_s) - self.start_s,
+			length_s,
 		})
 	}
 }
@@ -117,6 +142,12 @@ pub fn parse_time(text: &str) -> Result<f64, String> {
 pub fn kept_as_requested(src_bytes: u64, out_bytes: u64) -> String {
 	format!(
 		"the output is not smaller than the source ({src_bytes} → {out_bytes} bytes); it was written because it was requested"
+	)
+}
+
+pub fn kept_as_requested_part(part_bytes: u64, out_bytes: u64) -> String {
+	format!(
+		"the output is not smaller than the same part of the source ({part_bytes} → {out_bytes} bytes); it was written because it was requested"
 	)
 }
 
@@ -199,6 +230,33 @@ mod tests {
 				.contains("past the end")
 		);
 		assert!(trim(5.0, None).window(None).unwrap_err().contains("--to is needed"));
+	}
+
+	#[test]
+	fn a_trim_must_last_a_tenth_of_a_second() {
+		let too_short = trim(1.01, Some(1.03)).window(Some(60.0)).unwrap_err();
+
+		assert!(too_short.contains("at least 0.1 s"), "{too_short}");
+		assert!(trim(59.95, None).window(Some(60.0)).is_err());
+		assert!(trim(5.0, Some(5.05)).window(None).is_err());
+		assert!(trim(1.0, Some(1.1)).window(Some(60.0)).is_ok());
+	}
+
+	#[test]
+	fn a_window_is_moved_onto_the_source_timestamps() {
+		let window = TrimWindow {
+			start_s: 4.0,
+			length_s: 2.0,
+		};
+
+		assert_eq!(
+			window.on_source(Some(1.4)),
+			TrimWindow {
+				start_s: 5.4,
+				length_s: 2.0
+			}
+		);
+		assert_eq!(window.on_source(None), window);
 	}
 
 	#[test]

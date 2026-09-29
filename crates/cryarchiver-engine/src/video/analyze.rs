@@ -121,10 +121,7 @@ pub fn segment_command(
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	cmd.args(["-hide_banner", "-nostdin", "-noautorotate"]);
 	if let Some(length) = segment.length_s {
-		cmd.arg("-ss")
-			.arg(format!("{:.3}", segment.start_s))
-			.arg("-t")
-			.arg(format!("{length:.3}"));
+		cmd.seek(segment.start_s, length);
 	}
 
 	if let Some(decoder) = decoder {
