@@ -298,6 +298,8 @@ pub async fn first_frames(
 		"-hide_banner",
 		"-threads",
 		"0",
+		"-export_side_data",
+		"film_grain",
 		"-print_format",
 		"json",
 		"-select_streams",

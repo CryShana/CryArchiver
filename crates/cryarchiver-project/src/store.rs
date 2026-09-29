@@ -1161,6 +1161,7 @@ mod tests {
 			slope: Some(0.4),
 			bpp: Some(0.03),
 			observations: 2,
+			without_grain: false,
 		};
 		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
 		store.set_quality(key, &stats).unwrap();
@@ -1190,6 +1191,7 @@ mod tests {
 			slope: None,
 			bpp: None,
 			observations: 1,
+			without_grain: false,
 		};
 		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
 		store.set_quality(GOOD_PHOTO, &stats).unwrap();
@@ -1227,6 +1229,7 @@ mod tests {
 			slope: Some(0.4),
 			bpp: Some(0.03),
 			observations: 3,
+			without_grain: false,
 		};
 		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
 		store.set_quality(video, &good).unwrap();

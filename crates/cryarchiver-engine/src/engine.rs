@@ -31,7 +31,7 @@ use crate::video::burn::{self, Burn};
 use crate::video::encode::{EncodedVideo, Sample};
 use crate::video::mux::{self, Attachment, ChapterSource, CueFile, MuxInputs, MuxPlan};
 use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, usable_main};
-use crate::video::quality::{self as video_quality, MAX_RETRIES, Scorer, Searched, Strategy};
+use crate::video::quality::{self as video_quality, GrainChoice, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, check_sync, earliest_video_start, probe_temp, start_offsets,
@@ -182,6 +182,8 @@ struct VideoQuality {
 	target: Target,
 	strategy: Strategy,
 	slope: f64,
+	/// The plan's film grain was left out, for its group's learned setting or after a search without it won.
+	without_grain: bool,
 }
 
 impl VideoQuality {
@@ -670,6 +672,7 @@ impl Engine {
 		}
 
 		let mut quality = self.video_quality(cx.job, main, &analysis, &video);
+		Self::apply_learned_grain(cx.job, &mut video, &mut quality);
 		if cx.job.speed != Speed::Fast && !self.tools.has_vmaf() {
 			video
 				.warnings
@@ -811,6 +814,16 @@ impl Engine {
 			key,
 			stats,
 			target,
+			without_grain: false,
+		}
+	}
+
+	/// A group that learned it comes out smaller without film grain is encoded without it, against the full target.
+	fn apply_learned_grain(job: &Job, video: &mut VideoPlan, quality: &mut VideoQuality) {
+		if quality.stats.is_some_and(|stats| stats.without_grain) && video.encoder.film_grain() {
+			video.encoder = video.encoder.without_grain();
+			quality.target = video_quality::target(job.speed, false, &job.overrides);
+			quality.without_grain = true;
 		}
 	}
 
@@ -888,22 +901,63 @@ impl Engine {
 		quality: &mut VideoQuality,
 	) -> Result<Tuning, JobError> {
 		(cx.on_event)(JobEvent::Stage(Stage::Sample));
-		let searched = {
-			let scorer = self.scorer(cx, workspace, video);
-			let on_round = |round: usize| {
+		let level = video.encoder.grain_level();
+		let passes = if level.is_some() { 2 } else { 1 };
+		let progress = |pass: usize| {
+			move |round: usize| {
 				#[allow(clippy::cast_precision_loss)]
-				(cx.on_event)(JobEvent::Progress(round as f64 / MAX_PROBES as f64));
-			};
+				(cx.on_event)(JobEvent::Progress(
+					(pass * MAX_PROBES + round) as f64 / (passes * MAX_PROBES) as f64,
+				));
+			}
+		};
+		let mut searched = {
+			let scorer = self.scorer(cx, workspace, video);
+			let (start, target, slope) = (quality.start(), quality.target, quality.slope);
 			Box::pin(video_quality::search(
 				&scorer,
 				samples,
-				quality.start(),
-				quality.target,
-				quality.slope,
-				on_round,
+				start,
+				target,
+				slope,
+				progress(0),
 			))
 			.await?
 		};
+
+		if let Some(level) = level {
+			let plain_video = VideoPlan {
+				encoder: video.encoder.without_grain(),
+				..video.clone()
+			};
+			let plain_target = video_quality::target(cx.job.speed, false, &cx.job.overrides);
+			let plain = {
+				let scorer = self.scorer(cx, workspace, &plain_video);
+				let (start, slope) = (quality.start(), quality.slope);
+				Box::pin(video_quality::search(
+					&scorer,
+					samples,
+					start,
+					plain_target,
+					slope,
+					progress(1),
+				))
+				.await?
+			};
+
+			if video_quality::grain_choice(cx.job.speed, searched, plain) == GrainChoice::Plain {
+				video.warnings.extend(video_quality::dropped_grain_text(
+					level,
+					searched,
+					plain,
+					quality.target,
+				));
+				video.encoder = plain_video.encoder;
+				quality.target = plain_target;
+				quality.without_grain = true;
+				searched = plain;
+			}
+		}
 
 		let found = match searched {
 			Searched::Found(found) => found,
@@ -967,6 +1021,7 @@ impl Engine {
 					setting: search::implied_crf(crf, score, quality.target, quality.slope, bounds),
 					slope: Some(quality.slope),
 					bpp: output_bpp(&temps.video.path, video, temps.encoded.frames),
+					without_grain: quality.without_grain,
 				}));
 			}
 

@@ -5,8 +5,9 @@ use tokio_util::sync::CancellationToken;
 use crate::options::TrimWindow;
 use crate::outcome::JobError;
 use crate::probe::Stream;
-use crate::process::{self, STALL_TIMEOUT, ToolCommand};
+use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
 use crate::toolchain::Toolchain;
+use crate::video::noise::{self, Triplet};
 
 const SEGMENT_S: f64 = 3.0;
 const WHOLE_FILE_BELOW_S: f64 = 12.0;
@@ -18,15 +19,15 @@ const INTERLACED_SHARE: f64 = 0.6;
 const FIELD_ORDER_SHARE: f64 = 0.8;
 const REJECT_SHARE: f64 = 0.5;
 const INTERLACED_FIELD_ORDERS: &[&str] = &["tt", "bb", "tb", "bt"];
-const CLEAN_PSNR_DB: f64 = 50.0;
 const LOW_DETAIL_SI: f64 = 15.0;
-const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:d=1,split[n][m];\
-	[n]split[na][nb];[nb]hqdn3d[nd];[na][nd]psnr@native,nullsink;\
-	[m]scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,\
-	split=3[a][b][s];[s]format=yuv420p,siti=print_summary=1,nullsink;[b]hqdn3d[d];[a][d]psnr[out]";
-const NATIVE_PSNR_LOG: &str = "[psnr@native @";
+const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:d=1,\
+	scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,\
+	format=yuv420p,siti=print_summary=1[out]";
 
 pub const DEFAULT_SEGMENTS: usize = 4;
+/// The noise deviation, in 8-bit code values, from which a source counts as noisy. Clean animation and CG measure
+/// up to about 0.3 (dither, debanding and compression flicker), noisy and grainy live action from about 0.45.
+pub const NOISY_SIGMA: f64 = 0.36;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanType {
@@ -45,7 +46,8 @@ pub enum NoiseClass {
 pub struct Analysis {
 	pub scan: ScanType,
 	pub noise: NoiseClass,
-	pub noise_db: Option<f64>,
+	/// The temporal noise on flat areas (`noise::level`), in 8-bit code values.
+	pub noise_sigma: Option<f64>,
 	pub detail: Vec<Detail>,
 }
 
@@ -74,9 +76,8 @@ pub struct SegmentStats {
 	pub bff: u64,
 	pub black_s: f64,
 	pub frozen_s: f64,
-	pub psnr_y: Option<f64>,
-	pub native_psnr_y: Option<f64>,
 	pub si: Option<f64>,
+	pub noise: Vec<Triplet>,
 }
 
 pub fn segments(duration_s: Option<f64>, count: usize) -> Vec<Segment> {
@@ -166,12 +167,6 @@ pub fn parse_segment(stderr: &[String], start_s: f64, length_s: f64) -> Option<S
 		} else if let Some(value) = field(line, "freeze_duration:") {
 			stats.frozen_s += value;
 			open_freeze = None;
-		} else if let Some(value) = field(line, "PSNR y:") {
-			if line.contains(NATIVE_PSNR_LOG) {
-				stats.native_psnr_y = Some(value);
-			} else {
-				stats.psnr_y = Some(value);
-			}
 		}
 	}
 
@@ -217,12 +212,18 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 		_ => ScanType::Progressive,
 	};
 
-	let scaled_db = finite_mean(voting.iter().map(|segment| segment.psnr_y));
-	let noise_db = finite_mean(voting.iter().map(|segment| segment.native_psnr_y));
-	let noise = if scaled_db.is_none_or(|db| db >= CLEAN_PSNR_DB) {
-		NoiseClass::Clean
-	} else {
+	// Frozen segments vote on noise: frames repeated exactly are evidence of a clean source (animation holds its
+	// drawings), while any real noise keeps consecutive frames apart.
+	let triplets: Vec<Triplet> = stats
+		.iter()
+		.filter(|segment| segment.black_s < REJECT_SHARE * segment.length_s)
+		.flat_map(|segment| segment.noise.iter().copied())
+		.collect();
+	let noise_sigma = noise::level(&triplets);
+	let noise = if noise_sigma.is_some_and(|sigma| sigma >= NOISY_SIGMA) {
 		NoiseClass::Light
+	} else {
+		NoiseClass::Clean
 	};
 
 	let detail = stats
@@ -237,15 +238,9 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 	Analysis {
 		scan,
 		noise,
-		noise_db,
+		noise_sigma,
 		detail,
 	}
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn finite_mean(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
-	let finite: Vec<f64> = values.flatten().filter(|db| db.is_finite()).collect();
-	(!finite.is_empty()).then(|| finite.iter().sum::<f64>() / finite.len() as f64)
 }
 
 fn blank(segment: &SegmentStats) -> bool {
@@ -270,13 +265,16 @@ pub async fn analyze(
 		};
 
 		let cmd = segment_command(&tools.ffmpeg, source, main.index, forced_decoder(main), &segment);
-		let out = super::run_ffmpeg(&cmd, |_| {}, cancel).await?;
+		let (out, noise) = tokio::join!(
+			super::run_ffmpeg(&cmd, |_| {}, cancel),
+			segment_noise(tools, source, main, &segment, cancel)
+		);
+		let (out, noise) = (out?, noise?);
 
-		Ok::<_, JobError>(parse_segment(
-			&out.stderr_tail,
-			segment.start_s,
-			segment_length(&segment, end_s),
-		))
+		Ok::<_, JobError>(
+			parse_segment(&out.stderr_tail, segment.start_s, segment_length(&segment, end_s))
+				.map(|stats| SegmentStats { noise, ..stats }),
+		)
 	};
 
 	let mut stats = Vec::new();
@@ -291,6 +289,30 @@ pub async fn analyze(
 	}
 
 	Ok(classify(&stats, main.fps(), main.field_order.as_deref()))
+}
+
+/// A source whose luma can't be decoded to raw frames (an RGB stream, say) is left unmeasured rather than failed.
+async fn segment_noise(
+	tools: &Toolchain,
+	source: &Path,
+	main: &Stream,
+	segment: &Segment,
+	cancel: &CancellationToken,
+) -> Result<Vec<Triplet>, JobError> {
+	let cmd = noise::command(
+		&tools.ffmpeg,
+		source,
+		main.index,
+		forced_decoder(main),
+		segment,
+		main.fps(),
+	);
+	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
+	if !out.status.success() {
+		return Ok(Vec::new());
+	}
+
+	crate::images::blocking(cancel, move || noise::measure(&out.stdout)).await
 }
 
 pub fn forced_decoder(stream: &Stream) -> Option<&'static str> {
@@ -332,7 +354,6 @@ fn field(line: &str, key: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::video::plan::grain_level;
 
 	fn stats(repeated: [u64; 3], single: [u64; 2]) -> SegmentStats {
 		SegmentStats {
@@ -345,9 +366,8 @@ mod tests {
 			bff: single[1],
 			black_s: 0.0,
 			frozen_s: 0.0,
-			psnr_y: Some(45.4),
-			native_psnr_y: Some(45.4),
 			si: Some(60.0),
+			noise: Vec::new(),
 		}
 	}
 
@@ -458,9 +478,8 @@ mod tests {
 		assert_eq!((parsed.tff, parsed.bff), (72, 0));
 		assert!((parsed.black_s - 1.2).abs() < 1e-9);
 		assert!((parsed.frozen_s - 1.7).abs() < 1e-9);
-		assert_eq!(parsed.psnr_y, Some(57.184_443));
-		assert_eq!(parsed.native_psnr_y, Some(42.809_13));
 		assert_eq!(parsed.si, Some(102.528_107));
+		assert!(parsed.noise.is_empty());
 	}
 
 	#[test]
@@ -476,7 +495,7 @@ mod tests {
 		];
 
 		assert_eq!(parse_segment(&empty, 0.0, 3.0), None);
-		assert_eq!(parse_segment(&black, 0.0, 3.0).unwrap().psnr_y, Some(f64::INFINITY));
+		assert_eq!(parse_segment(&black, 0.0, 3.0).unwrap().neither, 90);
 	}
 
 	#[test]
@@ -548,79 +567,53 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn noise_class_comes_from_the_luma_psnr() {
-		let mut camera = stats([90, 0, 0], [0, 0]);
-		camera.psnr_y = Some(45.4);
-		let mut animation = stats([90, 0, 0], [0, 0]);
-		animation.psnr_y = Some(57.2);
-		let mut still = stats([90, 0, 0], [0, 0]);
-		still.psnr_y = Some(f64::INFINITY);
+	fn measured(bands: [Option<f64>; 4]) -> SegmentStats {
+		SegmentStats {
+			noise: vec![Triplet { bands }; 3],
+			..stats([90, 0, 0], [0, 0])
+		}
+	}
 
-		assert_eq!(classify(&[camera], Some(25.0), None).noise, NoiseClass::Light);
-		assert_eq!(
-			classify(&[animation, still.clone()], Some(25.0), None).noise,
-			NoiseClass::Clean
-		);
-		assert_eq!(classify(&[still], Some(25.0), None).noise, NoiseClass::Clean);
+	#[test]
+	fn the_noise_comes_from_the_triplets_of_every_segment_but_black_ones() {
+		let camera = measured([Some(0.3), Some(1.2), None, None]);
+		let animation = measured([Some(0.1), Some(0.25), Some(0.15), None]);
+		let mut black = measured([Some(5.0); 4]);
+		black.black_s = 2.9;
+		let mut held = measured([Some(0.0); 4]);
+		held.frozen_s = 3.0;
+
+		let grainy = classify(&[camera.clone(), black.clone()], Some(25.0), None);
+		let clean = classify(&[animation, black], Some(25.0), None);
+		let panned_and_held = classify(&[camera, held.clone(), held], Some(25.0), None);
+		let unmeasured = classify(&[stats([90, 0, 0], [0, 0])], Some(25.0), None);
+
+		assert_eq!((grainy.noise, grainy.noise_sigma), (NoiseClass::Light, Some(1.2)));
+		assert_eq!((clean.noise, clean.noise_sigma), (NoiseClass::Clean, Some(0.25)));
+		assert_eq!(panned_and_held.noise, NoiseClass::Clean, "{panned_and_held:?}");
+		assert_eq!((unmeasured.noise, unmeasured.noise_sigma), (NoiseClass::Clean, None));
 		assert_eq!(
 			classify(&[], Some(25.0), None),
 			Analysis {
 				scan: ScanType::Progressive,
 				noise: NoiseClass::Clean,
-				noise_db: None,
+				noise_sigma: None,
 				detail: Vec::new(),
 			}
 		);
 	}
 
 	#[test]
-	fn the_noise_level_is_the_average_finite_luma_psnr() {
-		let psnr = |db: f64| SegmentStats {
-			psnr_y: Some(db),
-			native_psnr_y: Some(db),
-			..stats([90, 0, 0], [0, 0])
-		};
-		let mut black = psnr(30.0);
-		black.black_s = 2.9;
-
-		let grainy = classify(&[psnr(42.0), psnr(44.0), psnr(f64::INFINITY), black], Some(25.0), None);
-		let still = classify(&[psnr(f64::INFINITY)], Some(25.0), None);
-		let unmeasured = classify(
-			&[SegmentStats {
-				psnr_y: None,
-				native_psnr_y: None,
-				..stats([90, 0, 0], [0, 0])
-			}],
+	fn noise_just_under_the_threshold_is_clean() {
+		let faint = classify(
+			&[measured([None, Some(NOISY_SIGMA - 0.01), None, None])],
 			Some(25.0),
 			None,
 		);
+		let noisy = classify(&[measured([None, Some(NOISY_SIGMA), None, None])], Some(25.0), None);
 
-		assert_eq!(grainy.noise_db, Some(43.0));
-		assert_eq!(grainy.noise, NoiseClass::Light);
-		assert_eq!(still.noise_db, None);
-		assert_eq!(unmeasured.noise_db, None);
-	}
-
-	#[test]
-	fn the_noise_level_is_the_native_measure_and_the_class_the_scaled_one() {
-		let segment = |scaled: f64, native: f64| SegmentStats {
-			psnr_y: Some(scaled),
-			native_psnr_y: Some(native),
-			..stats([90, 0, 0], [0, 0])
-		};
-
-		let grainy_4k = classify(&[segment(45.8, 42.8), segment(45.6, 42.6)], Some(60.0), None);
-		let sharp_4k = classify(&[segment(51.0, 46.0)], Some(60.0), None);
-
-		assert_eq!(grainy_4k.noise, NoiseClass::Light);
-		assert!(
-			grainy_4k.noise_db.is_some_and(|db| (db - 42.7).abs() < 1e-9),
-			"{grainy_4k:?}"
-		);
-		assert_eq!(grain_level(grainy_4k.noise_db), Some(20));
-		assert_eq!(sharp_4k.noise, NoiseClass::Clean);
-		assert_eq!(sharp_4k.noise_db, Some(46.0));
+		assert_eq!(faint.noise, NoiseClass::Clean);
+		assert_eq!(noisy.noise, NoiseClass::Light);
 	}
 
 	#[test]

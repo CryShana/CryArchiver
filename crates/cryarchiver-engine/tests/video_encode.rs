@@ -6,13 +6,15 @@ use std::process::Command;
 
 use cryarchiver_engine::options::SubtitlePick;
 use cryarchiver_engine::preset::Speed;
-use cryarchiver_engine::probe::probe;
+use cryarchiver_engine::probe::{first_frames, probe};
 use cryarchiver_engine::video::VideoStarts;
 use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, analyze};
 use cryarchiver_engine::video::burn::{self, FONT_DIR, SUBTITLE_FILE};
 use cryarchiver_engine::video::colour::{ColourTags, Range};
 use cryarchiver_engine::video::encode::{check_video_temp, encode_video, extract, video_command};
-use cryarchiver_engine::video::plan::{Encoder, VideoCaps, VideoPlan, grain_level, plan_video, precheck};
+use cryarchiver_engine::video::plan::{
+	Encoder, VideoCaps, VideoPlan, grain_level, plan_video, precheck, synthesized_grain, usable_main,
+};
 use cryarchiver_engine::video::streams::Extracted;
 use cryarchiver_engine::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
@@ -120,7 +122,7 @@ async fn a_noisy_clip_is_encoded_with_the_grain_level_its_noise_measures() {
 		.await
 		.unwrap();
 
-	let level = grain_level(analysis.noise_db);
+	let level = grain_level(analysis.noise_sigma);
 	assert_eq!(analysis.noise, NoiseClass::Light, "{analysis:?}");
 	assert!(level.is_some(), "{analysis:?}");
 	assert_eq!(video.encoder.grain_level(), level);
@@ -134,6 +136,51 @@ async fn a_noisy_clip_is_encoded_with_the_grain_level_its_noise_measures() {
 	);
 	assert_eq!(encoded.frames, 75);
 	assert_eq!(encoded.decode_errors, 0);
+}
+
+#[tokio::test]
+async fn an_av1_source_with_film_grain_gets_no_more_grain() {
+	let dir = tempfile::tempdir().unwrap();
+	let grained = dir.path().join("grained.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=gray:s=320x240:r=25:d=3,noise=alls=10:allf=t",
+		"-c:v",
+		"libsvtav1",
+		"-preset",
+		"12",
+		"-svtav1-params",
+		"crf=40:film-grain=10:film-grain-denoise=1",
+		grained.to_str().unwrap(),
+	]);
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let info = probe(&tools, &grained, &cancel).await.unwrap();
+	let caps = VideoCaps {
+		vp9_alpha: false,
+		libaom: false,
+	};
+	let main = usable_main(&info, &caps).unwrap();
+	let frames = first_frames(&tools, &grained, main.index, 5, &cancel).await.unwrap();
+	let analysis = Box::pin(analyze(
+		&tools,
+		&grained,
+		main,
+		info.format.duration,
+		DEFAULT_SEGMENTS,
+		None,
+		&cancel,
+	))
+	.await
+	.unwrap();
+
+	let video = plan_video(&info, main, &frames, &analysis, Speed::Slow);
+
+	assert!(synthesized_grain(&frames), "{frames:?}");
+	assert_eq!(analysis.noise, NoiseClass::Light, "{analysis:?}");
+	assert_eq!(video.encoder.grain_level(), None);
 }
 
 #[tokio::test]

@@ -111,7 +111,7 @@ async fn burning_plan(
 	let analysis = Analysis {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,
-		noise_db: None,
+		noise_sigma: None,
 		detail: Vec::new(),
 	};
 	let chosen = burn::pick(&info, &SubtitlePick::Default).unwrap();

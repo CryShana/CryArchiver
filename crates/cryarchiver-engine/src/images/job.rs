@@ -356,6 +356,7 @@ async fn encode_and_choose(
 							setting,
 							slope: None,
 							bpp: None,
+							without_grain: false,
 						},
 					));
 				}

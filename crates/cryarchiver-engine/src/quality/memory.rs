@@ -19,6 +19,9 @@ pub struct GroupStats {
 	#[serde(default)]
 	pub bpp: Option<f64>,
 	pub observations: u32,
+	/// A noisy group whose files came out smaller without film grain than with it; the setting is for no grain.
+	#[serde(default)]
+	pub without_grain: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,6 +29,7 @@ pub struct Observation {
 	pub setting: f64,
 	pub slope: Option<f64>,
 	pub bpp: Option<f64>,
+	pub without_grain: bool,
 }
 
 impl GroupStats {
@@ -35,11 +39,17 @@ impl GroupStats {
 			slope: observation.slope,
 			bpp: observation.bpp,
 			observations: 1,
+			without_grain: observation.without_grain,
 		}
 	}
 
+	/// Settings for and without grain don't mix: an observation of the other kind starts the group afresh.
 	#[must_use]
 	pub fn updated(self, observation: Observation) -> Self {
+		if observation.without_grain != self.without_grain {
+			return Self::first(observation);
+		}
+
 		let weight = f64::from(self.observations.min(HISTORY - 1));
 		let blend = |old: f64, new: f64| (old * weight + new) / (weight + 1.0);
 		let merge = |old: Option<f64>, new: Option<f64>| match (old, new) {
@@ -52,6 +62,7 @@ impl GroupStats {
 			slope: merge(self.slope, observation.slope),
 			bpp: merge(self.bpp, observation.bpp),
 			observations: self.observations.saturating_add(1),
+			without_grain: self.without_grain,
 		}
 	}
 
@@ -211,7 +222,25 @@ mod tests {
 			setting,
 			slope: Some(0.4),
 			bpp: None,
+			without_grain: false,
 		}
+	}
+
+	#[test]
+	fn a_group_that_switches_to_no_grain_starts_afresh() {
+		let mut stats = GroupStats::first(observation(30.0)).updated(observation(32.0));
+		let plain = Observation {
+			without_grain: true,
+			..observation(24.0)
+		};
+
+		stats = stats.updated(plain);
+
+		assert!(stats.without_grain);
+		assert!((stats.setting - 24.0).abs() < 1e-9, "{stats:?}");
+		assert_eq!(stats.observations, 1);
+		assert!(stats.updated(plain).without_grain);
+		assert_eq!(stats.updated(plain).observations, 2);
 	}
 
 	#[test]
@@ -270,6 +299,7 @@ mod tests {
 			slope,
 			bpp,
 			observations: 1,
+			without_grain: false,
 		};
 		let video = "video/h264/1080/fps31/sdr8/progressive/clean/opaque|svt-av1-4.2.0|p5|t93.0/89.0";
 		let photo = "image/jpeg/photo/opaque/8bit/mp12|ravif-0.13.0|p6|t85.0";

@@ -33,6 +33,11 @@ const TARGETS: [Target; 3] = [
 	},
 ];
 const GRAIN_ALLOWANCE: Target = Target { mean: 2.0, floor: 2.5 };
+/// (slow, moderate) CRFs below which grain costs more than it saves: its denoiser's loss is being bought back with
+/// bits.
+const GRAIN_MIN_CRF: [f64; 2] = [18.0, 20.0];
+/// How much larger than the samples without grain the samples with it may come out.
+const GRAIN_COST_FACTOR: f64 = 1.5;
 const SLOW_ANALYSIS_SEGMENTS: usize = 8;
 const SEARCH_SEGMENT_S: f64 = 4.0;
 const VERIFY_WINDOW_S: f64 = 5.0;
@@ -69,6 +74,12 @@ pub struct Found {
 pub enum Searched {
 	Found(Found),
 	Unreachable { crf: f64, score: Score },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrainChoice {
+	Grain,
+	Plain,
 }
 
 pub struct Scorer<'a> {
@@ -243,6 +254,48 @@ fn measured(crf: f64, score: Score, target: Target) -> String {
 
 pub fn unreachable_reason(crf: f64, score: Score, target: Target) -> KeepReason {
 	KeepReason::QualityUnreachable(unreachable_text(crf, score, target))
+}
+
+/// Grain stays unless it can't reach its target at a sane CRF, or costs `GRAIN_COST_FACTOR` times the bytes of the
+/// search without it, which aims at the full target. When neither reaches its target, the one without grain is kept:
+/// grain's denoiser only moves the picture further from the source.
+pub fn grain_choice(speed: Speed, grain: Searched, plain: Searched) -> GrainChoice {
+	let min_crf = GRAIN_MIN_CRF[usize::from(speed != Speed::Slow)];
+
+	match (grain, plain) {
+		(Searched::Found(grain), Searched::Found(plain)) => {
+			#[allow(clippy::cast_precision_loss)]
+			let costly = grain.sample_bytes as f64 > GRAIN_COST_FACTOR * plain.sample_bytes as f64;
+			if grain.crf < min_crf || costly {
+				GrainChoice::Plain
+			} else {
+				GrainChoice::Grain
+			}
+		}
+		(Searched::Found(_), Searched::Unreachable { .. }) => GrainChoice::Grain,
+		(Searched::Unreachable { .. }, _) => GrainChoice::Plain,
+	}
+}
+
+/// Why film grain was left out, when the search without it found a CRF.
+#[allow(clippy::cast_precision_loss)]
+pub fn dropped_grain_text(level: u8, grain: Searched, plain: Searched, grain_target: Target) -> Option<String> {
+	let Searched::Found(plain) = plain else {
+		return None;
+	};
+
+	let with = match grain {
+		Searched::Found(grain) => format!(
+			"with it the samples needed CRF {} and came out {:.1}× the size",
+			grain.crf,
+			grain.sample_bytes as f64 / plain.sample_bytes.max(1) as f64
+		),
+		Searched::Unreachable { crf, score } => format!("with it {}", short_text(crf, score, grain_target)),
+	};
+	Some(format!(
+		"film grain {level} was left out: {with}; without it CRF {} measured VMAF {:.1} / {:.1}",
+		plain.crf, plain.score.mean, plain.score.p5
+	))
 }
 
 impl Scorer<'_> {
@@ -528,6 +581,7 @@ mod tests {
 			slope: Some(0.4),
 			bpp: None,
 			observations: 3,
+			without_grain: false,
 		};
 
 		assert_eq!(
@@ -566,7 +620,7 @@ mod tests {
 		let analysis = Analysis {
 			scan: ScanType::Progressive,
 			noise: NoiseClass::Clean,
-			noise_db: None,
+			noise_sigma: None,
 			detail: vec![
 				detail(5.0, 40.0, true),
 				detail(35.0, 90.0, true),
@@ -600,7 +654,7 @@ mod tests {
 		let analysis = |duration: f64, count: usize| Analysis {
 			scan: ScanType::Progressive,
 			noise: NoiseClass::Clean,
-			noise_db: None,
+			noise_sigma: None,
 			detail: segments(Some(duration), count)
 				.iter()
 				.zip(0_u32..)
@@ -637,7 +691,7 @@ mod tests {
 		let analysis = Analysis {
 			scan: ScanType::Progressive,
 			noise: NoiseClass::Clean,
-			noise_db: None,
+			noise_sigma: None,
 			detail: vec![detail(40.0, 90.0, true), detail(57.0, 80.0, true)],
 		};
 		let trim = Some(TrimWindow {
@@ -676,7 +730,7 @@ mod tests {
 		let analysis = |detail: Vec<Detail>| Analysis {
 			scan: ScanType::Progressive,
 			noise: NoiseClass::Clean,
-			noise_db: None,
+			noise_sigma: None,
 			detail,
 		};
 		let four = |start_s: f64| Sample { start_s, length_s: 4.0 };
@@ -742,6 +796,86 @@ mod tests {
 			.step - 0.25)
 				.abs() < 1e-9
 		);
+	}
+
+	fn found(crf: f64, sample_bytes: u64) -> Searched {
+		Searched::Found(Found {
+			crf,
+			score: Score {
+				mean: 93.4,
+				p5: 89.2,
+				frames: 300,
+			},
+			sample_bytes,
+			slope: 0.5,
+		})
+	}
+
+	const MISSED: Searched = Searched::Unreachable {
+		crf: 10.0,
+		score: Score {
+			mean: 90.1,
+			p5: 84.0,
+			frames: 300,
+		},
+	};
+
+	#[test]
+	fn grain_stays_unless_it_needs_a_low_crf_or_far_more_bytes() {
+		assert_eq!(
+			grain_choice(Speed::Moderate, found(30.0, 140_000), found(29.0, 100_000)),
+			GrainChoice::Grain
+		);
+		assert_eq!(
+			grain_choice(Speed::Moderate, found(30.0, 151_000), found(29.0, 100_000)),
+			GrainChoice::Plain
+		);
+		assert_eq!(
+			grain_choice(Speed::Moderate, found(19.75, 90_000), found(29.0, 100_000)),
+			GrainChoice::Plain
+		);
+		assert_eq!(
+			grain_choice(Speed::Slow, found(19.75, 90_000), found(29.0, 100_000)),
+			GrainChoice::Grain
+		);
+		assert_eq!(
+			grain_choice(Speed::Slow, found(17.75, 90_000), found(29.0, 100_000)),
+			GrainChoice::Plain
+		);
+	}
+
+	#[test]
+	fn grain_that_cannot_reach_its_target_is_dropped() {
+		assert_eq!(
+			grain_choice(Speed::Moderate, MISSED, found(29.0, 100_000)),
+			GrainChoice::Plain
+		);
+		assert_eq!(grain_choice(Speed::Moderate, MISSED, MISSED), GrainChoice::Plain);
+		assert_eq!(
+			grain_choice(Speed::Moderate, found(12.0, 900_000), MISSED),
+			GrainChoice::Grain
+		);
+	}
+
+	#[test]
+	fn dropped_grain_is_explained_with_both_searches() {
+		let grain_target = target(Speed::Moderate, true, &Overrides::default());
+
+		assert_eq!(
+			dropped_grain_text(14, found(12.0, 600_000), found(29.0, 100_000), grain_target).as_deref(),
+			Some(
+				"film grain 14 was left out: with it the samples needed CRF 12 and came out 6.0× the size; \
+				 without it CRF 29 measured VMAF 93.4 / 89.2"
+			)
+		);
+		assert_eq!(
+			dropped_grain_text(20, MISSED, found(29.0, 100_000), grain_target).as_deref(),
+			Some(
+				"film grain 20 was left out: with it quality target not reached (VMAF 90.1 / 84.0 at CRF 10, target \
+				 91.0 / 86.5); without it CRF 29 measured VMAF 93.4 / 89.2"
+			)
+		);
+		assert_eq!(dropped_grain_text(8, MISSED, MISSED, grain_target), None);
 	}
 
 	#[test]

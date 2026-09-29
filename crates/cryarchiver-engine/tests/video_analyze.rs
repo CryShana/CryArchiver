@@ -2,8 +2,9 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
+use cryarchiver_engine::options::TrimWindow;
 use cryarchiver_engine::probe::probe;
-use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, ScanType, analyze};
+use cryarchiver_engine::video::analyze::{Analysis, DEFAULT_SEGMENTS, NoiseClass, ScanType, analyze};
 use cryarchiver_engine::video::plan::grain_level;
 use tokio_util::sync::CancellationToken;
 
@@ -117,31 +118,127 @@ async fn interlaced_h264_high_frame_rates_and_very_short_clips_are_detected() {
 	assert_eq!(scan_and_noise(&very_short).await.0, ScanType::Progressive);
 }
 
-#[tokio::test]
-#[ignore = "needs a grainy real clip (set CRY_GRAIN_CLIP to its path)"]
-async fn a_strongly_grainy_real_clip_gets_the_strongest_grain() {
-	let Some(clip) = std::env::var_os("CRY_GRAIN_CLIP").map(PathBuf::from) else {
-		return;
-	};
+async fn measured(path: &Path, window: Option<TrimWindow>) -> Analysis {
 	let tools = support::toolchain().await;
 	let cancel = CancellationToken::new();
-	let info = probe(&tools, &clip, &cancel).await.unwrap();
+	let info = probe(&tools, path, &cancel).await.unwrap();
 	let main = info.streams.iter().find(|stream| stream.is_real_video()).unwrap();
 
-	let analysis = Box::pin(analyze(
+	Box::pin(analyze(
 		&tools,
-		&clip,
+		path,
 		main,
 		info.format.duration,
 		DEFAULT_SEGMENTS,
-		None,
+		window,
 		&cancel,
 	))
 	.await
-	.unwrap();
+	.unwrap()
+}
 
-	assert_eq!(analysis.noise, NoiseClass::Light, "{:?}", analysis.noise_db);
-	assert_eq!(grain_level(analysis.noise_db), Some(20), "{:?}", analysis.noise_db);
+const CARTOON: &str = "testsrc2=s=640x360:r=24:d=4,\
+	drawbox=x=40:y=190:w=220:h=130:color=0xE0C080:t=fill,drawbox=x=40:y=190:w=220:h=130:color=black:t=4,\
+	drawbox=x=380:y=30:w=200:h=150:color=0x3070C0:t=fill,drawbox=x=380:y=30:w=200:h=150:color=black:t=3";
+
+#[tokio::test]
+async fn a_compressed_clean_cartoon_gets_no_grain() {
+	let dir = tempfile::tempdir().unwrap();
+	let cartoon = encode(
+		dir.path(),
+		"cartoon.mkv",
+		CARTOON,
+		&["-pix_fmt", "yuv420p", "-c:v", "libx264", "-crf", "30"],
+	);
+	let bars = encode(
+		dir.path(),
+		"bars.mkv",
+		"smptehdbars=s=640x360:r=24:d=4,drawbox=x=100:y=60:w=160:h=90:color=white:t=6",
+		&["-pix_fmt", "yuv420p", "-c:v", "libx264", "-crf", "30"],
+	);
+
+	for clip in [cartoon, bars] {
+		let analysis = measured(&clip, None).await;
+
+		assert_eq!(analysis.noise, NoiseClass::Clean, "{analysis:?}");
+		assert_eq!(grain_level(analysis.noise_sigma), None, "{analysis:?}");
+	}
+}
+
+#[tokio::test]
+async fn temporal_noise_gets_grain_that_rises_with_it() {
+	let dir = tempfile::tempdir().unwrap();
+	let noisy = |name: &str, strength: u32| {
+		encode(
+			dir.path(),
+			name,
+			&format!("{CARTOON},noise=alls={strength}:allf=t"),
+			&["-pix_fmt", "yuv420p", "-c:v", "libx264", "-crf", "8"],
+		)
+	};
+	let (light, heavy) = (noisy("light.mkv", 3), noisy("heavy.mkv", 8));
+
+	let (light, heavy) = (measured(&light, None).await, measured(&heavy, None).await);
+
+	assert_eq!(light.noise, NoiseClass::Light, "{light:?}");
+	assert_eq!(heavy.noise, NoiseClass::Light, "{heavy:?}");
+	assert!(heavy.noise_sigma > light.noise_sigma, "{light:?} {heavy:?}");
+	assert!(
+		grain_level(heavy.noise_sigma) > grain_level(light.noise_sigma),
+		"{light:?} {heavy:?}"
+	);
+}
+
+#[tokio::test]
+async fn fine_static_texture_gets_no_grain() {
+	let dir = tempfile::tempdir().unwrap();
+
+	for amplitude in [5, 45] {
+		let texture = encode(
+			dir.path(),
+			&format!("texture{amplitude}.mkv"),
+			&format!(
+				"color=c=gray:s=640x360:r=24:d=4,format=gray,\
+				 geq=lum='128+{amplitude}*sin(X*X*0.37+Y*1.9)*cos(Y*Y*0.23+X*0.7)',format=yuv420p"
+			),
+			&["-c:v", "libx264", "-crf", "18"],
+		);
+
+		let analysis = measured(&texture, None).await;
+
+		assert_eq!(analysis.noise, NoiseClass::Clean, "{amplitude}: {analysis:?}");
+	}
+}
+
+#[tokio::test]
+#[ignore = "calibration on a real clip: set CRY_GRAIN_CLIP, and optionally CRY_GRAIN_WINDOW (start:length in \
+            seconds) and CRY_GRAIN_LEVEL (the expected level, 0 for none)"]
+async fn a_real_clip_gets_its_expected_grain() {
+	let Some(clip) = std::env::var_os("CRY_GRAIN_CLIP").map(PathBuf::from) else {
+		return;
+	};
+	let window = std::env::var("CRY_GRAIN_WINDOW").ok().map(|window| {
+		let (start, length) = window.split_once(':').unwrap();
+		TrimWindow {
+			start_s: start.parse().unwrap(),
+			length_s: length.parse().unwrap(),
+		}
+	});
+
+	let analysis = measured(&clip, window).await;
+	eprintln!("noise {:?}, sigma {:?}", analysis.noise, analysis.noise_sigma);
+
+	if let Some(expected) = std::env::var("CRY_GRAIN_LEVEL")
+		.ok()
+		.map(|level| level.parse::<u8>().unwrap())
+	{
+		assert_eq!(
+			grain_level(analysis.noise_sigma).unwrap_or(0),
+			expected,
+			"{:?}",
+			analysis.noise_sigma
+		);
+	}
 }
 
 #[tokio::test]

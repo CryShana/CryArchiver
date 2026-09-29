@@ -94,6 +94,7 @@ async fn the_next_photo_of_a_group_starts_from_the_learned_quality() {
 			slope: None,
 			bpp: None,
 			observations: 5,
+			without_grain: false,
 		},
 	)]));
 
@@ -138,6 +139,7 @@ async fn a_group_that_learned_too_high_a_quality_falls_back_to_the_table_and_lea
 			slope: None,
 			bpp: None,
 			observations: 5,
+			without_grain: false,
 		},
 	)]));
 	let engine = Engine::new(support::toolchain().await)

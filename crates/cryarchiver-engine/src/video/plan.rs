@@ -3,7 +3,7 @@ use crate::outcome::KeepReason;
 use crate::preset::Speed;
 use crate::probe::{Frame, MediaInfo, Stream};
 use crate::video::VideoStarts;
-use crate::video::analyze::{Analysis, NoiseClass, ScanType, forced_decoder};
+use crate::video::analyze::{Analysis, NOISY_SIGMA, NoiseClass, ScanType, forced_decoder};
 use crate::video::burn::Overlay;
 use crate::video::colour::{ColourTags, conversion, output_tags, setparams};
 
@@ -23,14 +23,16 @@ const SVT_CRF: [[f64; 6]; 3] = [
 const VP9_CRF: [u8; 6] = [33, 32, 31, 30, 28, 28];
 const MASTERING_DISPLAY: &str = "Mastering display metadata";
 const HDR10_PLUS: &str = "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)";
+const FILM_GRAIN_PARAMETERS: &str = "Film grain parameters";
 const RATE_AGREEMENT: f64 = 0.001;
 const PACKET_AGREEMENT: f64 = 0.002;
 const MIN_PACKET_SLACK: f64 = 2.0;
 const SOURCE_FRAME_TOLERANCE: u64 = 2;
 const VIDEO_BASE_BYTES: u64 = 512 << 20;
 const VIDEO_BYTES_PER_PIXEL: u64 = 540;
-/// (luma PSNR against `hqdn3d` below which the level applies, film-grain level), noisiest first.
-const GRAIN_LEVELS: [(f64, u8); 3] = [(44.0, 20), (47.0, 14), (50.0, 8)];
+/// (noise deviation from which the level applies, film-grain level), noisiest first. Levels above 10 denoise so hard
+/// that even the grainiest sources can't reach the grain target at any CRF.
+const GRAIN_LEVELS: [(f64, u8); 3] = [(1.8, 10), (1.0, 8), (NOISY_SIGMA, 6)];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoCaps {
@@ -126,6 +128,18 @@ impl Encoder {
 			Self::Aom { .. } | Self::Vp9Alpha { .. } => None,
 		}
 	}
+
+	#[must_use]
+	pub fn without_grain(&self) -> Self {
+		match self {
+			Self::SvtAv1 { preset, crf, .. } => Self::SvtAv1 {
+				preset: *preset,
+				crf: *crf,
+				film_grain: None,
+			},
+			other => other.clone(),
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -218,7 +232,7 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 		Encoder::SvtAv1 {
 			preset: pick(speed, [3, 5, 8]),
 			crf: svt_crf(speed, resolution),
-			film_grain: source_grain(analysis).filter(|_| speed != Speed::Fast),
+			film_grain: source_grain(analysis).filter(|_| speed != Speed::Fast && !synthesized_grain(frames)),
 		}
 	};
 
@@ -310,20 +324,25 @@ pub fn svt_params(crf: f64, grain: Option<u8>) -> String {
 	format!("tune=0:keyint=5s:crf={crf}{grain}")
 }
 
-/// The scaled noise class decides whether a source is grainy at all; the native measure only picks how strongly.
 pub fn source_grain(analysis: &Analysis) -> Option<u8> {
 	let lightest = GRAIN_LEVELS[GRAIN_LEVELS.len() - 1].1;
 
-	(analysis.noise == NoiseClass::Light).then(|| grain_level(analysis.noise_db).unwrap_or(lightest))
+	(analysis.noise == NoiseClass::Light).then(|| grain_level(analysis.noise_sigma).unwrap_or(lightest))
 }
 
-pub fn grain_level(noise_db: Option<f64>) -> Option<u8> {
-	let noise_db = noise_db?;
+pub fn grain_level(noise_sigma: Option<f64>) -> Option<u8> {
+	let noise_sigma = noise_sigma?;
 
 	GRAIN_LEVELS
 		.iter()
-		.find(|(below_db, _)| noise_db < *below_db)
+		.find(|(from, _)| noise_sigma >= *from)
 		.map(|(_, level)| *level)
+}
+
+/// A source that carries film grain parameters (AV1, or H.264/HEVC film grain SEI) already has its grain made up by
+/// the decoder: denoising it would only blur the picture, and grain on top of grain doubles it.
+pub fn synthesized_grain(frames: &[Frame]) -> bool {
+	has_side_data(frames, FILM_GRAIN_PARAMETERS)
 }
 
 fn svt_crf(speed: Speed, resolution: Resolution) -> f64 {
@@ -452,7 +471,7 @@ mod tests {
 	const PROGRESSIVE_CLEAN: Analysis = Analysis {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,
-		noise_db: None,
+		noise_sigma: None,
 		detail: Vec::new(),
 	};
 
@@ -644,7 +663,7 @@ mod tests {
 	fn natural_noise_adds_film_grain_except_at_fast() {
 		let grainy = Analysis {
 			noise: NoiseClass::Light,
-			noise_db: Some(42.8),
+			noise_sigma: Some(2.2),
 			..PROGRESSIVE_CLEAN
 		};
 
@@ -657,7 +676,7 @@ mod tests {
 			Encoder::SvtAv1 {
 				preset: 5,
 				crf: 29.0,
-				film_grain: Some(20),
+				film_grain: Some(10),
 			}
 		);
 		assert_eq!(
@@ -665,37 +684,51 @@ mod tests {
 			Encoder::SvtAv1 {
 				preset: 3,
 				crf: 25.0,
-				film_grain: Some(20),
+				film_grain: Some(10),
 			}
 		);
 		assert!(moderate.encoder.film_grain());
-		assert_eq!(moderate.encoder.grain_level(), Some(20));
+		assert_eq!(moderate.encoder.grain_level(), Some(10));
 		assert!(!fast.encoder.film_grain());
 		assert_eq!(fast.encoder.grain_level(), None);
 	}
 
 	#[test]
-	fn the_scaled_class_decides_grain_and_the_native_measure_its_level() {
-		let light = |noise_db: Option<f64>| Analysis {
+	fn the_noise_class_decides_grain_and_the_measured_noise_its_level() {
+		let light = |noise_sigma: Option<f64>| Analysis {
 			noise: NoiseClass::Light,
-			noise_db,
+			noise_sigma,
 			..PROGRESSIVE_CLEAN
 		};
-		let clean_but_noisy_natively = Analysis {
-			noise_db: Some(42.8),
+		let clean = Analysis {
+			noise_sigma: Some(0.3),
 			..PROGRESSIVE_CLEAN
 		};
 
-		assert_eq!(source_grain(&light(Some(46.0))), Some(14));
-		assert_eq!(source_grain(&light(Some(51.0))), Some(8));
-		assert_eq!(source_grain(&light(None)), Some(8));
-		assert_eq!(source_grain(&clean_but_noisy_natively), None);
-		assert_eq!(
-			plan(&h264(""), &[], clean_but_noisy_natively, Speed::Moderate)
-				.encoder
-				.grain_level(),
-			None
-		);
+		assert_eq!(source_grain(&light(Some(1.2))), Some(8));
+		assert_eq!(source_grain(&light(Some(0.5))), Some(6));
+		assert_eq!(source_grain(&light(None)), Some(6));
+		assert_eq!(source_grain(&clean), None);
+		assert_eq!(plan(&h264(""), &[], clean, Speed::Moderate).encoder.grain_level(), None);
+	}
+
+	#[test]
+	fn a_source_with_film_grain_parameters_gets_no_more_grain() {
+		let grainy = Analysis {
+			noise: NoiseClass::Light,
+			noise_sigma: Some(1.2),
+			..PROGRESSIVE_CLEAN
+		};
+		let synthesized: Vec<Frame> = serde_json::from_str(
+			r#"[{"side_data_list":[{"side_data_type":"Film grain parameters","type":"av1","seed":"7391"}]}]"#,
+		)
+		.unwrap();
+
+		let plan = plan(&h264(""), &synthesized, grainy, Speed::Slow);
+
+		assert!(synthesized_grain(&synthesized));
+		assert!(!synthesized_grain(&[]));
+		assert_eq!(plan.encoder.grain_level(), None);
 	}
 
 	#[test]
@@ -711,14 +744,36 @@ mod tests {
 	#[test]
 	fn grain_strength_follows_the_measured_noise() {
 		assert_eq!(grain_level(None), None);
-		assert_eq!(grain_level(Some(57.2)), None);
-		assert_eq!(grain_level(Some(50.0)), None);
-		assert_eq!(grain_level(Some(49.99)), Some(8));
-		assert_eq!(grain_level(Some(47.0)), Some(8));
-		assert_eq!(grain_level(Some(46.99)), Some(14));
-		assert_eq!(grain_level(Some(44.0)), Some(14));
-		assert_eq!(grain_level(Some(43.99)), Some(20));
-		assert_eq!(grain_level(Some(42.8)), Some(20));
+		assert_eq!(grain_level(Some(0.0)), None);
+		assert_eq!(grain_level(Some(0.35)), None);
+		assert_eq!(grain_level(Some(0.36)), Some(6));
+		assert_eq!(grain_level(Some(0.99)), Some(6));
+		assert_eq!(grain_level(Some(1.0)), Some(8));
+		assert_eq!(grain_level(Some(1.79)), Some(8));
+		assert_eq!(grain_level(Some(1.8)), Some(10));
+		assert_eq!(grain_level(Some(4.0)), Some(10));
+	}
+
+	#[test]
+	fn an_encoder_without_grain_keeps_its_preset_and_crf() {
+		let grainy = Encoder::SvtAv1 {
+			preset: 5,
+			crf: 31.25,
+			film_grain: Some(14),
+		};
+
+		assert_eq!(
+			grainy.without_grain(),
+			Encoder::SvtAv1 {
+				preset: 5,
+				crf: 31.25,
+				film_grain: None,
+			}
+		);
+		assert_eq!(
+			Encoder::Aom { cpu_used: 4, crf: 30 }.without_grain(),
+			Encoder::Aom { cpu_used: 4, crf: 30 }
+		);
 	}
 
 	#[test]

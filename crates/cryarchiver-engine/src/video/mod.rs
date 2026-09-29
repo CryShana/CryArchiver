@@ -5,6 +5,7 @@ pub mod colour;
 pub mod cues;
 pub mod encode;
 pub mod mux;
+pub mod noise;
 pub mod plan;
 pub mod quality;
 pub mod streams;

@@ -1293,6 +1293,7 @@ fn quality_learned_in_one_run_is_there_the_next_time() {
 				setting: 90.5,
 				slope: None,
 				bpp: None,
+				without_grain: false,
 			},
 		);
 		let mut snapshot = Snapshot::default();
@@ -1324,6 +1325,7 @@ fn a_forgotten_group_is_gone_the_next_time() {
 		setting: 90.5,
 		slope: None,
 		bpp: None,
+		without_grain: false,
 	};
 	for forget in [false, true] {
 		let project = support::open(&setup, &encoder);

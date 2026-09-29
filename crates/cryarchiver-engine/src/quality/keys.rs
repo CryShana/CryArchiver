@@ -4,7 +4,7 @@ use crate::images::decode::deep_pix_fmt;
 use crate::metadata::ImageFormat;
 use crate::probe::Stream;
 use crate::video::analyze::{Analysis, ScanType};
-use crate::video::plan::{Resolution, VideoPlan, source_grain};
+use crate::video::plan::{Resolution, VideoPlan};
 
 const MPEG4: &[&str] = &["mpeg4", "msmpeg4v2", "msmpeg4v3", "h263", "flv1"];
 const INTERMEDIATE: &[&str] = &["prores", "dnxhd", "cfhd", "hqx", "hap"];
@@ -147,7 +147,7 @@ impl VideoGroup {
 			fps: FpsBucket::of(output_fps),
 			range: DynamicRange::of(&plan.colour.transfer, main.pix_fmt.as_deref()),
 			scan: analysis.scan,
-			grain: source_grain(analysis),
+			grain: plan.encoder.grain_level(),
 			alpha: plan.alpha,
 		}
 	}
@@ -301,22 +301,33 @@ fn format_name(format: ImageFormat) -> &'static str {
 mod tests {
 	use super::*;
 	use crate::video::analyze::NoiseClass;
-	use crate::video::plan::test_plan;
+	use crate::video::plan::{Encoder, test_plan};
 
 	fn stream(json: &str) -> Stream {
 		serde_json::from_str(json).unwrap()
 	}
 
-	fn progressive(noise_db: Option<f64>) -> Analysis {
+	fn progressive(noise_sigma: Option<f64>) -> Analysis {
 		Analysis {
 			scan: ScanType::Progressive,
-			noise: if noise_db.is_some_and(|db| db < 50.0) {
+			noise: if noise_sigma.is_some_and(|sigma| sigma >= 0.4) {
 				NoiseClass::Light
 			} else {
 				NoiseClass::Clean
 			},
-			noise_db,
+			noise_sigma,
 			detail: Vec::new(),
+		}
+	}
+
+	fn grained(film_grain: Option<u8>) -> VideoPlan {
+		VideoPlan {
+			encoder: Encoder::SvtAv1 {
+				preset: 5,
+				crf: 29.0,
+				film_grain,
+			},
+			..test_plan()
 		}
 	}
 
@@ -384,10 +395,10 @@ mod tests {
 	#[test]
 	fn cache_keys_name_the_encoder_version_preset_and_target() {
 		let main = h264_25();
-		let analysis = progressive(Some(45.4));
+		let analysis = progressive(Some(1.2));
 		let key = |encoder: &str, preset: u8, target: f64| {
 			CacheKey {
-				group: Group::Video(VideoGroup::of(&main, &analysis, &test_plan())),
+				group: Group::Video(VideoGroup::of(&main, &analysis, &grained(Some(14)))),
 				encoder: encoder.to_owned(),
 				preset,
 				target,
@@ -412,11 +423,11 @@ mod tests {
 	}
 
 	#[test]
-	fn groups_of_different_grain_strength_never_share_a_key() {
+	fn groups_of_different_planned_grain_never_share_a_key() {
 		let main = h264_25();
-		let key = |noise_db: Option<f64>| {
+		let key = |noise_sigma: Option<f64>, film_grain: Option<u8>| {
 			CacheKey {
-				group: Group::Video(VideoGroup::of(&main, &progressive(noise_db), &test_plan())),
+				group: Group::Video(VideoGroup::of(&main, &progressive(noise_sigma), &grained(film_grain))),
 				encoder: "svt-av1-4.2".to_owned(),
 				preset: 5,
 				target: 91.0,
@@ -425,14 +436,17 @@ mod tests {
 			.to_string()
 		};
 
-		let [clean, grain8, grain14, grain20] = [None, Some(48.0), Some(45.0), Some(42.8)].map(key);
+		let clean = key(None, None);
+		let grain8 = key(Some(0.5), Some(8));
+		let grain14 = key(Some(1.2), Some(14));
+		let grain20 = key(Some(2.2), Some(20));
 
 		assert!(clean.contains("/progressive/clean/"), "{clean}");
 		assert!(grain8.contains("/progressive/grain8/"), "{grain8}");
 		assert!(grain14.contains("/progressive/grain14/"), "{grain14}");
 		assert!(grain20.contains("/progressive/grain20/"), "{grain20}");
 		assert_ne!(grain8, grain20);
-		assert_eq!(key(Some(43.1)), grain20);
+		assert_eq!(key(Some(1.2), None), clean);
 	}
 
 	#[test]

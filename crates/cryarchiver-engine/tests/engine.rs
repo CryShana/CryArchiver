@@ -12,9 +12,10 @@ use cryarchiver_engine::images::plan::worst_case_memory;
 use cryarchiver_engine::options::{BurnSubs, JobOptions, SubtitlePick, Trim};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
-use cryarchiver_engine::probe::{Stream, probe};
+use cryarchiver_engine::probe::{self, Stream, probe};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
+use cryarchiver_engine::video::plan::synthesized_grain;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
 use lofty::config::ParseOptions;
 use lofty::file::AudioFile;
@@ -1930,6 +1931,75 @@ async fn a_search_that_cannot_reach_the_target_keeps_the_original_before_encodin
 	assert_eq!(stages(&events, Stage::Encode), 0, "{events:?}");
 	assert!(memory.entries().is_empty());
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn noise_that_grain_cannot_reach_the_target_on_is_encoded_and_learned_without_grain() {
+	let dir = tempfile::tempdir().unwrap();
+	let noisy = |name: &str, seed: u32| {
+		let path = dir.path().join(name);
+		support::ffmpeg(&[
+			"-f",
+			"lavfi",
+			"-i",
+			&format!("color=c=gray:s=320x240:r=25:d=3,noise=alls=6:allf=t:all_seed={seed}"),
+			"-pix_fmt",
+			"yuv420p",
+			"-c:v",
+			"ffv1",
+			path.to_str().unwrap(),
+		]);
+		path
+	};
+	let (first, second) = (noisy("first.mkv", 1), noisy("second.mkv", 2));
+	let memory = Arc::new(SharedMemory::default());
+	let tools = support::toolchain().await;
+	let engine = Engine::new(tools.clone()).with_quality_memory(memory.clone());
+	let reachable_without_grain = |source: &Path| Job {
+		overrides: Overrides {
+			video: Some(VmafOverride {
+				mean: 85.0,
+				floor: 75.0,
+			}),
+			..Overrides::default()
+		},
+		..job(source)
+	};
+	let grain_params = async |output: &Path| {
+		let frames = probe::first_frames(&tools, output, 0, 2, &CancellationToken::new())
+			.await
+			.unwrap();
+		synthesized_grain(&frames)
+	};
+
+	let (outcome, events) = run_recording(&engine, &reachable_without_grain(&first), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warned(&outcome, "was left out: with it quality target not reached"),
+		"{outcome:?}"
+	);
+	assert!(!grain_params(output).await, "{outcome:?}");
+	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
+	let learned = memory.entries();
+	assert!(
+		learned.len() == 1 && learned[0].0.contains("/grain10/") && learned[0].1.without_grain,
+		"{learned:?}"
+	);
+
+	let (outcome, events) = run_recording(&engine, &reachable_without_grain(&second), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(
+		stages(&events, Stage::Sample),
+		0,
+		"the learned CRF was used: {events:?}"
+	);
+	assert!(!grain_params(output).await, "{outcome:?}");
 }
 
 fn requested(source: &Path, format: OutputFormat) -> Job {
