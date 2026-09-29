@@ -36,6 +36,7 @@ fn job(source: &Path) -> Job {
 fn sink(out_dir: &Path) -> CliSink {
 	CliSink {
 		output_dir: Some(out_dir.to_path_buf()),
+		output_file: None,
 		overwrite: false,
 	}
 }

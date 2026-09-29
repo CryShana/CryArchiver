@@ -741,6 +741,60 @@ fn raw_camera_files_are_kept_as_they_are() {
 }
 
 #[test]
+fn an_output_file_needs_exactly_one_input() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "a.flac", 2);
+	flac(dir.path(), "b.flac", 2);
+
+	let out = cryarchiver(dir.path(), &["a.flac", "b.flac", "-o", "both.opus"]);
+
+	assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+	assert!(stderr(&out).contains("exactly one input"), "{}", stderr(&out));
+	assert!(!dir.path().join("both.opus").exists());
+	assert!(!dir.path().join("a.cry.opus").exists());
+}
+
+#[test]
+fn an_output_file_picks_the_format_and_must_agree_with_f() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "song.flac", 2);
+
+	let conflicting = cryarchiver(dir.path(), &["song.flac", "-o", "song.mka", "-f", "opus"]);
+	let out = cryarchiver(dir.path(), &["song.flac", "-o", "song.mka"]);
+
+	assert_eq!(conflicting.status.code(), Some(2), "{}", stderr(&conflicting));
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	let bytes = fs::read(dir.path().join("song.mka")).unwrap();
+	assert_eq!(&bytes[..4], b"\x1a\x45\xdf\xa3", "a Matroska file");
+}
+
+#[test]
+fn a_format_that_does_not_fit_a_file_fails_only_that_file() {
+	let dir = tempfile::tempdir().unwrap();
+	support::mpeg4(dir.path(), "clip.mp4", 3);
+	flac(dir.path(), "a.flac", 2);
+	support::photo_png(dir.path(), "photo.png", 64, 48);
+
+	let out = cryarchiver(
+		dir.path(),
+		&["-s", "fast", "-f", "webm", "clip.mp4", "a.flac", "photo.png"],
+	);
+
+	assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+	assert!(dir.path().join("clip.cry.webm").is_file(), "{}", stdout(&out));
+	assert!(
+		stdout(&out).contains("✗ a.flac  failed: encode failed: an audio file can't be written as .webm"),
+		"{}",
+		stdout(&out)
+	);
+	assert!(
+		stdout(&out).contains("✗ photo.png  failed: encode failed: an image can't be written as .webm"),
+		"{}",
+		stdout(&out)
+	);
+}
+
+#[test]
 fn help_and_doctor_mention_images() {
 	let dir = tempfile::tempdir().unwrap();
 

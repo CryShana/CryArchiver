@@ -7,37 +7,61 @@ use ulid::Ulid;
 
 use crate::commit::{Artifact, CommitError, OutputSink, Replace, commit_file};
 use crate::container::OUTPUT_EXTENSIONS;
+use crate::format::OutputFormat;
 use crate::naming::{cli_output_dir, cli_output_path};
 use crate::workspace::{ARCHIVE_DIR, ARCHIVE_WORK_DIR, CLI_WORK_DIR, CheckedFolders, RealFolders, STAGED_DIR};
 
 #[derive(Debug, Clone)]
 pub struct CliSink {
 	pub output_dir: Option<PathBuf>,
+	pub output_file: Option<PathBuf>,
 	pub overwrite: bool,
 }
 
 impl CliSink {
-	pub fn existing_output(&self, source: &Path) -> Option<PathBuf> {
+	pub fn existing_output(&self, source: &Path, format: Option<OutputFormat>) -> Option<PathBuf> {
 		if self.overwrite {
 			return None;
 		}
 
-		OUTPUT_EXTENSIONS
-			.iter()
+		if let Some(file) = &self.output_file {
+			return file.exists().then(|| file.clone());
+		}
+
+		let extensions: Vec<&str> = match format {
+			Some(format) => vec![format.extension()],
+			None => OUTPUT_EXTENSIONS.to_vec(),
+		};
+		extensions
+			.into_iter()
 			.map(|extension| cli_output_path(source, self.output_dir.as_deref(), extension))
 			.find(|path| path.exists())
+	}
+
+	fn target(&self, artifact: &Artifact) -> PathBuf {
+		match &self.output_file {
+			Some(file) => file.clone(),
+			None => cli_output_path(
+				&artifact.source,
+				self.output_dir.as_deref(),
+				artifact.path.extension().unwrap_or_default(),
+			),
+		}
 	}
 }
 
 impl OutputSink for CliSink {
 	fn work_root(&self, source: &Path) -> PathBuf {
 		// The workspace must be on the output's filesystem so the commit is a rename.
-		cli_output_dir(source, self.output_dir.as_deref()).join(CLI_WORK_DIR)
+		let dir = match &self.output_file {
+			Some(file) => file.parent().map(Path::to_path_buf).unwrap_or_default(),
+			None => cli_output_dir(source, self.output_dir.as_deref()),
+		};
+		dir.join(CLI_WORK_DIR)
 	}
 
 	fn commit(&self, artifact: &Artifact) -> Result<PathBuf, CommitError> {
-		let extension = artifact.path.extension().unwrap_or_default();
-		let target = cli_output_path(&artifact.source, self.output_dir.as_deref(), extension);
+		let target = self.target(artifact);
 		if let Some(dir) = target.parent().filter(|dir| !dir.as_os_str().is_empty()) {
 			fs::create_dir_all(dir)?;
 		}
@@ -207,6 +231,7 @@ mod tests {
 
 		let next_to = CliSink {
 			output_dir: None,
+			output_file: None,
 			overwrite: false,
 		};
 		assert_eq!(next_to.work_root(&source), dir.path().join(CLI_WORK_DIR));
@@ -217,6 +242,7 @@ mod tests {
 
 		let elsewhere = CliSink {
 			output_dir: Some(dir.path().join("out")),
+			output_file: None,
 			overwrite: false,
 		};
 		assert_eq!(elsewhere.work_root(&source), dir.path().join("out").join(CLI_WORK_DIR));
@@ -236,19 +262,65 @@ mod tests {
 		assert_eq!(
 			CliSink {
 				output_dir: None,
+				output_file: None,
 				overwrite: false
 			}
-			.existing_output(&source),
+			.existing_output(&source, None),
 			Some(dir.path().join("a.cry.mka"))
 		);
 		assert_eq!(
 			CliSink {
 				output_dir: None,
+				output_file: None,
 				overwrite: true
 			}
-			.existing_output(&source),
+			.existing_output(&source, None),
 			None
 		);
+	}
+
+	#[test]
+	fn an_output_file_is_the_exact_target() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("a.flac");
+		let target = dir.path().join("out").join("final.opus");
+		let work = dir.path().join("work.opus");
+		fs::write(&source, b"src").unwrap();
+		fs::write(&work, b"out").unwrap();
+		let sink = CliSink {
+			output_dir: None,
+			output_file: Some(target.clone()),
+			overwrite: false,
+		};
+
+		assert_eq!(sink.existing_output(&source, None), None);
+		assert_eq!(sink.work_root(&source), dir.path().join("out").join(CLI_WORK_DIR));
+		let committed = sink
+			.commit(&Artifact {
+				path: work,
+				source: source.clone(),
+				times: None,
+			})
+			.unwrap();
+
+		assert_eq!(committed, target);
+		assert_eq!(sink.existing_output(&source, None), Some(target));
+	}
+
+	#[test]
+	fn a_requested_format_only_looks_for_its_own_output() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("clip.mp4");
+		fs::write(dir.path().join("clip.cry.mkv"), b"earlier").unwrap();
+		let sink = CliSink {
+			output_dir: None,
+			output_file: None,
+			overwrite: false,
+		};
+
+		assert!(sink.existing_output(&source, None).is_some());
+		assert_eq!(sink.existing_output(&source, Some(OutputFormat::Webm)), None);
+		assert!(sink.existing_output(&source, Some(OutputFormat::Mkv)).is_some());
 	}
 
 	#[test]
@@ -261,10 +333,12 @@ mod tests {
 
 		let careful = CliSink {
 			output_dir: None,
+			output_file: None,
 			overwrite: false,
 		};
 		let replacing = CliSink {
 			output_dir: None,
+			output_file: None,
 			overwrite: true,
 		};
 

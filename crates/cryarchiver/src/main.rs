@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use cryarchiver_engine::commit::{OutputSink, check_space};
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
+use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::naming::cli_output_path;
 use cryarchiver_engine::options::JobOptions;
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
@@ -117,10 +118,17 @@ struct CompressArgs {
 	#[arg(
 		short,
 		long,
-		value_name = "DIR",
-		help = "Write outputs here instead of next to each source"
+		value_name = "PATH",
+		help = "Output folder, or a file for a single input (its extension picks the format)"
 	)]
 	output: Option<PathBuf>,
+	#[arg(
+		short = 'f',
+		long,
+		value_enum,
+		help = "Output format for every file [default: automatic]"
+	)]
+	format: Option<OutputFormat>,
 	#[arg(short, long, value_enum, default_value_t, help = "Speed preset")]
 	speed: Speed,
 	#[command(flatten)]
@@ -246,6 +254,51 @@ fn quality_label(speed: Speed, overrides: &Overrides) -> Option<String> {
 	}
 
 	Some(format!("{preset} · custom: {}", values.join(", ")))
+}
+
+struct OutputTarget {
+	dir: Option<PathBuf>,
+	file: Option<PathBuf>,
+	format: Option<OutputFormat>,
+}
+
+fn output_target(output: Option<&Path>, format: Option<OutputFormat>, inputs: usize) -> Result<OutputTarget, String> {
+	let Some(output) = output else {
+		return Ok(OutputTarget {
+			dir: None,
+			file: None,
+			format,
+		});
+	};
+
+	let Some(named) = OutputFormat::from_path(output).filter(|_| !output.is_dir()) else {
+		return Ok(OutputTarget {
+			dir: Some(absolute(output.to_path_buf())),
+			file: None,
+			format,
+		});
+	};
+
+	if inputs != 1 {
+		return Err(format!(
+			"-o {} names a file, which works with exactly one input ({inputs} given)",
+			display_path(output)
+		));
+	}
+	if let Some(format) = format
+		&& format != named
+	{
+		return Err(format!(
+			"-o {} asks for {named} but -f asks for {format}",
+			display_path(output)
+		));
+	}
+
+	Ok(OutputTarget {
+		dir: None,
+		file: Some(absolute(output.to_path_buf())),
+		format: Some(named),
+	})
 }
 
 #[derive(Default)]
@@ -532,6 +585,13 @@ async fn compress(args: CompressArgs) -> u8 {
 		eprintln!("nothing to do: no input files");
 		return 2;
 	}
+	let target = match output_target(args.output.as_deref(), args.format, inputs.files.len()) {
+		Ok(target) => target,
+		Err(message) => {
+			eprintln!("error: {message}");
+			return 2;
+		}
+	};
 
 	let cancel = CancellationToken::new();
 	let tools = match Toolchain::detect(&ToolConfig { ffmpeg: args.ffmpeg }, &cancel).await {
@@ -563,7 +623,8 @@ async fn compress(args: CompressArgs) -> u8 {
 
 	let files: Vec<PathBuf> = inputs.files.into_iter().map(absolute).collect();
 	let sink = Arc::new(CliSink {
-		output_dir: args.output.map(absolute),
+		output_dir: target.dir,
+		output_file: target.file,
 		overwrite: args.overwrite,
 	});
 	prepare_work_roots(&files, sink.as_ref());
@@ -586,7 +647,10 @@ async fn compress(args: CompressArgs) -> u8 {
 			drop_aux: args.drop_aux,
 			min_savings,
 			overrides,
-			options: JobOptions::default(),
+			options: JobOptions {
+				format: target.format,
+				..JobOptions::default()
+			},
 		})
 		.collect();
 	let parallel = args.jobs.unwrap_or_else(default_jobs).max(1);
@@ -629,7 +693,7 @@ async fn run_all(
 		}
 		claimed.insert(key, job.source.clone());
 
-		if let Some(existing) = sink.existing_output(&job.source) {
+		if let Some(existing) = sink.existing_output(&job.source, job.options.format) {
 			let reason = format!("output already exists: {}", display_path(&existing));
 			record(report, &mut totals, &job.source, &JobOutcome::Skipped { reason });
 			continue;
