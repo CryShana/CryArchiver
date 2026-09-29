@@ -744,6 +744,7 @@ async fn faintly_interlaced_home_video_of_either_field_order_is_deinterlaced_to_
 				&truth,
 				support::HOME_VIDEO_INSET,
 			);
+
 			assert!(
 				(info.streams[0].fps().unwrap() - 50.0).abs() < 0.5,
 				"{name}: {:?}",

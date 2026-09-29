@@ -77,13 +77,22 @@ async fn faintly_interlaced_still_home_video_is_detected_with_its_field_order() 
 }
 
 #[tokio::test]
-async fn a_still_progressive_picture_in_an_interlaced_container_stays_progressive() {
+async fn progressive_video_in_an_interlaced_container_stays_progressive() {
 	let dir = tempfile::tempdir().unwrap();
 
 	for container in ["mpg", "mkv"] {
-		let clip = support::still_home_video(dir.path(), &format!("progressive.{container}"), "progressive");
+		let name = format!("still.{container}");
+		let still = support::still_home_video(dir.path(), &name, "progressive");
 
-		assert_eq!(scan_and_noise(&clip).await.0, ScanType::Progressive, "{container}");
+		assert_eq!(scan_and_noise(&still).await.0, ScanType::Progressive, "{name}");
+
+		for (tilt, rows) in [("down", "n*3"), ("up", "1400-n*3")] {
+			let name = format!("tilt-{tilt}.{container}");
+			let source = format!("testsrc2=s=720x2000:r=25:d=4,crop=720:576:0:'{rows}',setfield=tff");
+			let panned = encode(dir.path(), &name, &source, INTERLACED_MPEG2);
+
+			assert_eq!(scan_and_noise(&panned).await.0, ScanType::Progressive, "{name}");
+		}
 	}
 }
 
@@ -255,7 +264,6 @@ async fn a_real_clip_gets_its_expected_grain() {
 
 	let analysis = measured(&clip, window).await;
 	eprintln!("noise {:?}, sigma {:?}", analysis.noise, analysis.noise_sigma);
-
 	if let Some(expected) = std::env::var("CRY_GRAIN_LEVEL")
 		.ok()
 		.map(|level| level.parse::<u8>().unwrap())

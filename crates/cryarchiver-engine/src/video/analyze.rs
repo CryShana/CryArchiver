@@ -17,6 +17,7 @@ const NTSC_FPS: f64 = 30_000.0 / 1001.0;
 const TELECINE_REPEATS: f64 = 0.25;
 const INTERLACED_SHARE: f64 = 0.6;
 const FLAGGED_INTERLACED_SHARE: f64 = 0.05;
+const FLAGGED_INTERLACED_VOTES: f64 = 10.0;
 const FIELD_ORDER_SHARE: f64 = 0.8;
 const REJECT_SHARE: f64 = 0.5;
 const INTERLACED_FIELD_ORDERS: &[&str] = &["tt", "bb", "tb", "bt"];
@@ -74,6 +75,7 @@ pub struct SegmentStats {
 	pub bottom: u64,
 	pub tff: u64,
 	pub bff: u64,
+	pub progressive: u64,
 	pub black_s: f64,
 	pub frozen_s: f64,
 	pub si: Option<f64>,
@@ -151,8 +153,7 @@ pub fn parse_segment(stderr: &[String], start_s: f64, length_s: f64) -> Option<S
 		if let Some(rest) = line.split("Repeated Fields:").nth(1) {
 			[stats.neither, stats.top, stats.bottom] = counts(rest);
 		} else if let Some(rest) = line.split("Single frame detection:").nth(1) {
-			let [tff, bff, _] = counts(rest);
-			(stats.tff, stats.bff) = (tff, bff);
+			[stats.tff, stats.bff, stats.progressive] = counts(rest);
 		} else if line.contains("Spatial Information:") {
 			spatial = true;
 		} else if spatial && let Some(value) = field(line, "Average:") {
@@ -187,10 +188,11 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 
 	let sum = |part: fn(&SegmentStats) -> u64| voting.iter().map(|segment| part(segment)).sum::<u64>() as f64;
 	let frames = sum(|segment| segment.neither + segment.top + segment.bottom);
-	let (repeated, tff, bff) = (
+	let (repeated, tff, bff, progressive) = (
 		sum(|segment| segment.top + segment.bottom),
 		sum(|segment| segment.tff),
 		sum(|segment| segment.bff),
+		sum(|segment| segment.progressive),
 	);
 
 	let flagged_interlaced = field_order.is_some_and(|order| INTERLACED_FIELD_ORDERS.contains(&order));
@@ -210,8 +212,13 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 			ScanType::Interlaced { top_first }
 		}
 		// A mostly still picture leaves most interlaced frames undetermined, so an interlaced container needs only a
-		// few frames that agree on one field order.
-		_ if flagged_interlaced && (tff + bff) / frames >= FLAGGED_INTERLACED_SHARE => {
+		// few frames that agree on one field order. They must outnumber the progressive frames: a slow vertical pan
+		// of progressive video draws a steady share of one-sided votes too.
+		_ if flagged_interlaced
+			&& (tff + bff) / frames >= FLAGGED_INTERLACED_SHARE
+			&& tff + bff >= FLAGGED_INTERLACED_VOTES
+			&& tff + bff > progressive =>
+		{
 			let top_share = tff / (tff + bff);
 			if top_share >= FIELD_ORDER_SHARE {
 				ScanType::Interlaced { top_first: true }
@@ -378,6 +385,7 @@ mod tests {
 			bottom: repeated[2],
 			tff: single[0],
 			bff: single[1],
+			progressive: 0,
 			black_s: 0.0,
 			frozen_s: 0.0,
 			si: Some(60.0),
@@ -489,7 +497,7 @@ mod tests {
 
 		assert!((parsed.start_s - 12.5).abs() < 1e-9);
 		assert_eq!((parsed.neither, parsed.top, parsed.bottom), (54, 18, 18));
-		assert_eq!((parsed.tff, parsed.bff), (72, 0));
+		assert_eq!((parsed.tff, parsed.bff, parsed.progressive), (72, 0, 18));
 		assert!((parsed.black_s - 1.2).abs() < 1e-9);
 		assert!((parsed.frozen_s - 1.7).abs() < 1e-9);
 		assert_eq!(parsed.si, Some(102.528_107));
@@ -619,6 +627,37 @@ mod tests {
 
 		assert_eq!(classify(&split, Some(25.0), Some("tt")).scan, ScanType::Progressive);
 		assert_eq!(classify(&stray, Some(25.0), Some("tt")).scan, ScanType::Progressive);
+	}
+
+	#[test]
+	fn faint_field_votes_outnumbered_by_progressive_ones_stay_progressive() {
+		let panned = |single: [u64; 2], progressive: u64| SegmentStats {
+			progressive,
+			..stats([100, 0, 0], single)
+		};
+		let down = [panned([0, 42], 58)];
+		let up = [panned([18, 0], 68)];
+		let tied = [panned([0, 50], 50)];
+		let short = [SegmentStats {
+			progressive: 1,
+			..stats([25, 0, 0], [3, 0])
+		}];
+
+		for order in ["tt", "bb", "tb", "bt"] {
+			assert_eq!(classify(&down, Some(25.0), Some(order)).scan, ScanType::Progressive);
+			assert_eq!(classify(&up, Some(25.0), Some(order)).scan, ScanType::Progressive);
+			assert_eq!(classify(&tied, Some(25.0), Some(order)).scan, ScanType::Progressive);
+			assert_eq!(classify(&short, Some(25.0), Some(order)).scan, ScanType::Progressive);
+		}
+
+		assert_eq!(
+			classify(&[panned([0, 32], 19)], Some(25.0), Some("bb")).scan,
+			ScanType::Interlaced { top_first: false }
+		);
+		assert_eq!(
+			classify(&[panned([10, 0], 9)], Some(25.0), Some("tt")).scan,
+			ScanType::Interlaced { top_first: true }
+		);
 	}
 
 	#[test]
