@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::plan::worst_case_memory;
-use cryarchiver_engine::options::JobOptions;
+use cryarchiver_engine::options::{JobOptions, Trim};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{Stream, probe};
@@ -2456,4 +2456,201 @@ async fn stripped_extraction_drops_chapters_and_the_cover() {
 		.await
 		.unwrap();
 	assert!(info.chapters.is_empty(), "{:?}", info.chapters);
+}
+
+fn trimmed(job: Job, start_s: f64, end_s: f64) -> Job {
+	with_options(
+		job,
+		JobOptions {
+			trim: Some(Trim {
+				start_s,
+				end_s: Some(end_s),
+			}),
+			..JobOptions::default()
+		},
+	)
+}
+
+fn subtitle_times(path: &Path) -> Vec<f64> {
+	let out = std::process::Command::new("ffprobe")
+		.args([
+			"-v",
+			"error",
+			"-select_streams",
+			"s",
+			"-show_entries",
+			"packet=pts_time",
+			"-of",
+			"csv=p=0",
+		])
+		.arg(path)
+		.output()
+		.unwrap();
+	String::from_utf8_lossy(&out.stdout)
+		.lines()
+		.filter_map(|line| line.trim().trim_end_matches(',').parse().ok())
+		.collect()
+}
+
+#[tokio::test]
+async fn trimmed_video_keeps_subtitles_and_chapters_in_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::clip_with_extras(dir.path());
+
+	let outcome = run(&trimmed(fast(&clip), 4.0, 8.0), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!((info.format.duration.unwrap() - 4.0).abs() < 0.25, "{:?}", info.format);
+	let titles: Vec<&str> = info
+		.chapters
+		.iter()
+		.filter_map(|chapter| chapter["tags"]["title"].as_str())
+		.collect();
+	assert_eq!(titles, ["B", "C"]);
+	let cues = subtitle_times(&output);
+	assert!((cues[0] - 1.0).abs() < 0.05, "{cues:?}");
+	assert!(cues.iter().all(|cue| *cue < 4.05), "{cues:?}");
+}
+
+#[tokio::test]
+async fn a_trimmed_transparent_video_checks_its_alpha_against_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let alpha = dir.path().join("moving-alpha.mov");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=4,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,mod(N*8,320)),255,0)'",
+		"-c:v",
+		"qtrle",
+		alpha.to_str().unwrap(),
+	]);
+
+	let outcome = run(&trimmed(fast(&alpha), 2.0, 3.0), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_trimmed_video_is_searched_and_checked_on_its_window_and_learns_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 6);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, events) = run_recording(&engine, &trimmed(job(&clip), 2.0, 5.0), dir.path()).await;
+
+	let JobOutcome::Encoded { warnings, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(warnings.is_empty(), "{warnings:?}");
+	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 2, "{events:?}");
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn trimmed_audio_is_cut_to_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let flac = support::tone(dir.path(), "a.flac", "stereo", 2, 10, &["-c:a", "flac"]);
+
+	let outcome = run(&trimmed(job(&flac), 2.0, 5.0), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!((info.format.duration.unwrap() - 3.0).abs() < 0.1, "{:?}", info.format);
+}
+
+#[tokio::test]
+async fn trimmed_audio_clips_its_chapters_to_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let chapters = dir.path().join("chapters.txt");
+	fs::write(
+		&chapters,
+		";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2000\ntitle=A\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=2000\nEND=6000\ntitle=B\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=6000\nEND=10000\ntitle=C\n",
+	)
+	.unwrap();
+	let album = dir.path().join("album.mka");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=10",
+		"-i",
+		chapters.to_str().unwrap(),
+		"-map",
+		"0",
+		"-map_chapters",
+		"1",
+		"-c:a",
+		"flac",
+		album.to_str().unwrap(),
+	]);
+	let options = JobOptions {
+		trim: Some(Trim {
+			start_s: 1.0,
+			end_s: Some(4.0),
+		}),
+		format: Some(OutputFormat::Mka),
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(job(&album), options), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let chapters: Vec<(&str, f64, f64)> = info
+		.chapters
+		.iter()
+		.map(|chapter| {
+			let time = |key: &str| chapter[key].as_str().unwrap().parse::<f64>().unwrap();
+			(
+				chapter["tags"]["title"].as_str().unwrap(),
+				time("start_time"),
+				time("end_time"),
+			)
+		})
+		.collect();
+	assert_eq!(chapters.len(), 2, "{chapters:?}");
+	assert_eq!((chapters[0].0, chapters[1].0), ("A", "B"), "{chapters:?}");
+	assert!(
+		chapters[0].1.abs() < 0.01 && (chapters[0].2 - 1.0).abs() < 0.01,
+		"{chapters:?}"
+	);
+	assert!(
+		(chapters[1].1 - 1.0).abs() < 0.01 && (chapters[1].2 - 3.0).abs() < 0.01,
+		"{chapters:?}"
+	);
+}
+
+#[tokio::test]
+async fn trims_outside_the_file_and_trimmed_images_fail() {
+	let dir = tempfile::tempdir().unwrap();
+	let flac = support::tone(dir.path(), "a.flac", "stereo", 2, 3, &["-c:a", "flac"]);
+	let photo = support::photo_png(dir.path(), "photo.png", 64, 48);
+
+	let late = run(&trimmed(job(&flac), 20.0, 25.0), dir.path()).await;
+	let image = run(&trimmed(job(&photo), 1.0, 2.0), dir.path()).await;
+
+	assert!(
+		matches!(&late, JobOutcome::Failed(err) if err.to_string().contains("past the end")),
+		"{late:?}"
+	);
+	assert!(
+		matches!(&image, JobOutcome::Failed(err) if err.to_string().contains("not images")),
+		"{image:?}"
+	);
 }

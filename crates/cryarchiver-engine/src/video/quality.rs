@@ -4,6 +4,7 @@ use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError, KeepReason};
 use crate::preset::{Overrides, Speed};
 use crate::quality::memory::GroupStats;
@@ -136,24 +137,25 @@ pub fn strategy(speed: Speed, stats: Option<&GroupStats>, table_crf: f64, vmaf: 
 	}
 }
 
-pub fn search_samples(analysis: &Analysis, declared_s: Option<f64>, speed: Speed) -> Vec<Sample> {
+pub fn search_samples(analysis: &Analysis, span: Option<TrimWindow>, speed: Speed) -> Vec<Sample> {
 	let count: u8 = match speed {
 		Speed::Slow => 6,
 		Speed::Moderate => 3,
 		Speed::Fast => 0,
 	};
-	let Some(duration) = declared_s.filter(|duration| *duration > 0.0 && count > 0) else {
+	let Some(span) = span.filter(|span| span.length_s > 0.0 && count > 0) else {
 		return Vec::new();
 	};
 
 	let whole = vec![Sample {
-		start_s: 0.0,
-		length_s: duration,
+		start_s: span.start_s,
+		length_s: span.length_s,
 	}];
-	if SEARCH_SEGMENT_S * f64::from(count) >= duration {
+	if SEARCH_SEGMENT_S * f64::from(count) >= span.length_s {
 		return whole;
 	}
 
+	let end_s = span.start_s + span.length_s;
 	let any_usable = analysis.detail.iter().any(|detail| detail.usable);
 	let mut ranked: Vec<&Detail> = analysis
 		.detail
@@ -167,7 +169,7 @@ pub fn search_samples(analysis: &Analysis, declared_s: Option<f64>, speed: Speed
 		.take(usize::from(count))
 		.map(|detail| Sample {
 			start_s: detail.start_s,
-			length_s: SEARCH_SEGMENT_S.min(duration - detail.start_s),
+			length_s: SEARCH_SEGMENT_S.min(end_s - detail.start_s),
 		})
 		.collect();
 	samples.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
@@ -305,6 +307,7 @@ impl Scorer<'_> {
 			stream: self.plan.streams[0],
 			decoder: self.plan.decoder,
 			filters: &self.plan.filters,
+			window: self.plan.window,
 		}
 	}
 
@@ -376,6 +379,11 @@ mod tests {
 			si: Some(si),
 			usable,
 		}
+	}
+
+	#[allow(clippy::unnecessary_wraps)]
+	fn whole(length_s: f64) -> Option<TrimWindow> {
+		Some(TrimWindow { start_s: 0.0, length_s })
 	}
 
 	#[test]
@@ -566,17 +574,17 @@ mod tests {
 		let four = |start_s: f64| Sample { start_s, length_s: 4.0 };
 
 		assert_eq!(
-			search_samples(&analysis, Some(100.0), Speed::Moderate),
+			search_samples(&analysis, whole(100.0), Speed::Moderate),
 			vec![four(5.0), four(35.0), four(65.0)]
 		);
 		assert_eq!(
-			search_samples(&analysis, Some(100.0), Speed::Slow),
+			search_samples(&analysis, whole(100.0), Speed::Slow),
 			vec![four(5.0), four(35.0), four(65.0)]
 		);
-		assert!(search_samples(&analysis, Some(100.0), Speed::Fast).is_empty());
+		assert!(search_samples(&analysis, whole(100.0), Speed::Fast).is_empty());
 		assert!(search_samples(&analysis, None, Speed::Moderate).is_empty());
 		assert_eq!(
-			search_samples(&analysis, Some(8.5), Speed::Slow),
+			search_samples(&analysis, whole(8.5), Speed::Slow),
 			vec![Sample {
 				start_s: 0.0,
 				length_s: 8.5
@@ -596,20 +604,68 @@ mod tests {
 				.map(|(segment, index)| detail(segment.start_s, 50.0 + f64::from(index), true))
 				.collect(),
 		};
-		let whole = |length_s: f64| vec![Sample { start_s: 0.0, length_s }];
+		let entire = |length_s: f64| vec![Sample { start_s: 0.0, length_s }];
 
 		assert_eq!(
-			search_samples(&analysis(12.0, 4), Some(12.0), Speed::Moderate),
-			whole(12.0)
+			search_samples(&analysis(12.0, 4), whole(12.0), Speed::Moderate),
+			entire(12.0)
 		);
 		assert_eq!(
-			search_samples(&analysis(16.0, 4), Some(16.0), Speed::Moderate),
-			whole(16.0)
+			search_samples(&analysis(16.0, 4), whole(16.0), Speed::Moderate),
+			entire(16.0)
 		);
-		assert_eq!(search_samples(&analysis(24.0, 8), Some(24.0), Speed::Slow), whole(24.0));
-		assert_eq!(search_samples(&analysis(34.0, 8), Some(34.0), Speed::Slow), whole(34.0));
-		assert_eq!(search_samples(&analysis(17.0, 4), Some(17.0), Speed::Moderate).len(), 3);
-		assert_eq!(search_samples(&analysis(35.0, 8), Some(35.0), Speed::Slow).len(), 6);
+		assert_eq!(
+			search_samples(&analysis(24.0, 8), whole(24.0), Speed::Slow),
+			entire(24.0)
+		);
+		assert_eq!(
+			search_samples(&analysis(34.0, 8), whole(34.0), Speed::Slow),
+			entire(34.0)
+		);
+		assert_eq!(
+			search_samples(&analysis(17.0, 4), whole(17.0), Speed::Moderate).len(),
+			3
+		);
+		assert_eq!(search_samples(&analysis(35.0, 8), whole(35.0), Speed::Slow).len(), 6);
+	}
+
+	#[test]
+	fn samples_of_a_trim_stay_inside_it() {
+		let analysis = Analysis {
+			scan: ScanType::Progressive,
+			noise: NoiseClass::Clean,
+			noise_db: None,
+			detail: vec![detail(40.0, 90.0, true), detail(57.0, 80.0, true)],
+		};
+		let trim = Some(TrimWindow {
+			start_s: 38.0,
+			length_s: 20.0,
+		});
+		let short = Some(TrimWindow {
+			start_s: 38.0,
+			length_s: 6.0,
+		});
+
+		assert_eq!(
+			search_samples(&analysis, trim, Speed::Moderate),
+			vec![
+				Sample {
+					start_s: 40.0,
+					length_s: 4.0
+				},
+				Sample {
+					start_s: 57.0,
+					length_s: 1.0
+				},
+			]
+		);
+		assert_eq!(
+			search_samples(&analysis, short, Speed::Moderate),
+			vec![Sample {
+				start_s: 38.0,
+				length_s: 6.0
+			}]
+		);
 	}
 
 	#[test]
@@ -635,16 +691,16 @@ mod tests {
 		]);
 
 		assert_eq!(
-			search_samples(&one_usable, Some(100.0), Speed::Moderate),
+			search_samples(&one_usable, whole(100.0), Speed::Moderate),
 			vec![four(35.0)]
 		);
-		assert_eq!(search_samples(&one_usable, Some(100.0), Speed::Slow), vec![four(35.0)]);
+		assert_eq!(search_samples(&one_usable, whole(100.0), Speed::Slow), vec![four(35.0)]);
 		assert_eq!(
-			search_samples(&none_usable, Some(100.0), Speed::Moderate),
+			search_samples(&none_usable, whole(100.0), Speed::Moderate),
 			vec![four(35.0), four(65.0), four(95.0)]
 		);
 		assert_eq!(
-			search_samples(&none_usable, Some(100.0), Speed::Slow),
+			search_samples(&none_usable, whole(100.0), Speed::Slow),
 			vec![four(5.0), four(35.0), four(65.0), four(95.0)]
 		);
 	}

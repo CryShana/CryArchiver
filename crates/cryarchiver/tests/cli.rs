@@ -858,6 +858,19 @@ fn an_output_file_naming_the_source_by_a_different_case_is_refused() {
 }
 
 #[test]
+fn trims_take_the_three_time_spellings() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "song.flac", 10);
+
+	let bad = cryarchiver(dir.path(), &["--ss", "1:75", "song.flac"]);
+	let out = cryarchiver(dir.path(), &["--ss", "0:02", "--to", "00:00:05.000", "song.flac"]);
+
+	assert_eq!(bad.status.code(), Some(2), "{}", stderr(&bad));
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	assert!(dir.path().join("song.cry.opus").is_file());
+}
+
+#[test]
 fn help_and_doctor_mention_images() {
 	let dir = tempfile::tempdir().unwrap();
 

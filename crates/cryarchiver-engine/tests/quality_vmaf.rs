@@ -17,6 +17,7 @@ fn reference(source: &Path) -> Reference<'_> {
 		stream: 0,
 		decoder: None,
 		filters: TEN_BIT,
+		window: None,
 	}
 }
 

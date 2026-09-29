@@ -17,7 +17,7 @@ use cryarchiver_engine::commit::{OutputSink, check_space};
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::naming::cli_output_path;
-use cryarchiver_engine::options::JobOptions;
+use cryarchiver_engine::options::{JobOptions, Trim, parse_time};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::sink::CliSink;
@@ -139,6 +139,10 @@ struct CompressArgs {
 	drop_aux: bool,
 	#[arg(long, help = "Keep only the main video and the audio")]
 	strip: bool,
+	#[arg(long = "ss", value_name = "TIME", value_parser = parse_time, help = "Start at this time: 90, 1:30 or 00:01:30.500")]
+	start: Option<f64>,
+	#[arg(long = "to", value_name = "TIME", value_parser = parse_time, help = "End at this time")]
+	end: Option<f64>,
 	#[arg(long, help = "Replace existing outputs (never sources)")]
 	overwrite: bool,
 	#[arg(
@@ -650,9 +654,12 @@ async fn compress(args: CompressArgs) -> u8 {
 			min_savings,
 			overrides,
 			options: JobOptions {
+				trim: (args.start.is_some() || args.end.is_some()).then(|| Trim {
+					start_s: args.start.unwrap_or(0.0),
+					end_s: args.end,
+				}),
 				format: target.format,
 				strip: args.strip,
-				..JobOptions::default()
 			},
 		})
 		.collect();

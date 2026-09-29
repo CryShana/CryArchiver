@@ -1,4 +1,5 @@
 pub mod analyze;
+pub mod chapters;
 pub mod colour;
 pub mod encode;
 pub mod mux;

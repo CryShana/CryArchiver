@@ -28,6 +28,17 @@ impl JobOptions {
 	}
 }
 
+impl TrimWindow {
+	pub fn shortfall(self, decoded_s: f64) -> Option<String> {
+		(self.length_s - decoded_s > (self.length_s * 0.02).max(1.0)).then(|| {
+			format!(
+				"the trimmed range decodes to {decoded_s:.1} s but should last {:.1} s",
+				self.length_s
+			)
+		})
+	}
+}
+
 impl Trim {
 	pub fn window(self, duration_s: Option<f64>) -> Result<TrimWindow, String> {
 		if let Some(end_s) = self.end_s
@@ -188,6 +199,17 @@ mod tests {
 				.contains("past the end")
 		);
 		assert!(trim(5.0, None).window(None).unwrap_err().contains("--to is needed"));
+	}
+
+	#[test]
+	fn a_window_that_decodes_short_is_damage() {
+		let window = TrimWindow {
+			start_s: 10.0,
+			length_s: 30.0,
+		};
+
+		assert_eq!(window.shortfall(29.5), None);
+		assert!(window.shortfall(20.0).unwrap().contains("20.0 s"));
 	}
 
 	#[test]

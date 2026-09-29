@@ -1,4 +1,4 @@
-use crate::audio::plan::{TrackJob, TrackPlan, plan_track};
+use crate::audio::plan::{TrackJob, TrackPlan, plan_track_with};
 use crate::container::{Container, MATROSKA_VIDEO};
 use crate::outcome::{KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
@@ -49,6 +49,7 @@ pub struct StreamRules {
 	pub keep_metadata: bool,
 	pub container: Container,
 	pub strip: bool,
+	pub trim: bool,
 }
 
 impl StreamRules {
@@ -59,6 +60,7 @@ impl StreamRules {
 			keep_metadata,
 			container: MATROSKA_VIDEO,
 			strip: false,
+			trim: false,
 		}
 	}
 }
@@ -155,7 +157,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 					continue;
 				}
 
-				let track = audio_track(stream, audio_tracks, rules.speed, &rules.overrides, &mut plan.warnings);
+				let track = audio_track(stream, audio_tracks, rules, &mut plan.warnings);
 				if track.plan == TrackPlan::Copy && !target.copies(&stream.codec_name) {
 					return Err(Refusal::Impossible(format!(
 						"audio track {audio_tracks} ({}) can't be stored in {} as it is",
@@ -185,7 +187,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 				)),
 			},
 			"data" if is_chapter_track(stream, info) => {}
-			"data" if rules.keep_metadata && target.holds_files() => plan.extracted.push(Extracted {
+			"data" if rules.keep_metadata && target.holds_files() && !rules.trim => plan.extracted.push(Extracted {
 				stream_index: stream.index,
 				file_name: format!("stream-{}-{}.bin", stream.index, data_codec(stream)),
 				mime_type: DATA_MIME.into(),
@@ -197,7 +199,9 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 
 	let plural = |count: usize| if count == 1 { "" } else { "s" };
 	if dropped_data > 0 {
-		let why = if target.holds_files() {
+		let why = if rules.trim {
+			": data streams can't be trimmed".to_owned()
+		} else if target.holds_files() {
 			" (use --keep-metadata to keep them)".to_owned()
 		} else {
 			format!(": {} can't hold them", target.name())
@@ -247,13 +251,7 @@ fn subtitle_track(stream: &Stream, target: Target) -> Result<Option<SubtitleTrac
 	}
 }
 
-fn audio_track(
-	stream: &Stream,
-	track: usize,
-	speed: Speed,
-	overrides: &Overrides,
-	warnings: &mut Vec<String>,
-) -> TrackJob {
+fn audio_track(stream: &Stream, track: usize, rules: &StreamRules, warnings: &mut Vec<String>) -> TrackJob {
 	let copy = |warnings: &mut Vec<String>, reason: &str| {
 		warnings.push(format!("audio track {track} copied as-is: {reason}"));
 		TrackJob {
@@ -266,7 +264,7 @@ fn audio_track(
 	let Some(sample_rate) = stream.sample_rate.filter(|&rate| rate > 0) else {
 		return copy(warnings, "unknown sample rate");
 	};
-	match plan_track(stream, None, speed, overrides) {
+	match plan_track_with(stream, None, rules.speed, &rules.overrides, !rules.trim) {
 		Ok(plan) => TrackJob {
 			stream_index: stream.index,
 			sample_rate,
@@ -591,6 +589,25 @@ mod tests {
 			plan.warnings,
 			["--strip left out 4 subtitle, attachment, cover and data streams"]
 		);
+	}
+
+	#[test]
+	fn a_trim_encodes_every_audio_track_and_drops_data_streams() {
+		let opus = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"audio","codec_name":"opus","sample_rate":"48000","channels":2,"channel_layout":"stereo"},
+			{"index":2,"codec_type":"data","codec_tag_string":"mebx"}]}"#,
+		);
+		let trimmed = StreamRules {
+			trim: true,
+			..StreamRules::new(Speed::Moderate, true)
+		};
+
+		let plan = plan_streams(&opus, &trimmed).unwrap();
+
+		assert!(matches!(plan.audio[0].plan, TrackPlan::Encode(_)), "{:?}", plan.audio);
+		assert!(plan.extracted.is_empty());
+		assert_eq!(plan.warnings, ["1 data stream dropped: data streams can't be trimmed"]);
 	}
 
 	#[test]

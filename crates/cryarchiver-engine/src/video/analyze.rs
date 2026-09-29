@@ -2,6 +2,7 @@ use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::options::TrimWindow;
 use crate::outcome::JobError;
 use crate::probe::Stream;
 use crate::process::{self, STALL_TIMEOUT, ToolCommand};
@@ -94,6 +95,20 @@ pub fn segments(duration_s: Option<f64>, count: usize) -> Vec<Segment> {
 			length_s: None,
 		}],
 	}
+}
+
+pub fn window_segments(duration_s: Option<f64>, count: usize, window: Option<TrimWindow>) -> Vec<Segment> {
+	let Some(window) = window else {
+		return segments(duration_s, count);
+	};
+
+	segments(Some(window.length_s), count)
+		.into_iter()
+		.map(|segment| Segment {
+			start_s: segment.start_s + window.start_s,
+			length_s: Some(segment.length_s.unwrap_or(window.length_s)),
+		})
+		.collect()
 }
 
 pub fn segment_command(
@@ -246,9 +261,11 @@ pub async fn analyze(
 	main: &Stream,
 	duration_s: Option<f64>,
 	count: usize,
+	window: Option<TrimWindow>,
 	cancel: &CancellationToken,
 ) -> Result<Analysis, JobError> {
-	let segments = segments(duration_s, count);
+	let end_s = window.map_or(duration_s, |window| Some(window.start_s + window.length_s));
+	let segments = window_segments(duration_s, count, window);
 
 	let run = |segment: Option<Segment>| async move {
 		let Some(segment) = segment else {
@@ -261,7 +278,7 @@ pub async fn analyze(
 		Ok::<_, JobError>(parse_segment(
 			&out.stderr_tail,
 			segment.start_s,
-			segment_length(&segment, duration_s),
+			segment_length(&segment, end_s),
 		))
 	};
 
@@ -364,6 +381,46 @@ mod tests {
 		assert_eq!(eight.len(), 8);
 		assert!((eight[0].start_s - 5.0).abs() < 1e-9);
 		assert!((eight[7].start_s + 3.0 - 95.0).abs() < 1e-9);
+	}
+
+	#[test]
+	fn a_trim_is_analysed_only_inside_its_window() {
+		let from_zero = window_segments(
+			Some(10.0),
+			4,
+			Some(TrimWindow {
+				start_s: 0.0,
+				length_s: 8.0,
+			}),
+		);
+		let later = window_segments(
+			Some(100.0),
+			4,
+			Some(TrimWindow {
+				start_s: 40.0,
+				length_s: 20.0,
+			}),
+		);
+		let whole = segment_command(Path::new("ffmpeg"), Path::new("in.mkv"), 0, None, &from_zero[0]);
+
+		assert_eq!(
+			from_zero,
+			vec![Segment {
+				start_s: 0.0,
+				length_s: Some(8.0)
+			}]
+		);
+		assert!(crate::video::joined(&whole).contains("-ss 0.000 -t 8.000 -i "));
+		assert_eq!(later.len(), 4);
+		assert!((later[0].start_s - 41.0).abs() < 1e-9, "{later:?}");
+		assert!((later[3].start_s + 3.0 - 59.0).abs() < 1e-9, "{later:?}");
+		assert_eq!(
+			window_segments(Some(10.0), 4, None),
+			vec![Segment {
+				start_s: 0.0,
+				length_s: None
+			}]
+		);
 	}
 
 	#[test]

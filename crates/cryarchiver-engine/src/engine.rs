@@ -17,7 +17,7 @@ use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput,
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{JobOptions, kept_as_requested};
+use crate::options::{JobOptions, TrimWindow, kept_as_requested};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -35,10 +35,11 @@ use crate::video::streams::{Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
 };
-use crate::video::{analyze, encode as video_encode};
+use crate::video::{analyze, chapters, encode as video_encode};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
+const CHAPTER_FILE: &str = "chapters.txt";
 const MEMORY_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
@@ -170,6 +171,7 @@ struct VideoInputs<'a> {
 	info: &'a MediaInfo,
 	streams: &'a StreamPlan,
 	declared_s: Option<f64>,
+	span: Option<TrimWindow>,
 }
 
 struct VideoQuality {
@@ -280,11 +282,13 @@ impl Engine {
 				on_event(JobEvent::Stage(Stage::Plan));
 				let rules = AudioRules {
 					forced: job.options.forced(),
+					reencode: job.options.trim.is_some(),
 				};
 				match plan_file_with(&info, job.speed, &job.overrides, rules) {
 					AudioPlan::Encode(plan) => {
 						let mut plan = retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?;
 						plan.options.strip = job.options.strip;
+						plan.options.window = trim_window(job, info.format.duration)?;
 
 						Planned::Audio {
 							plan,
@@ -305,11 +309,16 @@ impl Engine {
 				check_damage(&job.source)?;
 
 				on_event(JobEvent::Stage(Stage::Plan));
-				match plan_file_with(&info, job.speed, &job.overrides, AudioRules { forced: true }) {
+				let rules = AudioRules {
+					forced: true,
+					reencode: job.options.trim.is_some(),
+				};
+				match plan_file_with(&info, job.speed, &job.overrides, rules) {
 					AudioPlan::Encode(plan) => {
 						let mut plan =
 							extracted(retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?);
 						plan.options.strip = job.options.strip;
+						plan.options.window = trim_window(job, info.format.duration)?;
 
 						Planned::Audio {
 							plan,
@@ -337,6 +346,12 @@ impl Engine {
 				}
 			}
 			MediaClass::StillImage(info) | MediaClass::AnimatedImage(info) => {
+				if job.options.trim.is_some() {
+					return Err(
+						ErrorKind::EncodeFailed("--ss and --to apply to audio and video, not images".into()).into(),
+					);
+				}
+
 				self.require(MediaKind::Image)?;
 				on_event(JobEvent::Stage(Stage::Plan));
 				match image_job::prepare(&job.source, &info, animated, job.drop_aux, metadata_mode(job))? {
@@ -497,17 +512,22 @@ impl Engine {
 		workspace: &Workspace,
 	) -> Result<Produced, JobError> {
 		let output = workspace.file(&format!("out.{}", plan.container.extension));
+		let plan = &with_clipped_chapters(plan, info, workspace)?;
 
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let cmd = encode::command(&self.tools.ffmpeg, &cx.job.source, &output, plan);
 		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
-		let source_levels = encode::run(&cmd, plan, info.format.duration, on_fraction, cx.cancel).await?;
+		let duration_s = plan
+			.options
+			.window
+			.map_or(info.format.duration, |window| Some(window.length_s));
+		let source_levels = encode::run(&cmd, plan, duration_s, on_fraction, cx.cancel).await?;
 
 		let decoded_s = source_levels.iter().map(|levels| levels.duration_s).fold(0.0, f64::max);
-		let shortfall = if from_video {
-			extraction_shortfall(info, decoded_s)
-		} else {
-			info.duration_shortfall(decoded_s)
+		let shortfall = match plan.options.window {
+			Some(window) => window.shortfall(decoded_s),
+			None if from_video => extraction_shortfall(info, decoded_s),
+			None => info.duration_shortfall(decoded_s),
 		};
 		if let Some(reason) = shortfall {
 			return Err(ErrorKind::SourceDamaged(reason).into());
@@ -571,6 +591,10 @@ impl Engine {
 			Err(Refusal::Impossible(reason)) => return Err(ErrorKind::EncodeFailed(reason).into()),
 		};
 
+		let declared_s = main.declared_duration().or(info.format.duration);
+		let window = trim_window(cx.job, declared_s)?;
+		let span_s = window.map_or(declared_s, |window| Some(window.length_s));
+
 		if rules.container == MP4_VIDEO && video_plan::has_alpha(main) {
 			return Err(
 				ErrorKind::EncodeFailed("transparent video can't be stored in MP4; use MKV or WebM".into()).into(),
@@ -590,7 +614,6 @@ impl Engine {
 		let _memory = self.reserve_memory(estimate, cx.on_event, cx.cancel).await?;
 
 		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
-		let declared_s = main.declared_duration().or(info.format.duration);
 		let segments = video_quality::analysis_segments(cx.job.speed);
 		let analysis = Box::pin(analyze::analyze(
 			&self.tools,
@@ -598,10 +621,15 @@ impl Engine {
 			main,
 			declared_s,
 			segments,
+			window,
 			cx.cancel,
 		))
 		.await?;
 		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
+		video.window = window;
+		if window.is_some() {
+			video.expected_frames = None;
+		}
 		if cx.job.options.strip {
 			video.streams.truncate(1);
 		}
@@ -622,7 +650,8 @@ impl Engine {
 		let inputs = VideoInputs {
 			info: &info,
 			streams: &streams,
-			declared_s,
+			declared_s: span_s,
+			span: window.or(declared_s.map(|length_s| TrimWindow { start_s: 0.0, length_s })),
 		};
 		let verify =
 			match Box::pin(self.choose_crf(cx, workspace, &inputs, &analysis, &mut video, &mut quality)).await? {
@@ -631,9 +660,10 @@ impl Engine {
 			};
 
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
-		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &streams, declared_s)).await?;
+		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &streams, span_s)).await?;
 		let learned = if verify {
 			match Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await? {
+				Checked::Passed(_) if window.is_some() => None,
 				Checked::Passed(observation) => Some(observation),
 				Checked::Short => {
 					self.forget_learned(&quality);
@@ -732,7 +762,7 @@ impl Engine {
 		video: &mut VideoPlan,
 		quality: &mut VideoQuality,
 	) -> Result<Tuning, JobError> {
-		let samples = video_quality::search_samples(analysis, inputs.declared_s, cx.job.speed);
+		let samples = video_quality::search_samples(analysis, inputs.span, cx.job.speed);
 		let table_crf = video.encoder.crf();
 		let learned = matches!(quality.strategy, Strategy::Fixed { verify: true, .. });
 		let verify = match quality.strategy {
@@ -970,6 +1000,7 @@ impl Engine {
 		))
 	}
 
+	#[allow(clippy::too_many_lines)]
 	async fn mux_and_verify(
 		&self,
 		cx: &Context<'_>,
@@ -1001,6 +1032,21 @@ impl Engine {
 		let metadata = (cx.job.keep_metadata && keeps_files && !strip).then_some((job.probe_json, job.first_frame));
 		let attachments = collect_attachments(workspace, &job.streams.extracted, metadata, &mut warnings)?;
 
+		let chapter_file = workspace.file(CHAPTER_FILE);
+		let (chapter_source, chapter_count) = match (strip, job.video.window) {
+			(true, _) => (ChapterSource::Dropped, 0),
+			(false, None) => (ChapterSource::Source, job.info.chapters.len()),
+			(false, Some(window)) => {
+				let clipped = chapters::clip(&job.info.chapters, window);
+				if clipped.is_empty() {
+					(ChapterSource::Dropped, 0)
+				} else {
+					write_chapter_file(&chapter_file, &clipped)?;
+					(ChapterSource::File, clipped.len())
+				}
+			}
+		};
+
 		let output = workspace.file(&format!("mux.{}", container.extension));
 		let cmd = mux::command(
 			&self.tools.ffmpeg,
@@ -1010,6 +1056,7 @@ impl Engine {
 				source,
 				source_bytes: cx.source_bytes,
 				attachments: &attachments,
+				chapters: (chapter_source == ChapterSource::File).then_some(chapter_file.as_path()),
 			},
 			&MuxPlan {
 				info: job.info,
@@ -1017,11 +1064,8 @@ impl Engine {
 				streams: job.streams,
 				keep_metadata: cx.job.keep_metadata,
 				container,
-				chapters: if strip {
-					ChapterSource::Dropped
-				} else {
-					ChapterSource::Source
-				},
+				chapters: chapter_source,
+				window: job.video.window,
 			},
 			&output,
 		);
@@ -1047,12 +1091,22 @@ impl Engine {
 			video_temp: &temps.video.info,
 			audio_temp: temps.audio.as_ref().map(|temp| &temp.info),
 		};
+		let outputs = mux::output_streams(job.video, job.streams);
+		let mut offsets = start_offsets(&outputs, &timelines);
+		if job.video.window.is_some() {
+			for (offset, stream) in offsets.iter_mut().zip(&outputs) {
+				if !stream.is_encoded() {
+					*offset = None;
+				}
+			}
+		}
+
 		let expected = Expected {
 			video: job.video,
 			streams: job.streams,
-			source_chapters: if strip { 0 } else { job.info.chapters.len() },
+			source_chapters: chapter_count,
 			attached_files: attachments.len(),
-			start_offsets: start_offsets(&mux::output_streams(job.video, job.streams), &timelines),
+			start_offsets: offsets,
 			source_fps: job.main.fps(),
 		};
 		verify_output(&self.tools, &output, &expected, cx.cancel).await?;
@@ -1084,7 +1138,7 @@ impl Engine {
 	) -> Result<EncodedTemps, JobError> {
 		let video_path = workspace.file("video.a1.mkv");
 		let audio_temp = workspace.file("audio.mka");
-		let audio_plan = video_encode::audio_plan(streams);
+		let audio_plan = video_encode::audio_plan(streams, video.window);
 		let video_cmd = video_encode::video_command(&self.tools.ffmpeg, source, &video_path, video);
 		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
 
@@ -1194,8 +1248,31 @@ fn stream_rules(job: &Job) -> StreamRules {
 		container: video_container(job),
 		overrides: job.overrides,
 		strip: job.options.strip,
+		trim: job.options.trim.is_some(),
 		..StreamRules::new(job.speed, job.keep_metadata)
 	}
+}
+
+fn with_clipped_chapters(plan: &FilePlan, info: &MediaInfo, workspace: &Workspace) -> Result<FilePlan, JobError> {
+	let mut plan = plan.clone();
+	if let Some(window) = plan.options.window.filter(|_| !plan.options.strip) {
+		let path = workspace.file(CHAPTER_FILE);
+		write_chapter_file(&path, &chapters::clip(&info.chapters, window))?;
+		plan.options.chapters = Some(path);
+	}
+	Ok(plan)
+}
+
+fn write_chapter_file(path: &Path, clipped: &[chapters::Chapter]) -> Result<(), JobError> {
+	fs::write(path, chapters::ffmetadata(clipped)).map_err(|err| JobError::io(IoSide::Destination(path), &err))
+}
+
+fn trim_window(job: &Job, duration_s: Option<f64>) -> Result<Option<TrimWindow>, JobError> {
+	job.options
+		.trim
+		.map(|trim| trim.window(duration_s))
+		.transpose()
+		.map_err(|reason| ErrorKind::EncodeFailed(reason).into())
 }
 
 fn image_route(format: Option<OutputFormat>) -> Option<ImageRoute> {

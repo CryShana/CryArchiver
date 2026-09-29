@@ -36,6 +36,7 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 		alpha: false,
 		hdr10: false,
 		warnings: Vec::new(),
+		window: None,
 	}
 }
 
@@ -97,6 +98,7 @@ async fn a_noisy_clip_is_encoded_with_the_grain_level_its_noise_measures() {
 		main,
 		info.format.duration,
 		DEFAULT_SEGMENTS,
+		None,
 		&cancel,
 	))
 	.await

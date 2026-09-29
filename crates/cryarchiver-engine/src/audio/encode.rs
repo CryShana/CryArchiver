@@ -12,11 +12,26 @@ const RESAMPLE: &str = "aresample=resampler=soxr:osr=48000";
 
 pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
-	let chapters = if plan.options.strip { "-1" } else { "0" };
+	let chapter_file = plan.options.chapters.as_deref().filter(|_| !plan.options.strip);
+	let chapters = match chapter_file {
+		_ if plan.options.strip => "-1",
+		Some(_) => "1",
+		None => "0",
+	};
 
-	cmd.args(["-hide_banner", "-nostdin", "-y", "-i"])
-		.arg(process::tool_path(source))
-		.args(["-map_metadata", "0", "-map_chapters", chapters]);
+	cmd.args(["-hide_banner", "-nostdin", "-y"]);
+	if let Some(window) = plan.options.window {
+		cmd.arg("-ss")
+			.arg(format!("{:.3}", window.start_s))
+			.arg("-t")
+			.arg(format!("{:.3}", window.length_s));
+	}
+
+	cmd.arg("-i").arg(process::tool_path(source));
+	if let Some(file) = chapter_file {
+		cmd.args(["-f", "ffmetadata", "-i"]).arg(process::tool_path(file));
+	}
+	cmd.args(["-map_metadata", "0", "-map_chapters", chapters]);
 
 	for (out, track) in plan.tracks.iter().enumerate() {
 		cmd.arg("-map").arg(format!("0:{}", track.stream_index));
@@ -100,9 +115,12 @@ fn filter_chain(layout: LayoutFix) -> String {
 
 #[cfg(test)]
 mod tests {
+	use std::path::PathBuf;
+
 	use super::*;
 	use crate::audio::plan::{FileOptions, TrackJob};
 	use crate::container::{MATROSKA_AUDIO, OGG_OPUS};
+	use crate::options::TrimWindow;
 	use crate::process::tool_path;
 
 	fn joined(cmd: &ToolCommand) -> String {
@@ -189,7 +207,10 @@ mod tests {
 		let file = FilePlan {
 			container: MATROSKA_AUDIO,
 			tracks: vec![track(0, TrackPlan::Encode(stereo))],
-			options: FileOptions { strip: true },
+			options: FileOptions {
+				strip: true,
+				..FileOptions::default()
+			},
 		};
 
 		let args = joined(&command(
@@ -201,6 +222,70 @@ mod tests {
 
 		assert!(args.contains("-map_metadata 0 -map_chapters -1"), "{args}");
 		assert!(!args.contains("0:v?"), "{args}");
+	}
+
+	#[test]
+	fn a_trimmed_file_seeks_before_the_input() {
+		let stereo = EncodePlan {
+			bitrate_kbps: 128,
+			channels: 2,
+			layout: LayoutFix::Keep("stereo"),
+		};
+		let file = FilePlan {
+			container: OGG_OPUS,
+			tracks: vec![track(0, TrackPlan::Encode(stereo))],
+			options: FileOptions {
+				window: Some(TrimWindow {
+					start_s: 2.0,
+					length_s: 3.5,
+				}),
+				..FileOptions::default()
+			},
+		};
+
+		let args = joined(&command(
+			Path::new("ffmpeg"),
+			Path::new("in.flac"),
+			Path::new("out.opus"),
+			&file,
+		));
+
+		assert!(
+			args.starts_with("-hide_banner -nostdin -y -ss 2.000 -t 3.500 -i "),
+			"{args}"
+		);
+	}
+
+	#[test]
+	fn a_chapter_file_replaces_the_source_chapters() {
+		let stereo = EncodePlan {
+			bitrate_kbps: 128,
+			channels: 2,
+			layout: LayoutFix::Keep("stereo"),
+		};
+		let file = FilePlan {
+			container: MATROSKA_AUDIO,
+			tracks: vec![track(0, TrackPlan::Encode(stereo))],
+			options: FileOptions {
+				chapters: Some(PathBuf::from("chapters.txt")),
+				..FileOptions::default()
+			},
+		};
+
+		let args = joined(&command(
+			Path::new("ffmpeg"),
+			Path::new("in.flac"),
+			Path::new("out.mka"),
+			&file,
+		));
+
+		assert!(
+			args.contains(&format!(
+				" -f ffmetadata -i {} -map_metadata 0 -map_chapters 1 ",
+				tool_path(Path::new("chapters.txt")).display()
+			)),
+			"{args}"
+		);
 	}
 
 	#[test]

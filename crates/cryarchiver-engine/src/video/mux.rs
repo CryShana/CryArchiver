@@ -4,6 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audio::plan::TrackPlan;
 use crate::container::{Container, MP4_VIDEO};
+use crate::options::TrimWindow;
 use crate::outcome::JobError;
 use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, ToolCommand};
@@ -37,6 +38,7 @@ pub struct MuxInputs<'a> {
 	pub source: &'a Path,
 	pub source_bytes: u64,
 	pub attachments: &'a [Attachment],
+	pub chapters: Option<&'a Path>,
 }
 
 pub struct MuxPlan<'a> {
@@ -46,11 +48,13 @@ pub struct MuxPlan<'a> {
 	pub keep_metadata: bool,
 	pub container: Container,
 	pub chapters: ChapterSource,
+	pub window: Option<TrimWindow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChapterSource {
 	Source,
+	File,
 	Dropped,
 }
 
@@ -117,10 +121,24 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 	if plan.keep_metadata && plan.info.format.format_name.contains("mov") {
 		cmd.args(["-export_xmp", "1"]);
 	}
-	if let Some(offset) = source_offset(plan.info) {
+	if let Some(window) = plan.window {
+		cmd.arg("-ss")
+			.arg(format!("{:.3}", window.start_s))
+			.arg("-t")
+			.arg(format!("{:.3}", window.length_s));
+	}
+
+	if let Some(offset) = source_offset(plan.info, plan.window) {
 		cmd.arg("-itsoffset").arg(offset);
 	}
 	cmd.arg("-i").arg(process::tool_path(inputs.source));
+
+	let chapter_file = source + 1;
+	if plan.chapters == ChapterSource::File
+		&& let Some(chapters) = inputs.chapters
+	{
+		cmd.args(["-f", "ffmetadata", "-i"]).arg(process::tool_path(chapters));
+	}
 
 	let outputs = output_streams(plan.video, plan.streams);
 	push_maps(&mut cmd, &outputs, &plan.streams.attachments, source);
@@ -157,12 +175,18 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 
 	match plan.chapters {
 		ChapterSource::Source => cmd.arg("-map_chapters").arg(source.to_string()),
+		ChapterSource::File => cmd.arg("-map_chapters").arg(chapter_file.to_string()),
 		ChapterSource::Dropped => cmd.args(["-map_chapters", "-1"]),
 	};
 	if plan.container.muxer == MP4_VIDEO.muxer {
 		cmd.args(["-movflags", "+faststart"]);
 	} else {
 		cmd.args(["-cues_to_front", "1"]);
+	}
+
+	// The source's `-t` still passes a subtitle that starts exactly at the window's end.
+	if let Some(window) = plan.window {
+		cmd.arg("-t").arg(format!("{:.3}", window.length_s));
 	}
 	cmd.arg("-f").arg(plan.container.muxer).arg(process::tool_path(output));
 	cmd
@@ -172,13 +196,11 @@ pub async fn mux(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<(), Jo
 	run_ffmpeg(cmd, |_| {}, cancel).await.map(drop)
 }
 
-// The temps were cut from the source shifted by its start time; `-copyts` keeps them there, so the source itself
-// must be shifted the same way to stay in sync with them.
-fn source_offset(info: &MediaInfo) -> Option<String> {
-	info.format
-		.start_time
-		.filter(|start| *start != 0.0)
-		.map(|start| format!("{:.6}", -start))
+// The temps were cut from the source shifted by its start time and the trim's start; `-copyts` keeps them there, so
+// the source itself must be shifted the same way to stay in sync with them.
+fn source_offset(info: &MediaInfo, window: Option<TrimWindow>) -> Option<String> {
+	let shift = info.format.start_time.unwrap_or(0.0) + window.map_or(0.0, |window| window.start_s);
+	(shift.abs() > f64::EPSILON).then(|| format!("{:.6}", -shift))
 }
 
 fn push_maps(cmd: &mut ToolCommand, outputs: &[OutputStream], attachments: &[u32], source: usize) {
@@ -330,6 +352,7 @@ mod tests {
 			source: Path::new("source.mp4"),
 			source_bytes: 0,
 			attachments,
+			chapters: None,
 		};
 		let plan = MuxPlan {
 			info,
@@ -338,6 +361,7 @@ mod tests {
 			keep_metadata,
 			container: MATROSKA_VIDEO,
 			chapters: ChapterSource::Source,
+			window: None,
 		};
 		joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")))
 	}
@@ -402,6 +426,40 @@ mod tests {
 		assert!(unshifted.contains(" -copyts "), "{unshifted}");
 		assert!(!unshifted.contains("-itsoffset"), "{unshifted}");
 		assert!(!unknown.contains("-itsoffset"), "{unknown}");
+	}
+
+	#[test]
+	fn a_trimmed_source_is_seeked_shifted_and_gets_its_chapters_from_a_file() {
+		let mut delayed = info();
+		delayed.format.start_time = Some(1.4);
+		let (video, streams) = (test_plan(), stream_plan());
+		let inputs = MuxInputs {
+			video: Path::new("video.a1.mkv"),
+			audio: Some(Path::new("audio.mka")),
+			source: Path::new("source.mp4"),
+			source_bytes: 0,
+			attachments: &[],
+			chapters: Some(Path::new("chapters.txt")),
+		};
+		let plan = MuxPlan {
+			info: &delayed,
+			video: &video,
+			streams: &streams,
+			keep_metadata: false,
+			container: MATROSKA_VIDEO,
+			chapters: ChapterSource::File,
+			window: Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 4.0,
+			}),
+		};
+
+		let args = joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")));
+
+		assert!(args.contains(" -ss 4.000 -t 4.000 -itsoffset -5.400000 -i "), "{args}");
+		assert!(args.contains(" -f ffmetadata -i "), "{args}");
+		assert!(args.contains("-map_chapters 3 -cues_to_front 1"), "{args}");
+		assert!(args.contains(" -t 4.000 -f matroska "), "{args}");
 	}
 
 	#[test]
@@ -494,6 +552,7 @@ mod tests {
 			source: Path::new("source.mkv"),
 			source_bytes: 0,
 			attachments: &[],
+			chapters: None,
 		};
 		let plan = MuxPlan {
 			info: &info,
@@ -502,6 +561,7 @@ mod tests {
 			keep_metadata: true,
 			container: MATROSKA_VIDEO,
 			chapters: ChapterSource::Source,
+			window: None,
 		};
 
 		let args = joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")));
@@ -519,6 +579,7 @@ mod tests {
 			source: Path::new("source.mkv"),
 			source_bytes: 0,
 			attachments: &[],
+			chapters: None,
 		};
 		let plan = MuxPlan {
 			info: &info,
@@ -527,6 +588,7 @@ mod tests {
 			keep_metadata: false,
 			container: MATROSKA_VIDEO,
 			chapters: ChapterSource::Dropped,
+			window: None,
 		};
 
 		let args = joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")));
@@ -550,6 +612,7 @@ mod tests {
 			source: Path::new("source.mkv"),
 			source_bytes: 0,
 			attachments: &[],
+			chapters: None,
 		};
 		let muxed = |container| {
 			joined(&command(
@@ -562,6 +625,7 @@ mod tests {
 					keep_metadata: true,
 					container,
 					chapters: ChapterSource::Source,
+					window: None,
 				},
 				Path::new("mux.out"),
 			))

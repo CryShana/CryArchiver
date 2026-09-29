@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audio::plan::{FileOptions, FilePlan, TrackPlan};
 use crate::container::{Container, Cover, MATROSKA_AUDIO};
+use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
 use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
@@ -65,11 +66,14 @@ fn encode_command(
 	cmd.count_lines_containing(DECODE_ERRORS);
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "repeat+info"]);
 
-	if let Some(sample) = sample {
+	let seek = sample
+		.map(|sample| (sample.start_s, sample.length_s))
+		.or(plan.window.map(|window| (window.start_s, window.length_s)));
+	if let Some((start_s, length_s)) = seek {
 		cmd.arg("-ss")
-			.arg(format!("{:.3}", sample.start_s))
+			.arg(format!("{start_s:.3}"))
 			.arg("-t")
-			.arg(format!("{:.3}", sample.length_s));
+			.arg(format!("{length_s:.3}"));
 	}
 
 	if let Some(decoder) = plan.decoder {
@@ -324,12 +328,15 @@ fn lasts(encoded: &EncodedVideo, start_s: f64, declared_s: f64) -> bool {
 		.any(|decoded| (decoded - declared_s).abs() <= DURATION_TOLERANCE_S)
 }
 
-pub fn audio_plan(streams: &StreamPlan) -> Option<FilePlan> {
+pub fn audio_plan(streams: &StreamPlan, window: Option<TrimWindow>) -> Option<FilePlan> {
 	let tracks = streams.encoded_audio();
 	(!tracks.is_empty()).then_some(FilePlan {
 		container: AUDIO_TEMP,
 		tracks,
-		options: FileOptions::default(),
+		options: FileOptions {
+			window,
+			..FileOptions::default()
+		},
 	})
 }
 
@@ -704,11 +711,11 @@ mod tests {
 			..StreamPlan::default()
 		};
 
-		let temp = audio_plan(&mixed).unwrap();
+		let temp = audio_plan(&mixed, None).unwrap();
 
 		assert_eq!(temp.tracks, vec![encode]);
 		assert_eq!(temp.container.extension, "mka");
 		assert_eq!(temp.container.cover, Cover::Attachment);
-		assert_eq!(audio_plan(&copies_only), None);
+		assert_eq!(audio_plan(&copies_only, None), None);
 	}
 }

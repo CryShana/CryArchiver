@@ -28,6 +28,7 @@ async fn scan_and_noise(path: &Path) -> (ScanType, NoiseClass) {
 		main,
 		info.format.duration,
 		DEFAULT_SEGMENTS,
+		None,
 		&cancel,
 	))
 	.await
@@ -133,6 +134,7 @@ async fn a_strongly_grainy_real_clip_gets_the_strongest_grain() {
 		main,
 		info.format.duration,
 		DEFAULT_SEGMENTS,
+		None,
 		&cancel,
 	))
 	.await
@@ -156,7 +158,7 @@ async fn detail_is_measured_for_every_segment() {
 	let info = probe(&tools, &clip, &cancel).await.unwrap();
 	let main = info.streams.iter().find(|stream| stream.is_real_video()).unwrap();
 
-	let analysis = Box::pin(analyze(&tools, &clip, main, info.format.duration, 8, &cancel))
+	let analysis = Box::pin(analyze(&tools, &clip, main, info.format.duration, 8, None, &cancel))
 		.await
 		.unwrap();
 

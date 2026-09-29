@@ -1,3 +1,4 @@
+use crate::options::TrimWindow;
 use crate::outcome::KeepReason;
 use crate::preset::Speed;
 use crate::probe::{Frame, MediaInfo, Stream};
@@ -139,6 +140,7 @@ pub struct VideoPlan {
 	pub alpha: bool,
 	pub hdr10: bool,
 	pub warnings: Vec<String>,
+	pub window: Option<TrimWindow>,
 }
 
 /// Decoder, filters and SVT-AV1 together: about 5 GB for 4K (project layer spec §8.2).
@@ -257,6 +259,7 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 		colour,
 		alpha,
 		warnings,
+		window: None,
 	}
 }
 
@@ -415,6 +418,7 @@ pub(crate) fn test_plan() -> VideoPlan {
 		alpha: false,
 		hdr10: false,
 		warnings: Vec::new(),
+		window: None,
 	}
 }
 

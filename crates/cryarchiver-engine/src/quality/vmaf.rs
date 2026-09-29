@@ -7,6 +7,7 @@ use std::path::Path;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, Progress, STALL_TIMEOUT, ToolCommand};
 use crate::video::plan::Resolution;
@@ -40,6 +41,7 @@ pub struct Reference<'a> {
 	pub stream: u32,
 	pub decoder: Option<&'static str>,
 	pub filters: &'a str,
+	pub window: Option<TrimWindow>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -132,6 +134,12 @@ pub fn window_command(
 	scoring: &Scoring<'_>,
 ) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
+	if let Some(window) = reference.window {
+		cmd.arg("-ss")
+			.arg(format!("{:.3}", window.start_s))
+			.arg("-t")
+			.arg(format!("{:.3}", window.length_s));
+	}
 	push_reference(&mut cmd, reference);
 
 	let select = select(windows);
@@ -265,6 +273,7 @@ mod tests {
 			stream: 0,
 			decoder: Some("libvpx-vp9"),
 			filters: "bwdif=mode=send_field:parity=tff:deint=all,setparams=field_mode=prog",
+			window: None,
 		};
 
 		let cmd = sample_command(
@@ -298,6 +307,7 @@ mod tests {
 			stream: 3,
 			decoder: None,
 			filters: "scale=in_range=tv:out_range=tv,format=yuv420p10le",
+			window: None,
 		};
 		let windows = [
 			FrameWindow { first: 10, last: 19 },
@@ -328,5 +338,29 @@ mod tests {
 			args.ends_with("-map [pace] -f null - -map [scored] -f null -"),
 			"{args}"
 		);
+	}
+
+	#[test]
+	fn a_trimmed_reference_is_seeked_like_the_trimmed_encode() {
+		let reference = Reference {
+			source: Path::new("in.mkv"),
+			stream: 0,
+			decoder: None,
+			filters: "format=yuv420p10le",
+			window: Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 4.0,
+			}),
+		};
+
+		let args = joined(&window_command(
+			Path::new("ffmpeg"),
+			Path::new("video.a1.mkv"),
+			&reference,
+			&[FrameWindow { first: 0, last: 99 }],
+			&scoring(),
+		));
+
+		assert!(args.contains(" -ss 4.000 -t 4.000 -i "), "{args}");
 	}
 }

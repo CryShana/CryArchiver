@@ -138,6 +138,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 			source: &source,
 			source_bytes: fs::metadata(&source).unwrap().len(),
 			attachments: &attachments,
+			chapters: None,
 		},
 		&MuxPlan {
 			info: &info,
@@ -146,6 +147,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 			keep_metadata: false,
 			container: MATROSKA_VIDEO,
 			chapters: ChapterSource::Source,
+			window: None,
 		},
 		&output,
 	);

@@ -1,5 +1,8 @@
+use std::path::PathBuf;
+
 use crate::container::{Container, MATROSKA_AUDIO, OGG_OPUS};
 use crate::format::OutputFormat;
+use crate::options::TrimWindow;
 use crate::outcome::KeepReason;
 use crate::preset::{AUDIO_STEP_KBPS, Overrides, Speed};
 use crate::probe::{MediaInfo, Stream};
@@ -63,6 +66,9 @@ impl TrackJob {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FileOptions {
 	pub strip: bool,
+	pub window: Option<TrimWindow>,
+	/// An ffmetadata file whose chapters replace the source's.
+	pub chapters: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +87,7 @@ pub enum AudioPlan {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AudioRules {
 	pub forced: bool,
+	pub reencode: bool,
 }
 
 pub fn plan_file(info: &MediaInfo, speed: Speed, overrides: &Overrides) -> AudioPlan {
@@ -105,7 +112,7 @@ pub fn plan_file_with(info: &MediaInfo, speed: Speed, overrides: &Overrides, rul
 			return AudioPlan::Keep(KeepReason::Unsupported("unknown sample rate".into()));
 		};
 
-		match plan_track(stream, container_bitrate, speed, overrides) {
+		match plan_track_with(stream, container_bitrate, speed, overrides, !rules.reencode) {
 			Ok(plan) => tracks.push(TrackJob {
 				stream_index: stream.index,
 				sample_rate,
@@ -160,6 +167,16 @@ pub fn plan_track(
 	speed: Speed,
 	overrides: &Overrides,
 ) -> Result<TrackPlan, String> {
+	plan_track_with(stream, container_bitrate, speed, overrides, true)
+}
+
+pub fn plan_track_with(
+	stream: &Stream,
+	container_bitrate: Option<u64>,
+	speed: Speed,
+	overrides: &Overrides,
+	allow_copy: bool,
+) -> Result<TrackPlan, String> {
 	let Some(channels) = stream.channels.filter(|&count| count > 0) else {
 		return Err("unknown channel count".into());
 	};
@@ -177,7 +194,10 @@ pub fn plan_track(
 		.map(|bps| u32::try_from(bps / 1000).unwrap_or(u32::MAX));
 
 	let efficient = EFFICIENT.contains(&stream.codec_name.as_str());
-	if efficient && source_kbps.is_none_or(|kbps| f64::from(kbps) <= f64::from(target) * EFFICIENT_HEADROOM) {
+	if allow_copy
+		&& efficient
+		&& source_kbps.is_none_or(|kbps| f64::from(kbps) <= f64::from(target) * EFFICIENT_HEADROOM)
+	{
 		return Ok(TrackPlan::Copy);
 	}
 
@@ -614,7 +634,10 @@ mod tests {
 	#[test]
 	fn a_requested_output_copies_efficient_tracks_instead_of_keeping_the_file() {
 		let opus = stream("opus", 1, Some("mono"), None);
-		let forced = AudioRules { forced: true };
+		let forced = AudioRules {
+			forced: true,
+			..AudioRules::default()
+		};
 
 		let AudioPlan::Encode(plan) = plan_file_with(
 			&info(vec![opus], Some(32_000)),
@@ -626,6 +649,30 @@ mod tests {
 		};
 
 		assert_eq!(plan.tracks[0].plan, TrackPlan::Copy);
+	}
+
+	#[test]
+	fn a_reencode_encodes_tracks_that_would_be_copied() {
+		let opus = stream("opus", 1, Some("mono"), None);
+		let trimmed = AudioRules {
+			forced: true,
+			reencode: true,
+		};
+
+		let AudioPlan::Encode(plan) = plan_file_with(
+			&info(vec![opus.clone()], Some(32_000)),
+			Speed::Moderate,
+			&Overrides::default(),
+			trimmed,
+		) else {
+			panic!("a trimmed output is always produced")
+		};
+
+		assert_eq!(plan.tracks[0].plan, encode(48, 1, LayoutFix::Keep("mono")).unwrap());
+		assert_eq!(
+			plan_track_with(&opus, None, Speed::Moderate, PRESET, false),
+			encode(64, 1, LayoutFix::Keep("mono"))
+		);
 	}
 
 	#[test]
@@ -650,7 +697,10 @@ mod tests {
 			&vorbis_file,
 			Speed::Moderate,
 			&Overrides::default(),
-			AudioRules { forced: true },
+			AudioRules {
+				forced: true,
+				..AudioRules::default()
+			},
 		) else {
 			panic!()
 		};
