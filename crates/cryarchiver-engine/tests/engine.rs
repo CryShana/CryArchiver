@@ -2276,6 +2276,96 @@ fn with_options(job: Job, options: JobOptions) -> Job {
 }
 
 #[tokio::test]
+async fn merged_video_audio_is_one_stereo_track() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("two-tracks.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=3",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=3",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=880:duration=3",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-map",
+		"2",
+		"-c:v",
+		"mpeg4",
+		"-c:a",
+		"aac",
+		"-ac:a:0",
+		"2",
+		clip.to_str().unwrap(),
+	]);
+	let merge = JobOptions {
+		merge_audio: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(fast(&clip), merge), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let audio: Vec<&Stream> = info.audio_streams().collect();
+	assert_eq!(audio.len(), 1);
+	assert_eq!(audio[0].channels, Some(2));
+}
+
+#[tokio::test]
+async fn merged_mono_tracks_become_one_mono_opus() {
+	let dir = tempfile::tempdir().unwrap();
+	let two = dir.path().join("two.mka");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=2",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=880:duration=2",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-c:a",
+		"flac",
+		two.to_str().unwrap(),
+	]);
+	let merge = JobOptions {
+		merge_audio: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(job(&two), merge), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output, dir.path().join("two.cry.opus"));
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert_eq!(
+		info.audio_streams().map(|stream| stream.channels).collect::<Vec<_>>(),
+		[Some(1)]
+	);
+}
+
+#[tokio::test]
 async fn stripped_video_keeps_only_the_main_video_and_the_audio() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::clip_with_extras(dir.path());

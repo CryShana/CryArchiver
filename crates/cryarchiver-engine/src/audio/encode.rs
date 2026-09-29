@@ -1,9 +1,10 @@
+use std::fmt::Write as _;
 use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::plan::{EncodePlan, FilePlan, LayoutFix, TrackPlan};
-use crate::audio::verify::{Levels, parse_levels, push_stats_output};
+use crate::audio::verify::{Levels, STATS, parse_levels, push_stats_output};
 use crate::container::Cover;
 use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
@@ -30,14 +31,18 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 	}
 	cmd.args(["-map_metadata", "0", "-map_chapters", chapters]);
 
-	for (out, track) in plan.tracks.iter().enumerate() {
-		cmd.arg("-map").arg(format!("0:{}", track.stream_index));
-		match &track.plan {
-			TrackPlan::Encode(encode) => push_encode(&mut cmd, out, encode),
-			TrackPlan::Copy => {
-				cmd.arg(format!("-c:a:{out}")).arg("copy");
+	if plan.options.merge_from.is_empty() {
+		for (out, track) in plan.tracks.iter().enumerate() {
+			cmd.arg("-map").arg(format!("0:{}", track.stream_index));
+			match &track.plan {
+				TrackPlan::Encode(encode) => push_encode(&mut cmd, out, encode),
+				TrackPlan::Copy => {
+					cmd.arg(format!("-c:a:{out}")).arg("copy");
+				}
 			}
 		}
+	} else {
+		push_merge(&mut cmd, plan);
 	}
 
 	if plan.container.cover == Cover::Stream && !plan.options.strip {
@@ -45,13 +50,46 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 	}
 	cmd.args(["-f", plan.container.muxer]).arg(process::tool_path(output));
 
-	let sources: Vec<String> = plan
-		.tracks
-		.iter()
-		.map(|track| format!("0:{}", track.stream_index))
-		.collect();
-	push_stats_output(&mut cmd, &sources);
+	if plan.options.merge_from.is_empty() {
+		let sources: Vec<String> = plan
+			.tracks
+			.iter()
+			.map(|track| format!("0:{}", track.stream_index))
+			.collect();
+		push_stats_output(&mut cmd, &sources);
+	} else {
+		cmd.args(["-map", "[stats]", "-f", "null", "-"]);
+	}
 	cmd
+}
+
+fn push_merge(cmd: &mut ToolCommand, plan: &FilePlan) {
+	let Some(TrackPlan::Encode(encode)) = plan.tracks.first().map(|track| &track.plan) else {
+		return;
+	};
+	let sources = &plan.options.merge_from;
+	let layout = encode.layout.target();
+
+	let mut graph = String::new();
+	for (input, stream) in sources.iter().enumerate() {
+		let _ = write!(
+			graph,
+			"[0:{stream}]{RESAMPLE},aformat=channel_layouts={layout}[m{input}];"
+		);
+	}
+	for input in 0..sources.len() {
+		let _ = write!(graph, "[m{input}]");
+	}
+	let _ = write!(
+		graph,
+		"amix=inputs={}:duration=first:normalize=0,alimiter=limit=0.95,asplit[merged][measured];[measured]astats@s0={STATS}[stats]",
+		sources.len()
+	);
+
+	cmd.arg("-filter_complex")
+		.arg(graph)
+		.args(["-map", "[merged]", "-c:a:0", "libopus", "-b:a:0"])
+		.arg(format!("{}k", encode.bitrate_kbps));
 }
 
 pub async fn run(
@@ -283,6 +321,42 @@ mod tests {
 			)),
 			"{args}"
 		);
+	}
+
+	#[test]
+	fn merged_files_mix_every_track_and_measure_the_mix() {
+		let stereo = EncodePlan {
+			bitrate_kbps: 128,
+			channels: 2,
+			layout: LayoutFix::Keep("stereo"),
+		};
+		let file = FilePlan {
+			container: OGG_OPUS,
+			tracks: vec![track(1, TrackPlan::Encode(stereo))],
+			options: FileOptions {
+				merge_from: vec![1, 2],
+				..FileOptions::default()
+			},
+		};
+
+		let args = joined(&command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("out.opus"),
+			&file,
+		));
+
+		assert!(
+			args.contains(
+				"[0:1]aresample=resampler=soxr:osr=48000,aformat=channel_layouts=stereo[m0];\
+				 [0:2]aresample=resampler=soxr:osr=48000,aformat=channel_layouts=stereo[m1];\
+				 [m0][m1]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95,asplit[merged][measured];\
+				 [measured]astats@s0="
+			),
+			"{args}"
+		);
+		assert!(args.contains("-map [merged] -c:a:0 libopus -b:a:0 128k"), "{args}");
+		assert!(args.ends_with("-map [stats] -f null -"), "{args}");
 	}
 
 	#[test]

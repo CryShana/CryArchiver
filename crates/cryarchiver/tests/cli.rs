@@ -806,6 +806,16 @@ fn strip_is_a_flag() {
 }
 
 #[test]
+fn merge_audio_is_a_flag() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "song.flac", 2);
+
+	let out = cryarchiver(dir.path(), &["--merge-audio", "song.flac"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}
+
+#[test]
 fn an_output_file_naming_the_source_itself_is_refused() {
 	let dir = tempfile::tempdir().unwrap();
 	let source = support::mpeg4(dir.path(), "clip.mp4", 3);

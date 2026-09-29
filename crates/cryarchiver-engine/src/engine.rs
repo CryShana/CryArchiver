@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::audio::plan::{AudioPlan, AudioRules, FilePlan, plan_file_with, retarget};
+use crate::audio::plan::{AudioPlan, AudioRules, FilePlan, merge_file, plan_file_with, retarget};
 use crate::audio::{cover, encode, verify};
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
@@ -286,6 +286,11 @@ impl Engine {
 				};
 				match plan_file_with(&info, job.speed, &job.overrides, rules) {
 					AudioPlan::Encode(plan) => {
+						let plan = if job.options.merge_audio {
+							merge_file(plan, &info, job.speed, &job.overrides)
+						} else {
+							plan
+						};
 						let mut plan = retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?;
 						plan.options.strip = job.options.strip;
 						plan.options.window = trim_window(job, info.format.duration)?;
@@ -315,6 +320,11 @@ impl Engine {
 				};
 				match plan_file_with(&info, job.speed, &job.overrides, rules) {
 					AudioPlan::Encode(plan) => {
+						let plan = if job.options.merge_audio {
+							merge_file(plan, &info, job.speed, &job.overrides)
+						} else {
+							plan
+						};
 						let mut plan =
 							extracted(retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?);
 						plan.options.strip = job.options.strip;
@@ -1281,6 +1291,7 @@ fn stream_rules(job: &Job) -> StreamRules {
 		overrides: job.overrides,
 		strip: job.options.strip,
 		trim: job.options.trim.is_some(),
+		merge: job.options.merge_audio,
 		..StreamRules::new(job.speed, job.keep_metadata)
 	}
 }

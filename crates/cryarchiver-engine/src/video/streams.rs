@@ -1,4 +1,4 @@
-use crate::audio::plan::{TrackJob, TrackPlan, plan_track_with};
+use crate::audio::plan::{TrackJob, TrackPlan, merged, plan_track_with};
 use crate::container::{Container, MATROSKA_VIDEO};
 use crate::outcome::{KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
@@ -60,6 +60,7 @@ pub struct SubtitleTrack {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct StreamRules {
 	pub speed: Speed,
 	pub overrides: Overrides,
@@ -67,6 +68,7 @@ pub struct StreamRules {
 	pub container: Container,
 	pub strip: bool,
 	pub trim: bool,
+	pub merge: bool,
 }
 
 impl StreamRules {
@@ -78,6 +80,7 @@ impl StreamRules {
 			container: MATROSKA_VIDEO,
 			strip: false,
 			trim: false,
+			merge: false,
 		}
 	}
 }
@@ -139,6 +142,7 @@ pub struct StreamPlan {
 	pub attachments: Vec<u32>,
 	pub extracted: Vec<Extracted>,
 	pub warnings: Vec<String>,
+	pub merge_from: Vec<u32>,
 }
 
 impl StreamPlan {
@@ -216,6 +220,13 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 			"data" => dropped_data += 1,
 			_ => {}
 		}
+	}
+
+	if rules.merge
+		&& let Some((track, sources)) = merged(info, &plan.audio, rules.speed, &rules.overrides)
+	{
+		plan.audio = vec![track];
+		plan.merge_from = sources;
 	}
 
 	let plural = |count: usize| if count == 1 { "" } else { "s" };
@@ -752,6 +763,25 @@ mod tests {
 			"{:?}",
 			plan.warnings
 		);
+	}
+
+	#[test]
+	fn merging_leaves_one_encoded_track() {
+		let two = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo"},
+			{"index":2,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":1,"channel_layout":"mono"}]}"#,
+		);
+		let merge = StreamRules {
+			merge: true,
+			..StreamRules::new(Speed::Moderate, false)
+		};
+
+		let plan = plan_streams(&two, &merge).unwrap();
+
+		assert_eq!(plan.audio.len(), 1);
+		assert_eq!(plan.merge_from, [1, 2]);
+		assert_eq!(plan.encoded_audio().len(), 1);
 	}
 
 	#[test]

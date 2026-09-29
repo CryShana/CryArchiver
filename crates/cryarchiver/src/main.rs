@@ -139,6 +139,8 @@ struct CompressArgs {
 	drop_aux: bool,
 	#[arg(long, help = "Keep only the main video and the audio")]
 	strip: bool,
+	#[arg(long, help = "Mix all audio tracks into one")]
+	merge_audio: bool,
 	#[arg(long = "ss", value_name = "TIME", value_parser = parse_time, help = "Start at this time: 90, 1:30 or 00:01:30.500")]
 	start: Option<f64>,
 	#[arg(long = "to", value_name = "TIME", value_parser = parse_time, help = "End at this time")]
@@ -660,6 +662,7 @@ async fn compress(args: CompressArgs) -> u8 {
 				}),
 				format: target.format,
 				strip: args.strip,
+				merge_audio: args.merge_audio,
 			},
 		})
 		.collect();

@@ -69,6 +69,7 @@ pub struct FileOptions {
 	pub window: Option<TrimWindow>,
 	/// An ffmetadata file whose chapters replace the source's.
 	pub chapters: Option<PathBuf>,
+	pub merge_from: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +135,51 @@ pub fn plan_file_with(info: &MediaInfo, speed: Speed, overrides: &Overrides, rul
 		tracks,
 		options: FileOptions::default(),
 	})
+}
+
+pub fn merged(
+	info: &MediaInfo,
+	tracks: &[TrackJob],
+	speed: Speed,
+	overrides: &Overrides,
+) -> Option<(TrackJob, Vec<u32>)> {
+	if tracks.len() < 2 {
+		return None;
+	}
+
+	let sources: Vec<u32> = tracks.iter().map(|track| track.stream_index).collect();
+	let stereo = info
+		.streams
+		.iter()
+		.filter(|stream| sources.contains(&stream.index))
+		.any(|stream| stream.channels.unwrap_or(1) >= 2);
+	let (channels, layout) = if stereo { (2, "stereo") } else { (1, "mono") };
+
+	let track = TrackJob {
+		stream_index: sources[0],
+		sample_rate: OPUS_RATE,
+		plan: TrackPlan::Encode(EncodePlan {
+			bitrate_kbps: table_rate(channels, speed, overrides),
+			channels,
+			layout: LayoutFix::Keep(layout),
+		}),
+	};
+	Some((track, sources))
+}
+
+pub fn merge_file(plan: FilePlan, info: &MediaInfo, speed: Speed, overrides: &Overrides) -> FilePlan {
+	let Some((track, sources)) = merged(info, &plan.tracks, speed, overrides) else {
+		return plan;
+	};
+
+	FilePlan {
+		container: OGG_OPUS,
+		tracks: vec![track],
+		options: FileOptions {
+			merge_from: sources,
+			..plan.options
+		},
+	}
 }
 
 pub fn retarget(plan: FilePlan, format: Option<OutputFormat>, info: &MediaInfo) -> Result<FilePlan, String> {
@@ -673,6 +719,46 @@ mod tests {
 			plan_track_with(&opus, None, Speed::Moderate, PRESET, false),
 			encode(64, 1, LayoutFix::Keep("mono"))
 		);
+	}
+
+	#[test]
+	fn merged_tracks_are_stereo_when_any_source_is() {
+		let mono = stream("flac", 1, Some("mono"), None);
+		let surround = Stream {
+			index: 1,
+			..stream("ac3", 6, Some("5.1(side)"), Some(448))
+		};
+		let second_mono = Stream {
+			index: 1,
+			..mono.clone()
+		};
+		let mixed = info(vec![mono.clone(), surround], None);
+		let all_mono = info(vec![mono.clone(), second_mono], None);
+		let AudioPlan::Encode(mixed_plan) = plan_file(&mixed, Speed::Moderate, PRESET) else {
+			panic!()
+		};
+		let AudioPlan::Encode(mono_plan) = plan_file(&all_mono, Speed::Moderate, PRESET) else {
+			panic!()
+		};
+
+		let (stereo_track, sources) = merged(&mixed, &mixed_plan.tracks, Speed::Moderate, PRESET).unwrap();
+		let (mono_track, _) = merged(&all_mono, &mono_plan.tracks, Speed::Moderate, PRESET).unwrap();
+
+		assert_eq!(sources, [0, 1]);
+		assert_eq!(
+			stereo_track.plan,
+			TrackPlan::Encode(EncodePlan {
+				bitrate_kbps: 128,
+				channels: 2,
+				layout: LayoutFix::Keep("stereo"),
+			})
+		);
+		assert!(matches!(
+			mono_track.plan,
+			TrackPlan::Encode(EncodePlan { channels: 1, .. })
+		));
+		assert_eq!(merged(&mixed, &mixed_plan.tracks[..1], Speed::Moderate, PRESET), None);
+		assert_eq!(merge_file(mixed_plan, &mixed, Speed::Moderate, PRESET).tracks.len(), 1);
 	}
 
 	#[test]

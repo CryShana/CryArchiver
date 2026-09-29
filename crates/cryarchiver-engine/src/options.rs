@@ -23,11 +23,12 @@ pub struct JobOptions {
 	pub trim: Option<Trim>,
 	pub format: Option<OutputFormat>,
 	pub strip: bool,
+	pub merge_audio: bool,
 }
 
 impl JobOptions {
 	pub fn forced(&self) -> bool {
-		self.trim.is_some() || self.format.is_some() || self.strip
+		self.trim.is_some() || self.format.is_some() || self.strip || self.merge_audio
 	}
 }
 

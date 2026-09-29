@@ -10,7 +10,7 @@ use crate::toolchain::Toolchain;
 const DURATION_TOLERANCE_S: f64 = 0.05;
 const LEVEL_TOLERANCE_DB: f64 = 1.0;
 const SILENCE_DB: f64 = -60.0;
-const STATS: &str = "measure_overall=Number_of_samples:measure_perchannel=RMS_level";
+pub(crate) const STATS: &str = "measure_overall=Number_of_samples:measure_perchannel=RMS_level";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Levels {

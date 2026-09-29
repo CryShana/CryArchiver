@@ -332,6 +332,7 @@ pub fn audio_plan(streams: &StreamPlan, window: Option<TrimWindow>) -> Option<Fi
 		tracks,
 		options: FileOptions {
 			window,
+			merge_from: streams.merge_from.clone(),
 			..FileOptions::default()
 		},
 	})
