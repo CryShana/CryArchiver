@@ -7,6 +7,7 @@ use std::process::Command;
 use cryarchiver_engine::options::SubtitlePick;
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::probe;
+use cryarchiver_engine::video::VideoStarts;
 use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, analyze};
 use cryarchiver_engine::video::burn::{self, FONT_DIR, SUBTITLE_FILE};
 use cryarchiver_engine::video::colour::{ColourTags, Range};
@@ -41,6 +42,7 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 		hdr10: false,
 		warnings: Vec::new(),
 		window: None,
+		starts: VideoStarts::default(),
 		overlay: None,
 		subtitles: None,
 	}
@@ -292,7 +294,7 @@ async fn a_ten_bit_bitmap_burn_stays_ten_bit_through_the_overlay() {
 		.unwrap();
 	let burned = VideoPlan {
 		filters: "showinfo,format=yuv420p10le".into(),
-		overlay: Some(burn::overlay(&info, &[0], start_s)),
+		overlay: Some(burn::overlay(&info, 0, chosen, start_s)),
 		..plan(None)
 	};
 

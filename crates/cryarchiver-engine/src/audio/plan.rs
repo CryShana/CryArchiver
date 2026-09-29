@@ -67,6 +67,9 @@ impl TrackJob {
 pub struct FileOptions {
 	pub strip: bool,
 	pub window: Option<TrimWindow>,
+	/// An `-itsoffset` for the source, which keeps the tracks on the file's clock when ffmpeg starts them later than
+	/// the file (or the seek).
+	pub delay_s: Option<f64>,
 	/// An ffmetadata file whose chapters replace the source's.
 	pub chapters: Option<PathBuf>,
 	pub merge_from: Vec<u32>,

@@ -3403,13 +3403,13 @@ async fn marked_box_clip(dir: &Path) -> std::path::PathBuf {
 	b_frame_clip(dir, &pgs, Some(125)).await
 }
 
-/// Runs the untrimmed and the `--ss 4 --to 8` burn of `source`, and checks that the box is drawn on exactly the
-/// 25 frames that start at the marked one, wherever the cut and the source's timestamps put them.
-async fn drawn_from_the_marker(source: &Path, out_dir: &Path) {
-	for job in [
-		burning(fast(source), SubtitlePick::Default),
-		with_burn(trimmed(fast(source), 4.0, 8.0)),
-	] {
+/// Runs the untrimmed burn of `source` and one burn per trim in `trims`, and checks that the box is drawn on exactly
+/// the 25 frames that start at the marked one, wherever the cut and the source's timestamps put them.
+async fn drawn_from_the_marker(source: &Path, out_dir: &Path, trims: &[(f64, f64)]) {
+	let cuts = trims
+		.iter()
+		.map(|&(start_s, end_s)| with_burn(trimmed(fast(source), start_s, end_s)));
+	for job in std::iter::once(burning(fast(source), SubtitlePick::Default)).chain(cuts) {
 		let outcome = run(&job, out_dir).await;
 
 		let JobOutcome::Encoded { output, .. } = outcome else {
@@ -3451,7 +3451,7 @@ async fn bitmap_cues_in_an_m2ts_whose_audio_starts_first_are_drawn_on_their_fram
 		m2ts.to_str().unwrap(),
 	]);
 
-	drawn_from_the_marker(&m2ts, dir.path()).await;
+	drawn_from_the_marker(&m2ts, dir.path(), &[(4.0, 8.0), (0.1, 8.0), (0.2, 7.0)]).await;
 }
 
 #[tokio::test]
@@ -3473,7 +3473,198 @@ async fn bitmap_cues_on_a_video_time_base_of_one_tick_per_frame_are_drawn_on_the
 		&["-map", "0", "-c", "copy", "-video_track_timescale", "25"],
 	);
 
-	drawn_from_the_marker(&ticks, dir.path()).await;
+	drawn_from_the_marker(&ticks, dir.path(), &[(4.0, 8.0)]).await;
+}
+
+/// A clip of B-frame video whose frame 125 (5.00 s into the video) is marked, with a click in the audio at the same
+/// moment. The video starts `video_delay_s` and the audio `audio_delay_s` into the file. A `.m2ts` name gets the
+/// Blu-ray layout.
+async fn marked_click_clip(dir: &Path, name: &str, video_delay_s: f64, audio_delay_s: f64) -> std::path::PathBuf {
+	let path = dir.join(name);
+	let video = "color=c=black:s=320x240:r=25:d=10,drawbox=x=0:y=0:w=40:h=40:c=white:t=fill:enable='eq(n\\,125)'";
+	let click_s = 5.0 + video_delay_s - audio_delay_s;
+	let audio = format!(
+		"aevalsrc='if(between(t\\,{click_s}\\,{})\\,0.9\\,0)':s=48000:d=10",
+		click_s + 0.005
+	);
+	let (video_delay, audio_delay) = (video_delay_s.to_string(), audio_delay_s.to_string());
+
+	let mut args = vec![
+		"-itsoffset",
+		video_delay.as_str(),
+		"-f",
+		"lavfi",
+		"-i",
+		video,
+		"-itsoffset",
+		audio_delay.as_str(),
+		"-f",
+		"lavfi",
+		"-i",
+		audio.as_str(),
+		"-map",
+		"0",
+		"-map",
+		"1",
+	];
+	args.extend(b_frame_codec().await);
+	args.extend(["-c:a", "aac"]);
+	if path.extension().is_some_and(|extension| extension == "m2ts") {
+		args.extend(["-mpegts_m2ts_mode", "1"]);
+	}
+	args.push(path.to_str().unwrap());
+	support::ffmpeg(&args);
+	path
+}
+
+/// The first start of each stream kind in `path`.
+async fn start_of(path: &Path, kind: &str) -> f64 {
+	let info = probe(&support::toolchain().await, path, &CancellationToken::new())
+		.await
+		.unwrap();
+	info.streams
+		.iter()
+		.filter(|stream| stream.codec_type == kind)
+		.find_map(|stream| stream.start_time)
+		.unwrap()
+}
+
+/// Runs `source` without a burn, whole or cut to `trim`, and checks it against the file's own clock, which is what a
+/// player shows: the marked frame lands where that clock has it, less the cut's start, and the click stays as far
+/// from it as in the source. Uncut, the audio also starts as far from the video as in the source.
+async fn on_the_file_clock(source: &Path, out_dir: &Path, trim: Option<(f64, f64)>) {
+	let file_start = probe(&support::toolchain().await, source, &CancellationToken::new())
+		.await
+		.unwrap()
+		.format
+		.start_time
+		.unwrap_or(0.0);
+	let (marker, click) = support::marker_and_click(source);
+	let start_s = trim.map_or(0.0, |(start_s, _)| start_s);
+	let job = match trim {
+		Some((start_s, end_s)) => trimmed(fast(source), start_s, end_s),
+		None => with_options(
+			fast(source),
+			JobOptions {
+				strip: true,
+				..JobOptions::default()
+			},
+		),
+	};
+
+	let outcome = run(&job, out_dir).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let (cut_marker, cut_click) = support::marker_and_click(&output);
+	let name = source.file_name().unwrap().display();
+	let expected = marker - file_start - start_s;
+	assert!(
+		(cut_marker - expected).abs() < 0.021,
+		"{name} {trim:?}: marked frame at {cut_marker}, {expected:.3} on the file's clock"
+	);
+	assert!(
+		((cut_click - cut_marker) - (click - marker)).abs() < 0.03,
+		"{name} {trim:?}: click {:.3} s after the marked frame, {:.3} s in the source",
+		cut_click - cut_marker,
+		click - marker
+	);
+	if trim.is_none() {
+		let source_lead = start_of(source, "video").await - start_of(source, "audio").await;
+		let output_lead = start_of(&output, "video").await - start_of(&output, "audio").await;
+		assert!(
+			(output_lead - source_lead).abs() < 0.021,
+			"{name}: the video starts {output_lead:.3} s after the audio, {source_lead:.3} s in the source"
+		);
+	}
+	fs::remove_file(&output).unwrap();
+}
+
+#[tokio::test]
+async fn an_m2ts_keeps_every_stream_on_the_file_clock_whole_and_cut() {
+	let dir = tempfile::tempdir().unwrap();
+	let audio_first = marked_click_clip(dir.path(), "audio-first.m2ts", 0.3, 0.0).await;
+	let video_first = marked_click_clip(dir.path(), "video-first.m2ts", 0.0, 0.3).await;
+
+	for (source, trim) in [
+		(&audio_first, None),
+		(&audio_first, Some((4.0, 8.0))),
+		(&audio_first, Some((0.1, 8.0))),
+		(&video_first, None),
+		(&video_first, Some((0.1, 8.0))),
+	] {
+		on_the_file_clock(source, dir.path(), trim).await;
+	}
+}
+
+#[tokio::test]
+async fn an_mkv_whose_video_starts_after_its_audio_keeps_its_offsets() {
+	let dir = tempfile::tempdir().unwrap();
+	let late_video = marked_click_clip(dir.path(), "late-video.mkv", 0.3, 0.0).await;
+
+	for trim in [None, Some((4.0, 8.0))] {
+		on_the_file_clock(&late_video, dir.path(), trim).await;
+	}
+}
+
+const ORANGE: [u8; 3] = [152, 50, 188];
+const GREY: [u8; 3] = [196, 128, 128];
+/// Holds orange (ff8c00) and grey (d2d2d2), which ffmpeg's default DVD palette doesn't.
+const DVD_PALETTE: &str =
+	"000000,ff8c00,d2d2d2,808080,0000ff,00ff00,ff0000,ffff00,ff00ff,00ffff,808000,8080ff,800080,80ff80,008080,ffffff";
+
+#[tokio::test]
+async fn dvd_subtitles_are_drawn_in_their_own_palette_and_place_from_mkv_and_mp4() {
+	let dir = tempfile::tempdir().unwrap();
+	let bands = support::pgs_bands(dir.path(), 5_000, 6_000, &[ORANGE, GREY]);
+	let clip = support::black_clip(dir.path(), "bands.mkv", &bands, "copy", false);
+	let mkv = support::converted(
+		dir.path(),
+		"vobsub.mkv",
+		&["-fix_sub_duration"],
+		&clip,
+		&[
+			"-map",
+			"0",
+			"-c:v",
+			"copy",
+			"-c:a",
+			"copy",
+			"-c:s",
+			"dvdsub",
+			"-palette",
+			DVD_PALETTE,
+			"-s:s",
+			"320x240",
+		],
+	);
+	let mp4 = support::converted(dir.path(), "vobsub.mp4", &[], &mkv, &["-map", "0", "-c", "copy"]);
+
+	for source in [&mkv, &mp4] {
+		let outcome = run(&burning(fast(source), SubtitlePick::Default), dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		let name = source.file_name().unwrap().display();
+		for (region, expected) in [(support::BOX_TOP, ORANGE), (support::BOX_BOTTOM, GREY)] {
+			let colour = support::colour_in(&output, region);
+			assert!(
+				colour.is_some_and(|colour| colour
+					.iter()
+					.zip(expected)
+					.all(|(actual, expected)| (actual - f64::from(expected)).abs() < 3.0)),
+				"{name}: {region} is {colour:?}, {expected:?} expected"
+			);
+		}
+		assert_eq!(
+			support::lit_span_in(&output, 0, "crop=320:178:0:0"),
+			None,
+			"{name}: drawn above the box"
+		);
+		fs::remove_file(&output).unwrap();
+	}
 }
 
 #[tokio::test]

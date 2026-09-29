@@ -2,10 +2,11 @@ mod support;
 
 use std::path::Path;
 
+use cryarchiver_engine::video::VideoStarts;
 use cryarchiver_engine::video::colour::{ColourTags, Range};
 use cryarchiver_engine::video::plan::{Encoder, VideoPlan};
 use cryarchiver_engine::video::streams::StreamPlan;
-use cryarchiver_engine::video::verify::{Expected, alpha_ssim, check_alpha, verify_output};
+use cryarchiver_engine::video::verify::{Expected, Synced, alpha_ssim, check_alpha, check_sync, verify_output};
 use tokio_util::sync::CancellationToken;
 
 fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan {
@@ -36,6 +37,7 @@ fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan 
 		hdr10: false,
 		warnings: Vec::new(),
 		window: None,
+		starts: VideoStarts::default(),
 		overlay: None,
 		subtitles: None,
 	}
@@ -135,4 +137,83 @@ async fn alpha_survives_a_libvpx_round_trip_and_an_opaque_encode_is_caught() {
 
 	assert!(check_alpha(kept).is_ok(), "{kept}");
 	assert!(check_alpha(lost).is_err(), "{lost}");
+}
+
+#[tokio::test]
+async fn an_output_whose_audio_lags_its_video_fails_the_sync_check() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("audio-first.m2ts");
+	support::ffmpeg(&[
+		"-itsoffset",
+		"0.3",
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=4",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=4.3",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-c:v",
+		"mpeg2video",
+		"-c:a",
+		"mp2",
+		"-mpegts_m2ts_mode",
+		"1",
+		source.to_str().unwrap(),
+	]);
+	let s = source.to_str().unwrap();
+	let (synced, lagging) = (dir.path().join("synced.mkv"), dir.path().join("lagging.mkv"));
+	support::ffmpeg(&["-i", s, "-map", "0", "-c", "copy", synced.to_str().unwrap()]);
+	support::ffmpeg(&[
+		"-i",
+		s,
+		"-itsoffset",
+		"0.3",
+		"-i",
+		s,
+		"-map",
+		"0:v",
+		"-map",
+		"1:a",
+		"-c",
+		"copy",
+		lagging.to_str().unwrap(),
+	]);
+	let tools = support::toolchain().await;
+	let streams = [
+		Synced {
+			source: 0,
+			output: 0,
+			audio: false,
+		},
+		Synced {
+			source: 1,
+			output: 1,
+			audio: true,
+		},
+	];
+	let check = |output: std::path::PathBuf| {
+		let (tools, source, streams) = (&tools, &source, &streams);
+		async move {
+			check_sync(
+				tools,
+				(source, &output),
+				streams,
+				(0.0, false),
+				0.04,
+				&CancellationToken::new(),
+			)
+			.await
+		}
+	};
+
+	check(synced).await.unwrap();
+	let err = check(lagging).await.unwrap_err();
+
+	assert!(err.to_string().contains("stream 1 starts"), "{err}");
 }

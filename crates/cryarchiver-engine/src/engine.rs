@@ -34,9 +34,10 @@ use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan
 use crate::video::quality::{self as video_quality, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
-	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
+	Expected, Timelines, alpha_ssim, check_alpha, check_sync, earliest_video_start, probe_temp, start_offsets,
+	sync_tolerance_s, synced_streams, verify_output,
 };
-use crate::video::{analyze, chapters, cues, encode as video_encode};
+use crate::video::{VideoStarts, analyze, chapters, cues, encode as video_encode};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
@@ -660,6 +661,7 @@ impl Engine {
 		if cx.job.options.strip {
 			video.streams.truncate(1);
 		}
+		video.starts = VideoStarts::of(&info, &video.streams);
 		if let Some(chosen) = rules.burn {
 			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, chosen)).await?;
 		}
@@ -691,7 +693,7 @@ impl Engine {
 			};
 
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
-		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &streams, span_s)).await?;
+		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &inputs)).await?;
 		let learned = if verify {
 			match Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await? {
 				Checked::Passed(_) if window.is_some() => None,
@@ -752,7 +754,7 @@ impl Engine {
 			.map_or(0, |burn_subs| burn_subs.size_percent);
 		match burn::subtitle_filter(chosen.kind, size_percent) {
 			Some(filter) => video.subtitles = Some(filter),
-			None => video.overlay = Some(burn::overlay(info, &video.streams, start_s.unwrap_or(0.0))),
+			None => video.overlay = Some(burn::overlay(info, video.streams[0], chosen, start_s.unwrap_or(0.0))),
 		}
 		Ok(())
 	}
@@ -1210,6 +1212,19 @@ impl Engine {
 			source_fps: job.main.fps(),
 		};
 		verify_output(&self.tools, &output, &expected, cx.cancel).await?;
+		let window_start_s = job.video.window.map(|window| window.start_s);
+		check_sync(
+			&self.tools,
+			(source, &output),
+			&synced_streams(&outputs, job.info, &job.streams.merge_from),
+			(
+				job.info.format.start_time.unwrap_or(0.0) + window_start_s.unwrap_or(0.0),
+				window_start_s.is_some(),
+			),
+			sync_tolerance_s(job.main.fps()),
+			cx.cancel,
+		)
+		.await?;
 		if job.video.alpha {
 			check_alpha(alpha_ssim(&self.tools, &output, source, job.video, cx.cancel).await?)?;
 		}
@@ -1233,12 +1248,12 @@ impl Engine {
 		workspace: &Workspace,
 		source: &Path,
 		video: &VideoPlan,
-		streams: &StreamPlan,
-		declared_s: Option<f64>,
+		inputs: &VideoInputs<'_>,
 	) -> Result<EncodedTemps, JobError> {
+		let (streams, declared_s) = (inputs.streams, inputs.declared_s);
 		let video_path = workspace.file("video.a1.mkv");
 		let audio_temp = workspace.file("audio.mka");
-		let audio_plan = video_encode::audio_plan(streams, video.window);
+		let audio_plan = video_encode::audio_plan(inputs.info, streams, video.window);
 		let video_cmd = video_encode::video_command(&self.tools.ffmpeg, source, &video_path, video);
 		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
 

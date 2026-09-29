@@ -10,9 +10,8 @@ use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
 use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
 use crate::video::plan::{Encoder, VideoPlan, svt_params};
-use crate::video::run_ffmpeg;
 use crate::video::streams::{Extracted, StreamPlan};
-use crate::video::{analyze, burn};
+use crate::video::{InputStart, analyze, burn, run_ffmpeg};
 use crate::workspace::Workspace;
 
 pub const DECODE_ERRORS: &[&str] = &[
@@ -28,6 +27,7 @@ pub const DECODE_ERRORS: &[&str] = &[
 pub const MIN_PREDICTED_DURATION_S: f64 = 120.0;
 
 const DURATION_TOLERANCE_S: f64 = 0.1;
+const TIME_EPSILON_S: f64 = 1e-6;
 const PREDICTION_MARGIN: f64 = 0.05;
 const AUDIO_TEMP: Container = Container {
 	cover: Cover::Attachment,
@@ -76,15 +76,22 @@ fn encode_command(
 	if let Some((start_s, length_s)) = seek {
 		cmd.seek(start_s, length_s);
 	}
+	let seek_s = seek.map(|(start_s, _)| start_s);
+	let start = if sample.is_some() {
+		plan.starts.main
+	} else {
+		plan.starts.every
+	};
+	if let Some(offset) = start.offset_arg(seek_s) {
+		cmd.arg("-itsoffset").arg(offset);
+	}
 
 	if let Some(decoder) = plan.decoder {
 		cmd.arg("-c:v").arg(decoder);
 	}
 	cmd.arg("-i").arg(process::tool_path(source));
 	if let Some(overlay) = plan.overlay {
-		let offset_s = overlay.offset_s(seek.is_some(), sample.is_none());
-		cmd.arg("-itsoffset")
-			.arg(format!("{offset_s:.6}"))
+		cmd.args(overlay.input_args())
 			.arg("-i")
 			.arg(process::tool_path(&workspace.join(burn::BITMAP_FILE)));
 	}
@@ -94,7 +101,6 @@ fn encode_command(
 	} else {
 		plan.streams.as_slice()
 	};
-	let seek_s = seek.map(|(start_s, _)| start_s);
 	let main = burn::main_chain(plan.subtitles.as_deref(), &plan.filters, seek_s);
 	let graphed = if let Some(overlay) = plan.overlay {
 		cmd.arg("-filter_complex").arg(burn::overlay_graph(
@@ -353,13 +359,22 @@ fn lasts(encoded: &EncodedVideo, start_s: f64, declared_s: f64) -> bool {
 		.any(|decoded| (decoded - declared_s).abs() <= DURATION_TOLERANCE_S)
 }
 
-pub fn audio_plan(streams: &StreamPlan, window: Option<TrimWindow>) -> Option<FilePlan> {
+pub fn audio_plan(info: &MediaInfo, streams: &StreamPlan, window: Option<TrimWindow>) -> Option<FilePlan> {
 	let tracks = streams.encoded_audio();
+	let read: Vec<u32> = tracks
+		.iter()
+		.map(|track| track.stream_index)
+		.chain(streams.merge_from.iter().copied())
+		.collect();
+	let delay_s = Some(InputStart::of(info, &read).delay_s(window.map_or(0.0, |window| window.start_s)))
+		.filter(|delay_s| *delay_s > TIME_EPSILON_S);
+
 	(!tracks.is_empty()).then_some(FilePlan {
 		container: AUDIO_TEMP,
 		tracks,
 		options: FileOptions {
 			window,
+			delay_s,
 			merge_from: streams.merge_from.clone(),
 			merge_language: streams.merge_language.clone(),
 			..FileOptions::default()
@@ -396,9 +411,9 @@ pub async fn extract(
 mod tests {
 	use super::*;
 	use crate::audio::plan::{EncodePlan, LayoutFix, TrackJob};
-	use crate::video::joined;
 	use crate::video::plan::test_plan;
 	use crate::video::streams::SubtitleTrack;
+	use crate::video::{InputStart, VideoStarts, joined};
 
 	fn plan(encoder: Encoder, expected_frames: Option<u64>) -> VideoPlan {
 		VideoPlan {
@@ -473,10 +488,19 @@ mod tests {
 	#[test]
 	fn bitmap_subtitles_are_overlaid_from_their_own_input_in_a_complex_graph() {
 		let burned = VideoPlan {
+			starts: VideoStarts {
+				main: InputStart {
+					file_s: 1.4,
+					streams_s: Some(1.75),
+				},
+				every: InputStart {
+					file_s: 1.4,
+					streams_s: Some(1.7),
+				},
+			},
 			overlay: Some(burn::Overlay {
-				main_offset_s: 5.2,
-				all_offset_s: 5.1,
-				seeked_offset_s: 4.5,
+				offset_s: 5.3,
+				canvas: None,
 				ten_bit: false,
 			}),
 			window: Some(TrimWindow {
@@ -486,7 +510,7 @@ mod tests {
 			..plan(svt(), None)
 		};
 		let sample = Sample {
-			start_s: 6.0,
+			start_s: 0.2,
 			length_s: 1.0,
 		};
 
@@ -516,9 +540,14 @@ mod tests {
 		let args = joined(&cmd);
 		assert_eq!(cmd.current_dir, None);
 		assert!(args.contains(" -ss 4.000 -t 4.000 -i "), "{args}");
-		assert!(args.contains(" -itsoffset 4.500000 -i "), "{args}");
-		assert!(sampled.contains(" -itsoffset 4.500000 -i "), "{sampled}");
-		assert!(whole.contains(" -itsoffset 5.100000 -i "), "{whole}");
+		assert!(
+			sampled.contains(" -ss 0.200 -t 1.000 -itsoffset 0.150000 -i "),
+			"{sampled}"
+		);
+		assert!(whole.contains("repeat+info -itsoffset 0.300000 -i "), "{whole}");
+		for command in [&args, &sampled, &whole] {
+			assert!(command.contains(" -itsoffset 5.300000 -i "), "{command}");
+		}
 		assert!(args.contains("subs.mkv -filter_complex "), "{args}");
 		assert!(
 			args.contains(
@@ -870,11 +899,44 @@ mod tests {
 			..StreamPlan::default()
 		};
 
-		let temp = audio_plan(&mixed, None).unwrap();
+		let temp = audio_plan(&MediaInfo::default(), &mixed, None).unwrap();
 
 		assert_eq!(temp.tracks, vec![encode]);
 		assert_eq!(temp.container.extension, "mka");
 		assert_eq!(temp.container.cover, Cover::Attachment);
-		assert_eq!(audio_plan(&copies_only, None), None);
+		assert_eq!(temp.options.delay_s, None);
+		assert_eq!(audio_plan(&MediaInfo::default(), &copies_only, None), None);
+	}
+
+	#[test]
+	fn ts_audio_that_starts_after_the_file_or_the_seek_is_delayed_onto_the_file_clock() {
+		let info = |format: &str| {
+			MediaInfo::parse(
+				format!(
+					r#"{{"format":{{"format_name":"{format}","start_time":"1.400000"}},"streams":[
+					{{"index":0,"codec_type":"video","start_time":"1.400000"}},
+					{{"index":1,"codec_type":"audio","start_time":"1.900000"}}]}}"#
+				)
+				.as_bytes(),
+			)
+			.unwrap()
+		};
+		let streams = StreamPlan {
+			audio: vec![opus(1, 128)],
+			..StreamPlan::default()
+		};
+		let from = |start_s: f64| Some(TrimWindow { start_s, length_s: 4.0 });
+		let delay = |format: &str, window: Option<TrimWindow>| {
+			audio_plan(&info(format), &streams, window).unwrap().options.delay_s
+		};
+
+		let early = delay("mpegts", from(0.1)).unwrap();
+		let whole = delay("mpegts", None).unwrap();
+
+		assert!((early - 0.4).abs() < 1e-9, "{early}");
+		assert!((whole - 0.5).abs() < 1e-9, "{whole}");
+		assert_eq!(delay("mpegts", from(4.0)), None);
+		assert_eq!(delay("matroska,webm", from(0.1)), None);
+		assert_eq!(delay("matroska,webm", None), None);
 	}
 }

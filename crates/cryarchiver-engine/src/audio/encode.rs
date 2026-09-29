@@ -24,6 +24,9 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 	if let Some(window) = plan.options.window {
 		cmd.seek(window.start_s, window.length_s);
 	}
+	if let Some(delay_s) = plan.options.delay_s {
+		cmd.arg("-itsoffset").arg(format!("{delay_s:.6}"));
+	}
 
 	cmd.arg("-i").arg(process::tool_path(source));
 	if let Some(file) = chapter_file {
@@ -292,6 +295,24 @@ mod tests {
 
 		assert!(
 			args.starts_with("-hide_banner -nostdin -y -ss 2.000 -t 3.500 -i "),
+			"{args}"
+		);
+
+		let delayed = FilePlan {
+			options: FileOptions {
+				delay_s: Some(0.2),
+				..file.options.clone()
+			},
+			..file
+		};
+		let args = joined(&command(
+			Path::new("ffmpeg"),
+			Path::new("in.m2ts"),
+			Path::new("out.opus"),
+			&delayed,
+		));
+		assert!(
+			args.starts_with("-hide_banner -nostdin -y -ss 2.000 -t 3.500 -itsoffset 0.200000 -i "),
 			"{args}"
 		);
 	}

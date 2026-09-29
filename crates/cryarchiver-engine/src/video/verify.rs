@@ -13,6 +13,7 @@ use crate::video::streams::StreamPlan;
 
 const MIN_ALPHA_SSIM: f64 = 0.98;
 const MIN_START_TOLERANCE_S: f64 = 0.05;
+const MIN_SYNC_TOLERANCE_S: f64 = 0.02;
 const MASTERING_DISPLAY: &str = "Mastering display metadata";
 const DOVI_RECORD: &str = "DOVI configuration record";
 
@@ -143,6 +144,140 @@ pub fn start_offsets(outputs: &[OutputStream], timelines: &Timelines<'_>) -> Vec
 		.iter()
 		.map(|output| Some(landing(output, timelines)? - video_start?))
 		.collect()
+}
+
+/// An output stream whose start is checked against its source stream's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Synced {
+	pub source: u32,
+	pub output: u32,
+	pub audio: bool,
+}
+
+/// Where a stream's first decoded frame lands, in the source and in the output, each on its file's own timestamps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FirstFrames {
+	/// The stream's index in the output.
+	pub output: u32,
+	pub source_s: Option<f64>,
+	pub output_s: Option<f64>,
+}
+
+/// The output's audio and video streams, main video first. A merged track has no single source to start with.
+pub fn synced_streams(outputs: &[OutputStream], source: &MediaInfo, merge_from: &[u32]) -> Vec<Synced> {
+	outputs
+		.iter()
+		.zip(0..)
+		.filter_map(|(output, position)| {
+			let stream = source.streams.iter().find(|stream| stream.index == output.origin)?;
+			let audio = stream.codec_type == "audio";
+			let synced = stream.is_real_video() || (audio && !merge_from.contains(&output.origin));
+			synced.then_some(Synced {
+				source: output.origin,
+				output: position,
+				audio,
+			})
+		})
+		.collect()
+}
+
+pub fn sync_tolerance_s(fps: Option<f64>) -> f64 {
+	fps.filter(|fps| *fps > 0.0)
+		.map_or(MIN_SYNC_TOLERANCE_S, |fps| (1.0 / fps).max(MIN_SYNC_TOLERANCE_S))
+}
+
+/// `starts` follow `synced_streams`. The output's timestamps count from `zero_s` on the source's.
+///
+/// Each stream must start as far from the main video as in the source. In a trim, only streams that begin inside
+/// the window have a start to compare: one already running at the cut starts wherever the cut's first decodable
+/// frame falls. When the main video is one of those, the others are measured from the cut instead.
+pub fn sync_error(starts: &[FirstFrames], zero_s: f64, trimmed: bool, tolerance_s: f64) -> Option<String> {
+	let expected: Vec<Option<f64>> = starts
+		.iter()
+		.map(|start| {
+			let expected = start.source_s? - zero_s;
+			(!trimmed || expected > tolerance_s).then_some(expected)
+		})
+		.collect();
+	let main = starts
+		.first()
+		.and_then(|main| Some((expected.first().copied()??, main.output_s?)));
+	let (anchor, (expected_anchor, output_anchor)) = match main {
+		Some(main) => ("the main video", main),
+		None => ("the cut", (0.0, 0.0)),
+	};
+
+	starts
+		.iter()
+		.zip(&expected)
+		.skip(usize::from(main.is_some()))
+		.find_map(|(start, expected)| {
+			let wanted = expected.as_ref()? - expected_anchor;
+			let actual = start.output_s? - output_anchor;
+			((actual - wanted).abs() > tolerance_s).then(|| {
+				format!(
+					"stream {} starts {actual:.3} s after {anchor}, {wanted:.3} s in the source",
+					start.output
+				)
+			})
+		})
+}
+
+/// When `stream`'s first decoded frame is shown, on `path`'s own timestamps; `None` when nothing decodes.
+pub async fn first_decoded_s(
+	tools: &Toolchain,
+	path: &Path,
+	stream: u32,
+	audio: bool,
+	cancel: &CancellationToken,
+) -> Result<Option<f64>, JobError> {
+	let (frames, filter, info) = if audio {
+		("-frames:a", "-af", "ashowinfo")
+	} else {
+		("-frames:v", "-vf", "showinfo")
+	};
+	let mut cmd = ToolCommand::new(&tools.ffmpeg, STALL_TIMEOUT);
+	cmd.args(["-hide_banner", "-nostdin", "-copyts", "-i"])
+		.arg(process::tool_path(path))
+		.arg("-map")
+		.arg(format!("0:{stream}"))
+		.args([frames, "1", filter, info, "-f", "null", "-"]);
+
+	let out = run_ffmpeg(&cmd, |_| {}, cancel).await?;
+	Ok(out
+		.stderr_tail
+		.iter()
+		.filter(|line| line.contains(&format!("Parsed_{info}")))
+		.find_map(|line| {
+			line.split_whitespace()
+				.find_map(|field| field.strip_prefix("pts_time:"))?
+				.parse()
+				.ok()
+		}))
+}
+
+/// Fails when an output stream doesn't start as far from the main video as it does in the source (`sync_error`).
+pub async fn check_sync(
+	tools: &Toolchain,
+	(source, output): (&Path, &Path),
+	streams: &[Synced],
+	(zero_s, trimmed): (f64, bool),
+	tolerance_s: f64,
+	cancel: &CancellationToken,
+) -> Result<(), JobError> {
+	let mut starts = Vec::with_capacity(streams.len());
+	for stream in streams {
+		starts.push(FirstFrames {
+			output: stream.output,
+			source_s: first_decoded_s(tools, source, stream.source, stream.audio, cancel).await?,
+			output_s: first_decoded_s(tools, output, stream.output, stream.audio, cancel).await?,
+		});
+	}
+
+	match sync_error(&starts, zero_s, trimmed, tolerance_s) {
+		Some(reason) => Err(ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into()),
+		None => Ok(()),
+	}
 }
 
 pub fn parse_ssim(stderr: &[String]) -> Option<f64> {
@@ -609,5 +744,53 @@ mod tests {
 		assert_eq!(parse_ssim(&lines[1..]), None);
 		assert!(check_alpha(0.99).is_ok());
 		assert!(check_alpha(0.0786).is_err());
+	}
+
+	#[test]
+	fn every_stream_must_start_as_far_from_the_main_video_as_in_the_source() {
+		let starts = |pairs: &[(f64, f64)]| -> Vec<FirstFrames> {
+			pairs
+				.iter()
+				.zip(0..)
+				.map(|(&(source_s, output_s), output)| FirstFrames {
+					output,
+					source_s: Some(source_s),
+					output_s: Some(output_s),
+				})
+				.collect()
+		};
+		let whole = |pairs: &[(f64, f64)]| sync_error(&starts(pairs), 1.4, false, 0.04);
+		let cut = |pairs: &[(f64, f64)]| sync_error(&starts(pairs), 5.4, true, 0.04);
+
+		assert_eq!(whole(&[(1.743, 0.343), (1.4, 0.0)]), None);
+		assert_eq!(
+			whole(&[(1.743, 0.0), (1.4, 0.0)]).unwrap(),
+			"stream 1 starts 0.000 s after the main video, -0.343 s in the source"
+		);
+		assert_eq!(whole(&[(1.743, 5.343), (1.4, 5.0)]), None);
+		assert_eq!(whole(&[(1.4, 0.0), (1.743, 0.36)]), None);
+		assert!(whole(&[(1.4, 0.0), (1.743, 0.4)]).is_some());
+
+		assert_eq!(cut(&[(1.743, 0.32), (1.4, 0.0), (6.0, 0.6)]), None);
+		assert_eq!(
+			cut(&[(1.743, 0.32), (1.4, 0.0), (6.0, 0.9)]).unwrap(),
+			"stream 2 starts 0.900 s after the cut, 0.600 s in the source"
+		);
+		assert_eq!(cut(&[(5.743, 0.343), (1.4, 0.0), (6.0, 0.6)]), None);
+		assert!(cut(&[(5.743, 0.343), (1.4, 0.0), (6.0, 0.3)]).is_some());
+
+		let undecodable = [FirstFrames {
+			output: 0,
+			source_s: None,
+			output_s: Some(0.0),
+		}];
+		assert_eq!(sync_error(&undecodable, 0.0, false, 0.04), None);
+	}
+
+	#[test]
+	fn the_sync_tolerance_is_a_frame_or_20_ms() {
+		assert!((sync_tolerance_s(Some(25.0)) - 0.04).abs() < 1e-9);
+		assert!((sync_tolerance_s(Some(120.0)) - 0.02).abs() < 1e-9);
+		assert!((sync_tolerance_s(None) - 0.02).abs() < 1e-9);
 	}
 }

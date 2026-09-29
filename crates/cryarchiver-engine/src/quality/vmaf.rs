@@ -12,7 +12,7 @@ use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, Progress, STALL_TIMEOUT, ToolCommand};
 use crate::video::burn::{self, Overlay};
 use crate::video::plan::Resolution;
-use crate::video::run_ffmpeg;
+use crate::video::{InputStart, run_ffmpeg};
 
 pub const FILTER: &str = "libvmaf";
 pub const MODELS: [&str; 2] = [HD_MODEL, UHD_MODEL];
@@ -43,6 +43,8 @@ pub struct Reference<'a> {
 	pub decoder: Option<&'static str>,
 	pub filters: &'a str,
 	pub window: Option<TrimWindow>,
+	/// Where ffmpeg starts the source when it reads only `stream`.
+	pub start: InputStart,
 	pub overlay: Option<Overlay>,
 	pub subtitles: Option<&'a str>,
 }
@@ -113,7 +115,7 @@ pub fn sample_command(
 ) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
 	cmd.seek(start_s, length_s);
-	push_reference(&mut cmd, reference, scoring, true);
+	push_reference(&mut cmd, reference, scoring, Some(start_s));
 
 	let distorted_chain = chain(&[SCORED_FORMAT, BY_POSITION]);
 	let reference_chain = chain(&[reference.filters, SCORED_FORMAT, BY_POSITION]);
@@ -137,12 +139,12 @@ pub fn window_command(
 	if let Some(window) = reference.window {
 		cmd.seek(window.start_s, window.length_s);
 	}
-	push_reference(&mut cmd, reference, scoring, reference.window.is_some());
+	let seek_s = reference.window.map(|window| window.start_s);
+	push_reference(&mut cmd, reference, scoring, seek_s);
 
 	let select = select(windows);
 	let distorted_chain = chain(&[&select, SCORED_FORMAT, BY_POSITION]);
 	let reference_chain = chain(&[reference.filters, &select, SCORED_FORMAT, BY_POSITION]);
-	let seek_s = reference.window.map(|window| window.start_s);
 	cmd.arg("-filter_complex").arg(format!(
 		"[0:v:0]split[pace][all];[all]{distorted_chain}[d];{};[d][r]{}[scored]",
 		reference_branch(reference, &reference_chain, seek_s),
@@ -185,15 +187,17 @@ fn base(ffmpeg: &Path, distorted: &Path, scoring: &Scoring<'_>) -> ToolCommand {
 	cmd
 }
 
-fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Scoring<'_>, seeked: bool) {
+fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Scoring<'_>, seek_s: Option<f64>) {
+	if let Some(offset) = reference.start.offset_arg(seek_s) {
+		cmd.arg("-itsoffset").arg(offset);
+	}
 	if let Some(decoder) = reference.decoder {
 		cmd.arg("-c:v").arg(decoder);
 	}
 	cmd.arg("-i").arg(process::tool_path(reference.source));
 
 	if let Some(overlay) = reference.overlay {
-		cmd.arg("-itsoffset")
-			.arg(format!("{:.6}", overlay.offset_s(seeked, false)))
+		cmd.args(overlay.input_args())
 			.arg("-i")
 			.arg(process::tool_path(&scoring.dir.join(burn::BITMAP_FILE)));
 	}
@@ -237,7 +241,7 @@ fn select(windows: &[FrameWindow]) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::video::joined;
+	use crate::video::{InputStart, joined};
 
 	fn scoring() -> Scoring<'static> {
 		Scoring {
@@ -288,6 +292,7 @@ mod tests {
 			decoder: Some("libvpx-vp9"),
 			filters: "bwdif=mode=send_field:parity=tff:deint=all,setparams=field_mode=prog",
 			window: None,
+			start: InputStart::default(),
 			overlay: None,
 			subtitles: None,
 		};
@@ -324,6 +329,7 @@ mod tests {
 			decoder: None,
 			filters: "scale=in_range=tv:out_range=tv,format=yuv420p10le",
 			window: None,
+			start: InputStart::default(),
 			overlay: None,
 			subtitles: None,
 		};
@@ -369,6 +375,7 @@ mod tests {
 				start_s: 4.0,
 				length_s: 4.0,
 			}),
+			start: InputStart::default(),
 			overlay: None,
 			subtitles: None,
 		};
@@ -392,10 +399,13 @@ mod tests {
 			decoder: None,
 			filters: "format=yuv420p10le",
 			window: None,
+			start: InputStart {
+				file_s: 0.0,
+				streams_s: Some(2.5),
+			},
 			overlay: Some(Overlay {
-				main_offset_s: 0.5,
-				all_offset_s: 0.4,
-				seeked_offset_s: 1.5,
+				offset_s: 1.0,
+				canvas: Some((720, 480)),
 				ten_bit: true,
 			}),
 			subtitles: None,
@@ -411,7 +421,8 @@ mod tests {
 		));
 
 		assert!(
-			args.contains(" -ss 2.000 -t 4.000 -i ") && args.contains(" -itsoffset 1.500000 -i "),
+			args.contains(" -ss 2.000 -t 4.000 -itsoffset 0.500000 -i ")
+				&& args.contains(" -canvas_size 720x480 -itsoffset 1.000000 -i "),
 			"{args}"
 		);
 		assert!(
@@ -432,6 +443,7 @@ mod tests {
 			decoder: None,
 			filters: "format=yuv420p10le",
 			window,
+			start: InputStart::default(),
 			overlay: None,
 			subtitles: Some("subtitles=subs.ass"),
 		};

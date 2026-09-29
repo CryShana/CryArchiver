@@ -2,6 +2,7 @@ use crate::options::TrimWindow;
 use crate::outcome::KeepReason;
 use crate::preset::Speed;
 use crate::probe::{Frame, MediaInfo, Stream};
+use crate::video::VideoStarts;
 use crate::video::analyze::{Analysis, NoiseClass, ScanType, forced_decoder};
 use crate::video::burn::Overlay;
 use crate::video::colour::{ColourTags, conversion, output_tags, setparams};
@@ -142,6 +143,7 @@ pub struct VideoPlan {
 	pub hdr10: bool,
 	pub warnings: Vec<String>,
 	pub window: Option<TrimWindow>,
+	pub starts: VideoStarts,
 	pub overlay: Option<Overlay>,
 	/// The text/ASS subtitle filter for the main video, before it is shifted to a command's seek.
 	pub subtitles: Option<String>,
@@ -264,6 +266,7 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 		alpha,
 		warnings,
 		window: None,
+		starts: VideoStarts::default(),
 		overlay: None,
 		subtitles: None,
 	}
@@ -425,6 +428,7 @@ pub(crate) fn test_plan() -> VideoPlan {
 		hdr10: false,
 		warnings: Vec::new(),
 		window: None,
+		starts: VideoStarts::default(),
 		overlay: None,
 		subtitles: None,
 	}

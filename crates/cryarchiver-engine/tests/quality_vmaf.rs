@@ -7,6 +7,7 @@ use cryarchiver_engine::process::{STALL_TIMEOUT, ToolCommand};
 use cryarchiver_engine::quality::vmaf::{
 	FrameWindow, Reference, Scoring, frames, pool, sample_command, window_command,
 };
+use cryarchiver_engine::video::InputStart;
 use tokio_util::sync::CancellationToken;
 
 const TEN_BIT: &str = "format=yuv420p10le";
@@ -18,6 +19,7 @@ fn reference(source: &Path) -> Reference<'_> {
 		decoder: None,
 		filters: TEN_BIT,
 		window: None,
+		start: InputStart::default(),
 		overlay: None,
 		subtitles: None,
 	}

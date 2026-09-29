@@ -391,6 +391,91 @@ pub fn lit_span_in(path: &Path, stream: usize, region: &str) -> Option<(f64, f64
 	Some((*lit.first()?, *lit.last()?))
 }
 
+/// The average 8-bit Y, U and V of `region` (such as `BOX_TOP`) in the first frame where anything is drawn there.
+pub fn colour_in(path: &Path, region: &str) -> Option<[f64; 3]> {
+	let out = Command::new("ffmpeg")
+		.args(["-v", "error", "-i"])
+		.arg(path)
+		.args(["-map", "0:v:0", "-vf"])
+		.arg(format!(
+			"{region},format=yuv420p,signalstats,metadata=mode=print:file=-"
+		))
+		.args(["-f", "null", "-"])
+		.output()
+		.unwrap();
+
+	let mut averages = [0.0; 3];
+	for line in String::from_utf8_lossy(&out.stdout).lines() {
+		let Some((key, value)) = line
+			.strip_prefix("lavfi.signalstats.")
+			.and_then(|line| line.split_once('='))
+		else {
+			continue;
+		};
+		let plane = match key {
+			"YAVG" => 0,
+			"UAVG" => 1,
+			"VAVG" => 2,
+			_ => continue,
+		};
+
+		averages[plane] = value.parse().unwrap();
+		if plane == 2 && averages[0] > 32.0 {
+			return Some(averages);
+		}
+	}
+	None
+}
+
+/// When `MARKER` is first lit and when the first audio track first clicks, on the file's own timestamps.
+pub fn marker_and_click(path: &Path) -> (f64, f64) {
+	let printed = |stream: &str, filter: &str| {
+		let out = Command::new("ffmpeg")
+			.args(["-v", "error", "-copyts", "-i"])
+			.arg(path)
+			.args([
+				"-map",
+				stream,
+				if stream.contains(":v") { "-vf" } else { "-af" },
+				filter,
+			])
+			.args(["-f", "null", "-"])
+			.output()
+			.unwrap();
+		String::from_utf8_lossy(&out.stdout).into_owned()
+	};
+	let first = |text: &str, key: &str, lit: fn(f64) -> bool| {
+		let mut time = 0.0;
+		for line in text.lines() {
+			if let Some(pts) = line
+				.split_whitespace()
+				.find_map(|field| field.strip_prefix("pts_time:"))
+			{
+				time = pts.parse().unwrap();
+			} else if let Some(value) = line.strip_prefix(key)
+				&& value.parse::<f64>().is_ok_and(lit)
+			{
+				return time;
+			}
+		}
+		panic!("{key} never lit in {}", path.display())
+	};
+
+	let marker = printed(
+		"0:v:0",
+		&format!("{MARKER},format=gray,signalstats,metadata=mode=print:key=lavfi.signalstats.YMAX:file=-"),
+	);
+	let click = printed(
+		"0:a:0",
+		"aresample=48000,asetnsamples=48,astats=metadata=1:reset=1,\
+		 ametadata=mode=print:key=lavfi.astats.Overall.Peak_level:file=-",
+	);
+	(
+		first(&marker, "lavfi.signalstats.YMAX=", |ymax| ymax > 128.0),
+		first(&click, "lavfi.astats.Overall.Peak_level=", |peak| peak > -6.0),
+	)
+}
+
 /// The picture below `MARKER`'s rows, where subtitles are drawn.
 pub const BELOW_MARKER: &str = "crop=320:200:0:40";
 
@@ -398,6 +483,18 @@ pub const BELOW_MARKER: &str = "crop=320:200:0:40";
 /// ffmpeg can't turn text subtitles into bitmaps, so the segments are written by hand. Like a real track, it
 /// begins at its first cue.
 pub fn pgs_box(dir: &Path, from_ms: u32, to_ms: u32) -> PathBuf {
+	pgs_bands(dir, from_ms, to_ms, &[WHITE])
+}
+
+pub const WHITE: [u8; 3] = [235, 128, 128];
+
+/// The box at x 100..220, y 180..210.
+pub const BOX_TOP: &str = "crop=100:10:110:182";
+pub const BOX_BOTTOM: &str = "crop=100:10:110:198";
+
+/// `pgs_box` with the box's rows split into equal horizontal bands, one per `colours` entry (Y, Cb, Cr) from the
+/// top.
+pub fn pgs_bands(dir: &Path, from_ms: u32, to_ms: u32, colours: &[[u8; 3]]) -> PathBuf {
 	let (x, y, width, height) = (100_u16, 180_u16, 120_u16, 30_u16);
 	let segment = |pts_ms: u32, kind: u8, data: &[u8]| {
 		let mut bytes = b"PG".to_vec();
@@ -427,9 +524,18 @@ pub fn pgs_box(dir: &Path, from_ms: u32, to_ms: u32) -> PathBuf {
 	.concat();
 
 	let object = [&[0, 0, 0, 0][..], &x.to_be_bytes(), &y.to_be_bytes()].concat();
-	let palette = [0, 0, 1, 235, 128, 128, 255];
+	let mut palette = vec![0, 0];
+	for (entry, [luma, cb, cr]) in (1_u8..).zip(colours) {
+		palette.extend([entry, *luma, *cr, *cb, 255]);
+	}
 	let [high, low] = width.to_be_bytes();
-	let rle = [0x00, 0xC0 | high, low, 0x01, 0x00, 0x00].repeat(usize::from(height));
+	let band = usize::from(height) / colours.len();
+	let rle: Vec<u8> = (0..usize::from(height))
+		.flat_map(|row| {
+			let entry = u8::try_from((row / band).min(colours.len() - 1) + 1).unwrap();
+			[0x00, 0xC0 | high, low, entry, 0x00, 0x00]
+		})
+		.collect();
 	let length = u32::try_from(rle.len() + 4).unwrap().to_be_bytes();
 	let bitmap = [
 		&[0, 0, 0, 0xC0][..],
@@ -457,7 +563,13 @@ pub fn pgs_box(dir: &Path, from_ms: u32, to_ms: u32) -> PathBuf {
 	]
 	.concat();
 
-	let path = dir.join(format!("box-{from_ms}-{to_ms}.sup"));
+	let shades = colours
+		.iter()
+		.flatten()
+		.map(u8::to_string)
+		.collect::<Vec<_>>()
+		.join("-");
+	let path = dir.join(format!("box-{from_ms}-{to_ms}-{shades}.sup"));
 	std::fs::write(&path, [shown, clear(to_ms, 1)].concat()).unwrap();
 	path
 }
