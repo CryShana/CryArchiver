@@ -6,7 +6,7 @@ use std::process::Command;
 
 use cryarchiver_engine::options::SubtitlePick;
 use cryarchiver_engine::preset::Speed;
-use cryarchiver_engine::probe::{first_frames, probe};
+use cryarchiver_engine::probe::{av1_film_grain, first_frames, probe};
 use cryarchiver_engine::video::VideoStarts;
 use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, analyze};
 use cryarchiver_engine::video::burn::{self, FONT_DIR, SUBTITLE_FILE};
@@ -177,11 +177,26 @@ async fn an_av1_source_with_film_grain_gets_no_more_grain() {
 	.await
 	.unwrap();
 
+	let plain = dir.path().join("plain.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=gray:s=320x240:r=25:d=1",
+		"-c:v",
+		"libsvtav1",
+		"-preset",
+		"12",
+		plain.to_str().unwrap(),
+	]);
+
 	let video = plan_video(&info, main, &frames, &analysis, Speed::Slow);
 
 	assert!(synthesized_grain(&frames), "{frames:?}");
 	assert_eq!(analysis.noise, NoiseClass::Light, "{analysis:?}");
 	assert_eq!(video.encoder.grain_level(), None);
+	assert!(av1_film_grain(&tools, &grained, main.index, &cancel).await.unwrap());
+	assert!(!av1_film_grain(&tools, &plain, 0, &cancel).await.unwrap());
 }
 
 #[tokio::test]

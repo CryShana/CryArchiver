@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use cryarchiver_engine::process::{RunError, StdoutMode, ToolCommand, run};
+use cryarchiver_engine::process::{RunError, StdoutMode, ToolCommand, run, run_streamed};
 use tokio_util::sync::CancellationToken;
 
 const PATIENT: Duration = Duration::from_secs(60);
@@ -36,6 +36,45 @@ async fn captured_output_past_the_limit_stops_the_tool() {
 	let result = run(&cmd, StdoutMode::Capture, |_| {}, &CancellationToken::new()).await;
 
 	assert!(matches!(result, Err(RunError::CaptureLimit(1000))), "{result:?}");
+}
+
+#[tokio::test]
+async fn streamed_output_is_handed_over_not_kept_and_the_limit_counts_it() {
+	let rawvideo = |limit: Option<usize>| {
+		let mut cmd = tool(
+			"ffmpeg",
+			&[
+				"-hide_banner",
+				"-nostdin",
+				"-v",
+				"error",
+				"-f",
+				"lavfi",
+				"-i",
+				"color=size=64x64:rate=25:duration=1,format=gray",
+				"-f",
+				"rawvideo",
+				"-",
+			],
+			PATIENT,
+		);
+		cmd.capture_limit = limit;
+		cmd
+	};
+	let mut streamed = 0;
+
+	let out = run_streamed(
+		&rawvideo(None),
+		|chunk| streamed += chunk.len(),
+		&CancellationToken::new(),
+	)
+	.await
+	.unwrap();
+	let limited = run_streamed(&rawvideo(Some(1000)), |_| {}, &CancellationToken::new()).await;
+
+	assert_eq!(streamed, 25 * 64 * 64);
+	assert!(out.stdout.is_empty());
+	assert!(matches!(limited, Err(RunError::CaptureLimit(1000))), "{limited:?}");
 }
 
 #[tokio::test]

@@ -30,8 +30,7 @@ const MIN_PACKET_SLACK: f64 = 2.0;
 const SOURCE_FRAME_TOLERANCE: u64 = 2;
 const VIDEO_BASE_BYTES: u64 = 512 << 20;
 const VIDEO_BYTES_PER_PIXEL: u64 = 540;
-/// (noise deviation from which the level applies, film-grain level), noisiest first. Levels above 10 denoise so hard
-/// that even the grainiest sources can't reach the grain target at any CRF.
+/// (noise deviation from which the level applies, film-grain level), noisiest first.
 const GRAIN_LEVELS: [(f64, u8); 3] = [(1.8, 10), (1.0, 8), (NOISY_SIGMA, 6)];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,8 +338,7 @@ pub fn grain_level(noise_sigma: Option<f64>) -> Option<u8> {
 		.map(|(_, level)| *level)
 }
 
-/// A source that carries film grain parameters (AV1, or H.264/HEVC film grain SEI) already has its grain made up by
-/// the decoder: denoising it would only blur the picture, and grain on top of grain doubles it.
+/// Frames whose decoder made up their grain from film grain parameters (AV1, or H.264/HEVC film grain SEI).
 pub fn synthesized_grain(frames: &[Frame]) -> bool {
 	has_side_data(frames, FILM_GRAIN_PARAMETERS)
 }
@@ -746,8 +744,8 @@ mod tests {
 	fn grain_strength_follows_the_measured_noise() {
 		assert_eq!(grain_level(None), None);
 		assert_eq!(grain_level(Some(0.0)), None);
-		assert_eq!(grain_level(Some(0.35)), None);
-		assert_eq!(grain_level(Some(0.36)), Some(6));
+		assert_eq!(grain_level(Some(0.28)), None);
+		assert_eq!(grain_level(Some(0.29)), Some(6));
 		assert_eq!(grain_level(Some(0.99)), Some(6));
 		assert_eq!(grain_level(Some(1.0)), Some(8));
 		assert_eq!(grain_level(Some(1.79)), Some(8));

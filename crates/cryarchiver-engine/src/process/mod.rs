@@ -111,10 +111,32 @@ pub enum RunError {
 	CaptureLimit(usize),
 }
 
+type ChunkSink<'a> = dyn FnMut(&[u8]) + Send + 'a;
+
 pub async fn run(
 	cmd: &ToolCommand,
 	mode: StdoutMode,
+	on_progress: impl FnMut(&Progress),
+	cancel: &CancellationToken,
+) -> Result<ToolOutput, RunError> {
+	drive(cmd, mode, on_progress, None, cancel).await
+}
+
+/// `run` in `Capture` mode, handing stdout to `on_chunk` as it arrives instead of keeping it. `capture_limit` caps
+/// the bytes streamed.
+pub async fn run_streamed(
+	cmd: &ToolCommand,
+	mut on_chunk: impl FnMut(&[u8]) + Send,
+	cancel: &CancellationToken,
+) -> Result<ToolOutput, RunError> {
+	drive(cmd, StdoutMode::Capture, |_| {}, Some(&mut on_chunk), cancel).await
+}
+
+async fn drive(
+	cmd: &ToolCommand,
+	mode: StdoutMode,
 	mut on_progress: impl FnMut(&Progress),
+	mut on_chunk: Option<&mut ChunkSink<'_>>,
 	cancel: &CancellationToken,
 ) -> Result<ToolOutput, RunError> {
 	if cancel.is_cancelled() {
@@ -130,6 +152,7 @@ pub async fn run(
 	));
 
 	let mut captured = Vec::new();
+	let mut received = 0;
 	let mut splitter = LineSplitter::default();
 	let mut parser = ProgressParser::default();
 	let mut high_water = HighWater::default();
@@ -149,12 +172,16 @@ pub async fn run(
 			Ok(Ok(0)) => break child.wait().await.map_err(RunError::Io)?,
 			Ok(Ok(n)) if mode == StdoutMode::Capture => {
 				if let Some(limit) = cmd.capture_limit
-					&& captured.len() + n > limit
+					&& received + n > limit
 				{
 					return Err(stop(child.as_mut(), RunError::CaptureLimit(limit)).await);
 				}
 
-				captured.extend_from_slice(&buf[..n]);
+				received += n;
+				match on_chunk.as_mut() {
+					Some(on_chunk) => on_chunk(&buf[..n]),
+					None => captured.extend_from_slice(&buf[..n]),
+				}
 				last_advance = Instant::now();
 			}
 			Ok(Ok(n)) => {

@@ -33,11 +33,6 @@ const TARGETS: [Target; 3] = [
 	},
 ];
 const GRAIN_ALLOWANCE: Target = Target { mean: 2.0, floor: 2.5 };
-/// (slow, moderate) CRFs below which grain costs more than it saves: its denoiser's loss is being bought back with
-/// bits.
-const GRAIN_MIN_CRF: [f64; 2] = [18.0, 20.0];
-/// How much larger than the samples without grain the samples with it may come out.
-const GRAIN_COST_FACTOR: f64 = 1.5;
 const SLOW_ANALYSIS_SEGMENTS: usize = 8;
 const SEARCH_SEGMENT_S: f64 = 4.0;
 const VERIFY_WINDOW_S: f64 = 5.0;
@@ -256,32 +251,25 @@ pub fn unreachable_reason(crf: f64, score: Score, target: Target) -> KeepReason 
 	KeepReason::QualityUnreachable(unreachable_text(crf, score, target))
 }
 
-/// Grain stays unless it can't reach its target at a sane CRF, or costs `GRAIN_COST_FACTOR` times the bytes of the
-/// search without it, which aims at the full target. When neither reaches its target, the one without grain is kept:
-/// grain's denoiser only moves the picture further from the source.
-pub fn grain_choice(speed: Speed, grain: Searched, plain: Searched) -> GrainChoice {
-	let min_crf = GRAIN_MIN_CRF[usize::from(speed != Speed::Slow)];
-
+/// The smaller of the two results that reach their targets (grain on a tie). When neither does, the one without grain
+/// is kept: grain's denoiser only moves the picture further from the source.
+pub fn grain_choice(grain: Searched, plain: Searched) -> GrainChoice {
 	match (grain, plain) {
-		(Searched::Found(grain), Searched::Found(plain)) => {
-			#[allow(clippy::cast_precision_loss)]
-			let costly = grain.sample_bytes as f64 > GRAIN_COST_FACTOR * plain.sample_bytes as f64;
-			if grain.crf < min_crf || costly {
-				GrainChoice::Plain
-			} else {
-				GrainChoice::Grain
-			}
+		(Searched::Found(grain), Searched::Found(plain)) if grain.sample_bytes > plain.sample_bytes => {
+			GrainChoice::Plain
 		}
-		(Searched::Found(_), Searched::Unreachable { .. }) => GrainChoice::Grain,
+		(Searched::Found(_), _) => GrainChoice::Grain,
 		(Searched::Unreachable { .. }, _) => GrainChoice::Plain,
 	}
 }
 
-/// Why film grain was left out, when the search without it found a CRF.
+/// Why film grain was left out.
 #[allow(clippy::cast_precision_loss)]
-pub fn dropped_grain_text(level: u8, grain: Searched, plain: Searched, grain_target: Target) -> Option<String> {
+pub fn dropped_grain_text(level: u8, grain: Searched, plain: Searched, grain_target: Target) -> String {
 	let Searched::Found(plain) = plain else {
-		return None;
+		return format!(
+			"film grain {level} was left out: the quality target was reached neither with it nor without it"
+		);
 	};
 
 	let with = match grain {
@@ -292,10 +280,10 @@ pub fn dropped_grain_text(level: u8, grain: Searched, plain: Searched, grain_tar
 		),
 		Searched::Unreachable { crf, score } => format!("with it {}", short_text(crf, score, grain_target)),
 	};
-	Some(format!(
+	format!(
 		"film grain {level} was left out: {with}; without it CRF {} measured VMAF {:.1} / {:.1}",
 		plain.crf, plain.score.mean, plain.score.p5
-	))
+	)
 }
 
 impl Scorer<'_> {
@@ -383,6 +371,20 @@ pub async fn search(
 	start: f64,
 	target: Target,
 	prior_slope: f64,
+	on_round: impl FnMut(usize),
+) -> Result<Searched, JobError> {
+	search_below(scorer, samples, start, target, prior_slope, None, on_round).await
+}
+
+/// `search`, given up as unreachable once a probe misses the target at `bytes` or more: every CRF that would pass is
+/// lower and larger still, so nothing smaller than `bytes` can be found.
+pub async fn search_below(
+	scorer: &Scorer<'_>,
+	samples: &[Sample],
+	start: f64,
+	target: Target,
+	prior_slope: f64,
+	bytes: Option<u64>,
 	mut on_round: impl FnMut(usize),
 ) -> Result<Searched, JobError> {
 	let bounds = bounds(&scorer.plan.encoder);
@@ -392,9 +394,12 @@ pub async fn search(
 
 	loop {
 		on_round(probes.len());
-		let (score, bytes) = scorer.probe(crf, samples, probes.len()).await?;
+		let (score, size) = scorer.probe(crf, samples, probes.len()).await?;
 		probes.push(Probe { crf, score });
-		sample_bytes.push(bytes);
+		sample_bytes.push(size);
+		if !target.met(score) && bytes.is_some_and(|bytes| size >= bytes) {
+			return Ok(Searched::Unreachable { crf, score });
+		}
 
 		match crf_search::next(&probes, target, bounds, prior_slope) {
 			Next::Probe(next) => crf = next,
@@ -552,6 +557,7 @@ mod tests {
 			range: DynamicRange::Sdr8,
 			scan: ScanType::Progressive,
 			grain: None,
+			noisy: false,
 			alpha: false,
 		};
 		let key = |overrides: &Overrides| {
@@ -821,40 +827,30 @@ mod tests {
 	};
 
 	#[test]
-	fn grain_stays_unless_it_needs_a_low_crf_or_far_more_bytes() {
+	fn when_both_reach_their_targets_the_smaller_wins() {
 		assert_eq!(
-			grain_choice(Speed::Moderate, found(30.0, 140_000), found(29.0, 100_000)),
+			grain_choice(found(30.0, 101_000), found(29.0, 100_000)),
+			GrainChoice::Plain
+		);
+		assert_eq!(
+			grain_choice(found(30.0, 99_000), found(29.0, 100_000)),
 			GrainChoice::Grain
 		);
 		assert_eq!(
-			grain_choice(Speed::Moderate, found(30.0, 151_000), found(29.0, 100_000)),
-			GrainChoice::Plain
-		);
-		assert_eq!(
-			grain_choice(Speed::Moderate, found(19.75, 90_000), found(29.0, 100_000)),
-			GrainChoice::Plain
-		);
-		assert_eq!(
-			grain_choice(Speed::Slow, found(19.75, 90_000), found(29.0, 100_000)),
+			grain_choice(found(30.0, 100_000), found(29.0, 100_000)),
 			GrainChoice::Grain
 		);
 		assert_eq!(
-			grain_choice(Speed::Slow, found(17.75, 90_000), found(29.0, 100_000)),
-			GrainChoice::Plain
+			grain_choice(found(12.0, 90_000), found(29.0, 100_000)),
+			GrainChoice::Grain
 		);
 	}
 
 	#[test]
 	fn grain_that_cannot_reach_its_target_is_dropped() {
-		assert_eq!(
-			grain_choice(Speed::Moderate, MISSED, found(29.0, 100_000)),
-			GrainChoice::Plain
-		);
-		assert_eq!(grain_choice(Speed::Moderate, MISSED, MISSED), GrainChoice::Plain);
-		assert_eq!(
-			grain_choice(Speed::Moderate, found(12.0, 900_000), MISSED),
-			GrainChoice::Grain
-		);
+		assert_eq!(grain_choice(MISSED, found(29.0, 100_000)), GrainChoice::Plain);
+		assert_eq!(grain_choice(MISSED, MISSED), GrainChoice::Plain);
+		assert_eq!(grain_choice(found(12.0, 900_000), MISSED), GrainChoice::Grain);
 	}
 
 	#[test]
@@ -862,20 +858,19 @@ mod tests {
 		let grain_target = target(Speed::Moderate, true, &Overrides::default());
 
 		assert_eq!(
-			dropped_grain_text(14, found(12.0, 600_000), found(29.0, 100_000), grain_target).as_deref(),
-			Some(
-				"film grain 14 was left out: with it the samples needed CRF 12 and came out 6.0× the size; \
-				 without it CRF 29 measured VMAF 93.4 / 89.2"
-			)
+			dropped_grain_text(14, found(12.0, 600_000), found(29.0, 100_000), grain_target),
+			"film grain 14 was left out: with it the samples needed CRF 12 and came out 6.0× the size; \
+			 without it CRF 29 measured VMAF 93.4 / 89.2"
 		);
 		assert_eq!(
-			dropped_grain_text(20, MISSED, found(29.0, 100_000), grain_target).as_deref(),
-			Some(
-				"film grain 20 was left out: with it quality target not reached (VMAF 90.1 / 84.0 at CRF 10, target \
-				 91.0 / 86.5); without it CRF 29 measured VMAF 93.4 / 89.2"
-			)
+			dropped_grain_text(20, MISSED, found(29.0, 100_000), grain_target),
+			"film grain 20 was left out: with it quality target not reached (VMAF 90.1 / 84.0 at CRF 10, target \
+			 91.0 / 86.5); without it CRF 29 measured VMAF 93.4 / 89.2"
 		);
-		assert_eq!(dropped_grain_text(8, MISSED, MISSED, grain_target), None);
+		assert_eq!(
+			dropped_grain_text(8, MISSED, MISSED, grain_target),
+			"film grain 8 was left out: the quality target was reached neither with it nor without it"
+		);
 	}
 
 	#[test]

@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use crate::options::TrimWindow;
 use crate::outcome::JobError;
 use crate::probe::Stream;
-use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
+use crate::process::{self, RunError, STALL_TIMEOUT, ToolCommand};
 use crate::toolchain::Toolchain;
 use crate::video::noise::{self, Triplet};
 
@@ -25,9 +25,8 @@ const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:
 	format=yuv420p,siti=print_summary=1[out]";
 
 pub const DEFAULT_SEGMENTS: usize = 4;
-/// The noise deviation, in 8-bit code values, from which a source counts as noisy. Clean animation and CG measure
-/// up to about 0.3 (dither, debanding and compression flicker), noisy and grainy live action from about 0.45.
-pub const NOISY_SIGMA: f64 = 0.36;
+/// The noise deviation, in 8-bit code values, from which a source counts as noisy.
+pub const NOISY_SIGMA: f64 = 0.29;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanType {
@@ -212,12 +211,15 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 		_ => ScanType::Progressive,
 	};
 
-	// Frozen segments vote on noise: frames repeated exactly are evidence of a clean source (animation holds its
-	// drawings), while any real noise keeps consecutive frames apart.
+	// Frames repeated exactly carry no noise, so a held segment votes, but only once: freeze-frames over a noisy film
+	// mustn't outvote it.
 	let triplets: Vec<Triplet> = stats
 		.iter()
 		.filter(|segment| segment.black_s < REJECT_SHARE * segment.length_s)
-		.flat_map(|segment| segment.noise.iter().copied())
+		.flat_map(|segment| {
+			let held = segment.frozen_s >= REJECT_SHARE * segment.length_s;
+			segment.noise.iter().copied().take(if held { 1 } else { usize::MAX })
+		})
 		.collect();
 	let noise_sigma = noise::level(&triplets);
 	let noise = if noise_sigma.is_some_and(|sigma| sigma >= NOISY_SIGMA) {
@@ -299,20 +301,19 @@ async fn segment_noise(
 	segment: &Segment,
 	cancel: &CancellationToken,
 ) -> Result<Vec<Triplet>, JobError> {
-	let cmd = noise::command(
-		&tools.ffmpeg,
-		source,
-		main.index,
-		forced_decoder(main),
-		segment,
-		main.fps(),
-	);
-	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
-	if !out.status.success() {
-		return Ok(Vec::new());
-	}
+	let cmd = noise::command(&tools.ffmpeg, source, main, segment);
+	let mut reader = noise::Reader::default();
 
-	crate::images::blocking(cancel, move || noise::measure(&out.stdout)).await
+	let out = match process::run_streamed(&cmd, |chunk| reader.push(chunk), cancel).await {
+		Ok(out) => out,
+		Err(RunError::CaptureLimit(_)) => return Ok(Vec::new()),
+		Err(err) => return Err(err.into()),
+	};
+	Ok(if out.status.success() {
+		reader.finish()
+	} else {
+		Vec::new()
+	})
 }
 
 pub fn forced_decoder(stream: &Stream) -> Option<&'static str> {
@@ -576,8 +577,9 @@ mod tests {
 
 	#[test]
 	fn the_noise_comes_from_the_triplets_of_every_segment_but_black_ones() {
-		let camera = measured([Some(0.3), Some(1.2), None, None]);
+		let camera = measured([Some(0.9), Some(1.2), None, None]);
 		let animation = measured([Some(0.1), Some(0.25), Some(0.15), None]);
+		let flickering = measured([Some(0.5), Some(0.5), None, None]);
 		let mut black = measured([Some(5.0); 4]);
 		black.black_s = 2.9;
 		let mut held = measured([Some(0.0); 4]);
@@ -585,12 +587,21 @@ mod tests {
 
 		let grainy = classify(&[camera.clone(), black.clone()], Some(25.0), None);
 		let clean = classify(&[animation, black], Some(25.0), None);
-		let panned_and_held = classify(&[camera, held.clone(), held], Some(25.0), None);
+		let drawings_held = classify(
+			&[flickering, held.clone(), held.clone(), held.clone()],
+			Some(25.0),
+			None,
+		);
+		let freeze_frames = classify(&[camera.clone(), camera, held.clone(), held], Some(25.0), None);
 		let unmeasured = classify(&[stats([90, 0, 0], [0, 0])], Some(25.0), None);
 
 		assert_eq!((grainy.noise, grainy.noise_sigma), (NoiseClass::Light, Some(1.2)));
 		assert_eq!((clean.noise, clean.noise_sigma), (NoiseClass::Clean, Some(0.25)));
-		assert_eq!(panned_and_held.noise, NoiseClass::Clean, "{panned_and_held:?}");
+		assert_eq!(drawings_held.noise, NoiseClass::Clean, "{drawings_held:?}");
+		assert_eq!(
+			(freeze_frames.noise, freeze_frames.noise_sigma),
+			(NoiseClass::Light, Some(1.2))
+		);
 		assert_eq!((unmeasured.noise, unmeasured.noise_sigma), (NoiseClass::Clean, None));
 		assert_eq!(
 			classify(&[], Some(25.0), None),

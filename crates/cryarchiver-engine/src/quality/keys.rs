@@ -3,7 +3,7 @@ use std::fmt;
 use crate::images::decode::deep_pix_fmt;
 use crate::metadata::ImageFormat;
 use crate::probe::Stream;
-use crate::video::analyze::{Analysis, ScanType};
+use crate::video::analyze::{Analysis, NoiseClass, ScanType};
 use crate::video::plan::{Resolution, VideoPlan};
 
 const MPEG4: &[&str] = &["mpeg4", "msmpeg4v2", "msmpeg4v3", "h263", "flv1"];
@@ -130,6 +130,8 @@ pub struct VideoGroup {
 	pub range: DynamicRange,
 	pub scan: ScanType,
 	pub grain: Option<u8>,
+	/// Noisy to the encoder though no grain is planned (Fast, or grain the decoder makes up).
+	pub noisy: bool,
 	pub alpha: bool,
 }
 
@@ -148,6 +150,7 @@ impl VideoGroup {
 			range: DynamicRange::of(&plan.colour.transfer, main.pix_fmt.as_deref()),
 			scan: analysis.scan,
 			grain: plan.encoder.grain_level(),
+			noisy: analysis.noise == NoiseClass::Light,
 			alpha: plan.alpha,
 		}
 	}
@@ -234,7 +237,7 @@ impl fmt::Display for CacheKey {
 				group.fps.name(),
 				group.range.name(),
 				scan_name(group.scan),
-				grain_name(group.grain),
+				grain_name(group.grain, group.noisy),
 				alpha_name(group.alpha)
 			)?,
 			Group::Image(group) => write!(
@@ -275,8 +278,12 @@ fn scan_name(scan: ScanType) -> &'static str {
 	}
 }
 
-fn grain_name(grain: Option<u8>) -> String {
-	grain.map_or_else(|| "clean".to_owned(), |level| format!("grain{level}"))
+fn grain_name(grain: Option<u8>, noisy: bool) -> String {
+	match (grain, noisy) {
+		(Some(level), _) => format!("grain{level}"),
+		(None, true) => "noisy".to_owned(),
+		(None, false) => "clean".to_owned(),
+	}
 }
 
 fn alpha_name(alpha: bool) -> &'static str {
@@ -300,7 +307,6 @@ fn format_name(format: ImageFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::video::analyze::NoiseClass;
 	use crate::video::plan::{Encoder, test_plan};
 
 	fn stream(json: &str) -> Stream {
@@ -446,7 +452,13 @@ mod tests {
 		assert!(grain14.contains("/progressive/grain14/"), "{grain14}");
 		assert!(grain20.contains("/progressive/grain20/"), "{grain20}");
 		assert_ne!(grain8, grain20);
-		assert_eq!(key(Some(1.2), None), clean);
+
+		let noisy_without_grain = key(Some(1.2), None);
+		assert!(
+			noisy_without_grain.contains("/progressive/noisy/"),
+			"{noisy_without_grain}"
+		);
+		assert_ne!(noisy_without_grain, clean);
 	}
 
 	#[test]

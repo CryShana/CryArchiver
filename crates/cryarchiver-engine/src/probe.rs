@@ -11,6 +11,7 @@ use crate::process::{self, RunError, StdoutMode, ToolCommand};
 use crate::toolchain::Toolchain;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+const AV1_GRAIN_TRACE: &[&str] = &[" apply_grain "];
 const ESTIMATED_DURATION: &str = "Estimating duration from bitrate";
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -323,6 +324,37 @@ pub async fn first_frames(
 
 	let frames: Frames = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))?;
 	Ok(frames.frames)
+}
+
+/// Whether an AV1 stream's first frame header carries film grain parameters, read from the bitstream rather than from
+/// the decoder: libaom-av1 applies the grain without exporting it. The trace shows `apply_grain` only when the
+/// sequence header sets `film_grain_params_present`.
+pub async fn av1_film_grain(
+	tools: &Toolchain,
+	path: &Path,
+	stream_index: u32,
+	cancel: &CancellationToken,
+) -> Result<bool, ProbeError> {
+	let mut cmd = ToolCommand::new(&tools.ffmpeg, PROBE_TIMEOUT);
+	cmd.count_lines_containing(AV1_GRAIN_TRACE);
+	cmd.args(["-hide_banner", "-nostdin", "-i"])
+		.arg(process::tool_path(path))
+		.arg("-map")
+		.arg(format!("0:{stream_index}"))
+		.args([
+			"-c",
+			"copy",
+			"-bsf:v",
+			"trace_headers",
+			"-frames:v",
+			"1",
+			"-f",
+			"null",
+			"-",
+		]);
+
+	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
+	Ok(out.status.success() && out.counted_lines > 0)
 }
 
 fn number<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

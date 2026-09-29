@@ -667,6 +667,14 @@ impl Engine {
 		))
 		.await?;
 		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
+		if video.encoder.film_grain()
+			&& main.codec_name == "av1"
+			&& probe::av1_film_grain(&self.tools, source, main.index, cx.cancel)
+				.await
+				.map_err(video_probe_error)?
+		{
+			video.encoder = video.encoder.without_grain();
+		}
 		video.window = window;
 		if window.is_some() {
 			video.expected_frames = None;
@@ -942,22 +950,26 @@ impl Engine {
 				..video.clone()
 			};
 			let plain_target = video_quality::target(cx.job.speed, false, &cx.job.overrides);
+			let (start, bytes) = match searched {
+				Searched::Found(found) => (found.crf, Some(found.sample_bytes)),
+				Searched::Unreachable { .. } => (quality.start(), None),
+			};
 			let plain = {
 				let scorer = self.scorer(cx, workspace, &plain_video);
-				let (start, slope) = (quality.start(), quality.slope);
-				Box::pin(video_quality::search(
+				Box::pin(video_quality::search_below(
 					&scorer,
 					samples,
 					start,
 					plain_target,
-					slope,
+					quality.slope,
+					bytes,
 					progress(1),
 				))
 				.await?
 			};
 
-			if video_quality::grain_choice(cx.job.speed, searched, plain) == GrainChoice::Plain {
-				video.warnings.extend(video_quality::dropped_grain_text(
+			if video_quality::grain_choice(searched, plain) == GrainChoice::Plain {
+				video.warnings.push(video_quality::dropped_grain_text(
 					level,
 					searched,
 					plain,

@@ -7,13 +7,15 @@ use std::path::Path;
 use cryarchiver_engine::options::{SubtitlePick, TrimWindow};
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe::probe;
-use cryarchiver_engine::quality::search::DEFAULT_SLOPE;
+use cryarchiver_engine::quality::search::{DEFAULT_SLOPE, Target};
 use cryarchiver_engine::toolchain::Toolchain;
 use cryarchiver_engine::video::analyze::{Analysis, DEFAULT_SEGMENTS, NoiseClass, ScanType, analyze};
 use cryarchiver_engine::video::burn;
 use cryarchiver_engine::video::encode::{Sample, encode_sample, encode_video, video_command};
 use cryarchiver_engine::video::plan::{VideoCaps, VideoPlan, plan_video, precheck};
-use cryarchiver_engine::video::quality::{Scorer, Searched, search, search_samples, target, verify_windows};
+use cryarchiver_engine::video::quality::{
+	Scorer, Searched, search, search_below, search_samples, target, verify_windows,
+};
 use cryarchiver_engine::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
 
@@ -98,6 +100,53 @@ async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
 
 	assert_eq!(checked.frames, 75, "{checked:?}");
 	assert!(goal.met(checked), "{checked:?} at CRF {}", found.crf);
+}
+
+#[tokio::test]
+async fn a_search_below_a_size_gives_up_once_a_miss_is_already_that_large() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let cancel = CancellationToken::new();
+	let info = probe(&tools, &clip, &cancel).await.unwrap();
+	let main = precheck(&info, &CAPS).unwrap();
+	let analysis = Analysis {
+		scan: ScanType::Progressive,
+		noise: NoiseClass::Clean,
+		noise_sigma: None,
+		detail: Vec::new(),
+	};
+	let plan = plan_video(&info, main, &[], &analysis, Speed::Fast);
+	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
+	let unreachable = Target {
+		mean: 99.9,
+		floor: 99.9,
+	};
+	let samples = [Sample {
+		start_s: 0.0,
+		length_s: 3.0,
+	}];
+	let scorer = Scorer {
+		tools: &tools,
+		source: &clip,
+		workspace: &workspace,
+		plan: &plan,
+		threads: 4,
+		cancel: &cancel,
+	};
+
+	let mut rounds = 0;
+	let searched = search_below(&scorer, &samples, 40.0, unreachable, DEFAULT_SLOPE, Some(1), |_| {
+		rounds += 1;
+	})
+	.await
+	.unwrap();
+
+	assert!(
+		matches!(searched, Searched::Unreachable { crf, .. } if (crf - 40.0).abs() < 1e-9),
+		"{searched:?}"
+	);
+	assert_eq!(rounds, 1);
 }
 
 async fn burning_plan(
