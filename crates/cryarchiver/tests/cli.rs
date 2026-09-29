@@ -810,9 +810,10 @@ fn an_output_file_naming_the_source_itself_is_refused() {
 	let dir = tempfile::tempdir().unwrap();
 	let source = support::mpeg4(dir.path(), "clip.mp4", 3);
 	let before = fs::read(&source).unwrap();
+	fs::create_dir(dir.path().join("sub")).unwrap();
 
 	let exact = cryarchiver(dir.path(), &["clip.mp4", "-o", "clip.mp4"]);
-	let respelled = cryarchiver(dir.path(), &["clip.mp4", "-o", "./CLIP.MP4"]);
+	let respelled = cryarchiver(dir.path(), &["clip.mp4", "-o", "sub/../clip.mp4"]);
 
 	assert_eq!(exact.status.code(), Some(0), "{}{}", stdout(&exact), stderr(&exact));
 	assert!(stdout(&exact).contains("skipped"), "{}", stdout(&exact));
@@ -824,6 +825,28 @@ fn an_output_file_naming_the_source_itself_is_refused() {
 		stderr(&respelled)
 	);
 	assert!(stdout(&respelled).contains("skipped"), "{}", stdout(&respelled));
+	assert_eq!(fs::read(&source).unwrap(), before);
+
+	let mut entries: Vec<_> = fs::read_dir(dir.path())
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name())
+		.collect();
+	entries.sort();
+	assert_eq!(entries, ["clip.mp4", "sub"]);
+	assert_eq!(fs::read_dir(dir.path().join("sub")).unwrap().count(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn an_output_file_naming_the_source_by_a_different_case_is_refused() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let before = fs::read(&source).unwrap();
+
+	let out = cryarchiver(dir.path(), &["clip.mp4", "-o", "CLIP.MP4"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	assert!(stdout(&out).contains("skipped"), "{}", stdout(&out));
 	assert_eq!(fs::read(&source).unwrap(), before);
 	assert_eq!(
 		fs::read_dir(dir.path())

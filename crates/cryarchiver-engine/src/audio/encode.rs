@@ -13,6 +13,7 @@ const RESAMPLE: &str = "aresample=resampler=soxr:osr=48000";
 pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	let chapters = if plan.options.strip { "-1" } else { "0" };
+
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-i"])
 		.arg(process::tool_path(source))
 		.args(["-map_metadata", "0", "-map_chapters", chapters]);

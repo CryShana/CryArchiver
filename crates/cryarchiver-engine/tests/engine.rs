@@ -2322,3 +2322,138 @@ async fn stripped_audio_has_no_cover_art() {
 	.unwrap();
 	assert!(opus.vorbis_comments().pictures().is_empty());
 }
+
+#[tokio::test]
+async fn strip_drops_a_genuine_second_video_stream() {
+	let dir = tempfile::tempdir().unwrap();
+	let cues = dir.path().join("cues.srt");
+	fs::write(&cues, "1\n00:00:00,000 --> 00:00:01,000\nHello\n").unwrap();
+	let clip = dir.path().join("two-angle.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=64x64:r=25:d=1",
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=64x64:r=25:d=1",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=1",
+		"-i",
+		cues.to_str().unwrap(),
+		"-map",
+		"0:v",
+		"-map",
+		"1:v",
+		"-map",
+		"2:a",
+		"-map",
+		"3:s",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		"-c:a",
+		"aac",
+		"-c:s",
+		"srt",
+		clip.to_str().unwrap(),
+	]);
+	let strip = JobOptions {
+		strip: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(fast(&clip), strip), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(!warnings.is_empty(), "{warnings:?}");
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let video_streams = info
+		.streams
+		.iter()
+		.filter(|stream| stream.codec_type == "video")
+		.count();
+	assert_eq!(video_streams, 1, "{:?}", info.streams);
+}
+
+#[tokio::test]
+async fn stripped_extraction_drops_chapters_and_the_cover() {
+	let dir = tempfile::tempdir().unwrap();
+	let chapters = dir.path().join("chapters.txt");
+	fs::write(
+		&chapters,
+		";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle=One\n",
+	)
+	.unwrap();
+	let clip = dir.path().join("clip.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=64x64:r=25:d=1",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=1",
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=red:s=32x32",
+		"-i",
+		chapters.to_str().unwrap(),
+		"-map",
+		"0:v",
+		"-map",
+		"1:a",
+		"-map",
+		"2:v",
+		"-map_chapters",
+		"3",
+		"-frames:v:1",
+		"1",
+		"-c:v:0",
+		"mpeg4",
+		"-q:v",
+		"2",
+		"-c:a",
+		"aac",
+		"-c:v:1",
+		"png",
+		"-disposition:v:1",
+		"attached_pic",
+		clip.to_str().unwrap(),
+	]);
+	let extract_opus = JobOptions {
+		format: Some(OutputFormat::Opus),
+		strip: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(fast(&clip), extract_opus), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		!warnings.iter().any(|warning| warning.contains("cover art")),
+		"{warnings:?}"
+	);
+	let opus = OpusFile::read_from(
+		&mut File::open(&output).unwrap(),
+		ParseOptions::new().read_properties(false),
+	)
+	.unwrap();
+	assert!(opus.vorbis_comments().pictures().is_empty());
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!(info.chapters.is_empty(), "{:?}", info.chapters);
+}

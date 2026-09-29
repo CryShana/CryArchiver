@@ -285,6 +285,7 @@ impl Engine {
 					AudioPlan::Encode(plan) => {
 						let mut plan = retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?;
 						plan.options.strip = job.options.strip;
+
 						Planned::Audio {
 							plan,
 							info: Box::new(info),
@@ -309,6 +310,7 @@ impl Engine {
 						let mut plan =
 							extracted(retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?);
 						plan.options.strip = job.options.strip;
+
 						Planned::Audio {
 							plan,
 							info: Box::new(info),
