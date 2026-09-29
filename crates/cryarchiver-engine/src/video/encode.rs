@@ -11,7 +11,7 @@ use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
 use crate::video::plan::{Encoder, VideoPlan, svt_params};
 use crate::video::streams::{Extracted, StreamPlan};
-use crate::video::{InputStart, analyze, burn, run_ffmpeg};
+use crate::video::{InputStart, Seek, analyze, burn, run_ffmpeg};
 use crate::workspace::Workspace;
 
 pub const DECODE_ERRORS: &[&str] = &[
@@ -27,7 +27,6 @@ pub const DECODE_ERRORS: &[&str] = &[
 pub const MIN_PREDICTED_DURATION_S: f64 = 120.0;
 
 const DURATION_TOLERANCE_S: f64 = 0.1;
-const TIME_EPSILON_S: f64 = 1e-6;
 const PREDICTION_MARGIN: f64 = 0.05;
 const AUDIO_TEMP: Container = Container {
 	cover: Cover::Attachment,
@@ -70,21 +69,23 @@ fn encode_command(
 	cmd.count_lines_containing(DECODE_ERRORS);
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "repeat+info"]);
 
-	let seek = sample
-		.map(|sample| (sample.start_s, sample.length_s))
-		.or(plan.window.map(|window| (window.start_s, window.length_s)));
-	if let Some((start_s, length_s)) = seek {
-		cmd.seek(start_s, length_s);
-	}
-	let seek_s = seek.map(|(start_s, _)| start_s);
 	let start = if sample.is_some() {
 		plan.starts.main
 	} else {
 		plan.starts.every
 	};
-	if let Some(offset) = start.offset_arg(seek_s) {
+	let cut = sample
+		.map(|sample| (sample.start_s, sample.length_s))
+		.or(plan.window.map(|window| (window.start_s, window.length_s)))
+		.map(|(start_s, length_s)| start.seek(start_s, length_s));
+	if let Some(cut) = cut {
+		cmd.seek(cut.input_s, cut.input_length_s);
+	}
+	if let Some(offset) = start.offset_arg(cut.map(|cut| cut.input_s)) {
 		cmd.arg("-itsoffset").arg(offset);
 	}
+	let seek_s = cut.map(|cut| cut.start_s);
+	let trim = cut.and_then(Seek::trim_filter).unwrap_or_default();
 
 	if let Some(decoder) = plan.decoder {
 		cmd.arg("-c:v").arg(decoder);
@@ -101,14 +102,13 @@ fn encode_command(
 	} else {
 		plan.streams.as_slice()
 	};
-	let main = burn::main_chain(plan.subtitles.as_deref(), &plan.filters, seek_s);
 	let graphed = if let Some(overlay) = plan.overlay {
 		cmd.arg("-filter_complex").arg(burn::overlay_graph(
-			&format!("[0:{}]", streams[0]),
+			(&format!("[0:{}]", streams[0]), &trim),
 			"[1:0]",
 			overlay,
 			seek_s,
-			&main,
+			&burn::main_chain("", plan.subtitles.as_deref(), &plan.filters, seek_s),
 			"[burned]",
 		));
 		cmd.args(["-map", "[burned]"]);
@@ -119,8 +119,10 @@ fn encode_command(
 	for index in &streams[graphed..] {
 		cmd.arg("-map").arg(format!("0:{index}"));
 	}
+	let main = burn::main_chain(&trim, plan.subtitles.as_deref(), &plan.filters, seek_s);
+	let others = burn::main_chain(&trim, None, &plan.filters, None);
 	for ordinal in graphed..streams.len() {
-		let chain = if ordinal == 0 { &main } else { &plan.filters };
+		let chain = if ordinal == 0 { &main } else { &others };
 		cmd.arg(format!("-filter:v:{ordinal}")).arg(chain);
 	}
 
@@ -342,7 +344,7 @@ pub fn check_video_temp(
 		(Some(expected), _) if encoded.frames.abs_diff(expected) > plan.frame_tolerance => {
 			Err(ErrorKind::EncodeFailed(format!("the video has {} frames, {expected} expected", encoded.frames)).into())
 		}
-		(None, Some(declared)) if !lasts(encoded, start_s, declared) => Err(ErrorKind::EncodeFailed(format!(
+		(None, Some(declared)) if !lasts(plan, encoded, start_s, declared) => Err(ErrorKind::EncodeFailed(format!(
 			"the video lasts {:.2} s, {declared:.2} s expected",
 			encoded.decoded_s - start_s
 		))
@@ -352,11 +354,21 @@ pub fn check_video_temp(
 }
 
 // A declared duration is a length in MP4 but the end timestamp in Matroska's DURATION tag, and the video temp keeps
-// the source's start offset, so either reading may be the one that matches.
-fn lasts(encoded: &EncodedVideo, start_s: f64, declared_s: f64) -> bool {
-	[encoded.decoded_s - start_s, encoded.decoded_s]
-		.iter()
-		.any(|decoded| (decoded - declared_s).abs() <= DURATION_TOLERANCE_S)
+// the source's start offset, so either reading may be the one that matches. A TS/PS video's declared length counts
+// from its first packet, which the whole file's `-itsoffset` moved later on the temp, and which may not decode.
+fn lasts(plan: &VideoPlan, encoded: &EncodedVideo, start_s: f64, declared_s: f64) -> bool {
+	let offset_s = plan
+		.window
+		.map_or_else(|| plan.starts.every.offset_s(None), |_| None)
+		.unwrap_or(0.0);
+
+	[
+		encoded.decoded_s - start_s,
+		encoded.decoded_s,
+		encoded.decoded_s - offset_s,
+	]
+	.iter()
+	.any(|decoded| (decoded - declared_s).abs() <= DURATION_TOLERANCE_S)
 }
 
 pub fn audio_plan(info: &MediaInfo, streams: &StreamPlan, window: Option<TrimWindow>) -> Option<FilePlan> {
@@ -366,15 +378,19 @@ pub fn audio_plan(info: &MediaInfo, streams: &StreamPlan, window: Option<TrimWin
 		.map(|track| track.stream_index)
 		.chain(streams.merge_from.iter().copied())
 		.collect();
-	let delay_s = Some(InputStart::of(info, &read).delay_s(window.map_or(0.0, |window| window.start_s)))
-		.filter(|delay_s| *delay_s > TIME_EPSILON_S);
+	let start = InputStart::of(info, &read);
+	let cut = window.map(|window| start.seek(window.start_s, window.length_s));
 
 	(!tracks.is_empty()).then_some(FilePlan {
 		container: AUDIO_TEMP,
 		tracks,
 		options: FileOptions {
-			window,
-			delay_s,
+			window: cut.map(|cut| TrimWindow {
+				start_s: cut.input_s,
+				length_s: cut.input_length_s,
+			}),
+			kept: cut.and_then(|cut| cut.kept),
+			delay_s: start.offset_s(cut.map(|cut| cut.input_s)),
 			merge_from: streams.merge_from.clone(),
 			merge_language: streams.merge_language.clone(),
 			..FileOptions::default()
@@ -539,9 +555,9 @@ mod tests {
 
 		let args = joined(&cmd);
 		assert_eq!(cmd.current_dir, None);
-		assert!(args.contains(" -ss 4.000 -t 4.000 -i "), "{args}");
+		assert!(args.contains(" -ss 0.000 -t 8.000 -itsoffset 0.300000 -i "), "{args}");
 		assert!(
-			sampled.contains(" -ss 0.200 -t 1.000 -itsoffset 0.150000 -i "),
+			sampled.contains(" -ss 0.000 -t 1.200 -itsoffset 0.350000 -i "),
 			"{sampled}"
 		);
 		assert!(whole.contains("repeat+info -itsoffset 0.300000 -i "), "{whole}");
@@ -551,12 +567,40 @@ mod tests {
 		assert!(args.contains("subs.mkv -filter_complex "), "{args}");
 		assert!(
 			args.contains(
-				"-filter_complex [0:0]settb=AVTB,setpts=PTS+4.000/TB[bv];[1:0]setpts=PTS-0.002/TB[bs];\
+				"-filter_complex [0:0]trim=start=4.000000:end=8.000000,setpts=PTS-4.000000/TB,settb=AVTB,\
+				 setpts=PTS+4.000/TB[bv];[1:0]setpts=PTS-0.002/TB[bs];\
 				 [bs][bv]scale2ref[bss][bvs];[bss]null[bsd];[bvs][bsd]overlay=eof_action=pass,setpts=PTS-4.000/TB,\
-				 format=yuv420p10le,setparams=field_mode=prog[burned] -map [burned] -map 0:2 -filter:v:1 "
+				 format=yuv420p10le,setparams=field_mode=prog[burned] -map [burned] -map 0:2 \
+				 -filter:v:1 trim=start=4.000000:end=8.000000,setpts=PTS-4.000000/TB,format=yuv420p10le,"
 			),
 			"{args}"
 		);
+		assert!(
+			sampled.contains("[0:0]trim=start=0.200000:end=1.200000,setpts=PTS-0.200000/TB,settb=AVTB,"),
+			"{sampled}"
+		);
+		assert!(!whole.contains("trim="), "{whole}");
+	}
+
+	#[test]
+	fn a_matroska_trim_is_seeked_exactly_and_not_cut_again() {
+		let trimmed = VideoPlan {
+			window: Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 4.0,
+			}),
+			..plan(svt(), None)
+		};
+
+		let args = joined(&video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/video.a1.mkv"),
+			&trimmed,
+		));
+
+		assert!(args.contains("repeat+info -ss 4.000 -t 4.000 -i "), "{args}");
+		assert!(!args.contains("trim=") && !args.contains("-itsoffset"), "{args}");
 	}
 
 	#[test]
@@ -830,6 +874,27 @@ mod tests {
 	}
 
 	#[test]
+	fn a_whole_ts_video_moved_onto_the_file_clock_lasts_its_declared_length() {
+		let moved = VideoPlan {
+			starts: VideoStarts {
+				every: InputStart {
+					file_s: 2.909,
+					streams_s: Some(3.24),
+				},
+				..VideoStarts::default()
+			},
+			..plan(svt(), None)
+		};
+
+		assert_eq!(
+			check_video_temp(&moved, &encoded(152, 6.571, 0), Some(6.24), 0.491).unwrap(),
+			None
+		);
+		assert!(check_video_temp(&plan(svt(), None), &encoded(152, 6.571, 0), Some(6.24), 0.491).is_err());
+		assert!(check_video_temp(&moved, &encoded(140, 6.1, 0), Some(6.24), 0.491).is_err());
+	}
+
+	#[test]
 	fn without_a_trusted_frame_count_the_duration_must_match() {
 		let video = plan(svt(), None);
 
@@ -909,7 +974,7 @@ mod tests {
 	}
 
 	#[test]
-	fn ts_audio_that_starts_after_the_file_or_the_seek_is_delayed_onto_the_file_clock() {
+	fn ts_audio_is_seeked_early_cut_on_the_decoded_audio_and_delayed_onto_the_file_clock() {
 		let info = |format: &str| {
 			MediaInfo::parse(
 				format!(
@@ -925,18 +990,28 @@ mod tests {
 			audio: vec![opus(1, 128)],
 			..StreamPlan::default()
 		};
-		let from = |start_s: f64| Some(TrimWindow { start_s, length_s: 4.0 });
-		let delay = |format: &str, window: Option<TrimWindow>| {
-			audio_plan(&info(format), &streams, window).unwrap().options.delay_s
-		};
+		let window = |start_s: f64, length_s: f64| TrimWindow { start_s, length_s };
+		let options =
+			|format: &str, trim: Option<TrimWindow>| audio_plan(&info(format), &streams, trim).unwrap().options;
+		let near = |actual: Option<f64>, expected: f64| actual.is_some_and(|actual| (actual - expected).abs() < 1e-9);
 
-		let early = delay("mpegts", from(0.1)).unwrap();
-		let whole = delay("mpegts", None).unwrap();
+		let whole = options("mpegts", None);
+		let early = options("mpegts", Some(window(0.1, 4.0)));
+		let late = options("mpegts", Some(window(8.0, 4.0)));
+		let mkv = options("matroska,webm", Some(window(0.1, 4.0)));
 
-		assert!((early - 0.4).abs() < 1e-9, "{early}");
-		assert!((whole - 0.5).abs() < 1e-9, "{whole}");
-		assert_eq!(delay("mpegts", from(4.0)), None);
-		assert_eq!(delay("matroska,webm", from(0.1)), None);
-		assert_eq!(delay("matroska,webm", None), None);
+		assert!(near(whole.delay_s, 0.5), "{whole:?}");
+		assert_eq!((whole.window, whole.kept), (None, None));
+		assert!(near(early.delay_s, 0.5), "{early:?}");
+		assert_eq!(early.window, Some(window(0.0, 4.1)));
+		assert!(near(early.kept.map(|kept| kept.start_s), 0.1), "{early:?}");
+		assert!(near(early.kept.map(|kept| kept.length_s), 4.0), "{early:?}");
+		assert_eq!(late.delay_s, None);
+		assert_eq!(late.window, Some(window(3.0, 9.0)));
+		assert_eq!(late.kept, Some(window(5.0, 4.0)));
+		assert_eq!(
+			(mkv.delay_s, mkv.window, mkv.kept),
+			(None, Some(window(0.1, 4.0)), None)
+		);
 	}
 }

@@ -4,16 +4,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::outcome::{ErrorKind, JobError};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
-use crate::process::{self, STALL_TIMEOUT, ToolCommand};
+use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
 use crate::toolchain::Toolchain;
 use crate::video::mux::{MuxInput, OutputStream};
 use crate::video::plan::{Encoder, VideoPlan};
-use crate::video::run_ffmpeg;
 use crate::video::streams::StreamPlan;
+use crate::video::{delay, run_ffmpeg};
 
 const MIN_ALPHA_SSIM: f64 = 0.98;
 const MIN_START_TOLERANCE_S: f64 = 0.05;
 const MIN_SYNC_TOLERANCE_S: f64 = 0.02;
+/// Packets read to find the ones that don't decode: they all come before the first decodable GOP.
+const LEAD_PACKETS: &str = "%+#1000";
 const MASTERING_DISPLAY: &str = "Mastering display metadata";
 const DOVI_RECORD: &str = "DOVI configuration record";
 
@@ -254,6 +256,45 @@ pub async fn first_decoded_s(
 				.parse()
 				.ok()
 		}))
+}
+
+/// How many of video `stream`'s leading packets never decode into a frame: those shown before its first decoded
+/// frame, such as an open GOP's leading B-frames or the frames before the first keyframe of a TS cut mid-GOP.
+pub async fn undecoded_lead(
+	tools: &Toolchain,
+	path: &Path,
+	stream: u32,
+	cancel: &CancellationToken,
+) -> Result<u64, JobError> {
+	let Some(first_s) = first_decoded_s(tools, path, stream, false, cancel).await? else {
+		return Ok(0);
+	};
+
+	let mut cmd = ToolCommand::new(&tools.ffprobe, STALL_TIMEOUT);
+	cmd.args(["-v", "error", "-select_streams"])
+		.arg(stream.to_string())
+		.args(["-show_entries", "packet=pts_time", "-read_intervals", LEAD_PACKETS])
+		.args(["-of", "csv=p=0", "-i"])
+		.arg(process::tool_path(path));
+	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
+	if !out.status.success() {
+		return Err(JobError::with_log(
+			ErrorKind::EncodeFailed("the source's first video packets can't be listed".into()),
+			out.stderr_tail,
+		));
+	}
+
+	Ok(undecoded_count(&String::from_utf8_lossy(&out.stdout), first_s))
+}
+
+/// `packets` is ffprobe's `pts_time` list, one per line.
+pub fn undecoded_count(packets: &str, first_decoded_s: f64) -> u64 {
+	let count = packets
+		.lines()
+		.filter_map(|line| line.trim().trim_end_matches(',').parse::<f64>().ok())
+		.filter(|pts_s| delay(first_decoded_s - pts_s).is_some())
+		.count();
+	u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 /// Fails when an output stream doesn't start as far from the main video as it does in the source (`sync_error`).
@@ -785,6 +826,15 @@ mod tests {
 			output_s: Some(0.0),
 		}];
 		assert_eq!(sync_error(&undecodable, 0.0, false, 0.04), None);
+	}
+
+	#[test]
+	fn packets_shown_before_the_first_decoded_frame_are_the_ones_that_do_not_decode() {
+		let packets = "3.240000,\n3.400000,\n3.320000,\nN/A,\n3.280000\n3.360000\n3.560000\n3.480000,\n";
+
+		assert_eq!(undecoded_count(packets, 3.4), 4);
+		assert_eq!(undecoded_count(packets, 3.24), 0);
+		assert_eq!(undecoded_count("", 3.4), 0);
 	}
 
 	#[test]

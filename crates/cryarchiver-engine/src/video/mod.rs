@@ -12,6 +12,7 @@ pub mod verify;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError};
 use crate::probe::MediaInfo;
 use crate::process::{self, Progress, StdoutMode, ToolCommand, ToolOutput};
@@ -20,8 +21,45 @@ use crate::process::{self, Progress, StdoutMode, ToolCommand, ToolOutput};
 /// streams a command reads.
 const START_FROM_READ_STREAMS: &[&str] = &["mpegts", "mpegtsraw", "mpeg"];
 
-/// Shorter `-itsoffset` values than this aren't passed.
+/// Shorter delays than this are no delay: no `-itsoffset` or skip is passed for them.
 const NO_DELAY_S: f64 = 1e-6;
+/// How long before a cut a TS or PS input is seeked. Their seek lands just before the cut, mid-GOP, so the video
+/// would decode only from the next keyframe after it; seeked this much earlier, it decodes through the cut, which is
+/// then made on the decoded frames.
+const PRE_ROLL_S: f64 = 5.0;
+
+/// How a command reads `start_s..start_s + length_s` of the source.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Seek {
+	pub start_s: f64,
+	/// The input's `-ss` and `-t`.
+	pub input_s: f64,
+	pub input_length_s: f64,
+	/// For a TS or PS input, the part of what it decodes that is kept, on the command's own timeline. The input's
+	/// `-t` counts from where ffmpeg starts it, which can be later than the seek, so the end is cut here too.
+	pub kept: Option<TrimWindow>,
+}
+
+impl Seek {
+	/// The cut on a video stream, which moves it onto the timeline of an exact seek to `start_s`. It is a filter
+	/// rather than output options so that every command that reads the range keeps the same frames: an output's
+	/// `-t` is applied after the encoder rounds the times.
+	pub fn trim_filter(self) -> Option<String> {
+		self.kept.map(|kept| {
+			format!(
+				"trim=start={:.6}:end={:.6},setpts=PTS-{:.6}/TB",
+				kept.start_s,
+				kept.start_s + kept.length_s,
+				kept.start_s
+			)
+		})
+	}
+}
+
+/// `delay_s`, when it is long enough to act on.
+pub fn delay(delay_s: f64) -> Option<f64> {
+	(delay_s > NO_DELAY_S).then_some(delay_s)
+}
 
 /// Where ffmpeg starts a source's timeline in a command that reads some of its streams (measured on ffmpeg 9.0.1).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -64,9 +102,36 @@ impl InputStart {
 
 	/// The `-itsoffset` that moves what the command reads back onto the file's own clock, which counts from the
 	/// file's start as players do; `None` when ffmpeg already starts there.
+	pub fn offset_s(self, seek_s: Option<f64>) -> Option<f64> {
+		delay(self.delay_s(seek_s.unwrap_or(0.0)))
+	}
+
 	pub fn offset_arg(self, seek_s: Option<f64>) -> Option<String> {
-		let delay_s = self.delay_s(seek_s.unwrap_or(0.0));
-		(delay_s > NO_DELAY_S).then(|| format!("{delay_s:.6}"))
+		self.offset_s(seek_s).map(|delay_s| format!("{delay_s:.6}"))
+	}
+
+	/// How to read `start_s..start_s + length_s`. A TS or PS input is seeked `PRE_ROLL_S` earlier (not before its
+	/// start), and the command drops what it decodes before `start_s`.
+	pub fn seek(self, start_s: f64, length_s: f64) -> Seek {
+		if self.streams_s.is_none() {
+			return Seek {
+				start_s,
+				input_s: start_s,
+				input_length_s: length_s,
+				kept: None,
+			};
+		}
+
+		let input_s = (start_s - PRE_ROLL_S).max(0.0);
+		Seek {
+			start_s,
+			input_s,
+			input_length_s: length_s + start_s - input_s,
+			kept: Some(TrimWindow {
+				start_s: start_s - input_s,
+				length_s,
+			}),
+		}
 	}
 }
 

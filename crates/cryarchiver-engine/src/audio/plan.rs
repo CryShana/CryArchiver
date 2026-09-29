@@ -70,6 +70,9 @@ pub struct FileOptions {
 	/// An `-itsoffset` for the source, which keeps the tracks on the file's clock when ffmpeg starts them later than
 	/// the file (or the seek).
 	pub delay_s: Option<f64>,
+	/// The part of what `window` reads that is kept, on the command's own timeline, when the cut is made on the decoded
+	/// audio: a TS or PS input is seeked early.
+	pub kept: Option<TrimWindow>,
 	/// An ffmetadata file whose chapters replace the source's.
 	pub chapters: Option<PathBuf>,
 	pub merge_from: Vec<u32>,

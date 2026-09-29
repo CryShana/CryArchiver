@@ -12,7 +12,7 @@ use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, Progress, STALL_TIMEOUT, ToolCommand};
 use crate::video::burn::{self, Overlay};
 use crate::video::plan::Resolution;
-use crate::video::{InputStart, run_ffmpeg};
+use crate::video::{InputStart, Seek, run_ffmpeg};
 
 pub const FILTER: &str = "libvmaf";
 pub const MODELS: [&str; 2] = [HD_MODEL, UHD_MODEL];
@@ -114,17 +114,20 @@ pub fn sample_command(
 	scoring: &Scoring<'_>,
 ) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
-	cmd.seek(start_s, length_s);
-	push_reference(&mut cmd, reference, scoring, Some(start_s));
+	let cut = reference.start.seek(start_s, length_s);
+	cmd.seek(cut.input_s, cut.input_length_s);
+	push_reference(&mut cmd, reference, scoring, Some(cut));
 
 	let distorted_chain = chain(&[SCORED_FORMAT, BY_POSITION]);
 	let reference_chain = chain(&[reference.filters, SCORED_FORMAT, BY_POSITION]);
+	// A mapped label, not an unlabeled output: with an unlabeled one, ffmpeg 9 doesn't start a TS or PS reference at
+	// the streams it reads (as `InputStart` has it), but at the file's start.
 	cmd.arg("-filter_complex").arg(format!(
-		"[0:v:0]{distorted_chain}[d];{};[d][r]{}",
-		reference_branch(reference, &reference_chain, Some(start_s)),
+		"[0:v:0]{distorted_chain}[d];{};[d][r]{}[scored]",
+		reference_branch(reference, &reference_chain, Some(cut)),
 		libvmaf(scoring)
 	));
-	cmd.args(["-f", "null", "-"]);
+	cmd.args(["-map", "[scored]", "-f", "null", "-"]);
 	cmd
 }
 
@@ -136,18 +139,20 @@ pub fn window_command(
 	scoring: &Scoring<'_>,
 ) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
-	if let Some(window) = reference.window {
-		cmd.seek(window.start_s, window.length_s);
+	let cut = reference
+		.window
+		.map(|window| reference.start.seek(window.start_s, window.length_s));
+	if let Some(cut) = cut {
+		cmd.seek(cut.input_s, cut.input_length_s);
 	}
-	let seek_s = reference.window.map(|window| window.start_s);
-	push_reference(&mut cmd, reference, scoring, seek_s);
+	push_reference(&mut cmd, reference, scoring, cut);
 
 	let select = select(windows);
 	let distorted_chain = chain(&[&select, SCORED_FORMAT, BY_POSITION]);
 	let reference_chain = chain(&[reference.filters, &select, SCORED_FORMAT, BY_POSITION]);
 	cmd.arg("-filter_complex").arg(format!(
 		"[0:v:0]split[pace][all];[all]{distorted_chain}[d];{};[d][r]{}[scored]",
-		reference_branch(reference, &reference_chain, seek_s),
+		reference_branch(reference, &reference_chain, cut),
 		libvmaf(scoring)
 	));
 
@@ -187,8 +192,8 @@ fn base(ffmpeg: &Path, distorted: &Path, scoring: &Scoring<'_>) -> ToolCommand {
 	cmd
 }
 
-fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Scoring<'_>, seek_s: Option<f64>) {
-	if let Some(offset) = reference.start.offset_arg(seek_s) {
+fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Scoring<'_>, cut: Option<Seek>) {
+	if let Some(offset) = reference.start.offset_arg(cut.map(|cut| cut.input_s)) {
 		cmd.arg("-itsoffset").arg(offset);
 	}
 	if let Some(decoder) = reference.decoder {
@@ -203,12 +208,18 @@ fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Sc
 	}
 }
 
-/// The reference draws the same subtitles as the encode it is scored against, shifted to its own seek.
-fn reference_branch(reference: &Reference<'_>, chain: &str, seek_s: Option<f64>) -> String {
+/// The reference makes the same cut and draws the same subtitles as the encode it is scored against, shifted to its
+/// own seek.
+fn reference_branch(reference: &Reference<'_>, chain: &str, cut: Option<Seek>) -> String {
 	let video = format!("[1:{}]", reference.stream);
+	let trim = cut.and_then(Seek::trim_filter).unwrap_or_default();
+	let seek_s = cut.map(|cut| cut.start_s);
 	match reference.overlay {
-		Some(overlay) => burn::overlay_graph(&video, "[2:0]", overlay, seek_s, chain, "[r]"),
-		None => format!("{video}{}[r]", burn::main_chain(reference.subtitles, chain, seek_s)),
+		Some(overlay) => burn::overlay_graph((&video, &trim), "[2:0]", overlay, seek_s, chain, "[r]"),
+		None => format!(
+			"{video}{}[r]",
+			burn::main_chain(&trim, reference.subtitles, chain, seek_s)
+		),
 	}
 }
 
@@ -421,18 +432,46 @@ mod tests {
 		));
 
 		assert!(
-			args.contains(" -ss 2.000 -t 4.000 -itsoffset 0.500000 -i ")
+			args.contains(" -ss 0.000 -t 6.000 -itsoffset 2.500000 -i ")
 				&& args.contains(" -canvas_size 720x480 -itsoffset 1.000000 -i "),
 			"{args}"
 		);
 		assert!(
 			args.contains(
-				"[1:0]settb=AVTB,setpts=PTS+2.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];\
+				"[1:0]trim=start=2.000000:end=6.000000,setpts=PTS-2.000000/TB,settb=AVTB,setpts=PTS+2.000/TB[bv];\
+				 [2:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];\
 				 [bss]format=yuva420p10le[bsd];[bvs][bsd]overlay=eof_action=pass:format=yuv420p10,\
 				 setpts=PTS-2.000/TB,format=yuv420p10le,format=yuv420p10le,settb=1/1000,setpts=N[r];"
 			),
 			"{args}"
 		);
+		assert!(args.ends_with("[scored] -map [scored] -f null -"), "{args}");
+	}
+
+	#[test]
+	fn a_matroska_reference_is_seeked_exactly_and_not_cut_again() {
+		let reference = Reference {
+			source: Path::new("in.mkv"),
+			stream: 0,
+			decoder: None,
+			filters: "format=yuv420p10le",
+			window: None,
+			start: InputStart::default(),
+			overlay: None,
+			subtitles: None,
+		};
+
+		let args = joined(&sample_command(
+			Path::new("ffmpeg"),
+			Path::new("probe0-0.mkv"),
+			&reference,
+			12.5,
+			4.0,
+			&scoring(),
+		));
+
+		assert!(args.contains(" -ss 12.500 -t 4.000 -i "), "{args}");
+		assert!(!args.contains("trim="), "{args}");
 	}
 
 	#[test]

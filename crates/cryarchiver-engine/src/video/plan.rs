@@ -272,8 +272,14 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 	}
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn expected_frames(main: &Stream, declared_s: Option<f64>, scan: ScanType) -> Option<u64> {
+	decodable_frames(main, declared_s, scan, 0)
+}
+
+/// The frames the encode should get, when the packet count can be trusted: the packets less `undecoded` leading
+/// ones that never decode into a frame. The count is trusted by the packets the container declares.
+#[allow(clippy::cast_precision_loss)]
+pub fn decodable_frames(main: &Stream, declared_s: Option<f64>, scan: ScanType, undecoded: u64) -> Option<u64> {
 	let packets = main.nb_read_packets?;
 	let (average_fps, real_fps) = (main.avg_frame_rate?, main.r_frame_rate?);
 	let frames_by_duration = declared_s? * average_fps;
@@ -284,6 +290,7 @@ fn expected_frames(main: &Stream, declared_s: Option<f64>, scan: ScanType) -> Op
 		return None;
 	}
 
+	let packets = packets.saturating_sub(undecoded);
 	Some(match scan {
 		ScanType::Progressive => packets,
 		ScanType::Interlaced { .. } => packets * 2,
@@ -529,6 +536,29 @@ mod tests {
 		assert_eq!(expected_frames(&variable, Some(10.0), ScanType::Progressive), None);
 		assert_eq!(expected_frames(&pre_roll, Some(10.0), ScanType::Progressive), None);
 		assert_eq!(expected_frames(&field_rate, Some(10.0), ScanType::Progressive), None);
+	}
+
+	#[test]
+	fn leading_packets_that_never_decode_are_not_expected_as_frames() {
+		let open_gop_cut = Stream {
+			avg_frame_rate: Some(25.0),
+			r_frame_rate: Some(25.0),
+			nb_read_packets: Some(143),
+			..Stream::default()
+		};
+
+		assert_eq!(
+			decodable_frames(&open_gop_cut, Some(5.72), ScanType::Progressive, 3),
+			Some(140)
+		);
+		assert_eq!(
+			decodable_frames(&open_gop_cut, Some(5.72), ScanType::Interlaced { top_first: true }, 3),
+			Some(280)
+		);
+		assert_eq!(
+			decodable_frames(&open_gop_cut, Some(6.9), ScanType::Progressive, 3),
+			None
+		);
 	}
 
 	#[test]

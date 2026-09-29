@@ -4,8 +4,9 @@ use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::plan::{EncodePlan, FilePlan, LayoutFix, TrackPlan};
-use crate::audio::verify::{Levels, STATS, parse_levels, push_stats_output};
+use crate::audio::verify::{Levels, STATS, parse_levels, push_cut_stats_output};
 use crate::container::Cover;
+use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
 
@@ -48,7 +49,7 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 		let TrackPlan::Encode(encode) = &plan.tracks.first().expect("a merged file has one track").plan else {
 			unreachable!("a merged file's one track is always an encode plan")
 		};
-		push_merge(&mut cmd, encode, &plan.options.merge_from);
+		push_merge(&mut cmd, encode, &plan.options.merge_from, plan.options.kept);
 
 		cmd.args(["-map_metadata:s:a:0", "-1"]);
 		if let Some(language) = &plan.options.merge_language {
@@ -59,6 +60,9 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 	if plan.container.cover == Cover::Stream && !plan.options.strip {
 		cmd.args(["-map", "0:v?", "-c:v", "copy"]);
 	}
+	// A merge makes the cut inside its graph, where its levels are measured too.
+	let output_cut = plan.options.kept.filter(|_| plan.options.merge_from.is_empty());
+	push_cut(&mut cmd, output_cut);
 	cmd.args(["-f", plan.container.muxer]).arg(process::tool_path(output));
 
 	if plan.options.merge_from.is_empty() {
@@ -67,21 +71,41 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 			.iter()
 			.map(|track| format!("0:{}", track.stream_index))
 			.collect();
-		push_stats_output(&mut cmd, &sources);
+		push_cut_stats_output(&mut cmd, &sources, &output_cut.map_or_else(String::new, cut_filter));
 	} else {
 		cmd.args(["-map", "[stats]", "-f", "null", "-"]);
 	}
 	cmd
 }
 
-fn push_merge(cmd: &mut ToolCommand, encode: &EncodePlan, sources: &[u32]) {
+fn push_cut(cmd: &mut ToolCommand, kept: Option<TrimWindow>) {
+	if let Some(kept) = kept {
+		cmd.arg("-ss")
+			.arg(format!("{:.6}", kept.start_s))
+			.arg("-t")
+			.arg(format!("{:.6}", kept.length_s));
+	}
+}
+
+// Output options cut after an output's own filters, so what `astats` measures is cut in its chain.
+fn cut_filter(kept: TrimWindow) -> String {
+	format!(
+		"atrim=start={:.6}:end={:.6},asetpts=PTS-{:.6}/TB",
+		kept.start_s,
+		kept.start_s + kept.length_s,
+		kept.start_s
+	)
+}
+
+fn push_merge(cmd: &mut ToolCommand, encode: &EncodePlan, sources: &[u32], kept: Option<TrimWindow>) {
 	let layout = encode.layout.target();
+	let skipped = kept.map_or_else(String::new, |kept| format!("{},", cut_filter(kept)));
 
 	let mut graph = String::new();
 	for (input, stream) in sources.iter().enumerate() {
 		let _ = write!(
 			graph,
-			"[0:{stream}]{RESAMPLE},aformat=channel_layouts={layout}[m{input}];"
+			"[0:{stream}]{skipped}{RESAMPLE},aformat=channel_layouts={layout}[m{input}];"
 		);
 	}
 	for input in 0..sources.len() {

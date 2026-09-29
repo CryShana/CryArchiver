@@ -267,10 +267,11 @@ pub fn subtitle_filter(kind: BurnKind, size_percent: u8) -> Option<String> {
 	}
 }
 
-/// The main video's filter chain for a command whose input is seeked to `seek_s` of the source. Seeking restarts
-/// the frames' timestamps near 0 while `subs.ass` keeps the source's, so the frames are moved onto the source's
-/// timeline for the subtitle filter and back by the same amount afterwards.
-pub fn main_chain(subtitles: Option<&str>, filters: &str, seek_s: Option<f64>) -> String {
+/// The main video's filter chain for a command whose input is seeked to `seek_s` of the source, after `cut` (the
+/// seek's `trim_filter`, or empty). Seeking restarts the frames' timestamps near 0 while `subs.ass` keeps the
+/// source's, so the frames are moved onto the source's timeline for the subtitle filter and back by the same amount
+/// afterwards.
+pub fn main_chain(cut: &str, subtitles: Option<&str>, filters: &str, seek_s: Option<f64>) -> String {
 	let drawn = match (subtitles, seek_s) {
 		(Some(subtitles), Some(start_s)) => {
 			format!("{FINE_TIME_BASE},setpts=PTS+{start_s:.3}/TB,{subtitles},setpts=PTS-{start_s:.3}/TB")
@@ -279,14 +280,14 @@ pub fn main_chain(subtitles: Option<&str>, filters: &str, seek_s: Option<f64>) -
 		(None, _) => String::new(),
 	};
 
-	chained(&[&drawn, filters])
+	chained(&[cut, &drawn, filters])
 }
 
-/// The graph that draws `subs.mkv` (the `subtitles` input label) over `video`, then runs `chain`, into `out`. The
-/// bitmap input is read unseeked, so a cue already on screen at a seek is still drawn; the seeked video is moved
-/// onto the source's timeline for the overlay, like `main_chain` does.
+/// The graph that draws `subs.mkv` (the `subtitles` input label) over `video` after `cut`, then runs `chain`, into
+/// `out`. The bitmap input is read unseeked, so a cue already on screen at a seek is still drawn; the seeked video
+/// is moved onto the source's timeline for the overlay, like `main_chain` does.
 pub fn overlay_graph(
-	video: &str,
+	(video, cut): (&str, &str),
 	subtitles: &str,
 	overlay: Overlay,
 	seek_s: Option<f64>,
@@ -295,10 +296,10 @@ pub fn overlay_graph(
 ) -> String {
 	let (onto_source, back) = match seek_s {
 		Some(start_s) => (
-			format!("{FINE_TIME_BASE},setpts=PTS+{start_s:.3}/TB"),
+			chained(&[cut, FINE_TIME_BASE, &format!("setpts=PTS+{start_s:.3}/TB")]),
 			format!("setpts=PTS-{start_s:.3}/TB"),
 		),
-		None => (FINE_TIME_BASE.to_owned(), String::new()),
+		None => (chained(&[cut, FINE_TIME_BASE]), String::new()),
 	};
 	let (pictures, blend) = if overlay.ten_bit {
 		("[bss]format=yuva420p10le[bsd];", ":format=yuv420p10")
@@ -395,15 +396,22 @@ mod tests {
 		assert_eq!(ass, "subtitles=subs.ass:fontsdir=fonts");
 		assert_eq!(subtitle_filter(BurnKind::Bitmap, 5), None);
 		assert_eq!(
-			main_chain(Some(&ass), "format=yuv420p10le", Some(4.0)),
+			main_chain("", Some(&ass), "format=yuv420p10le", Some(4.0)),
 			"settb=AVTB,setpts=PTS+4.000/TB,subtitles=subs.ass:fontsdir=fonts,setpts=PTS-4.000/TB,format=yuv420p10le"
 		);
 		assert_eq!(
-			main_chain(Some(&ass), "format=yuv420p10le", None),
+			main_chain("", Some(&ass), "format=yuv420p10le", None),
 			"subtitles=subs.ass:fontsdir=fonts,format=yuv420p10le"
 		);
-		assert_eq!(main_chain(None, "format=yuv420p10le", Some(4.0)), "format=yuv420p10le");
-		assert_eq!(main_chain(None, "", None), "");
+		assert_eq!(
+			main_chain("", None, "format=yuv420p10le", Some(4.0)),
+			"format=yuv420p10le"
+		);
+		assert_eq!(main_chain("", None, "", None), "");
+		assert_eq!(
+			main_chain("trim=start=5", Some(&ass), "", Some(4.0)),
+			"trim=start=5,settb=AVTB,setpts=PTS+4.000/TB,subtitles=subs.ass:fontsdir=fonts,setpts=PTS-4.000/TB"
+		);
 	}
 
 	#[test]
@@ -416,14 +424,15 @@ mod tests {
 		let ten = Overlay { ten_bit: true, ..eight };
 
 		assert_eq!(
-			overlay_graph("[0:0]", "[1:0]", eight, None, "format=yuv420p10le", "[burned]"),
+			overlay_graph(("[0:0]", ""), "[1:0]", eight, None, "format=yuv420p10le", "[burned]"),
 			"[0:0]settb=AVTB[bv];[1:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];[bss]null[bsd];\
 			 [bvs][bsd]overlay=eof_action=pass,format=yuv420p10le[burned]"
 		);
 		assert_eq!(
-			overlay_graph("[1:0]", "[2:0]", ten, Some(4.0), "", "[r]"),
-			"[1:0]settb=AVTB,setpts=PTS+4.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];\
-			 [bss]format=yuva420p10le[bsd];[bvs][bsd]overlay=eof_action=pass:format=yuv420p10,setpts=PTS-4.000/TB[r]"
+			overlay_graph(("[1:0]", "trim=start=5"), "[2:0]", ten, Some(4.0), "", "[r]"),
+			"[1:0]trim=start=5,settb=AVTB,setpts=PTS+4.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];\
+			 [bs][bv]scale2ref[bss][bvs];[bss]format=yuva420p10le[bsd];\
+			 [bvs][bsd]overlay=eof_action=pass:format=yuv420p10,setpts=PTS-4.000/TB[r]"
 		);
 	}
 

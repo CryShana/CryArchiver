@@ -3531,7 +3531,8 @@ async fn start_of(path: &Path, kind: &str) -> f64 {
 
 /// Runs `source` without a burn, whole or cut to `trim`, and checks it against the file's own clock, which is what a
 /// player shows: the marked frame lands where that clock has it, less the cut's start, and the click stays as far
-/// from it as in the source. Uncut, the audio also starts as far from the video as in the source.
+/// from it as in the source. Uncut, the audio also starts as far from the video as in the source; cut, the video
+/// starts within a frame of where that clock puts the source's.
 async fn on_the_file_clock(source: &Path, out_dir: &Path, trim: Option<(f64, f64)>) {
 	let file_start = probe(&support::toolchain().await, source, &CancellationToken::new())
 		.await
@@ -3577,6 +3578,13 @@ async fn on_the_file_clock(source: &Path, out_dir: &Path, trim: Option<(f64, f64
 			(output_lead - source_lead).abs() < 0.021,
 			"{name}: the video starts {output_lead:.3} s after the audio, {source_lead:.3} s in the source"
 		);
+	} else {
+		let wanted = (start_of(source, "video").await - file_start - start_s).max(0.0);
+		let video_start = start_of(&output, "video").await;
+		assert!(
+			(-0.021..0.041).contains(&(video_start - wanted)),
+			"{name} {trim:?}: the video starts at {video_start}, {wanted:.3} on the file's clock"
+		);
 	}
 	fs::remove_file(&output).unwrap();
 }
@@ -3606,6 +3614,144 @@ async fn an_mkv_whose_video_starts_after_its_audio_keeps_its_offsets() {
 	for trim in [None, Some((4.0, 8.0))] {
 		on_the_file_clock(&late_video, dir.path(), trim).await;
 	}
+}
+
+/// A broadcast-style recording: a `.ts` whose video starts 0.3 s after its audio, cut on a packet boundary a fifth of
+/// the way in, so that it starts mid-GOP with packets that don't decode.
+async fn broadcast_cut(dir: &Path) -> std::path::PathBuf {
+	let full = dir.join("recording.ts");
+	let mut args = vec![
+		"-itsoffset",
+		"0.3",
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=8",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=8.3",
+		"-map",
+		"0",
+		"-map",
+		"1",
+	];
+	args.extend(b_frame_codec().await);
+	args.extend(["-c:a", "aac", full.to_str().unwrap()]);
+	support::ffmpeg(&args);
+
+	let bytes = fs::read(&full).unwrap();
+	let cut = dir.join("cut.ts");
+	fs::write(&cut, &bytes[bytes.len() / 5 / 188 * 188..]).unwrap();
+	cut
+}
+
+/// An open-GOP H.264 clip copied out from its second GOP, so that it starts with B-frames that don't decode.
+fn open_gop_cut(dir: &Path) -> std::path::PathBuf {
+	let full = dir.join("open-gop.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=8",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=8",
+		"-c:v",
+		"libx264",
+		"-bf",
+		"3",
+		"-g",
+		"12",
+		"-x264-params",
+		"open-gop=1",
+		"-pix_fmt",
+		"yuv420p",
+		"-c:a",
+		"aac",
+		full.to_str().unwrap(),
+	]);
+	support::converted(
+		dir,
+		"open-gop-cut.mp4",
+		&["-ss", "1.1"],
+		&full,
+		&["-map", "0", "-c", "copy"],
+	)
+}
+
+#[tokio::test]
+async fn sources_whose_first_packets_do_not_decode_encode_whole() {
+	let dir = tempfile::tempdir().unwrap();
+	if !support::toolchain().await.encoders.contains("libx264") {
+		return;
+	}
+	let broadcast = broadcast_cut(dir.path()).await;
+	assert!(start_of(&broadcast, "audio").await + 0.2 < start_of(&broadcast, "video").await);
+	let open_gop = open_gop_cut(dir.path());
+
+	for (source, format) in [
+		(&broadcast, OutputFormat::Mkv),
+		(&broadcast, OutputFormat::Mp4),
+		(&open_gop, OutputFormat::Mkv),
+		(&open_gop, OutputFormat::Mp4),
+	] {
+		let job = with_options(
+			fast(source),
+			JobOptions {
+				format: Some(format),
+				..JobOptions::default()
+			},
+		);
+
+		let outcome = run(&job, dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{} to {format:?}: {outcome:?}", source.display())
+		};
+		fs::remove_file(&output).unwrap();
+	}
+}
+
+#[tokio::test]
+async fn a_ts_trim_decodes_through_the_cut_and_its_samples_and_checks_stay_aligned() {
+	let dir = tempfile::tempdir().unwrap();
+	let m2ts = dir.path().join("moving.m2ts");
+	let mut args = vec![
+		"-itsoffset",
+		"0.3",
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=10",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=10.3",
+		"-map",
+		"0",
+		"-map",
+		"1",
+	];
+	args.extend(b_frame_codec().await);
+	args.extend(["-c:a", "aac", "-mpegts_m2ts_mode", "1", m2ts.to_str().unwrap()]);
+	support::ffmpeg(&args);
+	let engine = Engine::new(support::toolchain().await);
+
+	let (outcome, events) = run_recording(&engine, &trimmed(job(&m2ts), 4.0, 8.0), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		!warnings.iter().any(|warning| warning.contains("quality target")),
+		"{warnings:?}"
+	);
+	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 2, "{events:?}");
+	let video_start = start_of(output, "video").await;
+	assert!(video_start <= 0.041, "the video starts {video_start} s after the cut");
 }
 
 const ORANGE: [u8; 3] = [152, 50, 188];

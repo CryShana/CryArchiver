@@ -19,13 +19,23 @@ pub struct Levels {
 }
 
 pub fn push_stats_output(cmd: &mut ToolCommand, streams: &[String]) {
+	push_cut_stats_output(cmd, streams, "");
+}
+
+/// `push_stats_output` measuring only what `cut` (a filter such as `atrim`, or empty) keeps.
+pub fn push_cut_stats_output(cmd: &mut ToolCommand, streams: &[String], cut: &str) {
 	for stream in streams {
 		cmd.arg("-map").arg(stream);
 	}
 
+	let cut = if cut.is_empty() {
+		String::new()
+	} else {
+		format!("{cut},")
+	};
 	for track in 0..streams.len() {
 		cmd.arg(format!("-filter:a:{track}"))
-			.arg(format!("astats@s{track}={STATS}"));
+			.arg(format!("{cut}astats@s{track}={STATS}"));
 	}
 	cmd.args(["-f", "null", "-"]);
 }

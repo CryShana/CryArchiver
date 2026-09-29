@@ -35,7 +35,7 @@ use crate::video::quality::{self as video_quality, MAX_RETRIES, Scorer, Searched
 use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, check_sync, earliest_video_start, probe_temp, start_offsets,
-	sync_tolerance_s, synced_streams, verify_output,
+	sync_tolerance_s, synced_streams, undecoded_lead, verify_output,
 };
 use crate::video::{VideoStarts, analyze, chapters, cues, encode as video_encode};
 use crate::workspace::Workspace;
@@ -657,6 +657,9 @@ impl Engine {
 		video.window = window;
 		if window.is_some() {
 			video.expected_frames = None;
+		} else if video.expected_frames.is_some() {
+			let undecoded = undecoded_lead(&self.tools, source, main.index, cx.cancel).await?;
+			video.expected_frames = video_plan::decodable_frames(main, declared_s, analysis.scan, undecoded);
 		}
 		if cx.job.options.strip {
 			video.streams.truncate(1);
