@@ -2366,6 +2366,218 @@ async fn merged_mono_tracks_become_one_mono_opus() {
 }
 
 #[tokio::test]
+async fn merge_audio_on_a_single_track_file_changes_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let opus = support::tone(
+		dir.path(),
+		"low.opus",
+		"mono",
+		1,
+		3,
+		&["-c:a", "libopus", "-b:a", "32k"],
+	);
+	let merge = JobOptions {
+		merge_audio: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(job(&opus), merge), dir.path()).await;
+
+	assert!(
+		matches!(
+			&outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::AlreadyEfficient(_)
+			}
+		),
+		"{outcome:?}"
+	);
+}
+
+#[tokio::test]
+async fn a_short_first_track_does_not_fail_the_merge() {
+	let dir = tempfile::tempdir().unwrap();
+	let uneven = dir.path().join("uneven.mka");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=3",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=880:duration=8",
+		"-map",
+		"0:a",
+		"-map",
+		"1:a",
+		"-ac:a:1",
+		"2",
+		"-c:a",
+		"flac",
+		uneven.to_str().unwrap(),
+	]);
+	let merge = JobOptions {
+		merge_audio: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(job(&uneven), merge), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let duration = info.format.duration.unwrap();
+	assert!(
+		(duration - 3.0).abs() < 0.1,
+		"expected ~3.0 s (the first track), got {duration} s"
+	);
+}
+
+#[tokio::test]
+async fn a_trimmed_merge_lasts_exactly_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let two = dir.path().join("two-long.mka");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=6",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=880:duration=6",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-c:a",
+		"flac",
+		two.to_str().unwrap(),
+	]);
+	let options = JobOptions {
+		trim: Some(Trim {
+			start_s: 1.0,
+			end_s: Some(4.0),
+		}),
+		merge_audio: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(job(&two), options), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let duration = info.format.duration.unwrap();
+	assert!(
+		(duration - 3.0).abs() < 0.1,
+		"expected the 3 s window, got {duration} s"
+	);
+}
+
+#[tokio::test]
+async fn merged_extraction_mixes_a_two_track_video_to_one_opus_track() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("two-tracks.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=3",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=3",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=880:duration=3",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-map",
+		"2",
+		"-c:v",
+		"mpeg4",
+		"-c:a",
+		"aac",
+		clip.to_str().unwrap(),
+	]);
+	let options = JobOptions {
+		format: Some(OutputFormat::Opus),
+		merge_audio: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(fast(&clip), options), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Encoded { output, .. } if *output == dir.path().join("two-tracks.cry.opus")),
+		"{outcome:?}"
+	);
+	let info = encoded_info(outcome).await;
+	assert_eq!(info.audio_streams().count(), 1);
+	assert!(!info.streams.iter().any(Stream::is_video));
+}
+
+#[tokio::test]
+async fn merging_keeps_every_source_audible() {
+	let dir = tempfile::tempdir().unwrap();
+	let two = dir.path().join("two-tones.mka");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=2",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=880:duration=2",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-c:a",
+		"flac",
+		two.to_str().unwrap(),
+	]);
+	let merge = JobOptions {
+		merge_audio: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(job(&two), merge), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let filtered = std::process::Command::new("ffmpeg")
+		.args(["-hide_banner", "-i"])
+		.arg(&output)
+		.args(["-af", "highpass=f=660,volumedetect", "-f", "null", "-"])
+		.output()
+		.unwrap();
+	let log = String::from_utf8_lossy(&filtered.stderr);
+	let mean: f64 = log
+		.split("mean_volume:")
+		.nth(1)
+		.and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+		.unwrap_or_else(|| panic!("{log}"));
+	assert!(
+		mean > -30.0,
+		"the 880 Hz source should still be audible after a 660 Hz highpass: {mean} dB\n{log}"
+	);
+}
+
+#[tokio::test]
 async fn stripped_video_keeps_only_the_main_video_and_the_audio() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::clip_with_extras(dir.path());

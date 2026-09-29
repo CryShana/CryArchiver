@@ -42,7 +42,15 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 			}
 		}
 	} else {
-		push_merge(&mut cmd, plan);
+		let TrackPlan::Encode(encode) = &plan.tracks.first().expect("a merged file has one track").plan else {
+			unreachable!("a merged file's one track is always an encode plan")
+		};
+		push_merge(&mut cmd, encode, &plan.options.merge_from);
+
+		cmd.args(["-map_metadata:s:a:0", "-1"]);
+		if let Some(language) = &plan.options.merge_language {
+			cmd.arg("-metadata:s:a:0").arg(format!("language={language}"));
+		}
 	}
 
 	if plan.container.cover == Cover::Stream && !plan.options.strip {
@@ -63,11 +71,7 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 	cmd
 }
 
-fn push_merge(cmd: &mut ToolCommand, plan: &FilePlan) {
-	let Some(TrackPlan::Encode(encode)) = plan.tracks.first().map(|track| &track.plan) else {
-		return;
-	};
-	let sources = &plan.options.merge_from;
+fn push_merge(cmd: &mut ToolCommand, encode: &EncodePlan, sources: &[u32]) {
 	let layout = encode.layout.target();
 
 	let mut graph = String::new();
@@ -82,7 +86,8 @@ fn push_merge(cmd: &mut ToolCommand, plan: &FilePlan) {
 	}
 	let _ = write!(
 		graph,
-		"amix=inputs={}:duration=first:normalize=0,alimiter=limit=0.95,asplit[merged][measured];[measured]astats@s0={STATS}[stats]",
+		"amix=inputs={}:duration=first:normalize=0,alimiter=limit=0.95:level=0:latency=1,asplit[merged][measured];\
+		 [measured]astats@s0={STATS}[stats]",
 		sources.len()
 	);
 
@@ -350,13 +355,55 @@ mod tests {
 			args.contains(
 				"[0:1]aresample=resampler=soxr:osr=48000,aformat=channel_layouts=stereo[m0];\
 				 [0:2]aresample=resampler=soxr:osr=48000,aformat=channel_layouts=stereo[m1];\
-				 [m0][m1]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95,asplit[merged][measured];\
-				 [measured]astats@s0="
+				 [m0][m1]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:level=0:latency=1,\
+				 asplit[merged][measured];[measured]astats@s0="
 			),
 			"{args}"
 		);
 		assert!(args.contains("-map [merged] -c:a:0 libopus -b:a:0 128k"), "{args}");
+		assert!(
+			args.contains("-map [merged] -c:a:0 libopus -b:a:0 128k -map_metadata:s:a:0 -1"),
+			"{args}"
+		);
 		assert!(args.ends_with("-map [stats] -f null -"), "{args}");
+	}
+
+	#[test]
+	fn a_merged_track_keeps_its_language_but_drops_its_title() {
+		let stereo = EncodePlan {
+			bitrate_kbps: 128,
+			channels: 2,
+			layout: LayoutFix::Keep("stereo"),
+		};
+		let file = |merge_language: Option<&str>| FilePlan {
+			container: OGG_OPUS,
+			tracks: vec![track(1, TrackPlan::Encode(stereo.clone()))],
+			options: FileOptions {
+				merge_from: vec![1, 2],
+				merge_language: merge_language.map(str::to_owned),
+				..FileOptions::default()
+			},
+		};
+
+		let tagged = joined(&command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("out.opus"),
+			&file(Some("eng")),
+		));
+		let untagged = joined(&command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("out.opus"),
+			&file(None),
+		));
+
+		assert!(
+			tagged.contains("-map_metadata:s:a:0 -1 -metadata:s:a:0 language=eng"),
+			"{tagged}"
+		);
+		assert!(untagged.contains("-map_metadata:s:a:0 -1"), "{untagged}");
+		assert!(!untagged.contains("-metadata:s:a:0"), "{untagged}");
 	}
 
 	#[test]

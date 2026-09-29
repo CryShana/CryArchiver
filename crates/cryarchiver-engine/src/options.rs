@@ -27,8 +27,10 @@ pub struct JobOptions {
 }
 
 impl JobOptions {
-	pub fn forced(&self) -> bool {
-		self.trim.is_some() || self.format.is_some() || self.strip || self.merge_audio
+	/// `merge_possible` is whether the file actually has enough audio tracks for `--merge-audio` to merge anything;
+	/// a single-track file is not forced by the flag alone.
+	pub fn forced(&self, merge_possible: bool) -> bool {
+		self.trim.is_some() || self.format.is_some() || self.strip || (self.merge_audio && merge_possible)
 	}
 }
 
@@ -307,13 +309,25 @@ mod tests {
 
 	#[test]
 	fn only_transformations_force_an_output() {
-		assert!(!JobOptions::default().forced());
+		assert!(!JobOptions::default().forced(false));
 		assert!(
 			JobOptions {
 				trim: Some(trim(1.0, None)),
 				..JobOptions::default()
 			}
-			.forced()
+			.forced(false)
 		);
+	}
+
+	#[test]
+	fn merge_audio_forces_an_output_only_when_the_merge_is_possible() {
+		let merge = JobOptions {
+			merge_audio: true,
+			..JobOptions::default()
+		};
+
+		assert!(!merge.forced(false));
+		assert!(merge.forced(true));
+		assert!(!JobOptions::default().forced(true));
 	}
 }

@@ -281,7 +281,7 @@ impl Engine {
 				self.require(MediaKind::Audio)?;
 				on_event(JobEvent::Stage(Stage::Plan));
 				let rules = AudioRules {
-					forced: job.options.forced(),
+					forced: job.options.forced(merge_possible(&info)),
 					reencode: job.options.trim.is_some(),
 				};
 				match plan_file_with(&info, job.speed, &job.overrides, rules) {
@@ -346,7 +346,7 @@ impl Engine {
 				on_event(JobEvent::Stage(Stage::Plan));
 				let rules = stream_rules(job);
 				let planned = self
-					.video_main(&info, job.options.forced())
+					.video_main(&info, job.options.forced(merge_possible(&info)))
 					.map_err(Refusal::from)
 					.and_then(|_| plan_streams(&info, &rules));
 				match planned {
@@ -480,7 +480,7 @@ impl Engine {
 			cancel: cx.cancel,
 			memory: self.quality.as_ref(),
 			route: image_route(cx.job.options.format),
-			forced: cx.job.options.forced(),
+			forced: cx.job.options.forced(false),
 		};
 		Ok(match image_job::produce(&image, input, workspace).await? {
 			ImageOutcome::Output {
@@ -534,10 +534,14 @@ impl Engine {
 		let source_levels = encode::run(&cmd, plan, duration_s, on_fraction, cx.cancel).await?;
 
 		let decoded_s = source_levels.iter().map(|levels| levels.duration_s).fold(0.0, f64::max);
-		let shortfall = match plan.options.window {
-			Some(window) => window.shortfall(decoded_s),
-			None if from_video => extraction_shortfall(info, decoded_s),
-			None => info.duration_shortfall(decoded_s),
+		let shortfall = if plan.options.merge_from.is_empty() {
+			match plan.options.window {
+				Some(window) => window.shortfall(decoded_s),
+				None if from_video => extraction_shortfall(info, decoded_s),
+				None => info.duration_shortfall(decoded_s),
+			}
+		} else {
+			merge_shortfall(info, &plan.options.merge_from, plan.options.window, decoded_s)
 		};
 		if let Some(reason) = shortfall {
 			return Err(ErrorKind::SourceDamaged(reason).into());
@@ -558,7 +562,7 @@ impl Engine {
 			.len();
 		let share = source_share(cx.source_bytes, plan.options.window, info.format.duration);
 		if !saves_enough(share.unwrap_or(cx.source_bytes), bytes, cx.job.min_savings) {
-			if !cx.job.options.forced() {
+			if !cx.job.options.forced(merge_possible(info)) {
 				return Ok(Produced::Kept(KeepReason::NotSmaller {
 					src_bytes: cx.source_bytes,
 					out_bytes: bytes,
@@ -593,7 +597,7 @@ impl Engine {
 			.map_err(video_probe_error)?;
 		let rules = stream_rules(cx.job);
 		let planned = self
-			.video_main(&info, cx.job.options.forced())
+			.video_main(&info, cx.job.options.forced(merge_possible(&info)))
 			.map_err(Refusal::from)
 			.and_then(|main| plan_streams(&info, &rules).map(|streams| (main, streams)));
 		let (main, streams) = match planned {
@@ -658,7 +662,7 @@ impl Engine {
 		}
 
 		let learned_bpp = quality.stats.and_then(|stats| stats.bpp);
-		if !cx.job.options.forced()
+		if !cx.job.options.forced(merge_possible(&info))
 			&& let Some(reason) = learned_bpp.and_then(|bpp| video_plan::efficient_at(&info, main, bpp))
 		{
 			return Ok(Produced::Kept(KeepReason::AlreadyEfficient(reason)));
@@ -798,7 +802,7 @@ impl Engine {
 		};
 
 		video.encoder = video.encoder.with_crf(quality.start());
-		if cx.job.options.forced() {
+		if cx.job.options.forced(merge_possible(inputs.info)) {
 			return Ok(Tuning::Encode { verify });
 		}
 
@@ -844,7 +848,7 @@ impl Engine {
 
 		let found = match searched {
 			Searched::Found(found) => found,
-			Searched::Unreachable { crf, score } if cx.job.options.forced() => {
+			Searched::Unreachable { crf, score } if cx.job.options.forced(merge_possible(inputs.info)) => {
 				video.encoder = video.encoder.with_crf(crf);
 				video.warnings.push(format!(
 					"{}; encoded at CRF {crf} without a full check because it was requested",
@@ -863,7 +867,7 @@ impl Engine {
 		video.encoder = video.encoder.with_crf(found.crf);
 		quality.slope = found.slope;
 
-		if !cx.job.options.forced()
+		if !cx.job.options.forced(merge_possible(inputs.info))
 			&& let Some(duration_s) = inputs
 				.declared_s
 				.filter(|duration| *duration >= video_encode::MIN_PREDICTED_DURATION_S)
@@ -913,7 +917,7 @@ impl Engine {
 				None
 			};
 			let Some(lower) = lower else {
-				if cx.job.options.forced() {
+				if cx.job.options.forced(merge_possible(inputs.info)) {
 					temps.warnings.push(format!(
 						"{}; it was written because it was requested",
 						video_quality::short_text(crf, score, quality.target)
@@ -1117,7 +1121,7 @@ impl Engine {
 		let declared_s = job.main.declared_duration().or(job.info.format.duration);
 		let share = source_share(cx.source_bytes, job.video.window, declared_s);
 		if !saves_enough(share.unwrap_or(cx.source_bytes), bytes, cx.job.min_savings) {
-			if !cx.job.options.forced() {
+			if !cx.job.options.forced(merge_possible(job.info)) {
 				return Ok(Produced::Kept(KeepReason::NotSmaller {
 					src_bytes: cx.source_bytes,
 					out_bytes: bytes,
@@ -1382,6 +1386,32 @@ fn extraction_shortfall(info: &MediaInfo, decoded_s: f64) -> Option<String> {
 
 	(declared > 0.0 && declared - decoded_s > (declared * 0.02).max(1.0))
 		.then(|| format!("decodes to {decoded_s:.1} s but its audio declares {declared:.1} s"))
+}
+
+/// Whether `--merge-audio` has two or more usable audio tracks to mix, so `merged()` would return `Some`.
+fn merge_possible(info: &MediaInfo) -> bool {
+	info.audio_streams()
+		.filter(|stream| stream.channels.unwrap_or(0) > 0)
+		.count()
+		>= 2
+}
+
+/// A merged track is only as long as its first source (`amix duration=first`), so its shortfall is checked
+/// against that source's own declared duration, clipped to the trim window, not the container or the longest track.
+fn merge_shortfall(info: &MediaInfo, merge_from: &[u32], window: Option<TrimWindow>, decoded_s: f64) -> Option<String> {
+	let declared = merge_from
+		.first()
+		.and_then(|&index| info.streams.iter().find(|stream| stream.index == index))
+		.and_then(Stream::declared_duration)?;
+
+	match window {
+		Some(window) => {
+			let length_s = (declared - window.start_s).max(0.0).min(window.length_s);
+			TrimWindow { length_s, ..window }.shortfall(decoded_s)
+		}
+		None => (declared - decoded_s > (declared * 0.02).max(1.0))
+			.then(|| format!("decodes to {decoded_s:.1} s but declares {declared:.1} s")),
+	}
 }
 
 fn copy_cover(source: &Path, output: &Path, info: &MediaInfo) -> Option<String> {

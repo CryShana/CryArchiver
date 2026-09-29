@@ -1,4 +1,4 @@
-use crate::audio::plan::{TrackJob, TrackPlan, merged, plan_track_with};
+use crate::audio::plan::{TrackJob, TrackPlan, merge_language, merged, plan_track_with};
 use crate::container::{Container, MATROSKA_VIDEO};
 use crate::outcome::{KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
@@ -143,6 +143,7 @@ pub struct StreamPlan {
 	pub extracted: Vec<Extracted>,
 	pub warnings: Vec<String>,
 	pub merge_from: Vec<u32>,
+	pub merge_language: Option<String>,
 }
 
 impl StreamPlan {
@@ -162,6 +163,12 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 	let mut dropped_data = 0;
 	let mut dropped_files = 0;
 	let mut stripped = 0;
+	let will_merge = rules.merge
+		&& info
+			.streams
+			.iter()
+			.filter(|stream| stream.is_audio() && stream.channels.unwrap_or(0) > 0)
+			.count() >= 2;
 
 	for stream in &info.streams {
 		if rules.strip && !(stream.is_audio() || stream.is_real_video()) {
@@ -172,21 +179,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 		match stream.codec_type.as_str() {
 			"audio" => {
 				audio_tracks += 1;
-				if stream.channels.unwrap_or(0) == 0 {
-					plan.warnings
-						.push(format!("audio track {audio_tracks} has no audio data and was dropped"));
-					continue;
-				}
-
-				let track = audio_track(stream, audio_tracks, rules, &mut plan.warnings);
-				if track.plan == TrackPlan::Copy && !target.copies(&stream.codec_name) {
-					return Err(Refusal::Impossible(format!(
-						"audio track {audio_tracks} ({}) can't be stored in {} as it is",
-						stream.codec_name,
-						target.name()
-					)));
-				}
-				plan.audio.push(track);
+				plan_audio_stream(stream, audio_tracks, rules, target, will_merge, &mut plan)?;
 			}
 			"subtitle" => match subtitle_track(stream, target)? {
 				Some(track) if rules.trim => {
@@ -225,6 +218,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 	if rules.merge
 		&& let Some((track, sources)) = merged(info, &plan.audio, rules.speed, &rules.overrides)
 	{
+		plan.merge_language = merge_language(info, &sources);
 		plan.audio = vec![track];
 		plan.merge_from = sources;
 	}
@@ -259,6 +253,43 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 		));
 	}
 	Ok(plan)
+}
+
+/// A track that will be merged skips its own copy/encode decision entirely: no "copied as-is" warning and no
+/// container refusal, since the merge replaces it with the mixed track regardless.
+fn plan_audio_stream(
+	stream: &Stream,
+	audio_tracks: usize,
+	rules: &StreamRules,
+	target: Target,
+	will_merge: bool,
+	plan: &mut StreamPlan,
+) -> Result<(), Refusal> {
+	if stream.channels.unwrap_or(0) == 0 {
+		plan.warnings
+			.push(format!("audio track {audio_tracks} has no audio data and was dropped"));
+		return Ok(());
+	}
+
+	if will_merge {
+		plan.audio.push(TrackJob {
+			stream_index: stream.index,
+			sample_rate: stream.sample_rate.unwrap_or(0),
+			plan: TrackPlan::Copy,
+		});
+		return Ok(());
+	}
+
+	let track = audio_track(stream, audio_tracks, rules, &mut plan.warnings);
+	if track.plan == TrackPlan::Copy && !target.copies(&stream.codec_name) {
+		return Err(Refusal::Impossible(format!(
+			"audio track {audio_tracks} ({}) can't be stored in {} as it is",
+			stream.codec_name,
+			target.name()
+		)));
+	}
+	plan.audio.push(track);
+	Ok(())
 }
 
 fn is_text(codec: &str) -> bool {
@@ -782,6 +813,43 @@ mod tests {
 		assert_eq!(plan.audio.len(), 1);
 		assert_eq!(plan.merge_from, [1, 2]);
 		assert_eq!(plan.encoded_audio().len(), 1);
+	}
+
+	#[test]
+	fn merging_skips_per_track_warnings_and_impossible_refusals() {
+		let unencodable = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"audio","codec_name":"pcm_s16le","sample_rate":"48000","channels":10,"channel_layout":"5.1.4"},
+			{"index":2,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo"}]}"#,
+		);
+		let merge_webm = StreamRules {
+			merge: true,
+			..into(WEBM_VIDEO)
+		};
+
+		let plan = plan_streams(&unencodable, &merge_webm).unwrap();
+
+		assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+		assert_eq!(plan.merge_from, [1, 2]);
+		assert_eq!(plan.audio.len(), 1);
+	}
+
+	#[test]
+	fn a_merged_track_takes_its_language_from_the_first_source() {
+		let tagged = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo",
+			 "tags":{"language":"eng","title":"Commentary"}},
+			{"index":2,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":1,"channel_layout":"mono"}]}"#,
+		);
+		let merge = StreamRules {
+			merge: true,
+			..StreamRules::new(Speed::Moderate, false)
+		};
+
+		let plan = plan_streams(&tagged, &merge).unwrap();
+
+		assert_eq!(plan.merge_language.as_deref(), Some("eng"));
 	}
 
 	#[test]

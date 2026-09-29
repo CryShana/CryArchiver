@@ -808,11 +808,36 @@ fn strip_is_a_flag() {
 #[test]
 fn merge_audio_is_a_flag() {
 	let dir = tempfile::tempdir().unwrap();
-	flac(dir.path(), "song.flac", 2);
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=2",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=880:duration=2",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-c:a",
+		"flac",
+		dir.path().join("two.mka").to_str().unwrap(),
+	]);
 
-	let out = cryarchiver(dir.path(), &["--merge-audio", "song.flac"]);
+	let out = cryarchiver(dir.path(), &["--merge-audio", "two.mka"]);
 
 	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	let output = dir.path().join("two.cry.opus");
+	assert!(output.is_file());
+	let probed = Command::new("ffprobe")
+		.args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+		.arg(&output)
+		.output()
+		.unwrap();
+	let streams = String::from_utf8_lossy(&probed.stdout);
+	assert_eq!(streams.lines().filter(|line| *line == "audio").count(), 1, "{streams}");
 }
 
 #[test]

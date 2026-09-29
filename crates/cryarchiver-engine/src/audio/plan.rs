@@ -70,6 +70,8 @@ pub struct FileOptions {
 	/// An ffmetadata file whose chapters replace the source's.
 	pub chapters: Option<PathBuf>,
 	pub merge_from: Vec<u32>,
+	/// The first merged source's language tag, kept on the mixed track while its title is dropped.
+	pub merge_language: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -167,16 +169,28 @@ pub fn merged(
 	Some((track, sources))
 }
 
+/// The first merged source's language tag, so the mixed track can keep it while dropping the rest.
+pub fn merge_language(info: &MediaInfo, sources: &[u32]) -> Option<String> {
+	let first = *sources.first()?;
+	info.streams
+		.iter()
+		.find(|stream| stream.index == first)
+		.and_then(|stream| stream.tag("language"))
+		.map(str::to_owned)
+}
+
 pub fn merge_file(plan: FilePlan, info: &MediaInfo, speed: Speed, overrides: &Overrides) -> FilePlan {
 	let Some((track, sources)) = merged(info, &plan.tracks, speed, overrides) else {
 		return plan;
 	};
+	let merge_language = merge_language(info, &sources);
 
 	FilePlan {
 		container: OGG_OPUS,
 		tracks: vec![track],
 		options: FileOptions {
 			merge_from: sources,
+			merge_language,
 			..plan.options
 		},
 	}

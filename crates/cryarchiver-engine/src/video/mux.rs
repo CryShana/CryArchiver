@@ -388,6 +388,7 @@ mod tests {
 			extracted: Vec::new(),
 			warnings: Vec::new(),
 			merge_from: Vec::new(),
+			merge_language: None,
 		}
 	}
 
