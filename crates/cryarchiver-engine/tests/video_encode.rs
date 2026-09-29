@@ -278,6 +278,7 @@ async fn a_ten_bit_bitmap_burn_stays_ten_bit_through_the_overlay() {
 			seconds: 3,
 			codec: &["-c:v", "ffv1", "-pix_fmt", "yuv420p10le"],
 			second_angle: false,
+			marked_frame: None,
 		},
 		&pgs,
 		"copy",
@@ -291,7 +292,7 @@ async fn a_ten_bit_bitmap_burn_stays_ten_bit_through_the_overlay() {
 		.unwrap();
 	let burned = VideoPlan {
 		filters: "showinfo,format=yuv420p10le".into(),
-		overlay: Some(burn::overlay(&info.streams[0], start_s)),
+		overlay: Some(burn::overlay(&info, &[0], start_s)),
 		..plan(None)
 	};
 

@@ -82,8 +82,9 @@ fn encode_command(
 	}
 	cmd.arg("-i").arg(process::tool_path(source));
 	if let Some(overlay) = plan.overlay {
+		let offset_s = overlay.offset_s(seek.is_some(), sample.is_none());
 		cmd.arg("-itsoffset")
-			.arg(format!("{:.6}", overlay.start_s))
+			.arg(format!("{offset_s:.6}"))
 			.arg("-i")
 			.arg(process::tool_path(&workspace.join(burn::BITMAP_FILE)));
 	}
@@ -473,7 +474,9 @@ mod tests {
 	fn bitmap_subtitles_are_overlaid_from_their_own_input_in_a_complex_graph() {
 		let burned = VideoPlan {
 			overlay: Some(burn::Overlay {
-				start_s: 5.0,
+				main_offset_s: 5.2,
+				all_offset_s: 5.1,
+				seeked_offset_s: 4.5,
 				ten_bit: false,
 			}),
 			window: Some(TrimWindow {
@@ -482,6 +485,10 @@ mod tests {
 			}),
 			..plan(svt(), None)
 		};
+		let sample = Sample {
+			start_s: 6.0,
+			length_s: 1.0,
+		};
 
 		let cmd = video_command(
 			Path::new("ffmpeg"),
@@ -489,15 +496,33 @@ mod tests {
 			Path::new("work/video.a1.mkv"),
 			&burned,
 		);
+		let sampled = joined(&sample_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/sample-0.mkv"),
+			&burned,
+			&sample,
+		));
+		let whole = joined(&video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/video.a1.mkv"),
+			&VideoPlan {
+				window: None,
+				..burned.clone()
+			},
+		));
 
 		let args = joined(&cmd);
 		assert_eq!(cmd.current_dir, None);
 		assert!(args.contains(" -ss 4.000 -t 4.000 -i "), "{args}");
-		assert!(args.contains(" -itsoffset 5.000000 -i "), "{args}");
+		assert!(args.contains(" -itsoffset 4.500000 -i "), "{args}");
+		assert!(sampled.contains(" -itsoffset 4.500000 -i "), "{sampled}");
+		assert!(whole.contains(" -itsoffset 5.100000 -i "), "{whole}");
 		assert!(args.contains("subs.mkv -filter_complex "), "{args}");
 		assert!(
 			args.contains(
-				"-filter_complex [0:0]setpts=PTS+4.000/TB[bv];[1:0]setpts=PTS-0.002/TB[bs];\
+				"-filter_complex [0:0]settb=AVTB,setpts=PTS+4.000/TB[bv];[1:0]setpts=PTS-0.002/TB[bs];\
 				 [bs][bv]scale2ref[bss][bvs];[bss]null[bsd];[bvs][bsd]overlay=eof_action=pass,setpts=PTS-4.000/TB,\
 				 format=yuv420p10le,setparams=field_mode=prog[burned] -map [burned] -map 0:2 -filter:v:1 "
 			),
@@ -562,14 +587,14 @@ mod tests {
 		assert_eq!(full.current_dir.as_deref(), Some(Path::new("work")));
 		assert!(
 			args.contains(
-				"-filter:v:0 setpts=PTS+4.000/TB,subtitles=subs.ass,setpts=PTS-4.000/TB,format=yuv420p10le,\
+				"-filter:v:0 settb=AVTB,setpts=PTS+4.000/TB,subtitles=subs.ass,setpts=PTS-4.000/TB,format=yuv420p10le,\
 				 setparams=field_mode=prog -filter:v:1 format=yuv420p10le,setparams=field_mode=prog -c:v "
 			),
 			"{args}"
 		);
 		assert!(
 			sampled.contains(
-				"-filter:v:0 setpts=PTS+12.500/TB,subtitles=subs.ass,setpts=PTS-12.500/TB,format=yuv420p10le,"
+				"-filter:v:0 settb=AVTB,setpts=PTS+12.500/TB,subtitles=subs.ass,setpts=PTS-12.500/TB,format=yuv420p10le,"
 			),
 			"{sampled}"
 		);

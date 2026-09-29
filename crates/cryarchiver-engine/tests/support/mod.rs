@@ -274,6 +274,7 @@ pub fn black_clip(dir: &Path, name: &str, subtitles: &Path, codec: &str, second_
 			seconds: 10,
 			codec: &["-c:v", "mpeg4"],
 			second_angle,
+			marked_frame: None,
 		},
 		subtitles,
 		codec,
@@ -286,14 +287,21 @@ pub struct Picture<'a> {
 	pub seconds: u32,
 	pub codec: &'a [&'a str],
 	pub second_angle: bool,
+	/// A frame that gets a white 40×40 square in its top-left corner (`MARKER`), to find it again after a cut.
+	pub marked_frame: Option<u32>,
 }
+
+pub const MARKER: &str = "crop=40:40:0:0";
 
 /// A 320×240, 25 fps clip with a tone and `subtitles` muxed with `codec`. The subtitles keep their own times
 /// (`-copyts`), so a track whose first cue is late still starts late.
 pub fn subtitled_clip(dir: &Path, name: &str, picture: &Picture<'_>, subtitles: &Path, codec: &str) -> PathBuf {
 	let clip = dir.join(name);
 	let joint = if picture.source.contains('=') { ':' } else { '=' };
-	let video = format!("{}{joint}s=320x240:r=25:d={}", picture.source, picture.seconds);
+	let marker = picture.marked_frame.map_or_else(String::new, |frame| {
+		format!(",drawbox=x=0:y=0:w=40:h=40:c=white:t=fill:enable='eq(n\\,{frame})'")
+	});
+	let video = format!("{}{joint}s=320x240:r=25:d={}{marker}", picture.source, picture.seconds);
 	let audio = format!("sine=duration={}", picture.seconds);
 	let mut args = vec![
 		"-copyts",
@@ -320,6 +328,17 @@ pub fn subtitled_clip(dir: &Path, name: &str, picture: &Picture<'_>, subtitles: 
 	clip
 }
 
+/// `source` rewritten into `dir/name` by ffmpeg, with `before` as input options and `after` as output options.
+pub fn converted(dir: &Path, name: &str, before: &[&str], source: &Path, after: &[&str]) -> PathBuf {
+	let out = dir.join(name);
+	let mut args = before.to_vec();
+	args.extend(["-i", source.to_str().unwrap()]);
+	args.extend(after);
+	args.push(out.to_str().unwrap());
+	ffmpeg(&args);
+	out
+}
+
 /// Every video frame time of stream `stream`, in order.
 pub fn frame_times(path: &Path, stream: usize) -> Vec<f64> {
 	let out = Command::new("ffprobe")
@@ -337,18 +356,21 @@ pub fn frame_times(path: &Path, stream: usize) -> Vec<f64> {
 
 /// The first and last frame times at which anything bright is drawn on a black picture, in video stream `stream`.
 pub fn lit_span(path: &Path, stream: usize) -> Option<(f64, f64)> {
+	lit_span_in(path, stream, "null")
+}
+
+/// `lit_span` for the part of the picture that the `region` filter (such as `MARKER` or `BELOW_MARKER`) crops out.
+pub fn lit_span_in(path: &Path, stream: usize, region: &str) -> Option<(f64, f64)> {
 	let out = Command::new("ffmpeg")
 		.args(["-v", "error", "-i"])
 		.arg(path)
 		.arg("-map")
 		.arg(format!("0:v:{stream}"))
-		.args([
-			"-vf",
-			"format=gray,signalstats,metadata=mode=print:key=lavfi.signalstats.YMAX:file=-",
-			"-f",
-			"null",
-			"-",
-		])
+		.arg("-vf")
+		.arg(format!(
+			"{region},format=gray,signalstats,metadata=mode=print:key=lavfi.signalstats.YMAX:file=-"
+		))
+		.args(["-f", "null", "-"])
 		.output()
 		.unwrap();
 
@@ -368,6 +390,9 @@ pub fn lit_span(path: &Path, stream: usize) -> Option<(f64, f64)> {
 	}
 	Some((*lit.first()?, *lit.last()?))
 }
+
+/// The picture below `MARKER`'s rows, where subtitles are drawn.
+pub const BELOW_MARKER: &str = "crop=320:200:0:40";
 
 /// A PGS (bitmap) subtitle file for a 320×240 picture: a white 120×30 box shown from `from_ms` until `to_ms`.
 /// ffmpeg can't turn text subtitles into bitmaps, so the segments are written by hand. Like a real track, it

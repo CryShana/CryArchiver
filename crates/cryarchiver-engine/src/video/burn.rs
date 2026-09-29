@@ -27,6 +27,12 @@ const BITMAP_FILTERS: &[&str] = &["scale2ref", "overlay"];
 /// then still shows the previous picture. Moving every picture this much earlier (under half a frame even at
 /// 240 fps, more than Matroska's 1 ms rounding) puts it on the frame it starts on.
 const SAME_FRAME_S: &str = "0.002";
+/// Demuxers with discontinuous timestamps. For these, an unseeked input starts where the streams a command reads
+/// start, not where the file does; a seeked one still counts from the file's start.
+const START_FROM_READ_STREAMS: &[&str] = &["mpegts", "mpegtsraw", "mpeg"];
+/// Moves frames to 1 µs ticks first: with one tick per frame (AVI, or MP4 with timescale = fps), the shifts
+/// round onto whole frames and the overlay's 2 ms lead vanishes.
+const FINE_TIME_BASE: &str = "settb=AVTB";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BurnKind {
@@ -42,11 +48,29 @@ pub struct Burn {
 }
 
 /// A bitmap track drawn over the main video from `subs.mkv`, read as its own input from its start.
+///
+/// `subs.mkv` keeps the source's own timestamps. ffmpeg subtracts its start from them, and subtracts the source's
+/// start (as it computes it for each command) from the video; `-itsoffset` of the difference puts `subs.mkv` back
+/// on the video's timeline.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Overlay {
-	/// Where `subs.mkv` starts on the source's timeline; ffmpeg would otherwise move its first cue to 0.
-	pub start_s: f64,
+	/// The `-itsoffset` for `subs.mkv` in an unseeked command that reads only the main video.
+	pub main_offset_s: f64,
+	/// The same in an unseeked command that reads every planned video stream.
+	pub all_offset_s: f64,
+	/// The same in a seeked command.
+	pub seeked_offset_s: f64,
 	pub ten_bit: bool,
+}
+
+impl Overlay {
+	pub fn offset_s(&self, seeked: bool, every_video_stream: bool) -> f64 {
+		match (seeked, every_video_stream) {
+			(true, _) => self.seeked_offset_s,
+			(false, true) => self.all_offset_s,
+			(false, false) => self.main_offset_s,
+		}
+	}
 }
 
 pub fn pick(info: &MediaInfo, pick: &SubtitlePick) -> Result<Burn, String> {
@@ -117,12 +141,16 @@ pub fn extract_command(
 		}
 	}
 
+	// DVD subtitles are re-encoded: Matroska can't hold xsub, and a copy out of MP4 loses the canvas size.
 	let (codec, file) = match burn.kind {
 		BurnKind::Ass => ("copy", SUBTITLE_FILE),
 		BurnKind::Text => ("ass", SUBTITLE_FILE),
-		BurnKind::Bitmap if codec_of(info, burn) == "xsub" => ("dvdsub", BITMAP_FILE),
+		BurnKind::Bitmap if matches!(codec_of(info, burn), "xsub" | "dvd_subtitle") => ("dvdsub", BITMAP_FILE),
 		BurnKind::Bitmap => ("copy", BITMAP_FILE),
 	};
+	if burn.kind == BurnKind::Bitmap {
+		cmd.arg("-copyts");
+	}
 	cmd.arg("-i")
 		.arg(process::tool_path(source))
 		.arg("-map")
@@ -166,11 +194,38 @@ pub async fn prepare(
 	Ok(Some(extracted.format.start_time.unwrap_or(0.0)))
 }
 
-pub fn overlay(main: &Stream, start_s: f64) -> Overlay {
+/// `video_streams` are the planned video streams, main first; `track_start_s` is what `prepare` returned.
+pub fn overlay(info: &MediaInfo, video_streams: &[u32], track_start_s: f64) -> Overlay {
+	let main = video_streams
+		.first()
+		.and_then(|&index| info.streams.iter().find(|stream| stream.index == index));
+
 	Overlay {
-		start_s,
-		ten_bit: main.pix_fmt.as_deref().is_some_and(deep_pix_fmt),
+		main_offset_s: track_start_s - unseeked_origin(info, video_streams.get(..1).unwrap_or_default()),
+		all_offset_s: track_start_s - unseeked_origin(info, video_streams),
+		seeked_offset_s: track_start_s - info.format.start_time.unwrap_or(0.0),
+		ten_bit: main.and_then(|main| main.pix_fmt.as_deref()).is_some_and(deep_pix_fmt),
 	}
+}
+
+/// The start ffmpeg subtracts from the source's timestamps in an unseeked command that reads `streams` of it.
+fn unseeked_origin(info: &MediaInfo, streams: &[u32]) -> f64 {
+	let file_start = info.format.start_time.unwrap_or(0.0);
+	if !info
+		.format
+		.format_name
+		.split(',')
+		.any(|name| START_FROM_READ_STREAMS.contains(&name))
+	{
+		return file_start;
+	}
+
+	info.streams
+		.iter()
+		.filter(|stream| streams.contains(&stream.index))
+		.filter_map(|stream| stream.start_time)
+		.reduce(f64::min)
+		.unwrap_or(file_start)
 }
 
 /// What this ffmpeg lacks to burn `burn`, such as "subtitles filter" or "pgssub decoder".
@@ -233,7 +288,7 @@ pub fn subtitle_filter(kind: BurnKind, size_percent: u8) -> Option<String> {
 pub fn main_chain(subtitles: Option<&str>, filters: &str, seek_s: Option<f64>) -> String {
 	let drawn = match (subtitles, seek_s) {
 		(Some(subtitles), Some(start_s)) => {
-			format!("setpts=PTS+{start_s:.3}/TB,{subtitles},setpts=PTS-{start_s:.3}/TB")
+			format!("{FINE_TIME_BASE},setpts=PTS+{start_s:.3}/TB,{subtitles},setpts=PTS-{start_s:.3}/TB")
 		}
 		(Some(subtitles), None) => subtitles.to_owned(),
 		(None, _) => String::new(),
@@ -255,10 +310,10 @@ pub fn overlay_graph(
 ) -> String {
 	let (onto_source, back) = match seek_s {
 		Some(start_s) => (
-			format!("setpts=PTS+{start_s:.3}/TB"),
+			format!("{FINE_TIME_BASE},setpts=PTS+{start_s:.3}/TB"),
 			format!("setpts=PTS-{start_s:.3}/TB"),
 		),
-		None => ("null".to_owned(), String::new()),
+		None => (FINE_TIME_BASE.to_owned(), String::new()),
 	};
 	let (pictures, blend) = if overlay.ten_bit {
 		("[bss]format=yuva420p10le[bsd];", ":format=yuv420p10")
@@ -356,7 +411,7 @@ mod tests {
 		assert_eq!(subtitle_filter(BurnKind::Bitmap, 5), None);
 		assert_eq!(
 			main_chain(Some(&ass), "format=yuv420p10le", Some(4.0)),
-			"setpts=PTS+4.000/TB,subtitles=subs.ass:fontsdir=fonts,setpts=PTS-4.000/TB,format=yuv420p10le"
+			"settb=AVTB,setpts=PTS+4.000/TB,subtitles=subs.ass:fontsdir=fonts,setpts=PTS-4.000/TB,format=yuv420p10le"
 		);
 		assert_eq!(
 			main_chain(Some(&ass), "format=yuv420p10le", None),
@@ -369,21 +424,55 @@ mod tests {
 	#[test]
 	fn bitmaps_are_overlaid_from_their_own_input_on_the_source_timeline() {
 		let eight = Overlay {
-			start_s: 0.0,
+			main_offset_s: 0.0,
+			all_offset_s: 0.0,
+			seeked_offset_s: 0.0,
 			ten_bit: false,
 		};
 		let ten = Overlay { ten_bit: true, ..eight };
 
 		assert_eq!(
 			overlay_graph("[0:0]", "[1:0]", eight, None, "format=yuv420p10le", "[burned]"),
-			"[0:0]null[bv];[1:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];[bss]null[bsd];\
+			"[0:0]settb=AVTB[bv];[1:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];[bss]null[bsd];\
 			 [bvs][bsd]overlay=eof_action=pass,format=yuv420p10le[burned]"
 		);
 		assert_eq!(
 			overlay_graph("[1:0]", "[2:0]", ten, Some(4.0), "", "[r]"),
-			"[1:0]setpts=PTS+4.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];\
+			"[1:0]settb=AVTB,setpts=PTS+4.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];\
 			 [bss]format=yuva420p10le[bsd];[bvs][bsd]overlay=eof_action=pass:format=yuv420p10,setpts=PTS-4.000/TB[r]"
 		);
+	}
+
+	#[test]
+	fn the_overlay_offsets_follow_the_start_ffmpeg_gives_each_command() {
+		let mkv = info(
+			r#"{"format":{"format_name":"matroska,webm","start_time":"1.000000"},"streams":[
+			{"index":0,"codec_type":"video","codec_name":"h264","start_time":"1.200000","pix_fmt":"yuv420p10le"},
+			{"index":1,"codec_type":"audio","codec_name":"aac","start_time":"1.000000"}]}"#,
+		);
+		let m2ts = info(
+			r#"{"format":{"format_name":"mpegts","start_time":"1.457000"},"streams":[
+			{"index":0,"codec_type":"video","codec_name":"h264","start_time":"1.480000","pix_fmt":"yuv420p"},
+			{"index":1,"codec_type":"audio","codec_name":"aac","start_time":"1.457000"},
+			{"index":2,"codec_type":"video","codec_name":"h264","start_time":"1.400000"}]}"#,
+		);
+
+		let from_mkv = overlay(&mkv, &[0], 6.0);
+		let from_m2ts = overlay(&m2ts, &[0, 2], 6.48);
+		let near = |actual: f64, expected: f64| (actual - expected).abs() < 1e-9;
+
+		assert!(
+			[(true, false), (false, true), (false, false)]
+				.iter()
+				.all(|&(seeked, every)| near(from_mkv.offset_s(seeked, every), 5.0)),
+			"{from_mkv:?}"
+		);
+		assert!(from_mkv.ten_bit);
+		assert!(near(from_m2ts.offset_s(false, false), 5.0), "{from_m2ts:?}");
+		assert!(near(from_m2ts.offset_s(false, true), 5.08), "{from_m2ts:?}");
+		assert!(near(from_m2ts.offset_s(true, false), 5.023), "{from_m2ts:?}");
+		assert!(near(from_m2ts.offset_s(true, true), 5.023), "{from_m2ts:?}");
+		assert!(!from_m2ts.ten_bit);
 	}
 
 	#[test]
@@ -399,10 +488,11 @@ mod tests {
 	}
 
 	#[test]
-	fn bitmap_tracks_are_extracted_into_matroska_and_xsub_as_dvd_subtitles() {
+	fn bitmap_tracks_are_extracted_into_matroska_on_the_source_timeline_and_dvd_ones_reencoded() {
 		let xsub = info(
 			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"mpeg4"},
-			{"index":1,"codec_type":"subtitle","codec_name":"xsub"}]}"#,
+			{"index":1,"codec_type":"subtitle","codec_name":"xsub"},
+			{"index":2,"codec_type":"subtitle","codec_name":"dvd_subtitle"}]}"#,
 		);
 		let bitmap = Burn {
 			stream: 3,
@@ -423,9 +513,21 @@ mod tests {
 			&xsub,
 			Burn { stream: 1, ..bitmap },
 		));
+		let vobsub = joined(&extract_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mp4"),
+			Path::new("work"),
+			&xsub,
+			Burn { stream: 2, ..bitmap },
+		));
 
+		assert!(pgs.contains("-copyts -i "), "{pgs}");
 		assert!(pgs.ends_with("-map 0:3 -c:s copy -f matroska subs.mkv"), "{pgs}");
 		assert!(dvd.ends_with("-map 0:1 -c:s dvdsub -f matroska subs.mkv"), "{dvd}");
+		assert!(
+			vobsub.ends_with("-map 0:2 -c:s dvdsub -f matroska subs.mkv"),
+			"{vobsub}"
+		);
 	}
 
 	#[test]

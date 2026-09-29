@@ -3372,32 +3372,167 @@ async fn burned_text_subtitles_leave_no_subtitle_track() {
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
 }
 
-/// Black H.264 with B-frames, as Blu-ray video is, or MPEG-4 with B-frames when libx264 is missing.
-async fn b_frame_clip(dir: &Path, subtitles: &Path) -> std::path::PathBuf {
-	let codec: &[&str] = if support::toolchain().await.encoders.contains("libx264") {
+/// H.264 with B-frames, as Blu-ray video is, or MPEG-4 with B-frames when libx264 is missing.
+async fn b_frame_codec() -> &'static [&'static str] {
+	if support::toolchain().await.encoders.contains("libx264") {
 		&["-c:v", "libx264", "-bf", "3", "-g", "12", "-pix_fmt", "yuv420p"]
 	} else {
 		&["-c:v", "mpeg4", "-bf", "2", "-g", "12"]
-	};
+	}
+}
+
+async fn b_frame_clip(dir: &Path, subtitles: &Path, marked_frame: Option<u32>) -> std::path::PathBuf {
 	support::subtitled_clip(
 		dir,
 		"b-frames.mkv",
 		&support::Picture {
 			source: "color=c=black",
 			seconds: 10,
-			codec,
+			codec: b_frame_codec().await,
 			second_angle: false,
+			marked_frame,
 		},
 		subtitles,
 		"copy",
 	)
 }
 
+/// A B-frame clip whose frame 125 (5.00 s into the video) is marked and a PGS box shown from that frame for 1 s.
+async fn marked_box_clip(dir: &Path) -> std::path::PathBuf {
+	let pgs = support::pgs_box(dir, 5_000, 6_000);
+	b_frame_clip(dir, &pgs, Some(125)).await
+}
+
+/// Runs the untrimmed and the `--ss 4 --to 8` burn of `source`, and checks that the box is drawn on exactly the
+/// 25 frames that start at the marked one, wherever the cut and the source's timestamps put them.
+async fn drawn_from_the_marker(source: &Path, out_dir: &Path) {
+	for job in [
+		burning(fast(source), SubtitlePick::Default),
+		with_burn(trimmed(fast(source), 4.0, 8.0)),
+	] {
+		let outcome = run(&job, out_dir).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		let (marked, _) = support::lit_span_in(&output, 0, support::MARKER).unwrap();
+		let drawn = support::lit_span_in(&output, 0, support::BELOW_MARKER).unwrap();
+		assert!(
+			near(drawn, (marked, marked + 0.96)),
+			"{}: box {drawn:?}, marked frame {marked}",
+			output.display()
+		);
+		fs::remove_file(&output).unwrap();
+	}
+}
+
+#[tokio::test]
+async fn bitmap_cues_in_an_m2ts_whose_audio_starts_first_are_drawn_on_their_frames() {
+	let dir = tempfile::tempdir().unwrap();
+	let mkv = marked_box_clip(dir.path()).await;
+	let m2ts = dir.path().join("blu-ray.m2ts");
+	support::ffmpeg(&[
+		"-i",
+		mkv.to_str().unwrap(),
+		"-itsoffset",
+		"0.3",
+		"-i",
+		mkv.to_str().unwrap(),
+		"-map",
+		"1:v",
+		"-map",
+		"0:a",
+		"-map",
+		"1:s",
+		"-c",
+		"copy",
+		"-mpegts_m2ts_mode",
+		"1",
+		m2ts.to_str().unwrap(),
+	]);
+
+	drawn_from_the_marker(&m2ts, dir.path()).await;
+}
+
+#[tokio::test]
+async fn bitmap_cues_on_a_video_time_base_of_one_tick_per_frame_are_drawn_on_their_frames() {
+	let dir = tempfile::tempdir().unwrap();
+	let mkv = marked_box_clip(dir.path()).await;
+	let dvd = support::converted(
+		dir.path(),
+		"dvd.mkv",
+		&["-fix_sub_duration"],
+		&mkv,
+		&["-map", "0", "-c:v", "copy", "-c:a", "copy", "-c:s", "dvdsub"],
+	);
+	let ticks = support::converted(
+		dir.path(),
+		"ticks.mp4",
+		&[],
+		&dvd,
+		&["-map", "0", "-c", "copy", "-video_track_timescale", "25"],
+	);
+
+	drawn_from_the_marker(&ticks, dir.path()).await;
+}
+
+#[tokio::test]
+async fn a_trimmed_text_burn_on_a_video_time_base_of_one_tick_per_frame_keeps_every_frame_time() {
+	let dir = tempfile::tempdir().unwrap();
+	let cues = dir.path().join("late.srt");
+	fs::write(&cues, "1\n00:00:05,000 --> 00:00:06,000\nfive\n").unwrap();
+	let codec = [b_frame_codec().await, &["-video_track_timescale", "25"]].concat();
+	let ticks = support::subtitled_clip(
+		dir.path(),
+		"ticks.mp4",
+		&support::Picture {
+			source: "color=c=black",
+			seconds: 10,
+			codec: &codec,
+			second_angle: false,
+			marked_frame: Some(125),
+		},
+		&cues,
+		"mov_text",
+	);
+
+	let plain = run(&trimmed(fast(&ticks), 4.01, 6.0), dir.path()).await;
+	let JobOutcome::Encoded { output: plain, .. } = plain else {
+		panic!("{plain:?}")
+	};
+	let plain_times = support::frame_times(&plain, 0);
+	fs::remove_file(&plain).unwrap();
+	let burned = run(&with_burn(trimmed(fast(&ticks), 4.01, 6.0)), dir.path()).await;
+	let JobOutcome::Encoded { output: burned, .. } = burned else {
+		panic!("{burned:?}")
+	};
+
+	let burned_times = support::frame_times(&burned, 0);
+	assert!(
+		burned_times.windows(2).all(|pair| pair[1] > pair[0]),
+		"{burned_times:?}"
+	);
+	assert_eq!(burned_times.len(), plain_times.len());
+	assert!(
+		burned_times
+			.iter()
+			.zip(&plain_times)
+			.all(|(burned, plain)| (burned - plain).abs() < 0.001),
+		"{burned_times:?} vs {plain_times:?}"
+	);
+	let (marked, _) = support::lit_span_in(&burned, 0, support::MARKER).unwrap();
+	let drawn = support::lit_span_in(&burned, 0, support::BELOW_MARKER).unwrap();
+	assert!(
+		near(drawn, (marked, marked + 0.96)),
+		"text {drawn:?}, marked frame {marked}"
+	);
+}
+
 #[tokio::test]
 async fn burned_bitmap_subtitles_are_overlaid_on_exactly_their_frames() {
 	let dir = tempfile::tempdir().unwrap();
 	let pgs = support::pgs_box(dir.path(), 5_000, 6_000);
-	let bitmap = b_frame_clip(dir.path(), &pgs).await;
+	let bitmap = b_frame_clip(dir.path(), &pgs, None).await;
 
 	let whole = burning(fast(&bitmap), SubtitlePick::Track(1));
 	let cut = with_burn(trimmed(fast(&bitmap), 4.0, 8.0));
@@ -3615,6 +3750,7 @@ async fn burned_bitmap_subtitles_are_searched_and_checked_against_the_same_burn(
 			seconds: 3,
 			codec: &["-c:v", "mpeg4", "-q:v", "2"],
 			second_angle: false,
+			marked_frame: None,
 		},
 		&pgs,
 		"copy",

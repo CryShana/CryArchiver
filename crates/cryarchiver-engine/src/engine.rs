@@ -661,7 +661,7 @@ impl Engine {
 			video.streams.truncate(1);
 		}
 		if let Some(chosen) = rules.burn {
-			Box::pin(self.prepare_burn(cx, workspace, &info, main, &mut video, chosen)).await?;
+			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, chosen)).await?;
 		}
 
 		let mut quality = self.video_quality(cx.job, main, &analysis, &video);
@@ -735,7 +735,6 @@ impl Engine {
 		cx: &Context<'_>,
 		workspace: &Workspace,
 		info: &MediaInfo,
-		main: &Stream,
 		video: &mut VideoPlan,
 		chosen: Burn,
 	) -> Result<(), JobError> {
@@ -753,7 +752,7 @@ impl Engine {
 			.map_or(0, |burn_subs| burn_subs.size_percent);
 		match burn::subtitle_filter(chosen.kind, size_percent) {
 			Some(filter) => video.subtitles = Some(filter),
-			None => video.overlay = Some(burn::overlay(main, start_s.unwrap_or(0.0))),
+			None => video.overlay = Some(burn::overlay(info, &video.streams, start_s.unwrap_or(0.0))),
 		}
 		Ok(())
 	}

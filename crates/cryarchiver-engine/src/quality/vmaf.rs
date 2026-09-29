@@ -113,7 +113,7 @@ pub fn sample_command(
 ) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
 	cmd.seek(start_s, length_s);
-	push_reference(&mut cmd, reference, scoring);
+	push_reference(&mut cmd, reference, scoring, true);
 
 	let distorted_chain = chain(&[SCORED_FORMAT, BY_POSITION]);
 	let reference_chain = chain(&[reference.filters, SCORED_FORMAT, BY_POSITION]);
@@ -137,7 +137,7 @@ pub fn window_command(
 	if let Some(window) = reference.window {
 		cmd.seek(window.start_s, window.length_s);
 	}
-	push_reference(&mut cmd, reference, scoring);
+	push_reference(&mut cmd, reference, scoring, reference.window.is_some());
 
 	let select = select(windows);
 	let distorted_chain = chain(&[&select, SCORED_FORMAT, BY_POSITION]);
@@ -185,7 +185,7 @@ fn base(ffmpeg: &Path, distorted: &Path, scoring: &Scoring<'_>) -> ToolCommand {
 	cmd
 }
 
-fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Scoring<'_>) {
+fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Scoring<'_>, seeked: bool) {
 	if let Some(decoder) = reference.decoder {
 		cmd.arg("-c:v").arg(decoder);
 	}
@@ -193,7 +193,7 @@ fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Sc
 
 	if let Some(overlay) = reference.overlay {
 		cmd.arg("-itsoffset")
-			.arg(format!("{:.6}", overlay.start_s))
+			.arg(format!("{:.6}", overlay.offset_s(seeked, false)))
 			.arg("-i")
 			.arg(process::tool_path(&scoring.dir.join(burn::BITMAP_FILE)));
 	}
@@ -393,7 +393,9 @@ mod tests {
 			filters: "format=yuv420p10le",
 			window: None,
 			overlay: Some(Overlay {
-				start_s: 1.5,
+				main_offset_s: 0.5,
+				all_offset_s: 0.4,
+				seeked_offset_s: 1.5,
 				ten_bit: true,
 			}),
 			subtitles: None,
@@ -414,7 +416,7 @@ mod tests {
 		);
 		assert!(
 			args.contains(
-				"[1:0]setpts=PTS+2.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];\
+				"[1:0]settb=AVTB,setpts=PTS+2.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];\
 				 [bss]format=yuva420p10le[bsd];[bvs][bsd]overlay=eof_action=pass:format=yuv420p10,\
 				 setpts=PTS-2.000/TB,format=yuv420p10le,format=yuv420p10le,settb=1/1000,setpts=N[r];"
 			),
@@ -462,7 +464,9 @@ mod tests {
 		));
 
 		let shifted = |start: &str| {
-			format!("[1:0]setpts=PTS+{start}/TB,subtitles=subs.ass,setpts=PTS-{start}/TB,format=yuv420p10le,")
+			format!(
+				"[1:0]settb=AVTB,setpts=PTS+{start}/TB,subtitles=subs.ass,setpts=PTS-{start}/TB,format=yuv420p10le,"
+			)
 		};
 		assert!(sampled.contains(&shifted("12.500")), "{sampled}");
 		assert!(checked.contains(&shifted("4.000")), "{checked}");
