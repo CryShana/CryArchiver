@@ -2621,6 +2621,68 @@ async fn cut_ass_subtitles_keep_their_styles() {
 }
 
 #[tokio::test]
+async fn every_text_track_is_cut_onto_its_own_stream() {
+	let dir = tempfile::tempdir().unwrap();
+	let srt = dir.path().join("first.srt");
+	fs::write(&srt, "1\n00:00:01,000 --> 00:00:03,000\nfrom the srt\n").unwrap();
+	let ass = dir.path().join("second.ass");
+	fs::write(
+		&ass,
+		"[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\n\
+		 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, \
+		 Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, \
+		 MarginR, MarginV, Encoding\n\
+		 Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n\n\
+		 [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+		 Dialogue: 0,0:00:01.50,0:00:03.50,Default,,0,0,0,,from the ass\n",
+	)
+	.unwrap();
+	let clip = dir.path().join("two-tracks.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=5",
+		"-i",
+		srt.to_str().unwrap(),
+		"-i",
+		ass.to_str().unwrap(),
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-map",
+		"2",
+		"-c:v",
+		"mpeg4",
+		"-c:s",
+		"copy",
+		clip.to_str().unwrap(),
+	]);
+
+	let outcome = run(&trimmed(fast(&clip), 2.0, 4.0), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let track = |spec: &str| {
+		let out = std::process::Command::new("ffmpeg")
+			.args(["-v", "error", "-i"])
+			.arg(&output)
+			.args(["-map", spec, "-c:s", "srt", "-f", "srt", "-"])
+			.output()
+			.unwrap();
+		String::from_utf8_lossy(&out.stdout).into_owned()
+	};
+	assert_eq!(track("0:s:0"), "1\n00:00:00,000 --> 00:00:01,000\nfrom the srt\n\n");
+	let second = track("0:s:1");
+	assert!(
+		second.starts_with("1\n00:00:00,000 --> 00:00:01,500\n") && second.contains("from the ass"),
+		"{second}"
+	);
+}
+
+#[tokio::test]
 async fn cut_cues_become_mov_text_in_mp4() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::clip_with_extras(dir.path());
@@ -2853,6 +2915,24 @@ async fn trimmed_audio_clips_its_chapters_to_the_window() {
 	assert!(
 		(chapters[1].1 - 1.0).abs() < 0.01 && (chapters[1].2 - 3.0).abs() < 0.01,
 		"{chapters:?}"
+	);
+}
+
+#[tokio::test]
+async fn a_trim_shorter_than_a_frame_fails_with_the_frame_length() {
+	let dir = tempfile::tempdir().unwrap();
+	let slow = support::video(
+		dir.path(),
+		"slideshow.mkv",
+		3,
+		&["-r", "5", "-c:v", "mpeg4", "-q:v", "2"],
+	);
+
+	let outcome = run(&trimmed(fast(&slow), 1.05, 1.2), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.to_string().contains("it must last at least 0.2 s")),
+		"{outcome:?}"
 	);
 }
 

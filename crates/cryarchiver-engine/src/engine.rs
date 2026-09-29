@@ -31,7 +31,7 @@ use crate::video::encode::{EncodedVideo, Sample};
 use crate::video::mux::{self, Attachment, ChapterSource, CueFile, MuxInputs, MuxPlan};
 use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, usable_main};
 use crate::video::quality::{self as video_quality, MAX_RETRIES, Scorer, Searched, Strategy};
-use crate::video::streams::{Extracted, StreamPlan, StreamRules, plan_streams};
+use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
 };
@@ -593,7 +593,13 @@ impl Engine {
 		};
 
 		let declared_s = main.declared_duration().or(info.format.duration);
-		let window = trim_window(cx.job, declared_s)?;
+		let window = cx
+			.job
+			.options
+			.trim
+			.map(|trim| trim.video_window(declared_s, main.fps()))
+			.transpose()
+			.map_err(ErrorKind::EncodeFailed)?;
 		let span_s = window.map_or(declared_s, |window| Some(window.length_s));
 
 		if rules.container == MP4_VIDEO && video_plan::has_alpha(main) {
@@ -1011,29 +1017,27 @@ impl Engine {
 			return Ok(Vec::new());
 		};
 
+		let tracks: Vec<(u32, CueFormat)> = job
+			.streams
+			.subtitles
+			.iter()
+			.filter_map(|track| Some((track.stream_index, track.clipped?)))
+			.collect();
 		let window = window.on_source(job.info.format.start_time);
-		let mut cut = Vec::new();
-		for track in &job.streams.subtitles {
-			let Some(format) = track.clipped else {
-				continue;
-			};
+		let paths = cues::cut(
+			&self.tools.ffmpeg,
+			&cx.job.source,
+			workspace,
+			&tracks,
+			window,
+			cx.cancel,
+		);
 
-			let path = cues::cut(
-				&self.tools.ffmpeg,
-				&cx.job.source,
-				workspace,
-				track.stream_index,
-				format,
-				window,
-				cx.cancel,
-			);
-			cut.push(CueFile {
-				origin: track.stream_index,
-				path: Box::pin(path).await?,
-				format,
-			});
-		}
-		Ok(cut)
+		Ok(tracks
+			.iter()
+			.zip(Box::pin(paths).await?)
+			.map(|(&(origin, format), path)| CueFile { origin, path, format })
+			.collect())
 	}
 
 	#[allow(clippy::too_many_lines)]

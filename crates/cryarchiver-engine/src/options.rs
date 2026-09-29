@@ -3,6 +3,7 @@ use crate::format::OutputFormat;
 const DURATION_SLACK_S: f64 = 0.05;
 const SHORTEST_TRIM_S: f64 = 0.1;
 const SHORTEST_SPAN_S: f64 = 0.001;
+const TIME_EPSILON_S: f64 = 1e-9;
 const SIXTY: f64 = 60.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,6 +60,16 @@ impl TrimWindow {
 
 impl Trim {
 	pub fn window(self, duration_s: Option<f64>) -> Result<TrimWindow, String> {
+		self.window_of_at_least(duration_s, SHORTEST_TRIM_S)
+	}
+
+	/// Like `window`, and also at least one frame long, so the trim holds a frame at the source's rate.
+	pub fn video_window(self, duration_s: Option<f64>, fps: Option<f64>) -> Result<TrimWindow, String> {
+		let frame_s = fps.filter(|fps| *fps > 0.0).map_or(0.0, |fps| 1.0 / fps);
+		self.window_of_at_least(duration_s, frame_s.max(SHORTEST_TRIM_S))
+	}
+
+	fn window_of_at_least(self, duration_s: Option<f64>, shortest_s: f64) -> Result<TrimWindow, String> {
 		if let Some(end_s) = self.end_s
 			&& end_s <= self.start_s
 		{
@@ -72,7 +83,7 @@ impl Trim {
 			let end_s = self
 				.end_s
 				.ok_or_else(|| "the file's duration is unknown, so --to is needed".to_owned())?;
-			return self.lasting(end_s - self.start_s);
+			return self.lasting(end_s - self.start_s, shortest_s);
 		};
 
 		if self.start_s >= duration_s {
@@ -88,13 +99,15 @@ impl Trim {
 				"--to ({end_s:.3} s) is past the end of the file ({duration_s:.3} s)"
 			));
 		}
-		self.lasting(end_s.min(duration_s) - self.start_s)
+		self.lasting(end_s.min(duration_s) - self.start_s, shortest_s)
 	}
 
-	fn lasting(self, length_s: f64) -> Result<TrimWindow, String> {
-		if length_s < SHORTEST_TRIM_S {
+	fn lasting(self, length_s: f64, shortest_s: f64) -> Result<TrimWindow, String> {
+		if length_s + TIME_EPSILON_S < shortest_s {
+			let shortest = format!("{shortest_s:.3}");
 			return Err(format!(
-				"the trimmed range lasts {length_s:.3} s; it must last at least {SHORTEST_TRIM_S} s"
+				"the trimmed range lasts {length_s:.3} s; it must last at least {} s",
+				shortest.trim_end_matches('0').trim_end_matches('.')
 			));
 		}
 
@@ -240,6 +253,27 @@ mod tests {
 		assert!(trim(59.95, None).window(Some(60.0)).is_err());
 		assert!(trim(5.0, Some(5.05)).window(None).is_err());
 		assert!(trim(1.0, Some(1.1)).window(Some(60.0)).is_ok());
+	}
+
+	#[test]
+	fn a_video_trim_must_hold_a_frame() {
+		let five_fps = trim(1.0, Some(1.15)).video_window(Some(60.0), Some(5.0)).unwrap_err();
+
+		assert!(five_fps.contains("it must last at least 0.2 s"), "{five_fps}");
+		assert!(trim(1.0, Some(1.2)).video_window(Some(60.0), Some(5.0)).is_ok());
+		assert!(
+			trim(1.0, Some(1.05))
+				.video_window(Some(60.0), Some(50.0))
+				.unwrap_err()
+				.contains("at least 0.1 s")
+		);
+		assert!(
+			trim(1.0, Some(1.12))
+				.video_window(None, Some(7.0))
+				.unwrap_err()
+				.contains("at least 0.143 s")
+		);
+		assert!(trim(1.0, Some(1.1)).video_window(Some(60.0), None).is_ok());
 	}
 
 	#[test]
