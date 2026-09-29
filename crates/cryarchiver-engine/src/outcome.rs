@@ -148,6 +148,7 @@ impl From<KeepReason> for Refusal {
 pub enum JobOutcome {
 	Encoded {
 		output: PathBuf,
+		/// The source's size, or under a trim the window's share of it.
 		src_bytes: u64,
 		out_bytes: u64,
 		warnings: Vec<String>,

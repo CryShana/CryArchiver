@@ -104,8 +104,13 @@ pub fn outcome_line(source: &Path, outcome: &JobOutcome) -> String {
 			warnings,
 		} => {
 			let saved = 100.0 - percent(*out_bytes, *src_bytes);
+			let change = if saved < 0.0 {
+				format!("+{:.0} %", -saved)
+			} else {
+				format!("−{saved:.0} %")
+			};
 			let mut line = format!(
-				"✓ {name} → {}  {} → {} (−{saved:.0} %)",
+				"✓ {name} → {}  {} → {} ({change})",
 				file_label(output),
 				DecimalBytes(*src_bytes),
 				DecimalBytes(*out_bytes)
@@ -224,6 +229,18 @@ mod tests {
 		assert_eq!(
 			outcome_line(source, &encoded),
 			"✓ 02. 夜明け.flac → 02. 夜明け.cry.opus  20.00 MB → 2.00 MB (−90 %)"
+		);
+		assert_eq!(
+			outcome_line(
+				source,
+				&JobOutcome::Encoded {
+					output: PathBuf::from("music/02. 夜明け.cry.opus"),
+					src_bytes: 6_430_000,
+					out_bytes: 32_090_000,
+					warnings: Vec::new(),
+				}
+			),
+			"✓ 02. 夜明け.flac → 02. 夜明け.cry.opus  6.43 MB → 32.09 MB (+399 %)"
 		);
 		assert_eq!(outcome_line(source, &kept), "= 02. 夜明け.flac  kept: already Opus");
 		assert_eq!(

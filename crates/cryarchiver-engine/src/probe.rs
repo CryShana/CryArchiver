@@ -73,6 +73,8 @@ pub struct Stream {
 	#[serde(default)]
 	pub color_primaries: Option<String>,
 	#[serde(default)]
+	pub chroma_location: Option<String>,
+	#[serde(default)]
 	pub field_order: Option<String>,
 	#[serde(default, deserialize_with = "rational")]
 	pub r_frame_rate: Option<f64>,

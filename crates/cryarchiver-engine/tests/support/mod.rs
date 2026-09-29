@@ -281,6 +281,23 @@ pub fn black_clip(dir: &Path, name: &str, subtitles: &Path, codec: &str, second_
 	)
 }
 
+/// `black_clip` lasting `seconds`, without a second angle.
+pub fn black_clip_of(dir: &Path, name: &str, seconds: u32, subtitles: &Path, codec: &str) -> PathBuf {
+	subtitled_clip(
+		dir,
+		name,
+		&Picture {
+			source: "color=c=black",
+			seconds,
+			codec: &["-c:v", "mpeg4"],
+			second_angle: false,
+			marked_frame: None,
+		},
+		subtitles,
+		codec,
+	)
+}
+
 pub struct Picture<'a> {
 	/// A lavfi source without its size, rate or duration, such as `color=c=black` or `testsrc2`.
 	pub source: &'a str,

@@ -7,7 +7,9 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::audio::plan::{AudioPlan, AudioRules, FilePlan, merge_file, mergeable, plan_file_with, retarget};
+use crate::audio::plan::{
+	AudioPlan, AudioRules, FilePlan, merge_file, mergeable, mixed_languages_warning, plan_file_with, retarget,
+};
 use crate::audio::{cover, encode, verify};
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
@@ -24,7 +26,7 @@ use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::quality::keys::{CacheKey, Group, VideoGroup};
 use crate::quality::memory::{GroupStats, Observation, QualityMemory, SharedMemory};
 use crate::quality::search::{self, DEFAULT_SLOPE, MAX_PROBES, Target};
-use crate::text::display_path;
+use crate::text::{display_path, fold_repeats};
 use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
 use crate::video::analyze::Analysis;
 use crate::video::burn::{self, Burn};
@@ -127,6 +129,8 @@ struct Context<'a> {
 struct Staged {
 	path: PathBuf,
 	bytes: u64,
+	/// Under a trim, the window's share of the source: the size the output is weighed and reported against.
+	source_share: Option<u64>,
 	warnings: Vec<String>,
 	/// Recorded only once the output is committed.
 	learned: Vec<(CacheKey, Observation)>,
@@ -496,6 +500,7 @@ impl Engine {
 			} => Produced::Output(Staged {
 				path,
 				bytes,
+				source_share: None,
 				warnings,
 				learned,
 			}),
@@ -554,6 +559,11 @@ impl Engine {
 
 		(cx.on_event)(JobEvent::Stage(Stage::Metadata));
 		let mut warnings = Vec::new();
+		if let Some(warning) = mixed_languages_warning(info, &plan.options.merge_from) {
+			(cx.on_event)(JobEvent::Warning(warning.clone()));
+			warnings.push(warning);
+		}
+
 		if plan.container.cover == Cover::VorbisPicture
 			&& !plan.options.strip
 			&& let Some(warning) = copy_cover(&cx.job.source, &output, info)
@@ -569,7 +579,7 @@ impl Engine {
 		if !saves_enough(share.unwrap_or(cx.source_bytes), bytes, cx.job.min_savings) {
 			if !cx.job.options.forced(mergeable(info)) {
 				return Ok(Produced::Kept(KeepReason::NotSmaller {
-					src_bytes: cx.source_bytes,
+					src_bytes: share.unwrap_or(cx.source_bytes),
 					out_bytes: bytes,
 				}));
 			}
@@ -587,6 +597,7 @@ impl Engine {
 		Ok(Produced::Output(Staged {
 			path: output,
 			bytes,
+			source_share: share,
 			warnings,
 			learned: Vec::new(),
 		}))
@@ -1151,13 +1162,12 @@ impl Engine {
 			.iter()
 			.filter_map(|track| Some((track.stream_index, track.clipped?)))
 			.collect();
-		let window = window.on_source(job.info.format.start_time);
 		let paths = cues::cut(
 			&self.tools.ffmpeg,
 			&cx.job.source,
 			workspace,
 			&tracks,
-			window,
+			(window, job.info.format.start_time),
 			cx.cancel,
 		);
 
@@ -1237,7 +1247,7 @@ impl Engine {
 		if !saves_enough(share.unwrap_or(cx.source_bytes), bytes, cx.job.min_savings) {
 			if !cx.job.options.forced(mergeable(job.info)) {
 				return Ok(Produced::Kept(KeepReason::NotSmaller {
-					src_bytes: cx.source_bytes,
+					src_bytes: share.unwrap_or(cx.source_bytes),
 					out_bytes: bytes,
 				}));
 			}
@@ -1287,12 +1297,14 @@ impl Engine {
 			check_alpha(alpha_ssim(&self.tools, &output, source, job.video, cx.cancel).await?)?;
 		}
 
+		let warnings = fold_repeats(warnings);
 		for warning in &warnings {
 			(cx.on_event)(JobEvent::Warning(warning.clone()));
 		}
 		Ok(Produced::Output(Staged {
 			path: output,
 			bytes,
+			source_share: share,
 			warnings,
 			learned: Vec::new(),
 		}))
@@ -1650,9 +1662,9 @@ fn finish(
 	match sink.commit(&artifact) {
 		Ok(output) => Ok(JobOutcome::Encoded {
 			output,
-			src_bytes: meta.len(),
+			src_bytes: staged.source_share.unwrap_or(meta.len()),
 			out_bytes: staged.bytes,
-			warnings: staged.warnings,
+			warnings: fold_repeats(staged.warnings),
 		}),
 		Err(CommitError::Exists(path)) => Ok(skipped(&format!("output already exists: {}", display_path(&path)))),
 		Err(CommitError::IsSource(path)) => Ok(skipped(&format!("{} is the source file", display_path(&path)))),

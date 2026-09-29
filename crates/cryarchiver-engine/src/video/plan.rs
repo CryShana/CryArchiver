@@ -449,6 +449,7 @@ pub(crate) fn test_plan() -> VideoPlan {
 			transfer: "bt709".into(),
 			matrix: "bt709".into(),
 			range: crate::video::colour::Range::Limited,
+			chroma_location: None,
 		},
 		alpha: false,
 		hdr10: false,

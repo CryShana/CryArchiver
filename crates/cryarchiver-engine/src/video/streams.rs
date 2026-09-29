@@ -1,4 +1,6 @@
-use crate::audio::plan::{TrackJob, TrackPlan, merge_language, mergeable, merged, plan_track_with};
+use crate::audio::plan::{
+	TrackJob, TrackPlan, merge_language, mergeable, merged, mixed_languages_warning, plan_track_with,
+};
 use crate::container::{Container, MATROSKA_VIDEO};
 use crate::outcome::{KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
@@ -181,11 +183,15 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 			}
 			"subtitle" if rules.burn.is_some_and(|burn| burn.stream == stream.index) => {}
 			"subtitle" => match subtitle_track(stream, target)? {
-				Some(track) if rules.trim => {
-					let track = trimmed_subtitle(track, stream, target, &mut plan.warnings);
+				Some(track) => {
+					plan.warnings.extend(styling_warning(stream, target));
+					let track = if rules.trim {
+						trimmed_subtitle(track, stream, target, &mut plan.warnings)
+					} else {
+						track
+					};
 					plan.subtitles.push(track);
 				}
-				Some(track) => plan.subtitles.push(track),
 				None => plan.warnings.push(format!(
 					"subtitle stream {} ({}) dropped: {} holds only text subtitles; --burn-subs can draw it into the picture",
 					stream.index,
@@ -218,6 +224,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 		&& let Some((track, sources)) = merged(info, &plan.audio, rules.speed, &rules.overrides)
 	{
 		plan.merge_language = merge_language(info, &sources);
+		plan.warnings.extend(mixed_languages_warning(info, &sources));
 		plan.audio = vec![track];
 		plan.merge_from = sources;
 	}
@@ -318,6 +325,21 @@ fn subtitle_track(stream: &Stream, target: Target) -> Result<Option<SubtitleTrac
 	}
 }
 
+fn styling_warning(stream: &Stream, target: Target) -> Option<String> {
+	let format = match target {
+		Target::Webm => "WebVTT",
+		Target::Mp4 => "MP4 text",
+		Target::Matroska => return None,
+	};
+
+	matches!(stream.codec_name.as_str(), "ass" | "ssa").then(|| {
+		format!(
+			"{} subtitles become {format}: styling and fonts can't be kept in WebM/MP4",
+			stream.codec_name.to_ascii_uppercase()
+		)
+	})
+}
+
 fn trimmed_subtitle(
 	track: SubtitleTrack,
 	stream: &Stream,
@@ -326,8 +348,8 @@ fn trimmed_subtitle(
 ) -> SubtitleTrack {
 	if !is_text(&stream.codec_name) {
 		warnings.push(format!(
-			"subtitle stream {} ({}): a bitmap subtitle on screen at the cut isn't kept",
-			stream.index, stream.codec_name
+			"bitmap subtitles ({}): a cue already on screen at the start of the trim isn't kept",
+			stream.codec_name
 		));
 		return track;
 	}
@@ -754,7 +776,7 @@ mod tests {
 		);
 		assert_eq!(
 			mkv.warnings,
-			["subtitle stream 3 (hdmv_pgs_subtitle): a bitmap subtitle on screen at the cut isn't kept"]
+			["bitmap subtitles (hdmv_pgs_subtitle): a cue already on screen at the start of the trim isn't kept"]
 		);
 		assert_eq!(
 			tracks(&webm),
@@ -850,6 +872,32 @@ mod tests {
 		let plan = plan_streams(&tagged, &merge).unwrap();
 
 		assert_eq!(plan.merge_language.as_deref(), Some("eng"));
+		assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+	}
+
+	#[test]
+	fn merging_different_languages_warns_and_tags_the_mix_undetermined() {
+		let tracks = |second: &str| {
+			info(&format!(
+				r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"h264"}},
+				{{"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo",
+				 "tags":{{"language":"eng"}}}},
+				{{"index":2,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo",
+				 "tags":{{"language":"{second}"}}}}]}}"#
+			))
+		};
+		let merge = StreamRules {
+			merge: true,
+			..StreamRules::new(Speed::Moderate, false)
+		};
+
+		let mixed = plan_streams(&tracks("jpn"), &merge).unwrap();
+		let same = plan_streams(&tracks("eng"), &merge).unwrap();
+
+		assert_eq!(mixed.merge_language.as_deref(), Some("und"));
+		assert_eq!(mixed.warnings, ["mixing tracks in different languages: eng, jpn"]);
+		assert_eq!(same.merge_language.as_deref(), Some("eng"));
+		assert!(same.warnings.is_empty(), "{:?}", same.warnings);
 	}
 
 	#[test]

@@ -609,6 +609,44 @@ async fn video_becomes_verified_av1_in_mkv() {
 }
 
 #[tokio::test]
+async fn an_eight_bit_source_keeps_its_chroma_location() {
+	let dir = tempfile::tempdir().unwrap();
+
+	for location in ["left", "topleft"] {
+		let clip = support::video(
+			dir.path(),
+			&format!("chroma-{location}.mkv"),
+			2,
+			&[
+				"-map",
+				"0:v",
+				"-map",
+				"1:a",
+				"-c:v",
+				"mpeg4",
+				"-pix_fmt",
+				"yuv420p",
+				"-chroma_sample_location",
+				location,
+				"-c:a",
+				"aac",
+			],
+		);
+
+		let outcome = run(&fast(&clip), dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{location}: {outcome:?}")
+		};
+		let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(info.streams[0].pix_fmt.as_deref(), Some("yuv420p10le"));
+		assert_eq!(info.streams[0].chroma_location.as_deref(), Some(location));
+	}
+}
+
+#[tokio::test]
 async fn hdr10_keeps_its_transfer_and_mastering_metadata() {
 	let dir = tempfile::tempdir().unwrap();
 	let hdr = dir.path().join("hdr.mkv");
@@ -2282,6 +2320,94 @@ async fn mp4_output_has_mov_text_chapters_and_its_index_in_front() {
 	);
 }
 
+/// A clip whose video is tagged Japanese, with two titled ASS tracks.
+fn titled_ass_clip(dir: &Path) -> std::path::PathBuf {
+	let ass = dir.join("dialogue.ass");
+	fs::write(
+		&ass,
+		"[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\n\
+		 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, \
+		 Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, \
+		 MarginR, MarginV, Encoding\n\
+		 Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n\n\
+		 [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+		 Dialogue: 0,0:00:00.50,0:00:01.50,Default,,0,0,0,,{\\b1}bold\n",
+	)
+	.unwrap();
+	let clip = dir.join("titled.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=2",
+		"-i",
+		ass.to_str().unwrap(),
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-map",
+		"1",
+		"-c:v",
+		"mpeg4",
+		"-c:s",
+		"copy",
+		"-metadata:s:v:0",
+		"language=jpn",
+		"-metadata:s:s:0",
+		"title=Signs & Songs",
+		"-metadata:s:s:1",
+		"title=Dialogue",
+		clip.to_str().unwrap(),
+	]);
+	clip
+}
+
+#[tokio::test]
+async fn converted_ass_warns_and_mp4_keeps_track_names_and_the_video_language() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = titled_ass_clip(dir.path());
+	let tools = support::toolchain().await;
+
+	for (format, keep_metadata) in [
+		(OutputFormat::Mp4, false),
+		(OutputFormat::Mp4, true),
+		(OutputFormat::Webm, false),
+	] {
+		let job = Job {
+			keep_metadata,
+			..requested(&clip, format)
+		};
+
+		let outcome = run(&job, dir.path()).await;
+
+		let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+			panic!("{format}: {outcome:?}")
+		};
+		let styling: Vec<&String> = warnings
+			.iter()
+			.filter(|warning| warning.contains("styling and fonts can't be kept"))
+			.collect();
+		assert!(
+			styling.len() == 1 && styling[0].ends_with(" (×2)"),
+			"{format}: {warnings:?}"
+		);
+
+		let info = probe(&tools, &output, &CancellationToken::new()).await.unwrap();
+		if format == OutputFormat::Mp4 {
+			let names: Vec<Option<&str>> = info
+				.streams
+				.iter()
+				.filter(|stream| stream.codec_type == "subtitle")
+				.map(|stream| stream.tag("handler_name"))
+				.collect();
+			assert_eq!(names, [Some("Signs & Songs"), Some("Dialogue")], "keep {keep_metadata}");
+			assert_eq!(info.streams[0].tag("language"), Some("jpn"), "keep {keep_metadata}");
+		}
+		fs::remove_file(&output).unwrap();
+	}
+}
+
 #[tokio::test]
 async fn keep_metadata_leaves_the_source_metadata_out_of_webm_and_mp4() {
 	let dir = tempfile::tempdir().unwrap();
@@ -2998,6 +3124,29 @@ async fn cues_and_chapters_across_the_cuts_are_clipped_to_the_window() {
 }
 
 #[tokio::test]
+async fn a_cue_on_screen_at_a_late_cut_is_still_found() {
+	let dir = tempfile::tempdir().unwrap();
+	let cues = dir.path().join("late.srt");
+	fs::write(
+		&cues,
+		"1\n00:00:05,000 --> 00:00:06,000\nearly\n\n2\n00:00:36,000 --> 00:00:39,500\nacross the start\n\n\
+		 3\n00:00:40,000 --> 00:00:44,000\nacross the end\n",
+	)
+	.unwrap();
+	let clip = support::black_clip_of(dir.path(), "long.mkv", 45, &cues, "srt");
+
+	let outcome = run(&trimmed(fast(&clip), 38.0, 41.0), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let cues = subtitle_spans(&output);
+	assert_eq!(cues.len(), 2, "{cues:?}");
+	assert!(near(cues[0], (0.0, 1.5)), "{cues:?}");
+	assert!(near(cues[1], (2.0, 3.0)), "{cues:?}");
+}
+
+#[tokio::test]
 async fn cut_ass_subtitles_keep_their_styles() {
 	let dir = tempfile::tempdir().unwrap();
 	let ass = dir.path().join("signs.ass");
@@ -3204,6 +3353,28 @@ async fn a_trimmed_output_is_compared_with_the_same_part_of_the_source() {
 			.any(|warning| warning.starts_with("the output is not smaller than the same part of the source (")),
 		"{warnings:?}"
 	);
+}
+
+#[tokio::test]
+#[allow(clippy::cast_precision_loss)]
+async fn a_trimmed_outcome_reports_sizes_against_the_same_part_of_the_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let flac = support::tone(dir.path(), "long.flac", "stereo", 2, 20, &["-c:a", "flac"]);
+	let clip = support::clip_with_extras(dir.path());
+
+	for (source, end_s, duration_s) in [(&flac, 5.0, 20.0), (&clip, 6.0, 10.0)] {
+		let outcome = run(&trimmed(fast(source), 2.0, end_s), dir.path()).await;
+
+		let JobOutcome::Encoded { src_bytes, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		let expected = fs::metadata(source).unwrap().len() as f64 * (end_s - 2.0) / duration_s;
+		assert!(
+			(src_bytes as f64 - expected).abs() < expected * 0.02,
+			"{}: {src_bytes} bytes, expected about {expected}",
+			source.display()
+		);
+	}
 }
 
 #[tokio::test]
@@ -3970,6 +4141,102 @@ async fn a_bitmap_cue_on_screen_at_the_trim_start_shows_from_the_first_frame() {
 	};
 	let lit = support::lit_span(&output, 0).unwrap();
 	assert!(near(lit, (0.0, 2.96)), "{lit:?}");
+}
+
+/// A PGS clip whose box is shown from `from_ms` to `to_ms`, and the same clip with the track as DVD subtitles, whose
+/// packets last until the next one. The video has one keyframe, so a seek anywhere reads the clip from its start, as
+/// a seek into a real file reads back to a subtitle still on screen.
+fn bitmap_clips(dir: &Path, from_ms: u32, to_ms: u32) -> [std::path::PathBuf; 2] {
+	let pgs = support::pgs_box(dir, from_ms, to_ms);
+	let pgs_clip = support::subtitled_clip(
+		dir,
+		&format!("pgs-{from_ms}.mkv"),
+		&support::Picture {
+			source: "color=c=black",
+			seconds: 10,
+			codec: &["-c:v", "mpeg4", "-g", "250"],
+			second_angle: false,
+			marked_frame: None,
+		},
+		&pgs,
+		"copy",
+	);
+	let dvd_clip = support::converted(
+		dir,
+		&format!("dvd-{from_ms}.mkv"),
+		&["-fix_sub_duration"],
+		&pgs_clip,
+		&["-map", "0", "-c:v", "copy", "-c:a", "copy", "-c:s", "dvdsub"],
+	);
+	[pgs_clip, dvd_clip]
+}
+
+#[tokio::test]
+async fn a_kept_bitmap_cue_on_screen_at_the_trim_start_does_not_move_the_start() {
+	let dir = tempfile::tempdir().unwrap();
+
+	for source in bitmap_clips(dir.path(), 1_000, 7_000) {
+		let outcome = run(&trimmed(fast(&source), 3.0, 5.0), dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+			.await
+			.unwrap();
+		let starts: Vec<(String, Option<f64>)> = info
+			.streams
+			.iter()
+			.map(|stream| (stream.codec_name.clone(), stream.start_time))
+			.collect();
+		assert!(starts.iter().any(|(codec, _)| codec.contains("sub")), "{starts:?}");
+		assert!(
+			starts
+				.iter()
+				.all(|(_, start)| start.is_none_or(|start| (0.0..0.05).contains(&start))),
+			"{}: {starts:?}",
+			source.display()
+		);
+		assert!(
+			subtitle_times(&output).iter().all(|time| *time >= 0.0),
+			"{}: {:?}",
+			source.display(),
+			subtitle_times(&output)
+		);
+		fs::remove_file(&output).unwrap();
+	}
+}
+
+#[tokio::test]
+async fn a_kept_bitmap_cue_running_past_the_trim_end_ends_with_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+
+	for source in bitmap_clips(dir.path(), 4_000, 7_000) {
+		let outcome = run(&trimmed(fast(&source), 3.0, 5.0), dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+			.await
+			.unwrap();
+		let duration = info.format.duration.unwrap();
+		assert!(
+			(duration - 2.0).abs() < 0.05,
+			"{}: {duration} s, cues {:?}",
+			source.display(),
+			subtitle_spans(&output)
+		);
+		assert!(
+			subtitle_times(&output)
+				.first()
+				.is_some_and(|start| (start - 1.0).abs() < 0.02),
+			"{}: {:?}",
+			source.display(),
+			subtitle_times(&output)
+		);
+		fs::remove_file(&output).unwrap();
+	}
 }
 
 #[tokio::test]

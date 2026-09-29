@@ -16,6 +16,32 @@ const BRAND_TAGS: &[&str] = &["major_brand", "minor_version", "compatible_brands
 const CLEAN_STREAM_TAGS: &[&str] = &["language", "title"];
 const ATTACHMENT_TAGS: &[&str] = &["filename", "mimetype"];
 const CUE_DISPOSITIONS: &[&str] = &["default", "forced", "hearing_impaired", "visual_impaired", "comment"];
+/// Longer forms come first, so that `DTS-HD MA` is taken whole rather than as `DTS`.
+const CODEC_WORDS: &[&[&str]] = &[
+	&["DTS", "HD", "Master", "Audio"],
+	&["DTS", "HD", "MA"],
+	&["DTS", "HD"],
+	&["DTS"],
+	&["Dolby", "TrueHD"],
+	&["True", "HD"],
+	&["Dolby", "Atmos"],
+	&["Atmos"],
+	&["Dolby", "Digital", "Plus"],
+	&["Dolby", "Digital"],
+	&["E", "AC", "3"],
+	&["DD+"],
+	&["DDP"],
+	&["AC", "3"],
+	&["AAC"],
+	&["FLAC"],
+	&["LPCM"],
+	&["PCM"],
+	&["MP3"],
+	&["Opus"],
+	&["Vorbis"],
+];
+const CHANNEL_WORDS: &[&str] = &["2.0", "5.1", "7.1"];
+const TITLE_SEPARATORS: &[char] = &[' ', '.', '-', '_'];
 const STATISTICS_TAGS: &[&str] = &[
 	"BPS",
 	"DURATION",
@@ -169,6 +195,18 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 		cmd.arg(format!("-c:s:{ordinal}")).arg(codec);
 	}
 
+	if let Some(window) = plan.window {
+		for (ordinal, _) in plan
+			.streams
+			.subtitles
+			.iter()
+			.enumerate()
+			.filter(|(_, subtitle)| subtitle.clipped.is_none())
+		{
+			cmd.arg(format!("-bsf:s:{ordinal}")).arg(bitmap_cut(window));
+		}
+	}
+
 	for (offset, attachment) in inputs.attachments.iter().enumerate() {
 		let spec = format!("-metadata:s:t:{}", plan.streams.attachments.len() + offset);
 		cmd.arg("-attach")
@@ -185,10 +223,14 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 			cmd.arg("-metadata").arg(format!("{tag}="));
 		}
 		push_statistics_reset(&mut cmd, plan.info, &outputs);
+		push_encoded_titles(&mut cmd, plan, &outputs);
 	} else {
 		push_clean_metadata(&mut cmd, plan, &outputs);
 	}
 	push_cue_tags(&mut cmd, plan, &outputs, &cue_inputs);
+	if plan.container.muxer == MP4_VIDEO.muxer {
+		push_subtitle_names(&mut cmd, plan.info, &outputs);
+	}
 
 	match plan.chapters {
 		ChapterSource::Source => cmd.arg("-map_chapters").arg(source.to_string()),
@@ -218,6 +260,17 @@ pub async fn mux(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<(), Jo
 fn source_offset(info: &MediaInfo, window: Option<TrimWindow>) -> Option<String> {
 	let shift = info.format.start_time.unwrap_or(0.0) + window.map_or(0.0, |window| window.start_s);
 	(shift.abs() > f64::EPSILON).then(|| format!("{:.6}", -shift))
+}
+
+/// Under a trim, every subtitle track that isn't cut to a file is a bitmap one, copied from the seeked source. The
+/// seek can read back to a cue still on screen at the cut, which would move the file's start to that cue, so a packet
+/// that starts before the window (a negative `pts` here) is dropped, and one running past the end is cut short there.
+///
+/// `noise` drops a packet on any nonzero value, negative too, so `abs(pts)-pts` is 0 unless `pts` is negative. `lt`
+/// and `min` are spelled out because a comma would split the filter list.
+fn bitmap_cut(window: TrimWindow) -> String {
+	let end = format!("{:.3}/TB", window.length_s);
+	format!("noise=drop=abs(pts)-pts,setts=duration=(DURATION+{end}-PTS-abs(DURATION-{end}+PTS))/2")
 }
 
 fn push_maps(
@@ -255,6 +308,130 @@ fn push_statistics_reset(cmd: &mut ToolCommand, info: &MediaInfo, outputs: &[Out
 	}
 }
 
+fn push_encoded_titles(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, outputs: &[OutputStream]) {
+	for (position, output) in outputs.iter().enumerate() {
+		let Some(stream) = source_stream(plan.info, output.origin) else {
+			continue;
+		};
+
+		if let Some(title) = encoded_title(plan.streams, *output, stream) {
+			cmd.arg(format!("-metadata:s:{position}")).arg(format!("title={title}"));
+		}
+	}
+}
+
+/// The title of an encoded audio track, rewritten for Opus and its new channels; `None` when it stays as it is.
+fn encoded_title(streams: &StreamPlan, output: OutputStream, stream: &Stream) -> Option<String> {
+	if !matches!(output.input, MuxInput::AudioTemp(_)) || streams.merge_from.first() == Some(&output.origin) {
+		return None;
+	}
+
+	let encoded = streams.audio.iter().find_map(|track| match &track.plan {
+		TrackPlan::Encode(encoded) if track.stream_index == output.origin => Some(encoded),
+		_ => None,
+	})?;
+	retitle(stream.tag("title")?, channel_words(encoded.layout.target()))
+}
+
+fn channel_words(layout: &str) -> Option<&str> {
+	match layout {
+		"mono" => Some("1.0"),
+		"stereo" => Some("2.0"),
+		"quad" => Some("4.0"),
+		_ => {
+			let layout = layout.split('(').next()?;
+			(layout.starts_with(|c: char| c.is_ascii_digit()) && layout.contains('.')).then_some(layout)
+		}
+	}
+}
+
+/// `title` with its first codec word replaced by `Opus`, its other codec words removed and its channel words
+/// replaced by `channels`; `None` when that changes nothing.
+fn retitle(title: &str, channels: Option<&str>) -> Option<String> {
+	let mut words = Vec::new();
+	let mut at = 0;
+	while let Some(next) = title[at..].chars().next() {
+		if let Some(end) = codec_word_end(title, at) {
+			words.push((at..end, true));
+			at = end;
+		} else if let Some(end) = channel_word_end(title, at) {
+			words.push((at..end, false));
+			at = end;
+		} else {
+			at += next.len_utf8();
+		}
+	}
+
+	let mut retitled = String::new();
+	let mut last = 0;
+	let mut named = false;
+	for (word, is_codec) in words {
+		let between = &title[last..word.start];
+		last = word.end;
+		if is_codec && named {
+			retitled.push_str(between.strip_suffix(TITLE_SEPARATORS).unwrap_or(between));
+			continue;
+		}
+
+		retitled.push_str(between);
+		if is_codec {
+			named = true;
+			retitled.push_str("Opus");
+		} else {
+			retitled.push_str(channels.unwrap_or(&title[word]));
+		}
+	}
+	retitled.push_str(&title[last..]);
+
+	(retitled != title).then_some(retitled)
+}
+
+/// Where a codec word that starts at `at` ends. Its parts may be joined by one separator or none (`E-AC-3`, `EAC3`),
+/// and channels may follow it directly (`DDP5.1`).
+fn codec_word_end(title: &str, at: usize) -> Option<usize> {
+	let bytes = title.as_bytes();
+	if at > 0 && bytes[at - 1].is_ascii_alphanumeric() {
+		return None;
+	}
+
+	CODEC_WORDS.iter().find_map(|parts| {
+		let mut end = at;
+		for (ordinal, part) in parts.iter().enumerate() {
+			if ordinal > 0 && title[end..].starts_with(TITLE_SEPARATORS) {
+				end += 1;
+			}
+			if !title.get(end..end + part.len())?.eq_ignore_ascii_case(part) {
+				return None;
+			}
+			end += part.len();
+		}
+		bytes
+			.get(end)
+			.is_none_or(|next| !next.is_ascii_alphabetic())
+			.then_some(end)
+	})
+}
+
+/// Where a channel word that starts at `at` ends, taking an object layout's height along (`7.1.4`).
+fn channel_word_end(title: &str, at: usize) -> Option<usize> {
+	let bytes = title.as_bytes();
+	let digit = |index: usize| bytes.get(index).is_some_and(u8::is_ascii_digit);
+	let after_number = at > 0 && (digit(at - 1) || (bytes[at - 1] == b'.' && at > 1 && digit(at - 2)));
+	if after_number {
+		return None;
+	}
+
+	let word = CHANNEL_WORDS.iter().find(|word| title[at..].starts_with(**word))?;
+	let mut end = at + word.len();
+	if bytes.get(end) == Some(&b'.') && digit(end + 1) {
+		end += 1;
+		while digit(end) {
+			end += 1;
+		}
+	}
+	(!digit(end)).then_some(end)
+}
+
 fn is_statistics_tag(key: &str) -> bool {
 	let name = match key.rsplit_once('-') {
 		Some((name, language))
@@ -282,8 +459,13 @@ fn push_clean_metadata(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, outputs: &[Out
 		let Some(stream) = source_stream(plan.info, output.origin) else {
 			continue;
 		};
+		let title = encoded_title(plan.streams, *output, stream);
 		for key in CLEAN_STREAM_TAGS {
-			if let Some(value) = stream.tag(key) {
+			let value = match (*key, &title) {
+				("title", Some(title)) => Some(title.as_str()),
+				_ => stream.tag(key),
+			};
+			if let Some(value) = value {
 				cmd.arg(format!("-metadata:s:{position}")).arg(format!("{key}={value}"));
 			}
 		}
@@ -339,6 +521,22 @@ fn push_cue_tags(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, outputs: &[OutputStr
 			flags.join("+")
 		};
 		cmd.arg(format!("-disposition:{position}")).arg(flags);
+	}
+}
+
+/// The mp4 muxer stores a `title` where readers see it only as `name`; `handler_name` is read back as it was written.
+fn push_subtitle_names(cmd: &mut ToolCommand, info: &MediaInfo, outputs: &[OutputStream]) {
+	for (position, output) in outputs.iter().enumerate() {
+		let Some(stream) = source_stream(info, output.origin) else {
+			continue;
+		};
+
+		if stream.codec_type == "subtitle"
+			&& let Some(title) = stream.tag("title")
+		{
+			cmd.arg(format!("-metadata:s:{position}"))
+				.arg(format!("handler_name={title}"));
+		}
 	}
 }
 
@@ -603,6 +801,14 @@ mod tests {
 			"{kept}"
 		);
 		assert!(!kept.contains("-disposition:1"), "{kept}");
+		assert!(
+			kept.contains(
+				"-bsf:s:0 noise=drop=abs(pts)-pts,setts=duration=(DURATION+4.000/TB-PTS-abs(DURATION-4.000/TB+PTS))/2"
+			),
+			"{kept}"
+		);
+		assert!(!kept.contains("-bsf:s:1"), "{kept}");
+		assert!(!build(true, false, &[]).contains("-bsf"));
 		assert!(clean.contains("-metadata:s:2 language=deu"), "{clean}");
 		assert_eq!(clean.matches("language=deu").count(), 1, "{clean}");
 		assert!(clean.contains("-disposition:2 forced"), "{clean}");
@@ -706,6 +912,70 @@ mod tests {
 
 		assert!(args.contains("-metadata:s:1 language=eng"), "{args}");
 		assert!(!args.contains("title=Main"), "{args}");
+	}
+
+	#[test]
+	fn codec_and_channel_words_in_titles_follow_the_encode() {
+		assert_eq!(
+			retitle("English 2.0 AAC", Some("2.0")).as_deref(),
+			Some("English 2.0 Opus")
+		);
+		assert_eq!(
+			retitle("Japanese 2.0 FLAC", Some("2.0")).as_deref(),
+			Some("Japanese 2.0 Opus")
+		);
+		assert_eq!(
+			retitle("Film.2019.DTS-HD.MA.TrueHD.7.1.Atmos-GROUP", Some("7.1")).as_deref(),
+			Some("Film.2019.Opus.7.1-GROUP")
+		);
+		assert_eq!(
+			retitle("Dolby TrueHD 7.1 Atmos", Some("5.1")).as_deref(),
+			Some("Opus 5.1")
+		);
+		assert_eq!(
+			retitle("English DDP5.1", Some("5.1")).as_deref(),
+			Some("English Opus5.1")
+		);
+		assert_eq!(
+			retitle("Commentary (E-AC-3)", Some("2.0")).as_deref(),
+			Some("Commentary (Opus)")
+		);
+		assert_eq!(retitle("DTS-HD Master Audio 5.1", None).as_deref(), Some("Opus 5.1"));
+		assert_eq!(retitle("Surround 5.1", Some("2.0")).as_deref(), Some("Surround 2.0"));
+	}
+
+	#[test]
+	fn titles_without_codec_words_are_kept() {
+		for title in [
+			"Commentary",
+			"Director's cut",
+			"Opusculum",
+			"Track 12.0",
+			"AACS",
+			"Paccard",
+			"v1.5.1",
+		] {
+			assert_eq!(retitle(title, Some("2.0")), None, "{title}");
+		}
+		assert_eq!(retitle("English Opus 2.0", Some("2.0")), None);
+	}
+
+	#[test]
+	fn encoded_tracks_get_their_titles_rewritten_in_both_modes() {
+		let mut tagged = info();
+		tagged.streams[1].tags.insert("title".into(), "English 5.1 AC3".into());
+		tagged.streams[2]
+			.tags
+			.insert("title".into(), "Japanese 2.0 FLAC".into());
+
+		let clean = build_with(&tagged, false, false, &[]);
+		let kept = build_with(&tagged, true, false, &[]);
+
+		assert!(clean.contains("-metadata:s:1 title=English 2.0 Opus"), "{clean}");
+		assert!(!clean.contains("title=English 5.1 AC3"), "{clean}");
+		assert!(clean.contains("-metadata:s:2 title=Japanese 2.0 FLAC"), "{clean}");
+		assert!(kept.contains("-metadata:s:1 title=English 2.0 Opus"), "{kept}");
+		assert!(!kept.contains("title=Japanese"), "{kept}");
 	}
 
 	#[test]

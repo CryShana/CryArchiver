@@ -18,14 +18,20 @@ const ASS_DIALOGUE: &str = "Dialogue:";
 const ASS_COMMENT: &str = "Comment:";
 const BOM: char = '\u{feff}';
 
-/// Writes each track's cues inside `window` (on the source's own timestamps) to a file the mux reads as
-/// `-f <format extension>`, reading the source once for all of them. The files come back in `tracks` order.
+/// How long before the cut the cues are read from. A cue that started earlier than this and still shows at the cut
+/// is lost; reading from the file's start instead takes minutes on a large file.
+const LEAD_S: f64 = 30.0;
+/// How long after the window's end the cues are read to, past any rounding of the cut.
+const TAIL_S: f64 = 1.0;
+
+/// Writes each track's cues inside `window` to a file the mux reads as `-f <format extension>`, reading the source
+/// once for all of them. `start_time` is the source's; the files come back in `tracks` order.
 pub async fn cut(
 	ffmpeg: &Path,
 	source: &Path,
 	workspace: &Workspace,
 	tracks: &[(u32, CueFormat)],
-	window: TrimWindow,
+	(window, start_time): (TrimWindow, Option<f64>),
 	cancel: &CancellationToken,
 ) -> Result<Vec<PathBuf>, JobError> {
 	if tracks.is_empty() {
@@ -35,18 +41,15 @@ pub async fn cut(
 	let whole = |stream_index: u32, format: CueFormat| {
 		workspace.file(&format!("cues-{stream_index}.source.{}", format.extension()))
 	};
+	let outputs: Vec<(u32, CueFormat, PathBuf)> = tracks
+		.iter()
+		.map(|&(stream_index, format)| (stream_index, format, whole(stream_index, format)))
+		.collect();
 	let source_bytes = fs::metadata(source).map_or(0, |meta| meta.len());
-	let mut cmd = ToolCommand::new(ffmpeg, process::scaled_timeout(source_bytes));
-	cmd.args(["-hide_banner", "-nostdin", "-y", "-copyts", "-i"])
-		.arg(process::tool_path(source));
-	for &(stream_index, format) in tracks {
-		cmd.arg("-map")
-			.arg(format!("0:{stream_index}"))
-			.args(["-c:s", format.extension(), "-f", format.extension()])
-			.arg(process::tool_path(&whole(stream_index, format)));
-	}
+	let cmd = command(ffmpeg, (source, source_bytes), &outputs, window, start_time);
 	run_ffmpeg(&cmd, |_| {}, cancel).await?;
 
+	let window = window.on_source(start_time);
 	let mut cut = Vec::with_capacity(tracks.len());
 	for &(stream_index, format) in tracks {
 		let path = whole(stream_index, format);
@@ -63,6 +66,34 @@ pub async fn cut(
 		cut.push(out);
 	}
 	Ok(cut)
+}
+
+/// Reads the tracks from `LEAD_S` before the window to `TAIL_S` after it. Under `-copyts` the input's `-ss` is
+/// counted from the file's start and the outputs' `-to` on the source's own timestamps.
+fn command(
+	ffmpeg: &Path,
+	(source, source_bytes): (&Path, u64),
+	outputs: &[(u32, CueFormat, PathBuf)],
+	window: TrimWindow,
+	start_time: Option<f64>,
+) -> ToolCommand {
+	let seek_s = (window.start_s - LEAD_S).max(0.0);
+	let end_s = window.on_source(start_time).start_s + window.length_s + TAIL_S;
+
+	let mut cmd = ToolCommand::new(ffmpeg, process::scaled_timeout(source_bytes));
+	cmd.args(["-hide_banner", "-nostdin", "-y", "-copyts", "-ss"])
+		.arg(format!("{seek_s:.3}"))
+		.arg("-i")
+		.arg(process::tool_path(source));
+	for (stream_index, format, path) in outputs {
+		cmd.arg("-map")
+			.arg(format!("0:{stream_index}"))
+			.args(["-c:s", format.extension(), "-to"])
+			.arg(format!("{end_s:.3}"))
+			.args(["-f", format.extension()])
+			.arg(process::tool_path(path));
+	}
+	cmd
 }
 
 /// `text` is the track as ffmpeg writes it with `-copyts`, so its times are the source's own timestamps. `Err`
@@ -228,6 +259,34 @@ mod tests {
 		start_s: 4.0,
 		length_s: 4.0,
 	};
+
+	#[test]
+	fn the_source_is_read_from_shortly_before_the_window_to_just_after_it() {
+		let outputs = [(3, CueFormat::Ass, PathBuf::from("cues-3.source.ass"))];
+		let read = |window, start_time| {
+			crate::video::joined(&command(
+				Path::new("ffmpeg"),
+				(Path::new("in.mkv"), 0),
+				&outputs,
+				window,
+				start_time,
+			))
+		};
+
+		let late = read(
+			TrimWindow {
+				start_s: 600.0,
+				length_s: 15.0,
+			},
+			Some(1.4),
+		);
+		let early = read(WINDOW, None);
+
+		assert!(late.contains(" -copyts -ss 570.000 -i "), "{late}");
+		assert!(late.contains(" -map 0:3 -c:s ass -to 617.400 -f ass "), "{late}");
+		assert!(early.contains(" -copyts -ss 0.000 -i "), "{early}");
+		assert!(early.contains(" -to 9.000 "), "{early}");
+	}
 
 	#[test]
 	fn srt_cues_are_clipped_to_the_window_and_renumbered() {

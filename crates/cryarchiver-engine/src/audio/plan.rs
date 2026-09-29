@@ -9,6 +9,7 @@ use crate::probe::{MediaInfo, Stream};
 
 pub const OPUS_RATE: u32 = 48_000;
 
+const UNDETERMINED_LANGUAGE: &str = "und";
 const MAX_CHANNELS: u32 = 8;
 const EFFICIENT_HEADROOM: f64 = 1.2;
 const RELABEL: &[(&str, &str)] = &[
@@ -184,13 +185,37 @@ pub fn merged(
 	Some((track, sources))
 }
 
+/// The merged track's language: the one its tagged sources share, or `und` when they differ.
 pub fn merge_language(info: &MediaInfo, sources: &[u32]) -> Option<String> {
-	let first = *sources.first()?;
-	info.streams
-		.iter()
-		.find(|stream| stream.index == first)
-		.and_then(|stream| stream.tag("language"))
-		.map(str::to_owned)
+	match source_languages(info, sources).as_slice() {
+		[] => None,
+		[language] => Some((*language).to_owned()),
+		_ => Some(UNDETERMINED_LANGUAGE.to_owned()),
+	}
+}
+
+pub fn mixed_languages_warning(info: &MediaInfo, sources: &[u32]) -> Option<String> {
+	let languages = source_languages(info, sources);
+	(languages.len() > 1).then(|| format!("mixing tracks in different languages: {}", languages.join(", ")))
+}
+
+/// The distinct languages tagged on `sources`, in track order.
+fn source_languages<'a>(info: &'a MediaInfo, sources: &[u32]) -> Vec<&'a str> {
+	let mut languages = Vec::new();
+	for source in sources {
+		let language = info
+			.streams
+			.iter()
+			.find(|stream| stream.index == *source)
+			.and_then(|stream| stream.tag("language"))
+			.filter(|language| *language != UNDETERMINED_LANGUAGE);
+		if let Some(language) = language
+			&& !languages.contains(&language)
+		{
+			languages.push(language);
+		}
+	}
+	languages
 }
 
 pub fn merge_file(plan: FilePlan, info: &MediaInfo, speed: Speed, overrides: &Overrides) -> FilePlan {

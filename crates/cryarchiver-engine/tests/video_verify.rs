@@ -32,6 +32,7 @@ fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan 
 			transfer: "bt709".into(),
 			matrix: "bt709".into(),
 			range: Range::Limited,
+			chroma_location: None,
 		},
 		alpha,
 		hdr10: false,

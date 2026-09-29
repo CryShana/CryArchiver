@@ -1,4 +1,5 @@
 use crate::format::OutputFormat;
+use crate::text::decimal_bytes;
 
 const DURATION_SLACK_S: f64 = 0.05;
 const SHORTEST_TRIM_S: f64 = 0.1;
@@ -189,13 +190,17 @@ pub fn parse_time(text: &str) -> Result<f64, String> {
 
 pub fn kept_as_requested(src_bytes: u64, out_bytes: u64) -> String {
 	format!(
-		"the output is not smaller than the source ({src_bytes} → {out_bytes} bytes); it was written because it was requested"
+		"the output is not smaller than the source ({} → {}); it was written because it was requested",
+		decimal_bytes(src_bytes),
+		decimal_bytes(out_bytes)
 	)
 }
 
 pub fn kept_as_requested_part(part_bytes: u64, out_bytes: u64) -> String {
 	format!(
-		"the output is not smaller than the same part of the source ({part_bytes} → {out_bytes} bytes); it was written because it was requested"
+		"the output is not smaller than the same part of the source ({} → {}); it was written because it was requested",
+		decimal_bytes(part_bytes),
+		decimal_bytes(out_bytes)
 	)
 }
 
@@ -213,6 +218,15 @@ mod tests {
 
 	fn trim(start_s: f64, end_s: Option<f64>) -> Trim {
 		Trim { start_s, end_s }
+	}
+
+	#[test]
+	fn not_smaller_warnings_print_sizes_like_every_other_size() {
+		assert_eq!(
+			kept_as_requested(12_866_260, 34_335_604),
+			"the output is not smaller than the source (12.87 MB → 34.34 MB); it was written because it was requested"
+		);
+		assert!(kept_as_requested_part(900, 1_200).contains("(900 B → 1.20 kB)"));
 	}
 
 	#[test]

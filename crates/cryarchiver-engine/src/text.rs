@@ -50,6 +50,46 @@ pub fn display_path(path: &Path) -> String {
 	display_name(path.as_os_str())
 }
 
+/// A size as the CLI prints sizes (indicatif's `DecimalBytes`): `999 B`, `3.59 MB`.
+#[allow(clippy::cast_precision_loss)]
+pub fn decimal_bytes(bytes: u64) -> String {
+	const PREFIXES: [&str; 6] = ["k", "M", "G", "T", "P", "E"];
+
+	if bytes < 1000 {
+		return format!("{bytes} B");
+	}
+
+	let mut value = bytes as f64 / 1000.0;
+	let mut prefix = 0;
+	while value >= 1000.0 && prefix + 1 < PREFIXES.len() {
+		value /= 1000.0;
+		prefix += 1;
+	}
+	format!("{value:.2} {}B", PREFIXES[prefix])
+}
+
+/// `lines` with every repeated line kept once, where it first appears, followed by its count: `… (×31)`.
+pub fn fold_repeats(lines: Vec<String>) -> Vec<String> {
+	let mut counted: Vec<(String, usize)> = Vec::new();
+	for line in lines {
+		match counted.iter_mut().find(|(seen, _)| *seen == line) {
+			Some((_, count)) => *count += 1,
+			None => counted.push((line, 1)),
+		}
+	}
+
+	counted
+		.into_iter()
+		.map(|(line, count)| {
+			if count == 1 {
+				line
+			} else {
+				format!("{line} (×{count})")
+			}
+		})
+		.collect()
+}
+
 fn grapheme_width(g: &str) -> usize {
 	UnicodeWidthStr::width(g).clamp(1, 2)
 }
@@ -173,6 +213,22 @@ mod tests {
 		assert_eq!(display_name(OsStr::new("a\nb\u{1b}c\td")), "a\\nb\\x1bc\\td");
 		assert_eq!(display_name(OsStr::new("02. 夜明け.mp3")), "02. 夜明け.mp3");
 		assert_eq!(display_path(Path::new("dir/a\u{7}.flac")), "dir/a\\x07.flac");
+	}
+
+	#[test]
+	fn sizes_are_printed_with_decimal_prefixes() {
+		assert_eq!(decimal_bytes(999), "999 B");
+		assert_eq!(decimal_bytes(2_000), "2.00 kB");
+		assert_eq!(decimal_bytes(12_866_260), "12.87 MB");
+		assert_eq!(decimal_bytes(1_530_000_000), "1.53 GB");
+	}
+
+	#[test]
+	fn repeated_lines_are_folded_with_a_count_where_they_first_appear() {
+		let lines = ["a", "b", "a", "c", "a", "b"].map(String::from).to_vec();
+
+		assert_eq!(fold_repeats(lines), ["a (×3)", "b (×2)", "c"]);
+		assert!(fold_repeats(Vec::new()).is_empty());
 	}
 
 	#[cfg(unix)]

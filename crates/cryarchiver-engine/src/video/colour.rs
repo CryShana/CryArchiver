@@ -28,6 +28,8 @@ pub struct ColourTags {
 	pub transfer: String,
 	pub matrix: String,
 	pub range: Range,
+	/// Where the source's chroma samples sit, when it says.
+	pub chroma_location: Option<String>,
 }
 
 pub fn output_tags(stream: &Stream) -> ColourTags {
@@ -45,6 +47,7 @@ pub fn output_tags(stream: &Stream) -> ColourTags {
 			transfer: tagged(stream.color_transfer.as_deref(), transfer),
 			matrix: matrix.to_owned(),
 			range: Range::Limited,
+			chroma_location: None,
 		};
 	}
 
@@ -58,29 +61,41 @@ pub fn output_tags(stream: &Stream) -> ColourTags {
 		transfer: tagged(stream.color_transfer.as_deref(), transfer),
 		matrix: tagged(stream.color_space.as_deref(), matrix),
 		range: if full { Range::Full } else { Range::Limited },
+		chroma_location: stream
+			.chroma_location
+			.clone()
+			.filter(|location| !UNSET.contains(&location.as_str())),
 	}
 }
 
+/// The scale drops the frames' chroma location unless it is named, so it is passed through.
 pub fn conversion(stream: &Stream, tags: &ColourTags, target_pix_fmt: &str) -> Option<String> {
 	if stream.pix_fmt.as_deref() == Some(target_pix_fmt) {
 		return None;
 	}
 
 	let range = tags.range.name();
+	let chroma = tags.chroma_location.as_deref().map_or_else(String::new, |location| {
+		format!(":in_chroma_loc={location}:out_chroma_loc={location}")
+	});
 	let scale = if is_rgb(stream) {
 		format!("scale=out_range={range}:out_color_matrix={}", tags.matrix)
 	} else if SCALE_MATRICES.contains(&tags.matrix.as_str()) {
 		let matrix = &tags.matrix;
-		format!("scale=in_range={range}:out_range={range}:in_color_matrix={matrix}:out_color_matrix={matrix}")
+		format!("scale=in_range={range}:out_range={range}:in_color_matrix={matrix}:out_color_matrix={matrix}{chroma}")
 	} else {
-		format!("scale=in_range={range}:out_range={range}")
+		format!("scale=in_range={range}:out_range={range}{chroma}")
 	};
 	Some(format!("{scale},format={target_pix_fmt}"))
 }
 
 pub fn setparams(tags: &ColourTags) -> String {
+	let chroma = tags
+		.chroma_location
+		.as_deref()
+		.map_or_else(String::new, |location| format!(":chroma_location={location}"));
 	format!(
-		"setparams=field_mode=prog:range={}:color_primaries={}:color_trc={}:colorspace={}",
+		"setparams=field_mode=prog:range={}:color_primaries={}:color_trc={}:colorspace={}{chroma}",
 		tags.range.name(),
 		tags.primaries,
 		tags.transfer,
@@ -187,6 +202,30 @@ mod tests {
 			conversion(&full, &tags, "yuv420p10le").as_deref(),
 			Some("scale=in_range=pc:out_range=pc:in_color_matrix=bt709:out_color_matrix=bt709,format=yuv420p10le")
 		);
+	}
+
+	#[test]
+	fn the_chroma_location_is_carried_through_the_conversion() {
+		let topleft = stream(
+			r#"{"index":0,"codec_type":"video","width":1918,"height":802,"pix_fmt":"yuv420p","color_space":"bt709",
+			"chroma_location":"topleft"}"#,
+		);
+		let unspecified = stream(
+			r#"{"index":0,"codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuv420p","chroma_location":"unspecified"}"#,
+		);
+		let tags = output_tags(&topleft);
+
+		assert_eq!(tags.chroma_location.as_deref(), Some("topleft"));
+		assert_eq!(
+			conversion(&topleft, &tags, "yuv420p10le").as_deref(),
+			Some(
+				"scale=in_range=tv:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709:in_chroma_loc=topleft:\
+				 out_chroma_loc=topleft,format=yuv420p10le"
+			)
+		);
+		assert!(setparams(&tags).ends_with(":colorspace=bt709:chroma_location=topleft"));
+		assert_eq!(output_tags(&unspecified).chroma_location, None);
+		assert!(!setparams(&output_tags(&unspecified)).contains("chroma"));
 	}
 
 	#[test]

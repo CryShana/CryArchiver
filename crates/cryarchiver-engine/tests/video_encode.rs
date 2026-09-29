@@ -39,6 +39,7 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 			transfer: "bt709".into(),
 			matrix: "bt709".into(),
 			range: Range::Limited,
+			chroma_location: None,
 		},
 		alpha: false,
 		hdr10: false,
