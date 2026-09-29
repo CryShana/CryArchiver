@@ -39,7 +39,17 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 		for (out, track) in plan.tracks.iter().enumerate() {
 			cmd.arg("-map").arg(format!("0:{}", track.stream_index));
 			match &track.plan {
-				TrackPlan::Encode(encode) => push_encode(&mut cmd, out, encode),
+				TrackPlan::Encode(encode) => {
+					push_encode(&mut cmd, out, encode);
+					if let Some((_, title)) = plan
+						.options
+						.titles
+						.iter()
+						.find(|(index, _)| *index == track.stream_index)
+					{
+						cmd.arg(format!("-metadata:s:a:{out}")).arg(format!("title={title}"));
+					}
+				}
 				TrackPlan::Copy => {
 					cmd.arg(format!("-c:a:{out}")).arg("copy");
 				}

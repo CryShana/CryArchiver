@@ -9,6 +9,7 @@ pub mod noise;
 pub mod plan;
 pub mod quality;
 pub mod streams;
+pub mod titles;
 pub mod verify;
 
 use tokio_util::sync::CancellationToken;

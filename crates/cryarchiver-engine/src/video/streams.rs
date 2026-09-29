@@ -71,6 +71,9 @@ pub struct StreamRules {
 	pub container: Container,
 	pub strip: bool,
 	pub trim: bool,
+	/// Under a trim, whether it starts after the source's start and whether it ends before the source's end.
+	pub cut_start: bool,
+	pub cut_end: bool,
 	pub merge: bool,
 	pub burn: Option<Burn>,
 }
@@ -84,6 +87,8 @@ impl StreamRules {
 			container: MATROSKA_VIDEO,
 			strip: false,
 			trim: false,
+			cut_start: false,
+			cut_end: false,
 			merge: false,
 			burn: None,
 		}
@@ -186,7 +191,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 				Some(track) => {
 					plan.warnings.extend(styling_warning(stream, target));
 					let track = if rules.trim {
-						trimmed_subtitle(track, stream, target, &mut plan.warnings)
+						trimmed_subtitle(track, stream, (target, rules), &mut plan.warnings)
 					} else {
 						track
 					};
@@ -340,17 +345,27 @@ fn styling_warning(stream: &Stream, target: Target) -> Option<String> {
 	})
 }
 
+/// A cue on screen at the start of a trim is dropped. At its end, a DVD cue is dropped too, because its stop time is
+/// in its payload; any other is cut short, which needs no word.
+fn bitmap_cut_warning(codec: &str, rules: &StreamRules) -> Option<String> {
+	let end = rules.cut_end && codec == "dvd_subtitle";
+	let when = match (rules.cut_start, end) {
+		(true, true) => "already on screen at the start of the trim, or still on screen at its end,",
+		(true, false) => "already on screen at the start of the trim",
+		(false, true) => "still on screen at the end of the trim",
+		(false, false) => return None,
+	};
+	Some(format!("bitmap subtitles ({codec}): a cue {when} isn't kept"))
+}
+
 fn trimmed_subtitle(
 	track: SubtitleTrack,
 	stream: &Stream,
-	target: Target,
+	(target, rules): (Target, &StreamRules),
 	warnings: &mut Vec<String>,
 ) -> SubtitleTrack {
 	if !is_text(&stream.codec_name) {
-		warnings.push(format!(
-			"bitmap subtitles ({}): a cue already on screen at the start of the trim isn't kept",
-			stream.codec_name
-		));
+		warnings.extend(bitmap_cut_warning(&stream.codec_name, rules));
 		return track;
 	}
 
@@ -741,8 +756,45 @@ mod tests {
 	fn trimmed(container: Container) -> StreamRules {
 		StreamRules {
 			trim: true,
+			cut_start: true,
+			cut_end: true,
 			..into(container)
 		}
+	}
+
+	#[test]
+	fn bitmap_warnings_name_only_the_cuts_that_drop_cues() {
+		let bitmaps = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle"},
+			{"index":2,"codec_type":"subtitle","codec_name":"dvd_subtitle"}]}"#,
+		);
+		let cut = |cut_start, cut_end| {
+			plan_streams(
+				&bitmaps,
+				&StreamRules {
+					cut_start,
+					cut_end,
+					..trimmed(MATROSKA_VIDEO)
+				},
+			)
+			.unwrap()
+			.warnings
+		};
+
+		assert_eq!(
+			cut(false, true),
+			["bitmap subtitles (dvd_subtitle): a cue still on screen at the end of the trim isn't kept"]
+		);
+		assert!(cut(false, false).is_empty());
+		assert_eq!(
+			cut(true, true),
+			[
+				"bitmap subtitles (hdmv_pgs_subtitle): a cue already on screen at the start of the trim isn't kept",
+				"bitmap subtitles (dvd_subtitle): a cue already on screen at the start of the trim, or still on screen \
+				 at its end, isn't kept",
+			]
+		);
 	}
 
 	#[test]
@@ -898,6 +950,9 @@ mod tests {
 		assert_eq!(mixed.warnings, ["mixing tracks in different languages: eng, jpn"]);
 		assert_eq!(same.merge_language.as_deref(), Some("eng"));
 		assert!(same.warnings.is_empty(), "{:?}", same.warnings);
+		let equivalent = plan_streams(&tracks("en"), &merge).unwrap();
+		assert_eq!(equivalent.merge_language.as_deref(), Some("eng"));
+		assert!(equivalent.warnings.is_empty(), "{:?}", equivalent.warnings);
 	}
 
 	#[test]

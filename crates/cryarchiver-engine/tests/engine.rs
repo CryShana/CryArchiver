@@ -2320,7 +2320,47 @@ async fn mp4_output_has_mov_text_chapters_and_its_index_in_front() {
 	);
 }
 
-/// A clip whose video is tagged Japanese, with two titled ASS tracks.
+#[tokio::test]
+async fn an_audio_only_output_rewrites_its_track_titles() {
+	let dir = tempfile::tempdir().unwrap();
+	let two = dir.path().join("two.mka");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"anoisesrc=d=3:c=pink:a=0.3:r=48000",
+		"-f",
+		"lavfi",
+		"-i",
+		"anoisesrc=d=3:c=pink:a=0.3:r=48000:s=2",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-ac",
+		"2",
+		"-c:a",
+		"flac",
+		"-metadata:s:a:0",
+		"title=Japanese 2.0 FLAC",
+		"-metadata:s:a:1",
+		"title=Magnum opus",
+		two.to_str().unwrap(),
+	]);
+
+	let outcome = run(&job(&two), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let titles: Vec<Option<&str>> = info.streams.iter().map(|stream| stream.tag("title")).collect();
+	assert_eq!(titles, [Some("Japanese 2.0 Opus"), Some("Magnum opus")]);
+}
+
+/// A clip whose video is tagged Japanese, with a titled AAC track and two titled ASS tracks.
 fn titled_ass_clip(dir: &Path) -> std::path::PathBuf {
 	let ass = dir.join("dialogue.ass");
 	fs::write(
@@ -2342,18 +2382,28 @@ fn titled_ass_clip(dir: &Path) -> std::path::PathBuf {
 		"testsrc2=s=320x240:r=25:d=2",
 		"-i",
 		ass.to_str().unwrap(),
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=2",
 		"-map",
 		"0",
+		"-map",
+		"2",
 		"-map",
 		"1",
 		"-map",
 		"1",
 		"-c:v",
 		"mpeg4",
+		"-c:a",
+		"aac",
 		"-c:s",
 		"copy",
 		"-metadata:s:v:0",
 		"language=jpn",
+		"-metadata:s:a:0",
+		"title=English AAC",
 		"-metadata:s:s:0",
 		"title=Signs & Songs",
 		"-metadata:s:s:1",
@@ -2402,6 +2452,8 @@ async fn converted_ass_warns_and_mp4_keeps_track_names_and_the_video_language() 
 				.map(|stream| stream.tag("handler_name"))
 				.collect();
 			assert_eq!(names, [Some("Signs & Songs"), Some("Dialogue")], "keep {keep_metadata}");
+			let audio = info.streams.iter().find(|stream| stream.is_audio()).unwrap();
+			assert_eq!(audio.tag("handler_name"), Some("English Opus"), "keep {keep_metadata}");
 			assert_eq!(info.streams[0].tag("language"), Some("jpn"), "keep {keep_metadata}");
 		}
 		fs::remove_file(&output).unwrap();
@@ -4143,14 +4195,21 @@ async fn a_bitmap_cue_on_screen_at_the_trim_start_shows_from_the_first_frame() {
 	assert!(near(lit, (0.0, 2.96)), "{lit:?}");
 }
 
-/// A PGS clip whose box is shown from `from_ms` to `to_ms`, and the same clip with the track as DVD subtitles, whose
-/// packets last until the next one. The video has one keyframe, so a seek anywhere reads the clip from its start, as
-/// a seek into a real file reads back to a subtitle still on screen.
-fn bitmap_clips(dir: &Path, from_ms: u32, to_ms: u32) -> [std::path::PathBuf; 2] {
-	let pgs = support::pgs_box(dir, from_ms, to_ms);
+/// A PGS clip whose box is shown for each of `spans` (in ms), and the same clip with the track as DVD subtitles,
+/// whose packets last until the next one and carry that stop time in their payload too. The video has one keyframe,
+/// so a seek anywhere reads the clip from its start, as a seek into a real file reads back to a subtitle still on
+/// screen.
+fn bitmap_clips(dir: &Path, spans: &[(u32, u32)]) -> [std::path::PathBuf; 2] {
+	let first = spans[0].0;
+	let pgs = dir.join(format!("cues-{first}.sup"));
+	let cues: Vec<u8> = spans
+		.iter()
+		.flat_map(|&(from_ms, to_ms)| fs::read(support::pgs_box(dir, from_ms, to_ms)).unwrap())
+		.collect();
+	fs::write(&pgs, cues).unwrap();
 	let pgs_clip = support::subtitled_clip(
 		dir,
-		&format!("pgs-{from_ms}.mkv"),
+		&format!("pgs-{first}.mkv"),
 		&support::Picture {
 			source: "color=c=black",
 			seconds: 10,
@@ -4163,7 +4222,7 @@ fn bitmap_clips(dir: &Path, from_ms: u32, to_ms: u32) -> [std::path::PathBuf; 2]
 	);
 	let dvd_clip = support::converted(
 		dir,
-		&format!("dvd-{from_ms}.mkv"),
+		&format!("dvd-{first}.mkv"),
 		&["-fix_sub_duration"],
 		&pgs_clip,
 		&["-map", "0", "-c:v", "copy", "-c:a", "copy", "-c:s", "dvdsub"],
@@ -4175,33 +4234,86 @@ fn bitmap_clips(dir: &Path, from_ms: u32, to_ms: u32) -> [std::path::PathBuf; 2]
 async fn a_kept_bitmap_cue_on_screen_at_the_trim_start_does_not_move_the_start() {
 	let dir = tempfile::tempdir().unwrap();
 
-	for source in bitmap_clips(dir.path(), 1_000, 7_000) {
+	for source in bitmap_clips(dir.path(), &[(1_000, 3_500), (4_000, 4_500)]) {
 		let outcome = run(&trimmed(fast(&source), 3.0, 5.0), dir.path()).await;
 
 		let JobOutcome::Encoded { output, .. } = outcome else {
 			panic!("{outcome:?}")
 		};
-		let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
-			.await
-			.unwrap();
-		let starts: Vec<(String, Option<f64>)> = info
-			.streams
-			.iter()
-			.map(|stream| (stream.codec_name.clone(), stream.start_time))
-			.collect();
-		assert!(starts.iter().any(|(codec, _)| codec.contains("sub")), "{starts:?}");
+		let starts = stream_starts(&output).await;
+		let started = |codec: &str, start: Option<f64>| {
+			let earliest = if codec.contains("sub") { 1.05 } else { 0.05 };
+			start.is_some_and(|start| (0.0..earliest).contains(&start))
+		};
 		assert!(
-			starts
-				.iter()
-				.all(|(_, start)| start.is_none_or(|start| (0.0..0.05).contains(&start))),
+			starts.iter().all(|(codec, start)| started(codec, *start)),
 			"{}: {starts:?}",
 			source.display()
 		);
+		let cues = subtitle_times(&output);
 		assert!(
-			subtitle_times(&output).iter().all(|time| *time >= 0.0),
-			"{}: {:?}",
-			source.display(),
-			subtitle_times(&output)
+			cues.iter().all(|time| *time >= 0.0) && cues.iter().any(|time| (time - 1.0).abs() < 0.02),
+			"{}: {cues:?}",
+			source.display()
+		);
+		fs::remove_file(&output).unwrap();
+	}
+}
+
+#[tokio::test]
+async fn copied_audio_in_a_trim_starts_no_earlier_than_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let expr = (0..10).map(|_| "0.3*sin(2*PI*440*t)").collect::<Vec<_>>().join("|");
+	let wide = dir.path().join("wide.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=6",
+		"-f",
+		"lavfi",
+		"-i",
+		&format!("aevalsrc={expr}:s=48000:d=6"),
+		"-c:v",
+		"mpeg4",
+		"-c:a",
+		"pcm_s16le",
+		wide.to_str().unwrap(),
+	]);
+
+	let outcome = run(&trimmed(fast(&wide), 2.01, 4.0), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings.iter().any(|warning| warning.contains("copied as-is")),
+		"{warnings:?}"
+	);
+	let starts = stream_starts(&output).await;
+	assert!(
+		starts
+			.iter()
+			.all(|(_, start)| start.is_some_and(|start| (0.0..0.05).contains(&start))),
+		"{starts:?}"
+	);
+}
+
+#[tokio::test]
+async fn a_kept_bitmap_cue_starting_exactly_at_the_trim_start_is_kept_at_zero() {
+	let dir = tempfile::tempdir().unwrap();
+
+	for source in bitmap_clips(dir.path(), &[(3_000, 4_000)]) {
+		let outcome = run(&trimmed(fast(&source), 3.0, 5.0), dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		let cues = subtitle_times(&output);
+		assert!(
+			cues.first().is_some_and(|start| start.abs() < 0.001),
+			"{}: {cues:?}",
+			source.display()
 		);
 		fs::remove_file(&output).unwrap();
 	}
@@ -4210,9 +4322,10 @@ async fn a_kept_bitmap_cue_on_screen_at_the_trim_start_does_not_move_the_start()
 #[tokio::test]
 async fn a_kept_bitmap_cue_running_past_the_trim_end_ends_with_the_window() {
 	let dir = tempfile::tempdir().unwrap();
+	let [pgs, dvd] = bitmap_clips(dir.path(), &[(4_000, 7_000)]);
 
-	for source in bitmap_clips(dir.path(), 4_000, 7_000) {
-		let outcome = run(&trimmed(fast(&source), 3.0, 5.0), dir.path()).await;
+	for source in [&pgs, &dvd] {
+		let outcome = run(&trimmed(fast(source), 3.0, 5.0), dir.path()).await;
 
 		let JobOutcome::Encoded { output, .. } = outcome else {
 			panic!("{outcome:?}")
@@ -4227,16 +4340,68 @@ async fn a_kept_bitmap_cue_running_past_the_trim_end_ends_with_the_window() {
 			source.display(),
 			subtitle_spans(&output)
 		);
+		let shown = decoded_cue_spans(&output);
 		assert!(
-			subtitle_times(&output)
-				.first()
-				.is_some_and(|start| (start - 1.0).abs() < 0.02),
-			"{}: {:?}",
-			source.display(),
-			subtitle_times(&output)
+			shown.iter().all(|(_, end)| *end < 2.02),
+			"{}: decoded cues {shown:?}",
+			source.display()
 		);
+		if source == &pgs {
+			assert!(
+				subtitle_times(&output)
+					.first()
+					.is_some_and(|start| (start - 1.0).abs() < 0.02),
+				"{:?}",
+				subtitle_times(&output)
+			);
+		}
 		fs::remove_file(&output).unwrap();
 	}
+}
+
+async fn stream_starts(path: &Path) -> Vec<(String, Option<f64>)> {
+	probe(&support::toolchain().await, path, &CancellationToken::new())
+		.await
+		.unwrap()
+		.streams
+		.iter()
+		.map(|stream| (stream.codec_name.clone(), stream.start_time))
+		.collect()
+}
+
+/// When each decoded subtitle is shown and hidden, as a decoder that honours a DVD packet's own stop time sees it.
+/// A PGS cue has no stop time of its own, so it ends at its start here.
+fn decoded_cue_spans(path: &Path) -> Vec<(f64, f64)> {
+	let out = std::process::Command::new("ffprobe")
+		.args([
+			"-v",
+			"error",
+			"-select_streams",
+			"s",
+			"-show_frames",
+			"-show_entries",
+			"subtitle=pts_time,end_display_time",
+			"-of",
+			"csv=p=0",
+		])
+		.arg(path)
+		.output()
+		.unwrap();
+	let spans: Vec<(f64, f64)> = String::from_utf8_lossy(&out.stdout)
+		.lines()
+		.filter_map(|line| {
+			let (start, end_ms) = line.trim().trim_end_matches(',').split_once(',')?;
+			let start: f64 = start.parse().ok()?;
+			let end_ms: f64 = end_ms.parse().ok()?;
+			Some((start, start + if end_ms > 1e6 { 0.0 } else { end_ms / 1000.0 }))
+		})
+		.collect();
+	assert_eq!(
+		spans.len(),
+		subtitle_times(path).len(),
+		"every subtitle packet decodes: {spans:?}"
+	);
+	spans
 }
 
 #[tokio::test]

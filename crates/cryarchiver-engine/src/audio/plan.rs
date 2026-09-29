@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::container::{Container, MATROSKA_AUDIO, OGG_OPUS};
 use crate::format::OutputFormat;
+use crate::language;
 use crate::options::TrimWindow;
 use crate::outcome::KeepReason;
 use crate::preset::{AUDIO_STEP_KBPS, Overrides, Speed};
@@ -78,6 +79,8 @@ pub struct FileOptions {
 	pub chapters: Option<PathBuf>,
 	pub merge_from: Vec<u32>,
 	pub merge_language: Option<String>,
+	/// New titles for encoded tracks, by source stream.
+	pub titles: Box<[(u32, String)]>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,11 +190,11 @@ pub fn merged(
 
 /// The merged track's language: the one its tagged sources share, or `und` when they differ.
 pub fn merge_language(info: &MediaInfo, sources: &[u32]) -> Option<String> {
-	match source_languages(info, sources).as_slice() {
-		[] => None,
-		[language] => Some((*language).to_owned()),
-		_ => Some(UNDETERMINED_LANGUAGE.to_owned()),
+	let mut languages = source_languages(info, sources);
+	if languages.len() > 1 {
+		return Some(UNDETERMINED_LANGUAGE.to_owned());
 	}
+	languages.pop()
 }
 
 pub fn mixed_languages_warning(info: &MediaInfo, sources: &[u32]) -> Option<String> {
@@ -199,8 +202,8 @@ pub fn mixed_languages_warning(info: &MediaInfo, sources: &[u32]) -> Option<Stri
 	(languages.len() > 1).then(|| format!("mixing tracks in different languages: {}", languages.join(", ")))
 }
 
-/// The distinct languages tagged on `sources`, in track order.
-fn source_languages<'a>(info: &'a MediaInfo, sources: &[u32]) -> Vec<&'a str> {
+/// The distinct languages tagged on `sources`, as ISO 639-2/T codes in track order.
+fn source_languages(info: &MediaInfo, sources: &[u32]) -> Vec<String> {
 	let mut languages = Vec::new();
 	for source in sources {
 		let language = info
@@ -208,7 +211,8 @@ fn source_languages<'a>(info: &'a MediaInfo, sources: &[u32]) -> Vec<&'a str> {
 			.iter()
 			.find(|stream| stream.index == *source)
 			.and_then(|stream| stream.tag("language"))
-			.filter(|language| *language != UNDETERMINED_LANGUAGE);
+			.map(language::normalized)
+			.filter(|language| language != UNDETERMINED_LANGUAGE);
 		if let Some(language) = language
 			&& !languages.contains(&language)
 		{

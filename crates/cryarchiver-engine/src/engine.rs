@@ -8,7 +8,8 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::plan::{
-	AudioPlan, AudioRules, FilePlan, merge_file, mergeable, mixed_languages_warning, plan_file_with, retarget,
+	AudioPlan, AudioRules, FilePlan, TrackJob, TrackPlan, merge_file, mergeable, mixed_languages_warning,
+	plan_file_with, retarget,
 };
 use crate::audio::{cover, encode, verify};
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
@@ -39,7 +40,7 @@ use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, check_sync, earliest_video_start, probe_temp, start_offsets,
 	sync_tolerance_s, synced_streams, undecoded_lead, verify_output,
 };
-use crate::video::{VideoStarts, analyze, chapters, cues, encode as video_encode};
+use crate::video::{VideoStarts, analyze, chapters, cues, encode as video_encode, titles};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
@@ -178,6 +179,8 @@ struct VideoInputs<'a> {
 	streams: &'a StreamPlan,
 	declared_s: Option<f64>,
 	span: Option<TrimWindow>,
+	/// The source's size, or under a trim the window's share of it: what a predicted output is weighed against.
+	compared_bytes: u64,
 }
 
 struct VideoQuality {
@@ -532,7 +535,9 @@ impl Engine {
 		workspace: &Workspace,
 	) -> Result<Produced, JobError> {
 		let output = workspace.file(&format!("out.{}", plan.container.extension));
-		let plan = &with_clipped_chapters(plan, info, workspace)?;
+		let mut plan = with_clipped_chapters(plan, info, workspace)?;
+		plan.options.titles = encoded_titles(info, &plan.tracks);
+		let plan = &plan;
 
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let cmd = encode::command(&self.tools.ffmpeg, &cx.job.source, &output, plan);
@@ -710,6 +715,7 @@ impl Engine {
 			streams: &streams,
 			declared_s: span_s,
 			span: window.or(declared_s.map(|length_s| TrimWindow { start_s: 0.0, length_s })),
+			compared_bytes: source_share(cx.source_bytes, window, declared_s).unwrap_or(cx.source_bytes),
 		};
 		let verify =
 			match Box::pin(self.choose_crf(cx, workspace, &inputs, &analysis, &mut video, &mut quality)).await? {
@@ -897,7 +903,7 @@ impl Engine {
 			return Ok(Tuning::Encode { verify });
 		}
 
-		let gate = Box::pin(self.sample_gate(cx, workspace, inputs.info, video, inputs.streams, inputs.declared_s));
+		let gate = Box::pin(self.sample_gate(cx, workspace, inputs, video));
 		match gate.await? {
 			None => Ok(Tuning::Encode { verify }),
 			Some(_) if learned && !samples.is_empty() => {
@@ -1010,7 +1016,7 @@ impl Engine {
 		{
 			let other = video_encode::other_bitrate(inputs.info, inputs.streams);
 			let predicted = video_encode::predicted_bytes(found.sample_bytes, samples, duration_s, other);
-			if let Some(reason) = video_encode::predicted_keep(cx.source_bytes, predicted, cx.job.min_savings) {
+			if let Some(reason) = video_encode::predicted_keep(inputs.compared_bytes, predicted, cx.job.min_savings) {
 				return Ok(Tuning::Keep(reason));
 			}
 		}
@@ -1128,13 +1134,11 @@ impl Engine {
 		&self,
 		cx: &Context<'_>,
 		workspace: &Workspace,
-		info: &MediaInfo,
+		inputs: &VideoInputs<'_>,
 		video: &VideoPlan,
-		streams: &StreamPlan,
-		declared_s: Option<f64>,
 	) -> Result<Option<KeepReason>, JobError> {
-		let samples = video_encode::samples(declared_s);
-		let Some(duration_s) = declared_s.filter(|_| !samples.is_empty()) else {
+		let samples = video_encode::samples(inputs.declared_s);
+		let Some(duration_s) = inputs.declared_s.filter(|_| !samples.is_empty()) else {
 			return Ok(None);
 		};
 
@@ -1149,10 +1153,10 @@ impl Engine {
 		))
 		.await?;
 
-		let other_bits_per_s = video_encode::other_bitrate(info, streams);
+		let other_bits_per_s = video_encode::other_bitrate(inputs.info, inputs.streams);
 		let predicted = video_encode::predicted_bytes(sample_bytes, &samples, duration_s, other_bits_per_s);
 		Ok(video_encode::predicted_keep(
-			cx.source_bytes,
+			inputs.compared_bytes,
 			predicted,
 			cx.job.min_savings,
 		))
@@ -1454,10 +1458,30 @@ fn stream_rules(job: &Job, info: &MediaInfo) -> Result<StreamRules, JobError> {
 		overrides: job.overrides,
 		strip: job.options.strip,
 		trim: job.options.trim.is_some(),
+		cut_start: job.options.trim.is_some_and(|trim| trim.start_s > 0.0),
+		cut_end: job.options.trim.is_some_and(|trim| trim.end_s.is_some()),
 		merge: job.options.merge_audio,
 		burn,
 		..StreamRules::new(job.speed, job.keep_metadata)
 	})
+}
+
+/// Only Matroska names its tracks in their `title`: elsewhere a track's `title` is the song's.
+fn encoded_titles(info: &MediaInfo, tracks: &[TrackJob]) -> Box<[(u32, String)]> {
+	if !info.format.format_name.contains("matroska") {
+		return Box::default();
+	}
+
+	tracks
+		.iter()
+		.filter_map(|track| {
+			let TrackPlan::Encode(encoded) = &track.plan else {
+				return None;
+			};
+			let stream = info.streams.iter().find(|stream| stream.index == track.stream_index)?;
+			Some((track.stream_index, titles::encoded_title(stream, encoded)?))
+		})
+		.collect()
 }
 
 fn with_clipped_chapters(plan: &FilePlan, info: &MediaInfo, workspace: &Workspace) -> Result<FilePlan, JobError> {
@@ -1676,7 +1700,7 @@ fn finish(
 			output,
 			src_bytes: staged.source_share.unwrap_or(meta.len()),
 			out_bytes: staged.bytes,
-			warnings: fold_repeats(staged.warnings),
+			warnings: staged.warnings,
 		}),
 		Err(CommitError::Exists(path)) => Ok(skipped(&format!("output already exists: {}", display_path(&path)))),
 		Err(CommitError::IsSource(path)) => Ok(skipped(&format!("{} is the source file", display_path(&path)))),

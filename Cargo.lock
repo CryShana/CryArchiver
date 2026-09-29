@@ -693,6 +693,7 @@ dependencies = [
  "fast-ssim2",
  "flate2",
  "image",
+ "indicatif",
  "infer",
  "jxl-oxide",
  "libc",

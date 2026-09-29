@@ -503,6 +503,52 @@ mod tests {
 	}
 
 	#[test]
+	fn the_vmaf_reference_keeps_the_source_chroma_location() {
+		use crate::quality::vmaf::{Reference, Scoring, sample_command};
+
+		let plan = plan(
+			&h264(r#","chroma_location":"topleft""#),
+			&[],
+			PROGRESSIVE_CLEAN,
+			Speed::Moderate,
+		);
+		let reference = Reference {
+			source: std::path::Path::new("in.mkv"),
+			stream: 0,
+			decoder: None,
+			filters: &plan.filters,
+			window: None,
+			start: VideoStarts::default().main,
+			overlay: None,
+			subtitles: None,
+		};
+		let scoring = Scoring {
+			model: "vmaf_v0.6.1",
+			threads: 1,
+			dir: std::path::Path::new("work"),
+			log: "vmaf.json",
+		};
+
+		let args = crate::video::joined(&sample_command(
+			std::path::Path::new("ffmpeg"),
+			std::path::Path::new("sample.mkv"),
+			&reference,
+			1.0,
+			4.0,
+			&scoring,
+		));
+
+		assert!(
+			args.contains(
+				"[1:0]scale=in_range=tv:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709:in_chroma_loc=topleft:\
+				 out_chroma_loc=topleft,format=yuv420p10le,setparams=field_mode=prog:range=tv:color_primaries=bt709:\
+				 color_trc=bt709:colorspace=bt709:chroma_location=topleft,format=yuv420p10le"
+			),
+			"{args}"
+		);
+	}
+
+	#[test]
 	fn progressive_hd_uses_svt_at_the_table_crf() {
 		let plan = plan(&h264(""), &[], PROGRESSIVE_CLEAN, Speed::Moderate);
 

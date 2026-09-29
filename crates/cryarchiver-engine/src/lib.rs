@@ -6,6 +6,7 @@ pub mod engine;
 pub mod format;
 pub mod images;
 pub mod integrity;
+pub mod language;
 pub mod metadata;
 pub mod naming;
 pub mod options;

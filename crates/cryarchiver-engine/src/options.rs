@@ -1,5 +1,6 @@
+use indicatif::DecimalBytes;
+
 use crate::format::OutputFormat;
-use crate::text::decimal_bytes;
 
 const DURATION_SLACK_S: f64 = 0.05;
 const SHORTEST_TRIM_S: f64 = 0.1;
@@ -191,16 +192,16 @@ pub fn parse_time(text: &str) -> Result<f64, String> {
 pub fn kept_as_requested(src_bytes: u64, out_bytes: u64) -> String {
 	format!(
 		"the output is not smaller than the source ({} → {}); it was written because it was requested",
-		decimal_bytes(src_bytes),
-		decimal_bytes(out_bytes)
+		DecimalBytes(src_bytes),
+		DecimalBytes(out_bytes)
 	)
 }
 
 pub fn kept_as_requested_part(part_bytes: u64, out_bytes: u64) -> String {
 	format!(
 		"the output is not smaller than the same part of the source ({} → {}); it was written because it was requested",
-		decimal_bytes(part_bytes),
-		decimal_bytes(out_bytes)
+		DecimalBytes(part_bytes),
+		DecimalBytes(out_bytes)
 	)
 }
 
