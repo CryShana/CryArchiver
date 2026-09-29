@@ -17,7 +17,7 @@ use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput,
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{BurnSubs, JobOptions, TrimWindow, kept_as_requested, kept_as_requested_part};
+use crate::options::{JobOptions, TrimWindow, kept_as_requested, kept_as_requested_part};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -27,6 +27,7 @@ use crate::quality::search::{self, DEFAULT_SLOPE, MAX_PROBES, Target};
 use crate::text::display_path;
 use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
 use crate::video::analyze::Analysis;
+use crate::video::burn::{self, Burn};
 use crate::video::encode::{EncodedVideo, Sample};
 use crate::video::mux::{self, Attachment, ChapterSource, CueFile, MuxInputs, MuxPlan};
 use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, usable_main};
@@ -35,7 +36,7 @@ use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
 };
-use crate::video::{analyze, burn, chapters, cues, encode as video_encode};
+use crate::video::{analyze, chapters, cues, encode as video_encode};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
@@ -141,7 +142,7 @@ enum Planned {
 		plan: FilePlan,
 		from_video: bool,
 	},
-	Video,
+	Video(StreamRules),
 	Image(Box<ImageInput>),
 }
 
@@ -345,13 +346,13 @@ impl Engine {
 
 				on_event(JobEvent::Stage(Stage::Plan));
 				let rules = stream_rules(job, &info)?;
-				self.check_burn_filters(job, &info)?;
+				self.check_burn_tools(rules.burn, &info)?;
 				let planned = self
 					.video_main(&info, job.options.forced(mergeable(&info)))
 					.map_err(Refusal::from)
 					.and_then(|_| plan_streams(&info, &rules));
 				match planned {
-					Ok(_) => Planned::Video,
+					Ok(_) => Planned::Video(rules),
 					Err(Refusal::Keep(reason)) => return Ok(JobOutcome::KeptOriginal { reason }),
 					Err(Refusal::Impossible(reason)) => return Err(ErrorKind::EncodeFailed(reason).into()),
 				}
@@ -381,7 +382,7 @@ impl Engine {
 
 		let _memory = match &planned {
 			Planned::Image(input) => self.reserve_memory(input.memory_bytes, on_event, cancel).await?,
-			Planned::Audio { .. } | Planned::Video => None,
+			Planned::Audio { .. } | Planned::Video(_) => None,
 		};
 
 		let before =
@@ -400,7 +401,7 @@ impl Engine {
 			Planned::Audio { info, plan, from_video } => {
 				self.produce_audio(&cx, info, plan, *from_video, &workspace).await
 			}
-			Planned::Video => Box::pin(self.produce_video(&cx, &workspace)).await,
+			Planned::Video(rules) => Box::pin(self.produce_video(&cx, &workspace, *rules)).await,
 			Planned::Image(input) => Box::pin(self.produce_image(&cx, input, &workspace)).await,
 		};
 		let mut staged = match produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes))? {
@@ -589,14 +590,18 @@ impl Engine {
 	}
 
 	#[allow(clippy::too_many_lines)]
-	async fn produce_video(&self, cx: &Context<'_>, workspace: &Workspace) -> Result<Produced, JobError> {
+	async fn produce_video(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		rules: StreamRules,
+	) -> Result<Produced, JobError> {
 		let source = cx.job.source.as_path();
 
 		(cx.on_event)(JobEvent::Stage(Stage::Probe));
 		let (info, probe_json) = probe::probe_video(&self.tools, source, cx.source_bytes, cx.cancel)
 			.await
 			.map_err(video_probe_error)?;
-		let rules = stream_rules(cx.job, &info)?;
 		let planned = self
 			.video_main(&info, cx.job.options.forced(mergeable(&info)))
 			.map_err(Refusal::from)
@@ -655,8 +660,8 @@ impl Engine {
 		if cx.job.options.strip {
 			video.streams.truncate(1);
 		}
-		if let Some(burn_subs) = &cx.job.options.burn_subs {
-			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, burn_subs)).await?;
+		if let Some(chosen) = rules.burn {
+			Box::pin(self.prepare_burn(cx, workspace, &info, main, &mut video, chosen)).await?;
 		}
 
 		let mut quality = self.video_quality(cx.job, main, &analysis, &video);
@@ -730,37 +735,41 @@ impl Engine {
 		cx: &Context<'_>,
 		workspace: &Workspace,
 		info: &MediaInfo,
+		main: &Stream,
 		video: &mut VideoPlan,
-		burn_subs: &BurnSubs,
+		chosen: Burn,
 	) -> Result<(), JobError> {
 		if video.alpha {
 			return Err(ErrorKind::EncodeFailed("--burn-subs can't be used on transparent video".into()).into());
 		}
 
-		let chosen = burn::pick(info, &burn_subs.pick).map_err(ErrorKind::EncodeFailed)?;
-		burn::prepare(&self.tools.ffmpeg, &cx.job.source, workspace, info, chosen, cx.cancel).await?;
+		let start_s = burn::prepare(&self.tools, &cx.job.source, workspace, info, chosen, cx.cancel).await?;
 
-		match burn::subtitle_filter(chosen.kind, burn_subs.size_percent) {
+		let size_percent = cx
+			.job
+			.options
+			.burn_subs
+			.as_ref()
+			.map_or(0, |burn_subs| burn_subs.size_percent);
+		match burn::subtitle_filter(chosen.kind, size_percent) {
 			Some(filter) => video.subtitles = Some(filter),
-			None => video.overlay = Some(chosen.stream),
+			None => video.overlay = Some(burn::overlay(main, start_s.unwrap_or(0.0))),
 		}
 		Ok(())
 	}
 
-	fn check_burn_filters(&self, job: &Job, info: &MediaInfo) -> Result<(), JobError> {
-		let Some(burn_subs) = &job.options.burn_subs else {
+	fn check_burn_tools(&self, chosen: Option<Burn>, info: &MediaInfo) -> Result<(), JobError> {
+		let Some(chosen) = chosen else {
 			return Ok(());
 		};
 
-		let chosen = burn::pick(info, &burn_subs.pick).map_err(ErrorKind::EncodeFailed)?;
-		let missing = burn::missing_filters(chosen.kind, &self.tools.filters);
+		let missing = burn::missing_tools(chosen, info, &self.tools);
 		if missing.is_empty() {
 			return Ok(());
 		}
 
-		let plural = if missing.len() == 1 { "" } else { "s" };
 		Err(ErrorKind::Toolchain(format!(
-			"--burn-subs needs ffmpeg's {} filter{plural}, which this ffmpeg doesn't have",
+			"--burn-subs needs ffmpeg's {}, which this ffmpeg doesn't have",
 			missing.join(" and ")
 		))
 		.into())
@@ -1336,14 +1345,13 @@ fn video_container(job: &Job) -> Container {
 }
 
 fn stream_rules(job: &Job, info: &MediaInfo) -> Result<StreamRules, JobError> {
-	let burn = match &job.options.burn_subs {
-		Some(burn_subs) => Some(
-			burn::pick(info, &burn_subs.pick)
-				.map_err(ErrorKind::EncodeFailed)?
-				.stream,
-		),
-		None => None,
-	};
+	let burn = job
+		.options
+		.burn_subs
+		.as_ref()
+		.map(|burn_subs| burn::pick(info, &burn_subs.pick))
+		.transpose()
+		.map_err(ErrorKind::EncodeFailed)?;
 
 	Ok(StreamRules {
 		container: video_container(job),

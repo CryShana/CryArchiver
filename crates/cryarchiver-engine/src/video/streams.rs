@@ -3,6 +3,7 @@ use crate::container::{Container, MATROSKA_VIDEO};
 use crate::outcome::{KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{MediaInfo, Stream};
+use crate::video::burn::Burn;
 
 const MKV_SUBTITLES: &[&str] = &[
 	"subrip",
@@ -69,7 +70,7 @@ pub struct StreamRules {
 	pub strip: bool,
 	pub trim: bool,
 	pub merge: bool,
-	pub burn: Option<u32>,
+	pub burn: Option<Burn>,
 }
 
 impl StreamRules {
@@ -178,7 +179,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 				audio_tracks += 1;
 				plan_audio_stream(stream, audio_tracks, rules, target, will_merge, &mut plan)?;
 			}
-			"subtitle" if rules.burn == Some(stream.index) => {}
+			"subtitle" if rules.burn.is_some_and(|burn| burn.stream == stream.index) => {}
 			"subtitle" => match subtitle_track(stream, target)? {
 				Some(track) if rules.trim => {
 					let track = trimmed_subtitle(track, stream, target, &mut plan.warnings);
@@ -414,6 +415,7 @@ mod tests {
 	use super::*;
 	use crate::audio::plan::{EncodePlan, LayoutFix};
 	use crate::container::{MATROSKA_VIDEO, MP4_VIDEO, WEBM_VIDEO};
+	use crate::video::burn::BurnKind;
 
 	fn info(json: &str) -> MediaInfo {
 		MediaInfo::parse(json.as_bytes()).unwrap()
@@ -882,7 +884,10 @@ mod tests {
 			{"index":2,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle"}]}"#,
 		);
 		let burned = StreamRules {
-			burn: Some(2),
+			burn: Some(Burn {
+				stream: 2,
+				kind: BurnKind::Bitmap,
+			}),
 			..into(WEBM_VIDEO)
 		};
 

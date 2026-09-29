@@ -115,7 +115,7 @@ async fn burning_plan(
 		detail: Vec::new(),
 	};
 	let chosen = burn::pick(&info, &SubtitlePick::Default).unwrap();
-	burn::prepare(&tools.ffmpeg, source, workspace, &info, chosen, cancel)
+	burn::prepare(tools, source, workspace, &info, chosen, cancel)
 		.await
 		.unwrap();
 

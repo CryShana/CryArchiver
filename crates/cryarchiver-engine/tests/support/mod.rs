@@ -263,42 +263,76 @@ pub fn clip_with_extras(dir: &Path) -> PathBuf {
 	clip
 }
 
-/// A 10 s black 320×240 clip with a tone and `subtitles` muxed with `codec`, and optionally a second black video
-/// stream after the main one.
+/// A 10 s black 320×240 mpeg4 clip with a tone and `subtitles` muxed with `codec`, and optionally a second black
+/// video stream after the main one.
 pub fn black_clip(dir: &Path, name: &str, subtitles: &Path, codec: &str, second_angle: bool) -> PathBuf {
+	subtitled_clip(
+		dir,
+		name,
+		&Picture {
+			source: "color=c=black",
+			seconds: 10,
+			codec: &["-c:v", "mpeg4"],
+			second_angle,
+		},
+		subtitles,
+		codec,
+	)
+}
+
+pub struct Picture<'a> {
+	/// A lavfi source without its size, rate or duration, such as `color=c=black` or `testsrc2`.
+	pub source: &'a str,
+	pub seconds: u32,
+	pub codec: &'a [&'a str],
+	pub second_angle: bool,
+}
+
+/// A 320×240, 25 fps clip with a tone and `subtitles` muxed with `codec`. The subtitles keep their own times
+/// (`-copyts`), so a track whose first cue is late still starts late.
+pub fn subtitled_clip(dir: &Path, name: &str, picture: &Picture<'_>, subtitles: &Path, codec: &str) -> PathBuf {
 	let clip = dir.join(name);
+	let joint = if picture.source.contains('=') { ':' } else { '=' };
+	let video = format!("{}{joint}s=320x240:r=25:d={}", picture.source, picture.seconds);
+	let audio = format!("sine=duration={}", picture.seconds);
 	let mut args = vec![
+		"-copyts",
 		"-f",
 		"lavfi",
 		"-i",
-		"color=black:s=320x240:r=25:d=10",
+		&video,
 		"-f",
 		"lavfi",
 		"-i",
-		"sine=duration=10",
+		&audio,
 		"-i",
 		subtitles.to_str().unwrap(),
 		"-map",
 		"0",
 	];
-	if second_angle {
+	if picture.second_angle {
 		args.extend(["-map", "0"]);
 	}
-	args.extend([
-		"-map",
-		"1",
-		"-map",
-		"2",
-		"-c:v",
-		"mpeg4",
-		"-c:a",
-		"aac",
-		"-c:s",
-		codec,
-		clip.to_str().unwrap(),
-	]);
+	args.extend(["-map", "1", "-map", "2"]);
+	args.extend(picture.codec);
+	args.extend(["-c:a", "aac", "-c:s", codec, clip.to_str().unwrap()]);
 	ffmpeg(&args);
 	clip
+}
+
+/// Every video frame time of stream `stream`, in order.
+pub fn frame_times(path: &Path, stream: usize) -> Vec<f64> {
+	let out = Command::new("ffprobe")
+		.args(["-v", "error", "-select_streams"])
+		.arg(format!("v:{stream}"))
+		.args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"])
+		.arg(path)
+		.output()
+		.unwrap();
+	String::from_utf8_lossy(&out.stdout)
+		.lines()
+		.filter_map(|line| line.trim().trim_end_matches(',').parse().ok())
+		.collect()
 }
 
 /// The first and last frame times at which anything bright is drawn on a black picture, in video stream `stream`.
@@ -336,8 +370,8 @@ pub fn lit_span(path: &Path, stream: usize) -> Option<(f64, f64)> {
 }
 
 /// A PGS (bitmap) subtitle file for a 320×240 picture: a white 120×30 box shown from `from_ms` until `to_ms`.
-/// ffmpeg can't turn text subtitles into bitmaps, so the segments are written by hand. A box that starts exactly
-/// on a frame's time is drawn one frame late (ffmpeg's sub2video), so tests start it just before one.
+/// ffmpeg can't turn text subtitles into bitmaps, so the segments are written by hand. Like a real track, it
+/// begins at its first cue.
 pub fn pgs_box(dir: &Path, from_ms: u32, to_ms: u32) -> PathBuf {
 	let (x, y, width, height) = (100_u16, 180_u16, 120_u16, 30_u16);
 	let segment = |pts_ms: u32, kind: u8, data: &[u8]| {
@@ -390,7 +424,7 @@ pub fn pgs_box(dir: &Path, from_ms: u32, to_ms: u32) -> PathBuf {
 		.concat()
 	};
 	let shown = [
-		segment(from_ms, 0x16, &composition(1, &object)),
+		segment(from_ms, 0x16, &composition(0, &object)),
 		segment(from_ms, 0x17, &window),
 		segment(from_ms, 0x14, &palette),
 		segment(from_ms, 0x15, &bitmap),
@@ -398,7 +432,7 @@ pub fn pgs_box(dir: &Path, from_ms: u32, to_ms: u32) -> PathBuf {
 	]
 	.concat();
 
-	let path = dir.join("box.sup");
-	std::fs::write(&path, [clear(0, 0), shown, clear(to_ms, 2)].concat()).unwrap();
+	let path = dir.join(format!("box-{from_ms}-{to_ms}.sup"));
+	std::fs::write(&path, [shown, clear(to_ms, 1)].concat()).unwrap();
 	path
 }

@@ -1,6 +1,8 @@
 mod support;
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::process::Command;
 
 use cryarchiver_engine::options::SubtitlePick;
 use cryarchiver_engine::preset::Speed;
@@ -236,7 +238,7 @@ async fn a_text_burn_makes_no_fonts_folder_and_an_ass_burn_takes_the_attached_fo
 		let info = probe(&tools, source, &cancel).await.unwrap();
 		let chosen = burn::pick(&info, &SubtitlePick::Default).unwrap();
 		let workspace = Workspace::create(&dir.path().join(".cry-work"), source).unwrap();
-		burn::prepare(&tools.ffmpeg, source, &workspace, &info, chosen, &cancel)
+		burn::prepare(&tools, source, &workspace, &info, chosen, &cancel)
 			.await
 			.unwrap();
 		workspaces.push(workspace);
@@ -260,4 +262,48 @@ async fn a_text_burn_makes_no_fonts_folder_and_an_ass_burn_takes_the_attached_fo
 		fs::read(from_ass.file(FONT_DIR).join("attachment-0.ttf")).unwrap(),
 		b"not a real font"
 	);
+}
+
+#[tokio::test]
+async fn a_ten_bit_bitmap_burn_stays_ten_bit_through_the_overlay() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let pgs = support::pgs_box(dir.path(), 1_000, 2_000);
+	let deep = support::subtitled_clip(
+		dir.path(),
+		"deep.mkv",
+		&support::Picture {
+			source: "color=c=black",
+			seconds: 3,
+			codec: &["-c:v", "ffv1", "-pix_fmt", "yuv420p10le"],
+			second_angle: false,
+		},
+		&pgs,
+		"copy",
+	);
+	let info = probe(&tools, &deep, &cancel).await.unwrap();
+	let chosen = burn::pick(&info, &SubtitlePick::Default).unwrap();
+	let workspace = Workspace::create(&dir.path().join(".cry-work"), &deep).unwrap();
+	let start_s = burn::prepare(&tools, &deep, &workspace, &info, chosen, &cancel)
+		.await
+		.unwrap()
+		.unwrap();
+	let burned = VideoPlan {
+		filters: "showinfo,format=yuv420p10le".into(),
+		overlay: Some(burn::overlay(&info.streams[0], start_s)),
+		..plan(None)
+	};
+
+	let cmd = video_command(&tools.ffmpeg, &deep, &workspace.file("video.a1.mkv"), &burned);
+	let out = Command::new(&cmd.program).args(&cmd.args).output().unwrap();
+
+	let log = String::from_utf8_lossy(&out.stderr);
+	assert!(out.status.success(), "{log}");
+	let formats: BTreeSet<&str> = log
+		.lines()
+		.filter(|line| line.contains("Parsed_showinfo"))
+		.filter_map(|line| line.split_whitespace().find_map(|field| field.strip_prefix("fmt:")))
+		.collect();
+	assert_eq!(formats, BTreeSet::from(["yuv420p10le"]), "{log}");
 }

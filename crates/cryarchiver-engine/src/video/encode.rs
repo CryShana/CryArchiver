@@ -62,9 +62,10 @@ fn encode_command(
 	plan: &VideoPlan,
 	sample: Option<&Sample>,
 ) -> ToolCommand {
+	let workspace = output.parent().unwrap_or(Path::new(""));
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
-	if let Some(dir) = output.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-		cmd.in_dir(dir);
+	if plan.subtitles.is_some() && !workspace.as_os_str().is_empty() {
+		cmd.in_dir(workspace);
 	}
 	cmd.count_lines_containing(DECODE_ERRORS);
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "repeat+info"]);
@@ -80,21 +81,28 @@ fn encode_command(
 		cmd.arg("-c:v").arg(decoder);
 	}
 	cmd.arg("-i").arg(process::tool_path(source));
+	if let Some(overlay) = plan.overlay {
+		cmd.arg("-itsoffset")
+			.arg(format!("{:.6}", overlay.start_s))
+			.arg("-i")
+			.arg(process::tool_path(&workspace.join(burn::BITMAP_FILE)));
+	}
 
 	let streams = if sample.is_some() {
 		plan.streams.get(..1).unwrap_or_default()
 	} else {
 		plan.streams.as_slice()
 	};
-	let main = burn::main_chain(
-		plan.subtitles.as_deref(),
-		&plan.filters,
-		seek.map(|(start_s, _)| start_s),
-	);
-	let graphed = if let Some(subtitle) = plan.overlay {
-		cmd.arg("-filter_complex").arg(format!(
-			"[0:{subtitle}][0:{}]scale2ref[subs][base];[base][subs]overlay=eof_action=pass,{main}[burned]",
-			streams[0]
+	let seek_s = seek.map(|(start_s, _)| start_s);
+	let main = burn::main_chain(plan.subtitles.as_deref(), &plan.filters, seek_s);
+	let graphed = if let Some(overlay) = plan.overlay {
+		cmd.arg("-filter_complex").arg(burn::overlay_graph(
+			&format!("[0:{}]", streams[0]),
+			"[1:0]",
+			overlay,
+			seek_s,
+			&main,
+			"[burned]",
 		));
 		cmd.args(["-map", "[burned]"]);
 		1
@@ -462,26 +470,63 @@ mod tests {
 	}
 
 	#[test]
-	fn bitmap_subtitles_are_overlaid_in_a_complex_graph() {
+	fn bitmap_subtitles_are_overlaid_from_their_own_input_in_a_complex_graph() {
 		let burned = VideoPlan {
-			overlay: Some(3),
+			overlay: Some(burn::Overlay {
+				start_s: 5.0,
+				ten_bit: false,
+			}),
+			window: Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 4.0,
+			}),
 			..plan(svt(), None)
 		};
 
-		let args = joined(&video_command(
+		let cmd = video_command(
 			Path::new("ffmpeg"),
 			Path::new("in.mkv"),
 			Path::new("work/video.a1.mkv"),
 			&burned,
-		));
+		);
 
+		let args = joined(&cmd);
+		assert_eq!(cmd.current_dir, None);
+		assert!(args.contains(" -ss 4.000 -t 4.000 -i "), "{args}");
+		assert!(args.contains(" -itsoffset 5.000000 -i "), "{args}");
+		assert!(args.contains("subs.mkv -filter_complex "), "{args}");
 		assert!(
 			args.contains(
-				"-filter_complex [0:3][0:0]scale2ref[subs][base];[base][subs]overlay=eof_action=pass,\
+				"-filter_complex [0:0]setpts=PTS+4.000/TB[bv];[1:0]setpts=PTS-0.002/TB[bs];\
+				 [bs][bv]scale2ref[bss][bvs];[bss]null[bsd];[bvs][bsd]overlay=eof_action=pass,setpts=PTS-4.000/TB,\
 				 format=yuv420p10le,setparams=field_mode=prog[burned] -map [burned] -map 0:2 -filter:v:1 "
 			),
 			"{args}"
 		);
+	}
+
+	#[test]
+	fn only_a_text_burn_runs_in_the_workspace() {
+		let text = VideoPlan {
+			subtitles: Some("subtitles=subs.ass".into()),
+			..plan(svt(), None)
+		};
+
+		let unburned = video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/video.a1.mkv"),
+			&plan(svt(), None),
+		);
+		let burned = video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/video.a1.mkv"),
+			&text,
+		);
+
+		assert_eq!(unburned.current_dir, None);
+		assert_eq!(burned.current_dir.as_deref(), Some(Path::new("work")));
 	}
 
 	#[test]
@@ -517,14 +562,14 @@ mod tests {
 		assert_eq!(full.current_dir.as_deref(), Some(Path::new("work")));
 		assert!(
 			args.contains(
-				"-filter:v:0 setpts=PTS+4.000/TB,subtitles=subs.ass,setpts=PTS-STARTPTS,format=yuv420p10le,\
+				"-filter:v:0 setpts=PTS+4.000/TB,subtitles=subs.ass,setpts=PTS-4.000/TB,format=yuv420p10le,\
 				 setparams=field_mode=prog -filter:v:1 format=yuv420p10le,setparams=field_mode=prog -c:v "
 			),
 			"{args}"
 		);
 		assert!(
 			sampled.contains(
-				"-filter:v:0 setpts=PTS+12.500/TB,subtitles=subs.ass,setpts=PTS-STARTPTS,format=yuv420p10le,"
+				"-filter:v:0 setpts=PTS+12.500/TB,subtitles=subs.ass,setpts=PTS-12.500/TB,format=yuv420p10le,"
 			),
 			"{sampled}"
 		);

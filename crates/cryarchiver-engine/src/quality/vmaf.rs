@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, Progress, STALL_TIMEOUT, ToolCommand};
-use crate::video::burn;
+use crate::video::burn::{self, Overlay};
 use crate::video::plan::Resolution;
 use crate::video::run_ffmpeg;
 
@@ -43,7 +43,7 @@ pub struct Reference<'a> {
 	pub decoder: Option<&'static str>,
 	pub filters: &'a str,
 	pub window: Option<TrimWindow>,
-	pub overlay: Option<u32>,
+	pub overlay: Option<Overlay>,
 	pub subtitles: Option<&'a str>,
 }
 
@@ -113,14 +113,13 @@ pub fn sample_command(
 ) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
 	cmd.seek(start_s, length_s);
-	push_reference(&mut cmd, reference);
+	push_reference(&mut cmd, reference, scoring);
 
 	let distorted_chain = chain(&[SCORED_FORMAT, BY_POSITION]);
-	let main = burn::main_chain(reference.subtitles, reference.filters, Some(start_s));
-	let reference_chain = chain(&[&main, SCORED_FORMAT, BY_POSITION]);
+	let reference_chain = chain(&[reference.filters, SCORED_FORMAT, BY_POSITION]);
 	cmd.arg("-filter_complex").arg(format!(
 		"[0:v:0]{distorted_chain}[d];{};[d][r]{}",
-		reference_branch(reference, &reference_chain),
+		reference_branch(reference, &reference_chain, Some(start_s)),
 		libvmaf(scoring)
 	));
 	cmd.args(["-f", "null", "-"]);
@@ -138,19 +137,15 @@ pub fn window_command(
 	if let Some(window) = reference.window {
 		cmd.seek(window.start_s, window.length_s);
 	}
-	push_reference(&mut cmd, reference);
+	push_reference(&mut cmd, reference, scoring);
 
 	let select = select(windows);
 	let distorted_chain = chain(&[&select, SCORED_FORMAT, BY_POSITION]);
-	let main = burn::main_chain(
-		reference.subtitles,
-		reference.filters,
-		reference.window.map(|window| window.start_s),
-	);
-	let reference_chain = chain(&[&main, &select, SCORED_FORMAT, BY_POSITION]);
+	let reference_chain = chain(&[reference.filters, &select, SCORED_FORMAT, BY_POSITION]);
+	let seek_s = reference.window.map(|window| window.start_s);
 	cmd.arg("-filter_complex").arg(format!(
 		"[0:v:0]split[pace][all];[all]{distorted_chain}[d];{};[d][r]{}[scored]",
-		reference_branch(reference, &reference_chain),
+		reference_branch(reference, &reference_chain, seek_s),
 		libvmaf(scoring)
 	));
 
@@ -190,20 +185,26 @@ fn base(ffmpeg: &Path, distorted: &Path, scoring: &Scoring<'_>) -> ToolCommand {
 	cmd
 }
 
-fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>) {
+fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Scoring<'_>) {
 	if let Some(decoder) = reference.decoder {
 		cmd.arg("-c:v").arg(decoder);
 	}
 	cmd.arg("-i").arg(process::tool_path(reference.source));
+
+	if let Some(overlay) = reference.overlay {
+		cmd.arg("-itsoffset")
+			.arg(format!("{:.6}", overlay.start_s))
+			.arg("-i")
+			.arg(process::tool_path(&scoring.dir.join(burn::BITMAP_FILE)));
+	}
 }
 
-fn reference_branch(reference: &Reference<'_>, chain: &str) -> String {
+/// The reference draws the same subtitles as the encode it is scored against, shifted to its own seek.
+fn reference_branch(reference: &Reference<'_>, chain: &str, seek_s: Option<f64>) -> String {
+	let video = format!("[1:{}]", reference.stream);
 	match reference.overlay {
-		Some(subtitle) => format!(
-			"[1:{subtitle}][1:{}]scale2ref[rs][rb];[rb][rs]overlay=eof_action=pass,{chain}[r]",
-			reference.stream
-		),
-		None => format!("[1:{}]{chain}[r]", reference.stream),
+		Some(overlay) => burn::overlay_graph(&video, "[2:0]", overlay, seek_s, chain, "[r]"),
+		None => format!("{video}{}[r]", burn::main_chain(reference.subtitles, chain, seek_s)),
 	}
 }
 
@@ -391,7 +392,10 @@ mod tests {
 			decoder: None,
 			filters: "format=yuv420p10le",
 			window: None,
-			overlay: Some(3),
+			overlay: Some(Overlay {
+				start_s: 1.5,
+				ten_bit: true,
+			}),
 			subtitles: None,
 		};
 
@@ -405,7 +409,15 @@ mod tests {
 		));
 
 		assert!(
-			args.contains("[1:3][1:0]scale2ref[rs][rb];[rb][rs]overlay=eof_action=pass,format=yuv420p10le,"),
+			args.contains(" -ss 2.000 -t 4.000 -i ") && args.contains(" -itsoffset 1.500000 -i "),
+			"{args}"
+		);
+		assert!(
+			args.contains(
+				"[1:0]setpts=PTS+2.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];\
+				 [bss]format=yuva420p10le[bsd];[bvs][bsd]overlay=eof_action=pass:format=yuv420p10,\
+				 setpts=PTS-2.000/TB,format=yuv420p10le,format=yuv420p10le,settb=1/1000,setpts=N[r];"
+			),
 			"{args}"
 		);
 	}
@@ -450,7 +462,7 @@ mod tests {
 		));
 
 		let shifted = |start: &str| {
-			format!("[1:0]setpts=PTS+{start}/TB,subtitles=subs.ass,setpts=PTS-STARTPTS,format=yuv420p10le,")
+			format!("[1:0]setpts=PTS+{start}/TB,subtitles=subs.ass,setpts=PTS-{start}/TB,format=yuv420p10le,")
 		};
 		assert!(sampled.contains(&shifted("12.500")), "{sampled}");
 		assert!(checked.contains(&shifted("4.000")), "{checked}");

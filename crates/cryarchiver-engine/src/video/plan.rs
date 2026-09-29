@@ -3,6 +3,7 @@ use crate::outcome::KeepReason;
 use crate::preset::Speed;
 use crate::probe::{Frame, MediaInfo, Stream};
 use crate::video::analyze::{Analysis, NoiseClass, ScanType, forced_decoder};
+use crate::video::burn::Overlay;
 use crate::video::colour::{ColourTags, conversion, output_tags, setparams};
 
 const SVT_MAX_WIDTH: u32 = 16_384;
@@ -141,8 +142,7 @@ pub struct VideoPlan {
 	pub hdr10: bool,
 	pub warnings: Vec<String>,
 	pub window: Option<TrimWindow>,
-	/// A bitmap subtitle stream drawn over the main video.
-	pub overlay: Option<u32>,
+	pub overlay: Option<Overlay>,
 	/// The text/ASS subtitle filter for the main video, before it is shifted to a command's seek.
 	pub subtitles: Option<String>,
 }

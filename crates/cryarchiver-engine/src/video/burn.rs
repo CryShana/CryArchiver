@@ -4,21 +4,29 @@ use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::images::decode::deep_pix_fmt;
 use crate::options::SubtitlePick;
-use crate::outcome::{IoSide, JobError};
-use crate::probe::{MediaInfo, Stream};
+use crate::outcome::{ErrorKind, IoSide, JobError};
+use crate::probe::{self as ffprobe, MediaInfo, ProbeError, Stream};
 use crate::process::{self, STALL_TIMEOUT, ToolCommand};
+use crate::toolchain::Toolchain;
 use crate::video::run_ffmpeg;
 use crate::workspace::Workspace;
 
 pub const SUBTITLE_FILE: &str = "subs.ass";
+pub const BITMAP_FILE: &str = "subs.mkv";
 pub const FONT_DIR: &str = "fonts";
 
 const ASS_SCRIPT_HEIGHT: f64 = 288.0;
 const ASS: &[&str] = &["ass", "ssa"];
 const BITMAP: &[&str] = &["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"];
+const UNDRAWABLE: &[&str] = &["dvb_teletext", "arib_caption", "hdmv_text_subtitle"];
 const TEXT_FILTERS: &[&str] = &["subtitles"];
 const BITMAP_FILTERS: &[&str] = &["scale2ref", "overlay"];
+/// A picture from sub2video that shares its timestamp with a video frame reaches `overlay` after that frame, which
+/// then still shows the previous picture. Moving every picture this much earlier (under half a frame even at
+/// 240 fps, more than Matroska's 1 ms rounding) puts it on the frame it starts on.
+const SAME_FRAME_S: &str = "0.002";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BurnKind {
@@ -31,6 +39,14 @@ pub enum BurnKind {
 pub struct Burn {
 	pub stream: u32,
 	pub kind: BurnKind,
+}
+
+/// A bitmap track drawn over the main video from `subs.mkv`, read as its own input from its start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Overlay {
+	/// Where `subs.mkv` starts on the source's timeline; ffmpeg would otherwise move its first cue to 0.
+	pub start_s: f64,
+	pub ten_bit: bool,
 }
 
 pub fn pick(info: &MediaInfo, pick: &SubtitlePick) -> Result<Burn, String> {
@@ -61,6 +77,13 @@ pub fn pick(info: &MediaInfo, pick: &SubtitlePick) -> Result<Burn, String> {
 	};
 
 	let codec = chosen.codec_name.as_str();
+	if UNDRAWABLE.contains(&codec) {
+		return Err(format!(
+			"subtitle stream {} ({codec}) can't be burned: ffmpeg can't turn it into text or pictures to draw",
+			chosen.index
+		));
+	}
+
 	let kind = if ASS.contains(&codec) {
 		BurnKind::Ass
 	} else if BITMAP.contains(&codec) {
@@ -94,47 +117,102 @@ pub fn extract_command(
 		}
 	}
 
-	let codec = if burn.kind == BurnKind::Ass { "copy" } else { "ass" };
+	let (codec, file) = match burn.kind {
+		BurnKind::Ass => ("copy", SUBTITLE_FILE),
+		BurnKind::Text => ("ass", SUBTITLE_FILE),
+		BurnKind::Bitmap if codec_of(info, burn) == "xsub" => ("dvdsub", BITMAP_FILE),
+		BurnKind::Bitmap => ("copy", BITMAP_FILE),
+	};
 	cmd.arg("-i")
 		.arg(process::tool_path(source))
 		.arg("-map")
 		.arg(format!("0:{}", burn.stream))
-		.args(["-c:s", codec, SUBTITLE_FILE]);
+		.args(["-c:s", codec]);
+	if burn.kind == BurnKind::Bitmap {
+		cmd.args(["-f", "matroska"]);
+	}
+	cmd.arg(file);
 	cmd
 }
 
+/// Extracts the burned track into the workspace. For a bitmap track, returns where the extracted file starts.
 pub async fn prepare(
-	ffmpeg: &Path,
+	tools: &Toolchain,
 	source: &Path,
 	workspace: &Workspace,
 	info: &MediaInfo,
 	burn: Burn,
 	cancel: &CancellationToken,
-) -> Result<(), JobError> {
-	if burn.kind == BurnKind::Bitmap {
-		return Ok(());
-	}
-
+) -> Result<Option<f64>, JobError> {
 	if burn.kind == BurnKind::Ass {
 		let fonts = workspace.file(FONT_DIR);
 		fs::create_dir_all(&fonts).map_err(|err| JobError::io(IoSide::Destination(&fonts), &err))?;
 	}
 
-	run_ffmpeg(
-		&extract_command(ffmpeg, source, workspace.dir(), info, burn),
-		|_| {},
-		cancel,
-	)
-	.await?;
-	Ok(())
+	let cmd = extract_command(&tools.ffmpeg, source, workspace.dir(), info, burn);
+	run_ffmpeg(&cmd, |_| {}, cancel).await?;
+	if burn.kind != BurnKind::Bitmap {
+		return Ok(None);
+	}
+
+	let extracted = ffprobe::probe(tools, &workspace.file(BITMAP_FILE), cancel)
+		.await
+		.map_err(|err| match err {
+			ProbeError::Run(err) => err.into(),
+			other => JobError::from(ErrorKind::EncodeFailed(format!(
+				"the extracted subtitles can't be read: {other}"
+			))),
+		})?;
+	Ok(Some(extracted.format.start_time.unwrap_or(0.0)))
 }
 
-pub fn missing_filters(kind: BurnKind, filters: &BTreeSet<String>) -> Vec<&'static str> {
-	let needed = match kind {
-		BurnKind::Text | BurnKind::Ass => TEXT_FILTERS,
-		BurnKind::Bitmap => BITMAP_FILTERS,
+pub fn overlay(main: &Stream, start_s: f64) -> Overlay {
+	Overlay {
+		start_s,
+		ten_bit: main.pix_fmt.as_deref().is_some_and(deep_pix_fmt),
+	}
+}
+
+/// What this ffmpeg lacks to burn `burn`, such as "subtitles filter" or "pgssub decoder".
+pub fn missing_tools(burn: Burn, info: &MediaInfo, tools: &Toolchain) -> Vec<String> {
+	let codec = codec_of(info, burn);
+	let (filters, decoders, encoders): (&[&str], Vec<&str>, &[&str]) = match burn.kind {
+		BurnKind::Ass => (TEXT_FILTERS, vec!["ass"], &[]),
+		BurnKind::Text => (TEXT_FILTERS, vec![decoder(codec), "ass"], &["ass"]),
+		BurnKind::Bitmap if codec == "xsub" => (BITMAP_FILTERS, vec!["xsub", "dvdsub"], &["dvdsub"]),
+		BurnKind::Bitmap => (BITMAP_FILTERS, vec![decoder(codec)], &[]),
 	};
-	needed.iter().copied().filter(|name| !filters.contains(*name)).collect()
+
+	let absent = |names: &[&str], have: &BTreeSet<String>, what: &str| -> Vec<String> {
+		names
+			.iter()
+			.filter(|name| !have.contains(**name))
+			.map(|name| format!("{name} {what}"))
+			.collect()
+	};
+	[
+		absent(filters, &tools.filters, "filter"),
+		absent(&decoders, &tools.decoders, "decoder"),
+		absent(encoders, &tools.encoders, "encoder"),
+	]
+	.concat()
+}
+
+fn codec_of(info: &MediaInfo, burn: Burn) -> &str {
+	info.streams
+		.iter()
+		.find(|stream| stream.index == burn.stream)
+		.map_or("", |stream| stream.codec_name.as_str())
+}
+
+fn decoder(codec: &str) -> &str {
+	match codec {
+		"hdmv_pgs_subtitle" => "pgssub",
+		"dvd_subtitle" => "dvdsub",
+		"dvb_subtitle" => "dvbsub",
+		"eia_608" => "cc_dec",
+		other => other,
+	}
 }
 
 pub fn subtitle_filter(kind: BurnKind, size_percent: u8) -> Option<String> {
@@ -150,20 +228,66 @@ pub fn subtitle_filter(kind: BurnKind, size_percent: u8) -> Option<String> {
 }
 
 /// The main video's filter chain for a command whose input is seeked to `seek_s` of the source. Seeking restarts
-/// the frames' timestamps at 0 while `subs.ass` keeps the source's, so the frames are moved onto the source's
-/// timeline for the subtitle filter and back afterwards.
+/// the frames' timestamps near 0 while `subs.ass` keeps the source's, so the frames are moved onto the source's
+/// timeline for the subtitle filter and back by the same amount afterwards.
 pub fn main_chain(subtitles: Option<&str>, filters: &str, seek_s: Option<f64>) -> String {
 	let drawn = match (subtitles, seek_s) {
-		(Some(subtitles), Some(start_s)) => format!("setpts=PTS+{start_s:.3}/TB,{subtitles},setpts=PTS-STARTPTS"),
+		(Some(subtitles), Some(start_s)) => {
+			format!("setpts=PTS+{start_s:.3}/TB,{subtitles},setpts=PTS-{start_s:.3}/TB")
+		}
 		(Some(subtitles), None) => subtitles.to_owned(),
 		(None, _) => String::new(),
 	};
 
-	[drawn.as_str(), filters]
-		.into_iter()
+	chained(&[&drawn, filters])
+}
+
+/// The graph that draws `subs.mkv` (the `subtitles` input label) over `video`, then runs `chain`, into `out`. The
+/// bitmap input is read unseeked, so a cue already on screen at a seek is still drawn; the seeked video is moved
+/// onto the source's timeline for the overlay, like `main_chain` does.
+pub fn overlay_graph(
+	video: &str,
+	subtitles: &str,
+	overlay: Overlay,
+	seek_s: Option<f64>,
+	chain: &str,
+	out: &str,
+) -> String {
+	let (onto_source, back) = match seek_s {
+		Some(start_s) => (
+			format!("setpts=PTS+{start_s:.3}/TB"),
+			format!("setpts=PTS-{start_s:.3}/TB"),
+		),
+		None => ("null".to_owned(), String::new()),
+	};
+	let (pictures, blend) = if overlay.ten_bit {
+		("[bss]format=yuva420p10le[bsd];", ":format=yuv420p10")
+	} else {
+		("[bss]null[bsd];", "")
+	};
+
+	format!(
+		"{video}{onto_source}[bv];{subtitles}setpts=PTS-{SAME_FRAME_S}/TB[bs];[bs][bv]scale2ref[bss][bvs];{pictures}\
+		 [bvs][bsd]overlay=eof_action=pass{blend}{}{out}",
+		prefixed(&chained(&[&back, chain]))
+	)
+}
+
+fn chained(parts: &[&str]) -> String {
+	parts
+		.iter()
 		.filter(|part| !part.is_empty())
+		.copied()
 		.collect::<Vec<_>>()
 		.join(",")
+}
+
+fn prefixed(chain: &str) -> String {
+	if chain.is_empty() {
+		String::new()
+	} else {
+		format!(",{chain}")
+	}
 }
 
 #[cfg(test)]
@@ -232,7 +356,7 @@ mod tests {
 		assert_eq!(subtitle_filter(BurnKind::Bitmap, 5), None);
 		assert_eq!(
 			main_chain(Some(&ass), "format=yuv420p10le", Some(4.0)),
-			"setpts=PTS+4.000/TB,subtitles=subs.ass:fontsdir=fonts,setpts=PTS-STARTPTS,format=yuv420p10le"
+			"setpts=PTS+4.000/TB,subtitles=subs.ass:fontsdir=fonts,setpts=PTS-4.000/TB,format=yuv420p10le"
 		);
 		assert_eq!(
 			main_chain(Some(&ass), "format=yuv420p10le", None),
@@ -243,13 +367,65 @@ mod tests {
 	}
 
 	#[test]
-	fn each_kind_needs_its_filters() {
-		let filters: BTreeSet<String> = ["subtitles", "overlay"].map(String::from).into();
+	fn bitmaps_are_overlaid_from_their_own_input_on_the_source_timeline() {
+		let eight = Overlay {
+			start_s: 0.0,
+			ten_bit: false,
+		};
+		let ten = Overlay { ten_bit: true, ..eight };
 
-		assert!(missing_filters(BurnKind::Text, &filters).is_empty());
-		assert!(missing_filters(BurnKind::Ass, &filters).is_empty());
-		assert_eq!(missing_filters(BurnKind::Bitmap, &filters), ["scale2ref"]);
-		assert_eq!(missing_filters(BurnKind::Text, &BTreeSet::new()), ["subtitles"]);
+		assert_eq!(
+			overlay_graph("[0:0]", "[1:0]", eight, None, "format=yuv420p10le", "[burned]"),
+			"[0:0]null[bv];[1:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];[bss]null[bsd];\
+			 [bvs][bsd]overlay=eof_action=pass,format=yuv420p10le[burned]"
+		);
+		assert_eq!(
+			overlay_graph("[1:0]", "[2:0]", ten, Some(4.0), "", "[r]"),
+			"[1:0]setpts=PTS+4.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];\
+			 [bss]format=yuva420p10le[bsd];[bvs][bsd]overlay=eof_action=pass:format=yuv420p10,setpts=PTS-4.000/TB[r]"
+		);
+	}
+
+	#[test]
+	fn tracks_ffmpeg_can_not_draw_are_refused_by_name() {
+		let teletext = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"subtitle","codec_name":"dvb_teletext"}]}"#,
+		);
+
+		let err = pick(&teletext, &SubtitlePick::Default).unwrap_err();
+
+		assert!(err.contains("stream 1 (dvb_teletext) can't be burned"), "{err}");
+	}
+
+	#[test]
+	fn bitmap_tracks_are_extracted_into_matroska_and_xsub_as_dvd_subtitles() {
+		let xsub = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"mpeg4"},
+			{"index":1,"codec_type":"subtitle","codec_name":"xsub"}]}"#,
+		);
+		let bitmap = Burn {
+			stream: 3,
+			kind: BurnKind::Bitmap,
+		};
+
+		let pgs = joined(&extract_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work"),
+			&info(SUBTITLED),
+			bitmap,
+		));
+		let dvd = joined(&extract_command(
+			Path::new("ffmpeg"),
+			Path::new("in.avi"),
+			Path::new("work"),
+			&xsub,
+			Burn { stream: 1, ..bitmap },
+		));
+
+		assert!(pgs.ends_with("-map 0:3 -c:s copy -f matroska subs.mkv"), "{pgs}");
+		assert!(dvd.ends_with("-map 0:1 -c:s dvdsub -f matroska subs.mkv"), "{dvd}");
 	}
 
 	#[test]
