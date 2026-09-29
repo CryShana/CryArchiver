@@ -1390,7 +1390,6 @@ fn extraction_shortfall(info: &MediaInfo, decoded_s: f64) -> Option<String> {
 
 /// A merged track is only as long as its first source (`amix duration=first`), so its shortfall is checked
 /// against that source's own declared duration, clipped to the trim window, not the container or the longest track.
-/// A missing declared duration still leaves the trim-window check running, exactly like the non-merge path.
 fn merge_shortfall(info: &MediaInfo, merge_from: &[u32], window: Option<TrimWindow>, decoded_s: f64) -> Option<String> {
 	let declared = merge_from
 		.first()
