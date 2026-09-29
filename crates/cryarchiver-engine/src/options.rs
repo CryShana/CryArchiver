@@ -19,11 +19,12 @@ pub struct TrimWindow {
 pub struct JobOptions {
 	pub trim: Option<Trim>,
 	pub format: Option<OutputFormat>,
+	pub strip: bool,
 }
 
 impl JobOptions {
 	pub fn forced(&self) -> bool {
-		self.trim.is_some() || self.format.is_some()
+		self.trim.is_some() || self.format.is_some() || self.strip
 	}
 }
 

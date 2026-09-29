@@ -28,7 +28,7 @@ use crate::text::display_path;
 use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
 use crate::video::analyze::Analysis;
 use crate::video::encode::{EncodedVideo, Sample};
-use crate::video::mux::{self, Attachment, MuxInputs, MuxPlan};
+use crate::video::mux::{self, Attachment, ChapterSource, MuxInputs, MuxPlan};
 use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, usable_main};
 use crate::video::quality::{self as video_quality, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{Extracted, StreamPlan, StreamRules, plan_streams};
@@ -282,11 +282,15 @@ impl Engine {
 					forced: job.options.forced(),
 				};
 				match plan_file_with(&info, job.speed, &job.overrides, rules) {
-					AudioPlan::Encode(plan) => Planned::Audio {
-						plan: retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?,
-						info: Box::new(info),
-						from_video: false,
-					},
+					AudioPlan::Encode(plan) => {
+						let mut plan = retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?;
+						plan.options.strip = job.options.strip;
+						Planned::Audio {
+							plan,
+							info: Box::new(info),
+							from_video: false,
+						}
+					}
 					AudioPlan::Keep(reason) => return Ok(JobOutcome::KeptOriginal { reason }),
 				}
 			}
@@ -301,11 +305,16 @@ impl Engine {
 
 				on_event(JobEvent::Stage(Stage::Plan));
 				match plan_file_with(&info, job.speed, &job.overrides, AudioRules { forced: true }) {
-					AudioPlan::Encode(plan) => Planned::Audio {
-						plan: extracted(retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?),
-						info: Box::new(info),
-						from_video: true,
-					},
+					AudioPlan::Encode(plan) => {
+						let mut plan =
+							extracted(retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?);
+						plan.options.strip = job.options.strip;
+						Planned::Audio {
+							plan,
+							info: Box::new(info),
+							from_video: true,
+						}
+					}
 					AudioPlan::Keep(reason) => return Err(ErrorKind::EncodeFailed(extraction_refusal(&reason)).into()),
 				}
 			}
@@ -505,6 +514,7 @@ impl Engine {
 		(cx.on_event)(JobEvent::Stage(Stage::Metadata));
 		let mut warnings = Vec::new();
 		if plan.container.cover == Cover::VorbisPicture
+			&& !plan.options.strip
 			&& let Some(warning) = copy_cover(&cx.job.source, &output, info)
 		{
 			(cx.on_event)(JobEvent::Warning(warning.clone()));
@@ -590,6 +600,9 @@ impl Engine {
 		))
 		.await?;
 		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
+		if cx.job.options.strip {
+			video.streams.truncate(1);
+		}
 		let mut quality = self.video_quality(cx.job, main, &analysis, &video);
 		if cx.job.speed != Speed::Fast && !self.tools.has_vmaf() {
 			video
@@ -975,6 +988,7 @@ impl Engine {
 		(cx.on_event)(JobEvent::Stage(Stage::Mux));
 		let container = job.container;
 		let keeps_files = container == MATROSKA_VIDEO;
+		let strip = cx.job.options.strip;
 		if cx.job.keep_metadata && !keeps_files {
 			warnings.push(format!(
 				"the source metadata attachment was left out: .{} can't hold attachments",
@@ -982,7 +996,7 @@ impl Engine {
 			));
 		}
 
-		let metadata = (cx.job.keep_metadata && keeps_files).then_some((job.probe_json, job.first_frame));
+		let metadata = (cx.job.keep_metadata && keeps_files && !strip).then_some((job.probe_json, job.first_frame));
 		let attachments = collect_attachments(workspace, &job.streams.extracted, metadata, &mut warnings)?;
 
 		let output = workspace.file(&format!("mux.{}", container.extension));
@@ -1001,6 +1015,11 @@ impl Engine {
 				streams: job.streams,
 				keep_metadata: cx.job.keep_metadata,
 				container,
+				chapters: if strip {
+					ChapterSource::Dropped
+				} else {
+					ChapterSource::Source
+				},
 			},
 			&output,
 		);
@@ -1029,7 +1048,7 @@ impl Engine {
 		let expected = Expected {
 			video: job.video,
 			streams: job.streams,
-			source_chapters: job.info.chapters.len(),
+			source_chapters: if strip { 0 } else { job.info.chapters.len() },
 			attached_files: attachments.len(),
 			start_offsets: start_offsets(&mux::output_streams(job.video, job.streams), &timelines),
 			source_fps: job.main.fps(),
@@ -1172,6 +1191,7 @@ fn stream_rules(job: &Job) -> StreamRules {
 	StreamRules {
 		container: video_container(job),
 		overrides: job.overrides,
+		strip: job.options.strip,
 		..StreamRules::new(job.speed, job.keep_metadata)
 	}
 }

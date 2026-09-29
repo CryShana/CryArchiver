@@ -45,6 +45,13 @@ pub struct MuxPlan<'a> {
 	pub streams: &'a StreamPlan,
 	pub keep_metadata: bool,
 	pub container: Container,
+	pub chapters: ChapterSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChapterSource {
+	Source,
+	Dropped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +155,10 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 		push_clean_metadata(&mut cmd, plan, &outputs);
 	}
 
-	cmd.arg("-map_chapters").arg(source.to_string());
+	match plan.chapters {
+		ChapterSource::Source => cmd.arg("-map_chapters").arg(source.to_string()),
+		ChapterSource::Dropped => cmd.args(["-map_chapters", "-1"]),
+	};
 	if plan.container.muxer == MP4_VIDEO.muxer {
 		cmd.args(["-movflags", "+faststart"]);
 	} else {
@@ -327,6 +337,7 @@ mod tests {
 			streams: &streams,
 			keep_metadata,
 			container: MATROSKA_VIDEO,
+			chapters: ChapterSource::Source,
 		};
 		joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")))
 	}
@@ -490,12 +501,37 @@ mod tests {
 			streams: &streams,
 			keep_metadata: true,
 			container: MATROSKA_VIDEO,
+			chapters: ChapterSource::Source,
 		};
 
 		let args = joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")));
 
 		assert!(args.contains("-map 0:v:0 -map 1:2 -c copy"), "{args}");
 		assert!(args.contains("-map_metadata 1"), "{args}");
+	}
+
+	#[test]
+	fn dropped_chapters_are_not_mapped() {
+		let (info, video, streams) = (info(), test_plan(), StreamPlan::default());
+		let inputs = MuxInputs {
+			video: Path::new("video.a1.mkv"),
+			audio: None,
+			source: Path::new("source.mkv"),
+			source_bytes: 0,
+			attachments: &[],
+		};
+		let plan = MuxPlan {
+			info: &info,
+			video: &video,
+			streams: &streams,
+			keep_metadata: false,
+			container: MATROSKA_VIDEO,
+			chapters: ChapterSource::Dropped,
+		};
+
+		let args = joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")));
+
+		assert!(args.contains("-map_chapters -1 -cues_to_front 1"), "{args}");
 	}
 
 	#[test]
@@ -525,6 +561,7 @@ mod tests {
 					streams: &streams,
 					keep_metadata: true,
 					container,
+					chapters: ChapterSource::Source,
 				},
 				Path::new("mux.out"),
 			))

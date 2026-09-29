@@ -1,6 +1,6 @@
 mod support;
 
-use cryarchiver_engine::audio::plan::{EncodePlan, FilePlan, LayoutFix, TrackJob, TrackPlan};
+use cryarchiver_engine::audio::plan::{EncodePlan, FileOptions, FilePlan, LayoutFix, TrackJob, TrackPlan};
 use cryarchiver_engine::audio::verify::{Levels, compare, measure_output};
 use cryarchiver_engine::container::OGG_OPUS;
 use cryarchiver_engine::outcome::ErrorKind;
@@ -21,6 +21,7 @@ fn opus_plan() -> FilePlan {
 			sample_rate: 48_000,
 			plan: TrackPlan::Encode(plan),
 		}],
+		options: FileOptions::default(),
 	}
 }
 

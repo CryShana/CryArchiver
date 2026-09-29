@@ -48,6 +48,7 @@ pub struct StreamRules {
 	pub overrides: Overrides,
 	pub keep_metadata: bool,
 	pub container: Container,
+	pub strip: bool,
 }
 
 impl StreamRules {
@@ -57,6 +58,7 @@ impl StreamRules {
 			overrides: Overrides::default(),
 			keep_metadata,
 			container: MATROSKA_VIDEO,
+			strip: false,
 		}
 	}
 }
@@ -136,8 +138,14 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 	let mut audio_tracks = 0;
 	let mut dropped_data = 0;
 	let mut dropped_files = 0;
+	let mut stripped = 0;
 
 	for stream in &info.streams {
+		if rules.strip && !(stream.is_audio() || stream.is_real_video()) {
+			stripped += 1;
+			continue;
+		}
+
 		match stream.codec_type.as_str() {
 			"audio" => {
 				audio_tracks += 1;
@@ -206,6 +214,12 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 			plural(dropped_files),
 			plural(dropped_files),
 			target.name()
+		));
+	}
+
+	if stripped > 0 {
+		plan.warnings.push(format!(
+			"--strip left out {stripped} subtitle, attachment, cover and data streams"
 		));
 	}
 	Ok(plan)
@@ -552,6 +566,31 @@ mod tests {
 		assert!(webm.warnings.iter().any(|warning| warning.contains("--burn-subs")));
 		assert_eq!(mkv.attachments, [4]);
 		assert_eq!(mkv.extracted.len(), 2);
+	}
+
+	#[test]
+	fn strip_keeps_only_audio_and_video() {
+		let extras = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"channel_layout":"stereo"},
+			{"index":2,"codec_type":"subtitle","codec_name":"subrip"},
+			{"index":3,"codec_type":"attachment","codec_name":"ttf"},
+			{"index":4,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}},
+			{"index":5,"codec_type":"data","codec_tag_string":"mebx"}]}"#,
+		);
+		let stripped = StreamRules {
+			strip: true,
+			..StreamRules::new(Speed::Moderate, true)
+		};
+
+		let plan = plan_streams(&extras, &stripped).unwrap();
+
+		assert_eq!(plan.audio.len(), 1);
+		assert!(plan.subtitles.is_empty() && plan.attachments.is_empty() && plan.extracted.is_empty());
+		assert_eq!(
+			plan.warnings,
+			["--strip left out 4 subtitle, attachment, cover and data streams"]
+		);
 	}
 
 	#[test]

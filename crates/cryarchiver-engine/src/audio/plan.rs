@@ -60,13 +60,19 @@ impl TrackJob {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileOptions {
+	pub strip: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FilePlan {
 	pub container: Container,
 	pub tracks: Vec<TrackJob>,
+	pub options: FileOptions,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AudioPlan {
 	Keep(KeepReason),
 	Encode(FilePlan),
@@ -116,7 +122,11 @@ pub fn plan_file_with(info: &MediaInfo, speed: Speed, overrides: &Overrides, rul
 	}
 
 	let container = if tracks.len() == 1 { OGG_OPUS } else { MATROSKA_AUDIO };
-	AudioPlan::Encode(FilePlan { container, tracks })
+	AudioPlan::Encode(FilePlan {
+		container,
+		tracks,
+		options: FileOptions::default(),
+	})
 }
 
 pub fn retarget(plan: FilePlan, format: Option<OutputFormat>, info: &MediaInfo) -> Result<FilePlan, String> {

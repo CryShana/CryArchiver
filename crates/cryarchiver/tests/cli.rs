@@ -795,6 +795,46 @@ fn a_format_that_does_not_fit_a_file_fails_only_that_file() {
 }
 
 #[test]
+fn strip_is_a_flag() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "song.flac", 2);
+
+	let out = cryarchiver(dir.path(), &["--strip", "song.flac"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	assert!(dir.path().join("song.cry.opus").is_file());
+}
+
+#[test]
+fn an_output_file_naming_the_source_itself_is_refused() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let before = fs::read(&source).unwrap();
+
+	let exact = cryarchiver(dir.path(), &["clip.mp4", "-o", "clip.mp4"]);
+	let respelled = cryarchiver(dir.path(), &["clip.mp4", "-o", "./CLIP.MP4"]);
+
+	assert_eq!(exact.status.code(), Some(0), "{}{}", stdout(&exact), stderr(&exact));
+	assert!(stdout(&exact).contains("skipped"), "{}", stdout(&exact));
+	assert_eq!(
+		respelled.status.code(),
+		Some(0),
+		"{}{}",
+		stdout(&respelled),
+		stderr(&respelled)
+	);
+	assert!(stdout(&respelled).contains("skipped"), "{}", stdout(&respelled));
+	assert_eq!(fs::read(&source).unwrap(), before);
+	assert_eq!(
+		fs::read_dir(dir.path())
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect::<Vec<_>>(),
+		["clip.mp4"]
+	);
+}
+
+#[test]
 fn help_and_doctor_mention_images() {
 	let dir = tempfile::tempdir().unwrap();
 

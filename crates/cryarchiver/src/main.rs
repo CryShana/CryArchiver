@@ -137,6 +137,8 @@ struct CompressArgs {
 	keep_metadata: bool,
 	#[arg(long, help = "Convert photos that have gain or depth maps, dropping the extras")]
 	drop_aux: bool,
+	#[arg(long, help = "Keep only the main video and the audio")]
+	strip: bool,
 	#[arg(long, help = "Replace existing outputs (never sources)")]
 	overwrite: bool,
 	#[arg(
@@ -649,6 +651,7 @@ async fn compress(args: CompressArgs) -> u8 {
 			overrides,
 			options: JobOptions {
 				format: target.format,
+				strip: args.strip,
 				..JobOptions::default()
 			},
 		})

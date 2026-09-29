@@ -2270,3 +2270,55 @@ async fn transparent_video_can_not_be_written_as_mp4() {
 	);
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
 }
+
+fn with_options(job: Job, options: JobOptions) -> Job {
+	Job { options, ..job }
+}
+
+#[tokio::test]
+async fn stripped_video_keeps_only_the_main_video_and_the_audio() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::clip_with_extras(dir.path());
+	let strip = JobOptions {
+		strip: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(fast(&clip), strip), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings.iter().any(|warning| warning.starts_with("--strip left out")),
+		"{warnings:?}"
+	);
+	let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let kinds: Vec<&str> = info.streams.iter().map(|stream| stream.codec_type.as_str()).collect();
+	assert_eq!(kinds, ["video", "audio"]);
+	assert!(info.chapters.is_empty());
+}
+
+#[tokio::test]
+async fn stripped_audio_has_no_cover_art() {
+	let dir = tempfile::tempdir().unwrap();
+	let mp3 = support::mp3_with_cover(dir.path(), "song.mp3", "Song");
+	let strip = JobOptions {
+		strip: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(job(&mp3), strip), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let opus = OpusFile::read_from(
+		&mut File::open(&output).unwrap(),
+		ParseOptions::new().read_properties(false),
+	)
+	.unwrap();
+	assert!(opus.vorbis_comments().pictures().is_empty());
+}

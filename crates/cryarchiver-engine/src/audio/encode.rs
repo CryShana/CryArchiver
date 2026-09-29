@@ -12,9 +12,10 @@ const RESAMPLE: &str = "aresample=resampler=soxr:osr=48000";
 
 pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
+	let chapters = if plan.options.strip { "-1" } else { "0" };
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-i"])
 		.arg(process::tool_path(source))
-		.args(["-map_metadata", "0", "-map_chapters", "0"]);
+		.args(["-map_metadata", "0", "-map_chapters", chapters]);
 
 	for (out, track) in plan.tracks.iter().enumerate() {
 		cmd.arg("-map").arg(format!("0:{}", track.stream_index));
@@ -26,7 +27,7 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 		}
 	}
 
-	if plan.container.cover == Cover::Stream {
+	if plan.container.cover == Cover::Stream && !plan.options.strip {
 		cmd.args(["-map", "0:v?", "-c:v", "copy"]);
 	}
 	cmd.args(["-f", plan.container.muxer]).arg(process::tool_path(output));
@@ -99,7 +100,7 @@ fn filter_chain(layout: LayoutFix) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::audio::plan::TrackJob;
+	use crate::audio::plan::{FileOptions, TrackJob};
 	use crate::container::{MATROSKA_AUDIO, OGG_OPUS};
 	use crate::process::tool_path;
 
@@ -129,6 +130,7 @@ mod tests {
 		let file = FilePlan {
 			container: OGG_OPUS,
 			tracks: vec![track(0, TrackPlan::Encode(plan))],
+			options: FileOptions::default(),
 		};
 
 		let cmd = command(Path::new("ffmpeg"), Path::new("in.ac3"), Path::new("out.opus"), &file);
@@ -157,6 +159,7 @@ mod tests {
 		let file = FilePlan {
 			container: MATROSKA_AUDIO,
 			tracks: vec![track(0, TrackPlan::Encode(stereo)), track(1, TrackPlan::Copy)],
+			options: FileOptions::default(),
 		};
 
 		let args = joined(&command(
@@ -173,6 +176,30 @@ mod tests {
 			output.display()
 		)));
 		assert!(args.contains("-filter:a:1 astats@s1="));
+	}
+
+	#[test]
+	fn stripped_files_carry_no_chapters_or_covers() {
+		let stereo = EncodePlan {
+			bitrate_kbps: 128,
+			channels: 2,
+			layout: LayoutFix::Keep("stereo"),
+		};
+		let file = FilePlan {
+			container: MATROSKA_AUDIO,
+			tracks: vec![track(0, TrackPlan::Encode(stereo))],
+			options: FileOptions { strip: true },
+		};
+
+		let args = joined(&command(
+			Path::new("ffmpeg"),
+			Path::new("in.mka"),
+			Path::new("out.mka"),
+			&file,
+		));
+
+		assert!(args.contains("-map_metadata 0 -map_chapters -1"), "{args}");
+		assert!(!args.contains("0:v?"), "{args}");
 	}
 
 	#[test]

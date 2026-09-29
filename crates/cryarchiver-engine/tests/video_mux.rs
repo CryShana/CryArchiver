@@ -7,7 +7,7 @@ use cryarchiver_engine::container::MATROSKA_VIDEO;
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::video::analyze::{Analysis, NoiseClass, ScanType};
-use cryarchiver_engine::video::mux::{Attachment, MuxInputs, MuxPlan, command, mux};
+use cryarchiver_engine::video::mux::{Attachment, ChapterSource, MuxInputs, MuxPlan, command, mux};
 use cryarchiver_engine::video::plan::{VideoCaps, plan_video, precheck};
 use cryarchiver_engine::video::streams::{StreamRules, plan_streams};
 use tokio_util::sync::CancellationToken;
@@ -145,6 +145,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 			streams: &streams,
 			keep_metadata: false,
 			container: MATROSKA_VIDEO,
+			chapters: ChapterSource::Source,
 		},
 		&output,
 	);

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::audio::plan::{FilePlan, TrackPlan};
+use crate::audio::plan::{FileOptions, FilePlan, TrackPlan};
 use crate::container::{Container, Cover, MATROSKA_AUDIO};
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
 use crate::probe::{MediaInfo, Stream};
@@ -329,6 +329,7 @@ pub fn audio_plan(streams: &StreamPlan) -> Option<FilePlan> {
 	(!tracks.is_empty()).then_some(FilePlan {
 		container: AUDIO_TEMP,
 		tracks,
+		options: FileOptions::default(),
 	})
 }
 
