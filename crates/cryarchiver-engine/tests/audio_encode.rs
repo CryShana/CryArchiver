@@ -149,7 +149,7 @@ async fn merging_loud_sources_leaves_headroom_and_no_leading_silence() {
 		"the mix should keep headroom under the limiter instead of hitting full scale: {peak} dB"
 	);
 
-	let onset = volume_stat(&output, &["-t", "0.01"], "max_volume:");
+	let onset = volume_stat(&output, &["-t", "0.003"], "max_volume:");
 	assert!(
 		onset > -20.0,
 		"the output should not start with leading silence from the limiter's look-ahead delay: {onset} dB"

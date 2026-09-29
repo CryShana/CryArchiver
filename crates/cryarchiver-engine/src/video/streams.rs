@@ -1,4 +1,4 @@
-use crate::audio::plan::{TrackJob, TrackPlan, merge_language, merged, plan_track_with};
+use crate::audio::plan::{TrackJob, TrackPlan, merge_language, mergeable, merged, plan_track_with};
 use crate::container::{Container, MATROSKA_VIDEO};
 use crate::outcome::{KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
@@ -163,12 +163,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 	let mut dropped_data = 0;
 	let mut dropped_files = 0;
 	let mut stripped = 0;
-	let will_merge = rules.merge
-		&& info
-			.streams
-			.iter()
-			.filter(|stream| stream.is_audio() && stream.channels.unwrap_or(0) > 0)
-			.count() >= 2;
+	let will_merge = rules.merge && mergeable(info);
 
 	for stream in &info.streams {
 		if rules.strip && !(stream.is_audio() || stream.is_real_video()) {

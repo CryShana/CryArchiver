@@ -70,7 +70,6 @@ pub struct FileOptions {
 	/// An ffmetadata file whose chapters replace the source's.
 	pub chapters: Option<PathBuf>,
 	pub merge_from: Vec<u32>,
-	/// The first merged source's language tag, kept on the mixed track while its title is dropped.
 	pub merge_language: Option<String>,
 }
 
@@ -139,6 +138,16 @@ pub fn plan_file_with(info: &MediaInfo, speed: Speed, overrides: &Overrides, rul
 	})
 }
 
+/// Whether the file has two or more usable audio tracks for `--merge-audio` to mix, so `merged()` would return
+/// `Some`. Shared by the audio-file/extraction arms (`engine.rs`) and the video path (`video::streams`), which must
+/// agree on what counts as mergeable.
+pub fn mergeable(info: &MediaInfo) -> bool {
+	info.audio_streams()
+		.filter(|stream| stream.channels.unwrap_or(0) > 0)
+		.count()
+		>= 2
+}
+
 pub fn merged(
 	info: &MediaInfo,
 	tracks: &[TrackJob],
@@ -169,7 +178,6 @@ pub fn merged(
 	Some((track, sources))
 }
 
-/// The first merged source's language tag, so the mixed track can keep it while dropping the rest.
 pub fn merge_language(info: &MediaInfo, sources: &[u32]) -> Option<String> {
 	let first = *sources.first()?;
 	info.streams

@@ -271,6 +271,14 @@ fn push_clean_metadata(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, outputs: &[Out
 	cmd.args(["-map_metadata:g", "-1", "-map_metadata:s", "-1"]);
 
 	for (position, output) in outputs.iter().enumerate() {
+		if plan.streams.merge_from.first() == Some(&output.origin) {
+			if let Some(language) = &plan.streams.merge_language {
+				cmd.arg(format!("-metadata:s:{position}"))
+					.arg(format!("language={language}"));
+			}
+			continue;
+		}
+
 		let Some(stream) = source_stream(plan.info, output.origin) else {
 			continue;
 		};
@@ -655,6 +663,49 @@ mod tests {
 			args.contains("-metadata:s:t:0 filename=a.ttf -metadata:s:t:0 mimetype=font/ttf"),
 			"{args}"
 		);
+	}
+
+	#[test]
+	fn a_merged_track_keeps_its_language_but_drops_its_title() {
+		let merged_track = TrackJob {
+			stream_index: 1,
+			sample_rate: 48_000,
+			plan: TrackPlan::Encode(EncodePlan {
+				bitrate_kbps: 128,
+				channels: 2,
+				layout: LayoutFix::Keep("stereo"),
+			}),
+		};
+		let streams = StreamPlan {
+			audio: vec![merged_track],
+			merge_from: vec![1, 2],
+			merge_language: Some("eng".into()),
+			..stream_plan()
+		};
+		let video = test_plan();
+		let inputs = MuxInputs {
+			video: Path::new("video.a1.mkv"),
+			audio: Some(Path::new("audio.mka")),
+			source: Path::new("source.mp4"),
+			source_bytes: 0,
+			attachments: &[],
+			chapters: None,
+			cues: &[],
+		};
+		let plan = MuxPlan {
+			info: &info(),
+			video: &video,
+			streams: &streams,
+			keep_metadata: false,
+			container: MATROSKA_VIDEO,
+			chapters: ChapterSource::Source,
+			window: None,
+		};
+
+		let args = joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")));
+
+		assert!(args.contains("-metadata:s:1 language=eng"), "{args}");
+		assert!(!args.contains("title=Main"), "{args}");
 	}
 
 	#[test]

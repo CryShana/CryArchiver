@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::audio::plan::{AudioPlan, AudioRules, FilePlan, merge_file, plan_file_with, retarget};
+use crate::audio::plan::{AudioPlan, AudioRules, FilePlan, merge_file, mergeable, plan_file_with, retarget};
 use crate::audio::{cover, encode, verify};
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
@@ -281,7 +281,7 @@ impl Engine {
 				self.require(MediaKind::Audio)?;
 				on_event(JobEvent::Stage(Stage::Plan));
 				let rules = AudioRules {
-					forced: job.options.forced(merge_possible(&info)),
+					forced: job.options.forced(mergeable(&info)),
 					reencode: job.options.trim.is_some(),
 				};
 				match plan_file_with(&info, job.speed, &job.overrides, rules) {
@@ -346,7 +346,7 @@ impl Engine {
 				on_event(JobEvent::Stage(Stage::Plan));
 				let rules = stream_rules(job);
 				let planned = self
-					.video_main(&info, job.options.forced(merge_possible(&info)))
+					.video_main(&info, job.options.forced(mergeable(&info)))
 					.map_err(Refusal::from)
 					.and_then(|_| plan_streams(&info, &rules));
 				match planned {
@@ -562,7 +562,7 @@ impl Engine {
 			.len();
 		let share = source_share(cx.source_bytes, plan.options.window, info.format.duration);
 		if !saves_enough(share.unwrap_or(cx.source_bytes), bytes, cx.job.min_savings) {
-			if !cx.job.options.forced(merge_possible(info)) {
+			if !cx.job.options.forced(mergeable(info)) {
 				return Ok(Produced::Kept(KeepReason::NotSmaller {
 					src_bytes: cx.source_bytes,
 					out_bytes: bytes,
@@ -597,7 +597,7 @@ impl Engine {
 			.map_err(video_probe_error)?;
 		let rules = stream_rules(cx.job);
 		let planned = self
-			.video_main(&info, cx.job.options.forced(merge_possible(&info)))
+			.video_main(&info, cx.job.options.forced(mergeable(&info)))
 			.map_err(Refusal::from)
 			.and_then(|main| plan_streams(&info, &rules).map(|streams| (main, streams)));
 		let (main, streams) = match planned {
@@ -662,7 +662,7 @@ impl Engine {
 		}
 
 		let learned_bpp = quality.stats.and_then(|stats| stats.bpp);
-		if !cx.job.options.forced(merge_possible(&info))
+		if !cx.job.options.forced(mergeable(&info))
 			&& let Some(reason) = learned_bpp.and_then(|bpp| video_plan::efficient_at(&info, main, bpp))
 		{
 			return Ok(Produced::Kept(KeepReason::AlreadyEfficient(reason)));
@@ -802,7 +802,7 @@ impl Engine {
 		};
 
 		video.encoder = video.encoder.with_crf(quality.start());
-		if cx.job.options.forced(merge_possible(inputs.info)) {
+		if cx.job.options.forced(mergeable(inputs.info)) {
 			return Ok(Tuning::Encode { verify });
 		}
 
@@ -848,7 +848,7 @@ impl Engine {
 
 		let found = match searched {
 			Searched::Found(found) => found,
-			Searched::Unreachable { crf, score } if cx.job.options.forced(merge_possible(inputs.info)) => {
+			Searched::Unreachable { crf, score } if cx.job.options.forced(mergeable(inputs.info)) => {
 				video.encoder = video.encoder.with_crf(crf);
 				video.warnings.push(format!(
 					"{}; encoded at CRF {crf} without a full check because it was requested",
@@ -867,7 +867,7 @@ impl Engine {
 		video.encoder = video.encoder.with_crf(found.crf);
 		quality.slope = found.slope;
 
-		if !cx.job.options.forced(merge_possible(inputs.info))
+		if !cx.job.options.forced(mergeable(inputs.info))
 			&& let Some(duration_s) = inputs
 				.declared_s
 				.filter(|duration| *duration >= video_encode::MIN_PREDICTED_DURATION_S)
@@ -917,7 +917,7 @@ impl Engine {
 				None
 			};
 			let Some(lower) = lower else {
-				if cx.job.options.forced(merge_possible(inputs.info)) {
+				if cx.job.options.forced(mergeable(inputs.info)) {
 					temps.warnings.push(format!(
 						"{}; it was written because it was requested",
 						video_quality::short_text(crf, score, quality.target)
@@ -1121,7 +1121,7 @@ impl Engine {
 		let declared_s = job.main.declared_duration().or(job.info.format.duration);
 		let share = source_share(cx.source_bytes, job.video.window, declared_s);
 		if !saves_enough(share.unwrap_or(cx.source_bytes), bytes, cx.job.min_savings) {
-			if !cx.job.options.forced(merge_possible(job.info)) {
+			if !cx.job.options.forced(mergeable(job.info)) {
 				return Ok(Produced::Kept(KeepReason::NotSmaller {
 					src_bytes: cx.source_bytes,
 					out_bytes: bytes,
@@ -1388,29 +1388,24 @@ fn extraction_shortfall(info: &MediaInfo, decoded_s: f64) -> Option<String> {
 		.then(|| format!("decodes to {decoded_s:.1} s but its audio declares {declared:.1} s"))
 }
 
-/// Whether `--merge-audio` has two or more usable audio tracks to mix, so `merged()` would return `Some`.
-fn merge_possible(info: &MediaInfo) -> bool {
-	info.audio_streams()
-		.filter(|stream| stream.channels.unwrap_or(0) > 0)
-		.count()
-		>= 2
-}
-
 /// A merged track is only as long as its first source (`amix duration=first`), so its shortfall is checked
 /// against that source's own declared duration, clipped to the trim window, not the container or the longest track.
+/// A missing declared duration still leaves the trim-window check running, exactly like the non-merge path.
 fn merge_shortfall(info: &MediaInfo, merge_from: &[u32], window: Option<TrimWindow>, decoded_s: f64) -> Option<String> {
 	let declared = merge_from
 		.first()
 		.and_then(|&index| info.streams.iter().find(|stream| stream.index == index))
-		.and_then(Stream::declared_duration)?;
+		.and_then(Stream::declared_duration);
 
-	match window {
-		Some(window) => {
+	match (declared, window) {
+		(Some(declared), Some(window)) => {
 			let length_s = (declared - window.start_s).max(0.0).min(window.length_s);
 			TrimWindow { length_s, ..window }.shortfall(decoded_s)
 		}
-		None => (declared - decoded_s > (declared * 0.02).max(1.0))
+		(Some(declared), None) => (declared - decoded_s > (declared * 0.02).max(1.0))
 			.then(|| format!("decodes to {decoded_s:.1} s but declares {declared:.1} s")),
+		(None, Some(window)) => window.shortfall(decoded_s),
+		(None, None) => None,
 	}
 }
 

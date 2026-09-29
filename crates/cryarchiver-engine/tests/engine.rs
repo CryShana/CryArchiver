@@ -2483,6 +2483,66 @@ async fn a_trimmed_merge_lasts_exactly_the_window() {
 }
 
 #[tokio::test]
+async fn a_merge_without_a_declared_duration_still_checks_the_trim_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let two = dir.path().join("piped.mka");
+	let piped = std::process::Command::new("ffmpeg")
+		.args([
+			"-hide_banner",
+			"-v",
+			"error",
+			"-y",
+			"-f",
+			"lavfi",
+			"-i",
+			"sine=duration=2",
+			"-f",
+			"lavfi",
+			"-i",
+			"sine=frequency=880:duration=2",
+			"-map",
+			"0",
+			"-map",
+			"1",
+			"-c:a",
+			"flac",
+			"-f",
+			"matroska",
+			"pipe:1",
+		])
+		.output()
+		.unwrap();
+	assert!(piped.status.success(), "{}", String::from_utf8_lossy(&piped.stderr));
+	fs::write(&two, &piped.stdout).unwrap();
+	let fixture = probe(&support::toolchain().await, &two, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!(
+		fixture.format.duration.is_none(),
+		"the fixture must have no declared duration: {:?}",
+		fixture.format
+	);
+	let options = JobOptions {
+		trim: Some(Trim {
+			start_s: 0.0,
+			end_s: Some(5.0),
+		}),
+		merge_audio: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(job(&two), options), dir.path()).await;
+
+	assert!(
+		matches!(
+			&outcome,
+			JobOutcome::Failed(err) if matches!(&err.kind, ErrorKind::SourceDamaged(reason) if reason.contains("should last"))
+		),
+		"{outcome:?}"
+	);
+}
+
+#[tokio::test]
 async fn merged_extraction_mixes_a_two_track_video_to_one_opus_track() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = dir.path().join("two-tracks.mkv");
