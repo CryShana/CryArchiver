@@ -16,6 +16,7 @@ const MAX_INTERLACED_FPS: f64 = 31.0;
 const NTSC_FPS: f64 = 30_000.0 / 1001.0;
 const TELECINE_REPEATS: f64 = 0.25;
 const INTERLACED_SHARE: f64 = 0.6;
+const FLAGGED_INTERLACED_SHARE: f64 = 0.05;
 const FIELD_ORDER_SHARE: f64 = 0.8;
 const REJECT_SHARE: f64 = 0.5;
 const INTERLACED_FIELD_ORDERS: &[&str] = &["tt", "bb", "tb", "bt"];
@@ -207,6 +208,18 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 				!matches!(field_order, Some("bb" | "bt"))
 			};
 			ScanType::Interlaced { top_first }
+		}
+		// A mostly still picture leaves most interlaced frames undetermined, so an interlaced container needs only a
+		// few frames that agree on one field order.
+		_ if flagged_interlaced && (tff + bff) / frames >= FLAGGED_INTERLACED_SHARE => {
+			let top_share = tff / (tff + bff);
+			if top_share >= FIELD_ORDER_SHARE {
+				ScanType::Interlaced { top_first: true }
+			} else if top_share <= 1.0 - FIELD_ORDER_SHARE {
+				ScanType::Interlaced { top_first: false }
+			} else {
+				ScanType::Progressive
+			}
 		}
 		_ => ScanType::Progressive,
 	};
@@ -552,6 +565,60 @@ mod tests {
 			classify(&mixed, Some(25.0), None).scan,
 			ScanType::Interlaced { top_first: true }
 		);
+	}
+
+	#[test]
+	fn faint_field_evidence_in_an_interlaced_container_is_interlaced() {
+		let still_home_video = |first: [u64; 2], second: [u64; 2]| {
+			[
+				stats([75, 0, 0], first),
+				stats([75, 0, 0], second),
+				stats([75, 0, 0], [0, 0]),
+				stats([75, 0, 0], [0, 0]),
+			]
+		};
+		let top = still_home_video([3, 0], [49, 0]);
+		let bottom = still_home_video([0, 3], [0, 49]);
+
+		for order in ["tt", "tb"] {
+			assert_eq!(
+				classify(&top, Some(25.0), Some(order)).scan,
+				ScanType::Interlaced { top_first: true },
+				"{order}"
+			);
+		}
+
+		for order in ["bb", "bt"] {
+			assert_eq!(
+				classify(&bottom, Some(25.0), Some(order)).scan,
+				ScanType::Interlaced { top_first: false },
+				"{order}"
+			);
+		}
+
+		assert_eq!(
+			classify(&top, Some(25.0), Some("bb")).scan,
+			ScanType::Interlaced { top_first: true }
+		);
+	}
+
+	#[test]
+	fn faint_or_split_field_evidence_alone_is_progressive() {
+		let faint = [stats([75, 0, 0], [30, 0]), stats([75, 0, 0], [0, 0])];
+		let split = [stats([75, 0, 0], [20, 12]), stats([75, 0, 0], [0, 0])];
+		let still = stats([75, 0, 0], [0, 0]);
+		let stray = [stats([75, 0, 0], [3, 0]), still.clone(), still];
+
+		for order in [None, Some("progressive"), Some("unknown")] {
+			assert_eq!(
+				classify(&faint, Some(25.0), order).scan,
+				ScanType::Progressive,
+				"{order:?}"
+			);
+		}
+
+		assert_eq!(classify(&split, Some(25.0), Some("tt")).scan, ScanType::Progressive);
+		assert_eq!(classify(&stray, Some(25.0), Some("tt")).scan, ScanType::Progressive);
 	}
 
 	#[test]

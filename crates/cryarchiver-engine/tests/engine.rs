@@ -718,6 +718,50 @@ async fn interlaced_video_is_deinterlaced_to_double_rate() {
 }
 
 #[tokio::test]
+async fn faintly_interlaced_home_video_of_either_field_order_is_deinterlaced_to_field_rate() {
+	let dir = tempfile::tempdir().unwrap();
+	let truth = support::still_home_video(dir.path(), "truth.mkv", "50p");
+
+	for (scan, wrong_parity) in [("tff", "bff"), ("bff", "tff")] {
+		for container in ["mpg", "mkv"] {
+			let name = format!("{scan}.{container}");
+			let clip = support::still_home_video(dir.path(), &name, scan);
+			let out_dir = dir.path().join(format!("{scan}-{container}"));
+			fs::create_dir(&out_dir).unwrap();
+
+			let JobOutcome::Encoded { output, .. } = run(&fast_keeping_any_saving(&clip), &out_dir).await else {
+				panic!("{name} was not encoded")
+			};
+
+			let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+				.await
+				.unwrap();
+			let (interlaced, progressive, frames) = support::idet_verdicts(&output, support::HOME_VIDEO_INSET);
+			let encoded = support::psnr_in(&output, "", &truth, support::HOME_VIDEO_INSET);
+			let swapped = support::psnr_in(
+				&clip,
+				&format!("bwdif=mode=send_field:parity={wrong_parity}:deint=all,"),
+				&truth,
+				support::HOME_VIDEO_INSET,
+			);
+			assert!(
+				(info.streams[0].fps().unwrap() - 50.0).abs() < 0.5,
+				"{name}: {:?}",
+				info.streams[0]
+			);
+			assert!(
+				progressive * 100 >= frames * 95,
+				"{name}: {interlaced} interlaced and {progressive} progressive of {frames} frames"
+			);
+			assert!(
+				encoded > swapped + 2.0,
+				"{name}: {encoded} dB against the pictures, {swapped} dB with the fields swapped"
+			);
+		}
+	}
+}
+
+#[tokio::test]
 async fn transparent_video_stays_vp9_with_alpha() {
 	let dir = tempfile::tempdir().unwrap();
 	let alpha = dir.path().join("alpha.mov");

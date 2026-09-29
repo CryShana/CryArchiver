@@ -63,6 +63,86 @@ pub fn mpeg4(dir: &Path, name: &str, seconds: u32) -> PathBuf {
 	)
 }
 
+/// Where `still_home_video` moves, as a `crop` argument.
+pub const HOME_VIDEO_INSET: &str = "260:208:200:200";
+
+/// Like a tripod home video: a still, noisy picture with a small moving inset. idet at the analysis threshold tells
+/// the field order of only about a third of its frames and leaves the rest undetermined. `scan` is `tff` or `bff`
+/// for 25i, `50p` for the pictures its fields come from, and anything else for 25p in an interlaced container.
+pub fn still_home_video(dir: &Path, name: &str, scan: &str) -> PathBuf {
+	let (rate, fields) = match scan {
+		"tff" | "bff" => (50, format!("interlace=scan={scan},setfield={scan}")),
+		"50p" => (50, "setfield=prog".to_owned()),
+		_ => (25, "setfield=tff".to_owned()),
+	};
+	let graph = format!(
+		"testsrc2=s=720x576:r={rate}:d=0.02,loop=loop=-1:size=1,setpts=N/{rate}/TB,trim=duration=4,\
+		 noise=alls=6:allf=t[still];testsrc2=s=260x208:r={rate}:d=4[inset];[still][inset]overlay=x=200:y=200,{fields}"
+	);
+	let path = dir.join(name);
+
+	ffmpeg(&[
+		"-filter_complex",
+		&graph,
+		"-c:v",
+		"mpeg2video",
+		"-b:v",
+		"8M",
+		"-flags",
+		"+ilme+ildct",
+		path.to_str().unwrap(),
+	]);
+	path
+}
+
+/// idet's single-frame verdicts inside `region` (a `crop` argument): (TFF + BFF, progressive, all frames). Still
+/// areas are undetermined either way, and the multi-frame verdicts carry one guess across them.
+pub fn idet_verdicts(path: &Path, region: &str) -> (u64, u64, u64) {
+	let filters = format!("crop={region},idet");
+	let out = Command::new("ffmpeg")
+		.args(["-hide_banner", "-nostdin", "-i"])
+		.arg(path)
+		.args(["-map", "0:v:0", "-vf", &filters, "-f", "null", "-"])
+		.output()
+		.unwrap();
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	let line = stderr
+		.lines()
+		.rfind(|line| line.contains("Single frame detection:"))
+		.unwrap_or_else(|| panic!("{stderr}"));
+	let counts: Vec<u64> = line
+		.split("detection:")
+		.nth(1)
+		.unwrap()
+		.split(':')
+		.skip(1)
+		.filter_map(|part| part.split_whitespace().next()?.parse().ok())
+		.collect();
+
+	(counts[0] + counts[1], counts[2], counts.iter().sum())
+}
+
+/// The PSNR of `path` after `filters` against `truth` inside `region`, pairing frames by their position.
+pub fn psnr_in(path: &Path, filters: &str, truth: &Path, region: &str) -> f64 {
+	let by_position = format!("format=yuv420p,crop={region},settb=1/1000,setpts=N");
+	let graph = format!("[0:v:0]{filters}{by_position}[measured];[1:v:0]{by_position}[truth];[measured][truth]psnr");
+	let out = Command::new("ffmpeg")
+		.args(["-hide_banner", "-nostdin", "-i"])
+		.arg(path)
+		.arg("-i")
+		.arg(truth)
+		.args(["-filter_complex", &graph, "-f", "null", "-"])
+		.output()
+		.unwrap();
+	let stderr = String::from_utf8_lossy(&out.stderr);
+
+	stderr
+		.lines()
+		.rev()
+		.find_map(|line| line.split(" average:").nth(1)?.split_whitespace().next()?.parse().ok())
+		.unwrap_or_else(|| panic!("{stderr}"))
+}
+
 pub fn mp3_with_cover(dir: &Path, name: &str, title: &str) -> PathBuf {
 	let path = dir.join(name);
 	let title_tag = format!("title={title}");

@@ -60,6 +60,34 @@ async fn detects_interlaced_tff_and_bff() {
 }
 
 #[tokio::test]
+async fn faintly_interlaced_still_home_video_is_detected_with_its_field_order() {
+	let dir = tempfile::tempdir().unwrap();
+
+	for (scan, top_first) in [("tff", true), ("bff", false)] {
+		for container in ["mpg", "mkv"] {
+			let clip = support::still_home_video(dir.path(), &format!("{scan}.{container}"), scan);
+
+			assert_eq!(
+				scan_and_noise(&clip).await.0,
+				ScanType::Interlaced { top_first },
+				"{scan}.{container}"
+			);
+		}
+	}
+}
+
+#[tokio::test]
+async fn a_still_progressive_picture_in_an_interlaced_container_stays_progressive() {
+	let dir = tempfile::tempdir().unwrap();
+
+	for container in ["mpg", "mkv"] {
+		let clip = support::still_home_video(dir.path(), &format!("progressive.{container}"), "progressive");
+
+		assert_eq!(scan_and_noise(&clip).await.0, ScanType::Progressive, "{container}");
+	}
+}
+
+#[tokio::test]
 async fn detects_telecine_and_progressive() {
 	let dir = tempfile::tempdir().unwrap();
 	let telecined = encode(
