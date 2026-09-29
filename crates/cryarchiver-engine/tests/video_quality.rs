@@ -2,13 +2,17 @@ mod support;
 
 use std::fs;
 
-use cryarchiver_engine::options::TrimWindow;
+use std::path::Path;
+
+use cryarchiver_engine::options::{SubtitlePick, TrimWindow};
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::quality::search::DEFAULT_SLOPE;
-use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, analyze};
-use cryarchiver_engine::video::encode::{encode_video, video_command};
-use cryarchiver_engine::video::plan::{VideoCaps, plan_video, precheck};
+use cryarchiver_engine::toolchain::Toolchain;
+use cryarchiver_engine::video::analyze::{Analysis, DEFAULT_SEGMENTS, NoiseClass, ScanType, analyze};
+use cryarchiver_engine::video::burn;
+use cryarchiver_engine::video::encode::{Sample, encode_sample, encode_video, video_command};
+use cryarchiver_engine::video::plan::{VideoCaps, VideoPlan, plan_video, precheck};
 use cryarchiver_engine::video::quality::{Scorer, Searched, search, search_samples, target, verify_windows};
 use cryarchiver_engine::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
@@ -94,4 +98,78 @@ async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
 
 	assert_eq!(checked.frames, 75, "{checked:?}");
 	assert!(goal.met(checked), "{checked:?} at CRF {}", found.crf);
+}
+
+async fn burning_plan(
+	tools: &Toolchain,
+	source: &Path,
+	workspace: &Workspace,
+	cancel: &CancellationToken,
+) -> VideoPlan {
+	let info = probe(tools, source, cancel).await.unwrap();
+	let main = precheck(&info, &CAPS).unwrap();
+	let analysis = Analysis {
+		scan: ScanType::Progressive,
+		noise: NoiseClass::Clean,
+		noise_db: None,
+		detail: Vec::new(),
+	};
+	let chosen = burn::pick(&info, &SubtitlePick::Default).unwrap();
+	burn::prepare(&tools.ffmpeg, source, workspace, &info, chosen, cancel)
+		.await
+		.unwrap();
+
+	VideoPlan {
+		subtitles: burn::subtitle_filter(chosen.kind, 20),
+		..plan_video(&info, main, &[], &analysis, Speed::Moderate)
+	}
+}
+
+#[tokio::test]
+async fn a_search_sample_and_its_reference_draw_the_subtitles_on_screen_at_its_own_time() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let cues = dir.path().join("late.srt");
+	fs::write(&cues, "1\n00:00:05,000 --> 00:00:06,000\nfive\n").unwrap();
+	let black = support::black_clip(dir.path(), "black.mkv", &cues, "srt", false);
+	let colour = support::clip_with_extras(dir.path());
+	let on_screen = Sample {
+		start_s: 5.0,
+		length_s: 1.0,
+	};
+	let off_screen = Sample {
+		start_s: 2.5,
+		length_s: 1.0,
+	};
+
+	let black_work = Workspace::create(&dir.path().join("work"), &black).unwrap();
+	let black_plan = burning_plan(&tools, &black, &black_work, &cancel).await;
+	let during = black_work.file("during.mkv");
+	let before = black_work.file("before.mkv");
+	for (sample, output) in [(&on_screen, &during), (&off_screen, &before)] {
+		encode_sample(&tools.ffmpeg, &black, output, &black_plan, sample, &cancel)
+			.await
+			.unwrap();
+	}
+
+	let colour_work = Workspace::create(&dir.path().join("work"), &colour).unwrap();
+	let colour_plan = burning_plan(&tools, &colour, &colour_work, &cancel).await;
+	let scorer = Scorer {
+		tools: &tools,
+		source: &colour,
+		workspace: &colour_work,
+		plan: &colour_plan,
+		threads: 4,
+		cancel: &cancel,
+	};
+	let (score, _) = scorer.probe(20.0, &[on_screen], 0).await.unwrap();
+
+	let lit = support::lit_span(&during, 0).unwrap();
+	assert!(lit.0.abs() < 0.02 && (lit.1 - 0.96).abs() < 0.02, "{lit:?}");
+	assert_eq!(support::lit_span(&before, 0), None);
+	assert!(
+		score.p5 > 90.0,
+		"a reference without the sample's cue scores about 80: {score:?}"
+	);
 }

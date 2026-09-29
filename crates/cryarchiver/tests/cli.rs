@@ -806,6 +806,17 @@ fn strip_is_a_flag() {
 }
 
 #[test]
+fn burn_subs_takes_its_value_after_an_equals_sign() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "song.flac", 2);
+
+	let out = cryarchiver(dir.path(), &["--burn-subs", "song.flac", "--sub-size", "8"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	assert!(dir.path().join("song.cry.opus").is_file(), "song.flac stays an input");
+}
+
+#[test]
 fn merge_audio_is_a_flag() {
 	let dir = tempfile::tempdir().unwrap();
 	support::ffmpeg(&[

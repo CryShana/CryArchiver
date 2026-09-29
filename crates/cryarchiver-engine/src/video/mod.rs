@@ -1,4 +1,5 @@
 pub mod analyze;
+pub mod burn;
 pub mod chapters;
 pub mod colour;
 pub mod cues;

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::plan::worst_case_memory;
-use cryarchiver_engine::options::{JobOptions, Trim};
+use cryarchiver_engine::options::{BurnSubs, JobOptions, SubtitlePick, Trim};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{Stream, probe};
@@ -3325,4 +3325,192 @@ async fn trims_outside_the_file_and_trimmed_images_fail() {
 		matches!(&image, JobOutcome::Failed(err) if err.to_string().contains("not images")),
 		"{image:?}"
 	);
+}
+
+fn burning(job: Job, pick: SubtitlePick) -> Job {
+	with_options(
+		job,
+		JobOptions {
+			burn_subs: Some(BurnSubs { pick, size_percent: 5 }),
+			..JobOptions::default()
+		},
+	)
+}
+
+async fn subtitle_count(output: &Path) -> usize {
+	probe(&support::toolchain().await, output, &CancellationToken::new())
+		.await
+		.unwrap()
+		.streams
+		.iter()
+		.filter(|stream| stream.codec_type == "subtitle")
+		.count()
+}
+
+#[tokio::test]
+async fn burned_text_subtitles_leave_no_subtitle_track() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::clip_with_extras(dir.path());
+
+	let outcome = run(&burning(fast(&clip), SubtitlePick::Default), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(subtitle_count(&output).await, 0);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn burned_bitmap_subtitles_are_overlaid() {
+	let dir = tempfile::tempdir().unwrap();
+	let pgs = support::pgs_box(dir.path(), 4_980, 5_980);
+	let bitmap = support::black_clip(dir.path(), "bitmap.mkv", &pgs, "copy", false);
+
+	let outcome = run(&burning(fast(&bitmap), SubtitlePick::Track(1)), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(subtitle_count(&output).await, 0);
+	let lit = support::lit_span(&output, 0).unwrap();
+	assert!(near(lit, (5.0, 5.96)), "{lit:?}");
+}
+
+#[tokio::test]
+async fn subtitles_are_burned_into_the_main_video_only() {
+	let dir = tempfile::tempdir().unwrap();
+	let cues = dir.path().join("late.srt");
+	fs::write(&cues, "1\n00:00:05,000 --> 00:00:06,000\nfive\n").unwrap();
+	let text = support::black_clip(dir.path(), "text-angles.mkv", &cues, "srt", true);
+	let pgs = support::pgs_box(dir.path(), 4_980, 5_980);
+	let bitmap = support::black_clip(dir.path(), "bitmap-angles.mkv", &pgs, "copy", true);
+
+	let from_text = run(&burning(fast(&text), SubtitlePick::Default), dir.path()).await;
+	let from_bitmap = run(&burning(fast(&bitmap), SubtitlePick::Default), dir.path()).await;
+
+	for outcome in [from_text, from_bitmap] {
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		let info = probe(&support::toolchain().await, &output, &CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(
+			info.streams
+				.iter()
+				.filter(|stream| stream.codec_type == "video")
+				.count(),
+			2
+		);
+		let main = support::lit_span(&output, 0).unwrap();
+		assert!(near(main, (5.0, 5.96)), "{}: {main:?}", output.display());
+		assert_eq!(support::lit_span(&output, 1), None, "{}", output.display());
+	}
+}
+
+#[tokio::test]
+async fn a_burn_without_its_filter_fails_before_any_encoding() {
+	let dir = tempfile::tempdir().unwrap();
+	let text = support::clip_with_extras(dir.path());
+	let pgs = support::pgs_box(dir.path(), 4_980, 5_980);
+	let bitmap = support::black_clip(dir.path(), "bitmap.mkv", &pgs, "copy", false);
+	let mut without_libass = support::toolchain().await;
+	without_libass.filters.remove("subtitles");
+	let mut without_overlay = support::toolchain().await;
+	without_overlay.filters.remove("overlay");
+
+	let cases = [
+		(without_libass, &text, "subtitles"),
+		(without_overlay, &bitmap, "overlay"),
+	];
+	for (tools, source, filter) in cases {
+		let engine = Engine::new(tools);
+		let (outcome, events) = run_recording(&engine, &burning(fast(source), SubtitlePick::Default), dir.path()).await;
+
+		let JobOutcome::Failed(err) = &outcome else {
+			panic!("{outcome:?}")
+		};
+		assert!(matches!(err.kind, ErrorKind::Toolchain(_)), "{err:?}");
+		assert!(err.to_string().contains(&format!("{filter} filter")), "{err}");
+		assert_eq!(stages(&events, Stage::Analyze), 0, "{events:?}");
+	}
+}
+
+#[tokio::test]
+async fn a_missing_subtitle_language_fails_before_encoding() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::clip_with_extras(dir.path());
+
+	let outcome = run(&burning(fast(&clip), SubtitlePick::Language("jpn".into())), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.to_string().contains("jpn")),
+		"{outcome:?}"
+	);
+}
+
+#[tokio::test]
+async fn a_trimmed_and_stripped_burn_draws_each_cue_at_its_time_in_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let cues = dir.path().join("late.srt");
+	fs::write(&cues, "1\n00:00:05,000 --> 00:00:06,000\nfive\n").unwrap();
+	let text = support::black_clip(dir.path(), "text.mkv", &cues, "srt", false);
+	let pgs = support::pgs_box(dir.path(), 4_980, 5_980);
+	let bitmap = support::black_clip(dir.path(), "bitmap.mkv", &pgs, "copy", false);
+	let options = JobOptions {
+		trim: Some(Trim {
+			start_s: 4.0,
+			end_s: Some(8.0),
+		}),
+		strip: true,
+		burn_subs: Some(BurnSubs {
+			pick: SubtitlePick::Default,
+			size_percent: 5,
+		}),
+		..JobOptions::default()
+	};
+
+	let from_text = run(&with_options(fast(&text), options.clone()), dir.path()).await;
+	let from_bitmap = run(&with_options(fast(&bitmap), options), dir.path()).await;
+
+	for outcome in [from_text, from_bitmap] {
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		assert_eq!(subtitle_count(&output).await, 0);
+		let lit = support::lit_span(&output, 0).unwrap();
+		assert!(near(lit, (1.0, 1.96)), "{}: {lit:?}", output.display());
+	}
+}
+
+#[tokio::test]
+async fn burned_subtitles_are_searched_and_checked_against_the_same_burn() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::clip_with_extras(dir.path());
+	let engine = Engine::new(support::toolchain().await);
+	let options = JobOptions {
+		trim: Some(Trim {
+			start_s: 2.0,
+			end_s: Some(6.0),
+		}),
+		burn_subs: Some(BurnSubs {
+			pick: SubtitlePick::Track(1),
+			size_percent: 20,
+		}),
+		..JobOptions::default()
+	};
+
+	let (outcome, events) = run_recording(&engine, &with_options(job(&clip), options), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		!warnings.iter().any(|warning| warning.contains("quality target")),
+		"{warnings:?}"
+	);
+	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 2, "{events:?}");
+	assert_eq!(subtitle_count(output).await, 0);
 }

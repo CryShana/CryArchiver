@@ -69,6 +69,7 @@ pub struct StreamRules {
 	pub strip: bool,
 	pub trim: bool,
 	pub merge: bool,
+	pub burn: Option<u32>,
 }
 
 impl StreamRules {
@@ -81,6 +82,7 @@ impl StreamRules {
 			strip: false,
 			trim: false,
 			merge: false,
+			burn: None,
 		}
 	}
 }
@@ -176,6 +178,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 				audio_tracks += 1;
 				plan_audio_stream(stream, audio_tracks, rules, target, will_merge, &mut plan)?;
 			}
+			"subtitle" if rules.burn == Some(stream.index) => {}
 			"subtitle" => match subtitle_track(stream, target)? {
 				Some(track) if rules.trim => {
 					let track = trimmed_subtitle(track, stream, target, &mut plan.warnings);
@@ -869,5 +872,29 @@ mod tests {
 		assert!(plan_streams(&pcm, &into(MATROSKA_VIDEO)).is_ok());
 		assert!(plan_streams(&opus, &into(WEBM_VIDEO)).is_ok());
 		assert!(plan_streams(&opus, &into(MP4_VIDEO)).is_ok());
+	}
+
+	#[test]
+	fn the_burned_track_is_left_out_without_a_warning() {
+		let subtitles = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},
+			{"index":1,"codec_type":"subtitle","codec_name":"subrip"},
+			{"index":2,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle"}]}"#,
+		);
+		let burned = StreamRules {
+			burn: Some(2),
+			..into(WEBM_VIDEO)
+		};
+
+		let plan = plan_streams(&subtitles, &burned).unwrap();
+
+		assert_eq!(
+			plan.subtitles
+				.iter()
+				.map(|track| track.stream_index)
+				.collect::<Vec<_>>(),
+			[1]
+		);
+		assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
 	}
 }

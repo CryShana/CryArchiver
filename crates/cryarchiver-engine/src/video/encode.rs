@@ -9,10 +9,10 @@ use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
 use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
-use crate::video::analyze;
 use crate::video::plan::{Encoder, VideoPlan, svt_params};
 use crate::video::run_ffmpeg;
 use crate::video::streams::{Extracted, StreamPlan};
+use crate::video::{analyze, burn};
 use crate::workspace::Workspace;
 
 pub const DECODE_ERRORS: &[&str] = &[
@@ -63,6 +63,9 @@ fn encode_command(
 	sample: Option<&Sample>,
 ) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
+	if let Some(dir) = output.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+		cmd.in_dir(dir);
+	}
 	cmd.count_lines_containing(DECODE_ERRORS);
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "repeat+info"]);
 
@@ -83,11 +86,27 @@ fn encode_command(
 	} else {
 		plan.streams.as_slice()
 	};
-	for index in streams {
+	let main = burn::main_chain(
+		plan.subtitles.as_deref(),
+		&plan.filters,
+		seek.map(|(start_s, _)| start_s),
+	);
+	let graphed = if let Some(subtitle) = plan.overlay {
+		cmd.arg("-filter_complex").arg(format!(
+			"[0:{subtitle}][0:{}]scale2ref[subs][base];[base][subs]overlay=eof_action=pass,{main}[burned]",
+			streams[0]
+		));
+		cmd.args(["-map", "[burned]"]);
+		1
+	} else {
+		0
+	};
+	for index in &streams[graphed..] {
 		cmd.arg("-map").arg(format!("0:{index}"));
 	}
-	for ordinal in 0..streams.len() {
-		cmd.arg(format!("-filter:v:{ordinal}")).arg(&plan.filters);
+	for ordinal in graphed..streams.len() {
+		let chain = if ordinal == 0 { &main } else { &plan.filters };
+		cmd.arg(format!("-filter:v:{ordinal}")).arg(chain);
 	}
 
 	encoder_args(&mut cmd, &plan.encoder);
@@ -440,6 +459,75 @@ mod tests {
 		assert!(!args.contains("variance-boost"), "{args}");
 		assert!(args.contains("-fps_mode passthrough -f matroska"), "{args}");
 		assert_eq!(cmd.counted, DECODE_ERRORS);
+	}
+
+	#[test]
+	fn bitmap_subtitles_are_overlaid_in_a_complex_graph() {
+		let burned = VideoPlan {
+			overlay: Some(3),
+			..plan(svt(), None)
+		};
+
+		let args = joined(&video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/video.a1.mkv"),
+			&burned,
+		));
+
+		assert!(
+			args.contains(
+				"-filter_complex [0:3][0:0]scale2ref[subs][base];[base][subs]overlay=eof_action=pass,\
+				 format=yuv420p10le,setparams=field_mode=prog[burned] -map [burned] -map 0:2 -filter:v:1 "
+			),
+			"{args}"
+		);
+	}
+
+	#[test]
+	fn burned_text_goes_on_the_main_stream_only_and_follows_each_seek() {
+		let burned = VideoPlan {
+			subtitles: Some("subtitles=subs.ass".into()),
+			window: Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 20.0,
+			}),
+			..plan(svt(), None)
+		};
+		let sample = Sample {
+			start_s: 12.5,
+			length_s: 3.0,
+		};
+
+		let full = video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/video.a1.mkv"),
+			&burned,
+		);
+		let sampled = joined(&sample_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/sample-0.mkv"),
+			&burned,
+			&sample,
+		));
+
+		let args = joined(&full);
+		assert_eq!(full.current_dir.as_deref(), Some(Path::new("work")));
+		assert!(
+			args.contains(
+				"-filter:v:0 setpts=PTS+4.000/TB,subtitles=subs.ass,setpts=PTS-STARTPTS,format=yuv420p10le,\
+				 setparams=field_mode=prog -filter:v:1 format=yuv420p10le,setparams=field_mode=prog -c:v "
+			),
+			"{args}"
+		);
+		assert!(
+			sampled.contains(
+				"-filter:v:0 setpts=PTS+12.500/TB,subtitles=subs.ass,setpts=PTS-STARTPTS,format=yuv420p10le,"
+			),
+			"{sampled}"
+		);
 	}
 
 	#[test]

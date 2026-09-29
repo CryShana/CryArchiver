@@ -2,9 +2,11 @@ mod support;
 
 use std::fs;
 
+use cryarchiver_engine::options::SubtitlePick;
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, analyze};
+use cryarchiver_engine::video::burn::{self, FONT_DIR, SUBTITLE_FILE};
 use cryarchiver_engine::video::colour::{ColourTags, Range};
 use cryarchiver_engine::video::encode::{check_video_temp, encode_video, extract, video_command};
 use cryarchiver_engine::video::plan::{Encoder, VideoCaps, VideoPlan, grain_level, plan_video, precheck};
@@ -37,6 +39,8 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 		hdr10: false,
 		warnings: Vec::new(),
 		window: None,
+		overlay: None,
+		subtitles: None,
 	}
 }
 
@@ -206,4 +210,54 @@ async fn extracts_covers_and_data_streams_byte_exact() {
 
 	let written = fs::read(workspace.file("stream-1.bin")).unwrap();
 	assert_eq!(&written[..8], b"\x89PNG\r\n\x1a\n");
+}
+
+#[tokio::test]
+async fn a_text_burn_makes_no_fonts_folder_and_an_ass_burn_takes_the_attached_fonts() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let text = support::clip_with_extras(dir.path());
+	let ass = dir.path().join("styled.mkv");
+	support::ffmpeg(&[
+		"-i",
+		text.to_str().unwrap(),
+		"-map",
+		"0",
+		"-c",
+		"copy",
+		"-c:s",
+		"ass",
+		ass.to_str().unwrap(),
+	]);
+
+	let mut workspaces = Vec::new();
+	for source in [&text, &ass] {
+		let info = probe(&tools, source, &cancel).await.unwrap();
+		let chosen = burn::pick(&info, &SubtitlePick::Default).unwrap();
+		let workspace = Workspace::create(&dir.path().join(".cry-work"), source).unwrap();
+		burn::prepare(&tools.ffmpeg, source, &workspace, &info, chosen, &cancel)
+			.await
+			.unwrap();
+		workspaces.push(workspace);
+	}
+
+	let [from_text, from_ass] = workspaces.as_slice() else {
+		unreachable!()
+	};
+	assert!(
+		fs::read_to_string(from_text.file(SUBTITLE_FILE))
+			.unwrap()
+			.contains("five")
+	);
+	assert!(!from_text.file(FONT_DIR).exists());
+	assert!(
+		fs::read_to_string(from_ass.file(SUBTITLE_FILE))
+			.unwrap()
+			.contains("five")
+	);
+	assert_eq!(
+		fs::read(from_ass.file(FONT_DIR).join("attachment-0.ttf")).unwrap(),
+		b"not a real font"
+	);
 }

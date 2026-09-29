@@ -17,7 +17,7 @@ use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput,
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{JobOptions, TrimWindow, kept_as_requested, kept_as_requested_part};
+use crate::options::{BurnSubs, JobOptions, TrimWindow, kept_as_requested, kept_as_requested_part};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -35,7 +35,7 @@ use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_
 use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, earliest_video_start, probe_temp, start_offsets, verify_output,
 };
-use crate::video::{analyze, chapters, cues, encode as video_encode};
+use crate::video::{analyze, burn, chapters, cues, encode as video_encode};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
@@ -344,7 +344,8 @@ impl Engine {
 				check_damage(&job.source)?;
 
 				on_event(JobEvent::Stage(Stage::Plan));
-				let rules = stream_rules(job);
+				let rules = stream_rules(job, &info)?;
+				self.check_burn_filters(job, &info)?;
 				let planned = self
 					.video_main(&info, job.options.forced(mergeable(&info)))
 					.map_err(Refusal::from)
@@ -595,7 +596,7 @@ impl Engine {
 		let (info, probe_json) = probe::probe_video(&self.tools, source, cx.source_bytes, cx.cancel)
 			.await
 			.map_err(video_probe_error)?;
-		let rules = stream_rules(cx.job);
+		let rules = stream_rules(cx.job, &info)?;
 		let planned = self
 			.video_main(&info, cx.job.options.forced(mergeable(&info)))
 			.map_err(Refusal::from)
@@ -654,6 +655,10 @@ impl Engine {
 		if cx.job.options.strip {
 			video.streams.truncate(1);
 		}
+		if let Some(burn_subs) = &cx.job.options.burn_subs {
+			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, burn_subs)).await?;
+		}
+
 		let mut quality = self.video_quality(cx.job, main, &analysis, &video);
 		if cx.job.speed != Speed::Fast && !self.tools.has_vmaf() {
 			video
@@ -718,6 +723,47 @@ impl Engine {
 			}),
 			Produced::Kept(reason) => self.kept_video(&quality, reason),
 		})
+	}
+
+	async fn prepare_burn(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		info: &MediaInfo,
+		video: &mut VideoPlan,
+		burn_subs: &BurnSubs,
+	) -> Result<(), JobError> {
+		if video.alpha {
+			return Err(ErrorKind::EncodeFailed("--burn-subs can't be used on transparent video".into()).into());
+		}
+
+		let chosen = burn::pick(info, &burn_subs.pick).map_err(ErrorKind::EncodeFailed)?;
+		burn::prepare(&self.tools.ffmpeg, &cx.job.source, workspace, info, chosen, cx.cancel).await?;
+
+		match burn::subtitle_filter(chosen.kind, burn_subs.size_percent) {
+			Some(filter) => video.subtitles = Some(filter),
+			None => video.overlay = Some(chosen.stream),
+		}
+		Ok(())
+	}
+
+	fn check_burn_filters(&self, job: &Job, info: &MediaInfo) -> Result<(), JobError> {
+		let Some(burn_subs) = &job.options.burn_subs else {
+			return Ok(());
+		};
+
+		let chosen = burn::pick(info, &burn_subs.pick).map_err(ErrorKind::EncodeFailed)?;
+		let missing = burn::missing_filters(chosen.kind, &self.tools.filters);
+		if missing.is_empty() {
+			return Ok(());
+		}
+
+		let plural = if missing.len() == 1 { "" } else { "s" };
+		Err(ErrorKind::Toolchain(format!(
+			"--burn-subs needs ffmpeg's {} filter{plural}, which this ffmpeg doesn't have",
+			missing.join(" and ")
+		))
+		.into())
 	}
 
 	fn kept_video(&self, quality: &VideoQuality, reason: KeepReason) -> Produced {
@@ -1289,15 +1335,25 @@ fn video_container(job: &Job) -> Container {
 		.unwrap_or(MATROSKA_VIDEO)
 }
 
-fn stream_rules(job: &Job) -> StreamRules {
-	StreamRules {
+fn stream_rules(job: &Job, info: &MediaInfo) -> Result<StreamRules, JobError> {
+	let burn = match &job.options.burn_subs {
+		Some(burn_subs) => Some(
+			burn::pick(info, &burn_subs.pick)
+				.map_err(ErrorKind::EncodeFailed)?
+				.stream,
+		),
+		None => None,
+	};
+
+	Ok(StreamRules {
 		container: video_container(job),
 		overrides: job.overrides,
 		strip: job.options.strip,
 		trim: job.options.trim.is_some(),
 		merge: job.options.merge_audio,
+		burn,
 		..StreamRules::new(job.speed, job.keep_metadata)
-	}
+	})
 }
 
 fn with_clipped_chapters(plan: &FilePlan, info: &MediaInfo, workspace: &Workspace) -> Result<FilePlan, JobError> {

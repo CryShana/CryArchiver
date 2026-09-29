@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, Progress, STALL_TIMEOUT, ToolCommand};
+use crate::video::burn;
 use crate::video::plan::Resolution;
 use crate::video::run_ffmpeg;
 
@@ -42,6 +43,8 @@ pub struct Reference<'a> {
 	pub decoder: Option<&'static str>,
 	pub filters: &'a str,
 	pub window: Option<TrimWindow>,
+	pub overlay: Option<u32>,
+	pub subtitles: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,10 +116,11 @@ pub fn sample_command(
 	push_reference(&mut cmd, reference);
 
 	let distorted_chain = chain(&[SCORED_FORMAT, BY_POSITION]);
-	let reference_chain = chain(&[reference.filters, SCORED_FORMAT, BY_POSITION]);
+	let main = burn::main_chain(reference.subtitles, reference.filters, Some(start_s));
+	let reference_chain = chain(&[&main, SCORED_FORMAT, BY_POSITION]);
 	cmd.arg("-filter_complex").arg(format!(
-		"[0:v:0]{distorted_chain}[d];[1:{}]{reference_chain}[r];[d][r]{}",
-		reference.stream,
+		"[0:v:0]{distorted_chain}[d];{};[d][r]{}",
+		reference_branch(reference, &reference_chain),
 		libvmaf(scoring)
 	));
 	cmd.args(["-f", "null", "-"]);
@@ -138,10 +142,15 @@ pub fn window_command(
 
 	let select = select(windows);
 	let distorted_chain = chain(&[&select, SCORED_FORMAT, BY_POSITION]);
-	let reference_chain = chain(&[reference.filters, &select, SCORED_FORMAT, BY_POSITION]);
+	let main = burn::main_chain(
+		reference.subtitles,
+		reference.filters,
+		reference.window.map(|window| window.start_s),
+	);
+	let reference_chain = chain(&[&main, &select, SCORED_FORMAT, BY_POSITION]);
 	cmd.arg("-filter_complex").arg(format!(
-		"[0:v:0]split[pace][all];[all]{distorted_chain}[d];[1:{}]{reference_chain}[r];[d][r]{}[scored]",
-		reference.stream,
+		"[0:v:0]split[pace][all];[all]{distorted_chain}[d];{};[d][r]{}[scored]",
+		reference_branch(reference, &reference_chain),
 		libvmaf(scoring)
 	));
 
@@ -186,6 +195,16 @@ fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>) {
 		cmd.arg("-c:v").arg(decoder);
 	}
 	cmd.arg("-i").arg(process::tool_path(reference.source));
+}
+
+fn reference_branch(reference: &Reference<'_>, chain: &str) -> String {
+	match reference.overlay {
+		Some(subtitle) => format!(
+			"[1:{subtitle}][1:{}]scale2ref[rs][rb];[rb][rs]overlay=eof_action=pass,{chain}[r]",
+			reference.stream
+		),
+		None => format!("[1:{}]{chain}[r]", reference.stream),
+	}
 }
 
 fn chain(parts: &[&str]) -> String {
@@ -268,6 +287,8 @@ mod tests {
 			decoder: Some("libvpx-vp9"),
 			filters: "bwdif=mode=send_field:parity=tff:deint=all,setparams=field_mode=prog",
 			window: None,
+			overlay: None,
+			subtitles: None,
 		};
 
 		let cmd = sample_command(
@@ -302,6 +323,8 @@ mod tests {
 			decoder: None,
 			filters: "scale=in_range=tv:out_range=tv,format=yuv420p10le",
 			window: None,
+			overlay: None,
+			subtitles: None,
 		};
 		let windows = [
 			FrameWindow { first: 10, last: 19 },
@@ -345,6 +368,8 @@ mod tests {
 				start_s: 4.0,
 				length_s: 4.0,
 			}),
+			overlay: None,
+			subtitles: None,
 		};
 
 		let args = joined(&window_command(
@@ -356,5 +381,82 @@ mod tests {
 		));
 
 		assert!(args.contains(" -ss 4.000 -t 4.000 -i "), "{args}");
+	}
+
+	#[test]
+	fn an_overlaid_reference_draws_the_same_subtitles() {
+		let reference = Reference {
+			source: Path::new("in.mkv"),
+			stream: 0,
+			decoder: None,
+			filters: "format=yuv420p10le",
+			window: None,
+			overlay: Some(3),
+			subtitles: None,
+		};
+
+		let args = joined(&sample_command(
+			Path::new("ffmpeg"),
+			Path::new("probe0-0.mkv"),
+			&reference,
+			2.0,
+			4.0,
+			&scoring(),
+		));
+
+		assert!(
+			args.contains("[1:3][1:0]scale2ref[rs][rb];[rb][rs]overlay=eof_action=pass,format=yuv420p10le,"),
+			"{args}"
+		);
+	}
+
+	#[test]
+	fn burned_text_in_the_reference_follows_its_seek() {
+		let burned = |window: Option<TrimWindow>| Reference {
+			source: Path::new("in.mkv"),
+			stream: 0,
+			decoder: None,
+			filters: "format=yuv420p10le",
+			window,
+			overlay: None,
+			subtitles: Some("subtitles=subs.ass"),
+		};
+		let trim = TrimWindow {
+			start_s: 4.0,
+			length_s: 20.0,
+		};
+
+		let sampled = joined(&sample_command(
+			Path::new("ffmpeg"),
+			Path::new("probe0-0.mkv"),
+			&burned(Some(trim)),
+			12.5,
+			4.0,
+			&scoring(),
+		));
+		let checked = joined(&window_command(
+			Path::new("ffmpeg"),
+			Path::new("video.a1.mkv"),
+			&burned(Some(trim)),
+			&[FrameWindow { first: 0, last: 99 }],
+			&scoring(),
+		));
+		let untrimmed = joined(&window_command(
+			Path::new("ffmpeg"),
+			Path::new("video.a1.mkv"),
+			&burned(None),
+			&[FrameWindow { first: 0, last: 99 }],
+			&scoring(),
+		));
+
+		let shifted = |start: &str| {
+			format!("[1:0]setpts=PTS+{start}/TB,subtitles=subs.ass,setpts=PTS-STARTPTS,format=yuv420p10le,")
+		};
+		assert!(sampled.contains(&shifted("12.500")), "{sampled}");
+		assert!(checked.contains(&shifted("4.000")), "{checked}");
+		assert!(
+			untrimmed.contains("[1:0]subtitles=subs.ass,format=yuv420p10le,select="),
+			"{untrimmed}"
+		);
 	}
 }

@@ -18,19 +18,51 @@ pub struct TrimWindow {
 	pub length_s: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubtitlePick {
+	Default,
+	Track(u32),
+	Language(String),
+}
+
+impl SubtitlePick {
+	pub fn parse(text: &str) -> Self {
+		let text = text.trim();
+		if text.is_empty() {
+			return Self::Default;
+		}
+
+		match text.parse() {
+			Ok(number) if text.bytes().all(|byte| byte.is_ascii_digit()) => Self::Track(number),
+			_ => Self::Language(text.to_ascii_lowercase()),
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BurnSubs {
+	pub pick: SubtitlePick,
+	pub size_percent: u8,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobOptions {
 	pub trim: Option<Trim>,
 	pub format: Option<OutputFormat>,
 	pub strip: bool,
 	pub merge_audio: bool,
+	pub burn_subs: Option<BurnSubs>,
 }
 
 impl JobOptions {
 	/// `merge_possible` is whether the file actually has enough audio tracks for `--merge-audio` to merge anything;
 	/// a single-track file is not forced by the flag alone.
 	pub fn forced(&self, merge_possible: bool) -> bool {
-		self.trim.is_some() || self.format.is_some() || self.strip || (self.merge_audio && merge_possible)
+		self.trim.is_some()
+			|| self.format.is_some()
+			|| self.strip
+			|| (self.merge_audio && merge_possible)
+			|| self.burn_subs.is_some()
 	}
 }
 
@@ -329,5 +361,12 @@ mod tests {
 		assert!(!merge.forced(false));
 		assert!(merge.forced(true));
 		assert!(!JobOptions::default().forced(true));
+	}
+
+	#[test]
+	fn subtitle_picks_are_a_number_or_a_language() {
+		assert_eq!(SubtitlePick::parse(""), SubtitlePick::Default);
+		assert_eq!(SubtitlePick::parse("2"), SubtitlePick::Track(2));
+		assert_eq!(SubtitlePick::parse("ENG"), SubtitlePick::Language("eng".into()));
 	}
 }

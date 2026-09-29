@@ -262,3 +262,143 @@ pub fn clip_with_extras(dir: &Path) -> PathBuf {
 	]);
 	clip
 }
+
+/// A 10 s black 320×240 clip with a tone and `subtitles` muxed with `codec`, and optionally a second black video
+/// stream after the main one.
+pub fn black_clip(dir: &Path, name: &str, subtitles: &Path, codec: &str, second_angle: bool) -> PathBuf {
+	let clip = dir.join(name);
+	let mut args = vec![
+		"-f",
+		"lavfi",
+		"-i",
+		"color=black:s=320x240:r=25:d=10",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=10",
+		"-i",
+		subtitles.to_str().unwrap(),
+		"-map",
+		"0",
+	];
+	if second_angle {
+		args.extend(["-map", "0"]);
+	}
+	args.extend([
+		"-map",
+		"1",
+		"-map",
+		"2",
+		"-c:v",
+		"mpeg4",
+		"-c:a",
+		"aac",
+		"-c:s",
+		codec,
+		clip.to_str().unwrap(),
+	]);
+	ffmpeg(&args);
+	clip
+}
+
+/// The first and last frame times at which anything bright is drawn on a black picture, in video stream `stream`.
+pub fn lit_span(path: &Path, stream: usize) -> Option<(f64, f64)> {
+	let out = Command::new("ffmpeg")
+		.args(["-v", "error", "-i"])
+		.arg(path)
+		.arg("-map")
+		.arg(format!("0:v:{stream}"))
+		.args([
+			"-vf",
+			"format=gray,signalstats,metadata=mode=print:key=lavfi.signalstats.YMAX:file=-",
+			"-f",
+			"null",
+			"-",
+		])
+		.output()
+		.unwrap();
+
+	let mut time = 0.0;
+	let mut lit = Vec::new();
+	for line in String::from_utf8_lossy(&out.stdout).lines() {
+		if let Some(pts) = line
+			.split_whitespace()
+			.find_map(|field| field.strip_prefix("pts_time:"))
+		{
+			time = pts.parse().unwrap();
+		} else if let Some(ymax) = line.strip_prefix("lavfi.signalstats.YMAX=")
+			&& ymax.parse::<f64>().unwrap() > 128.0
+		{
+			lit.push(time);
+		}
+	}
+	Some((*lit.first()?, *lit.last()?))
+}
+
+/// A PGS (bitmap) subtitle file for a 320×240 picture: a white 120×30 box shown from `from_ms` until `to_ms`.
+/// ffmpeg can't turn text subtitles into bitmaps, so the segments are written by hand. A box that starts exactly
+/// on a frame's time is drawn one frame late (ffmpeg's sub2video), so tests start it just before one.
+pub fn pgs_box(dir: &Path, from_ms: u32, to_ms: u32) -> PathBuf {
+	let (x, y, width, height) = (100_u16, 180_u16, 120_u16, 30_u16);
+	let segment = |pts_ms: u32, kind: u8, data: &[u8]| {
+		let mut bytes = b"PG".to_vec();
+		bytes.extend((pts_ms * 90).to_be_bytes());
+		bytes.extend(0_u32.to_be_bytes());
+		bytes.push(kind);
+		bytes.extend(u16::try_from(data.len()).unwrap().to_be_bytes());
+		bytes.extend(data);
+		bytes
+	};
+	let composition = |number: u16, objects: &[u8]| {
+		let mut pcs = [320_u16.to_be_bytes(), 240_u16.to_be_bytes()].concat();
+		pcs.push(0x10);
+		pcs.extend(number.to_be_bytes());
+		pcs.extend([if objects.is_empty() { 0x00 } else { 0x80 }, 0, 0]);
+		pcs.push(u8::from(!objects.is_empty()));
+		pcs.extend(objects);
+		pcs
+	};
+	let window = [
+		&[1, 0][..],
+		&x.to_be_bytes(),
+		&y.to_be_bytes(),
+		&width.to_be_bytes(),
+		&height.to_be_bytes(),
+	]
+	.concat();
+
+	let object = [&[0, 0, 0, 0][..], &x.to_be_bytes(), &y.to_be_bytes()].concat();
+	let palette = [0, 0, 1, 235, 128, 128, 255];
+	let [high, low] = width.to_be_bytes();
+	let rle = [0x00, 0xC0 | high, low, 0x01, 0x00, 0x00].repeat(usize::from(height));
+	let length = u32::try_from(rle.len() + 4).unwrap().to_be_bytes();
+	let bitmap = [
+		&[0, 0, 0, 0xC0][..],
+		&length[1..],
+		&width.to_be_bytes(),
+		&height.to_be_bytes(),
+		&rle,
+	]
+	.concat();
+
+	let clear = |pts_ms: u32, number: u16| {
+		[
+			segment(pts_ms, 0x16, &composition(number, &[])),
+			segment(pts_ms, 0x17, &window),
+			segment(pts_ms, 0x80, &[]),
+		]
+		.concat()
+	};
+	let shown = [
+		segment(from_ms, 0x16, &composition(1, &object)),
+		segment(from_ms, 0x17, &window),
+		segment(from_ms, 0x14, &palette),
+		segment(from_ms, 0x15, &bitmap),
+		segment(from_ms, 0x80, &[]),
+	]
+	.concat();
+
+	let path = dir.join("box.sup");
+	std::fs::write(&path, [clear(0, 0), shown, clear(to_ms, 2)].concat()).unwrap();
+	path
+}

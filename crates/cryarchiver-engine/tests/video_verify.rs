@@ -36,6 +36,8 @@ fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan 
 		hdr10: false,
 		warnings: Vec::new(),
 		window: None,
+		overlay: None,
+		subtitles: None,
 	}
 }
 

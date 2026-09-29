@@ -18,6 +18,8 @@ fn reference(source: &Path) -> Reference<'_> {
 		decoder: None,
 		filters: TEN_BIT,
 		window: None,
+		overlay: None,
+		subtitles: None,
 	}
 }
 

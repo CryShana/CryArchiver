@@ -141,6 +141,10 @@ pub struct VideoPlan {
 	pub hdr10: bool,
 	pub warnings: Vec<String>,
 	pub window: Option<TrimWindow>,
+	/// A bitmap subtitle stream drawn over the main video.
+	pub overlay: Option<u32>,
+	/// The text/ASS subtitle filter for the main video, before it is shifted to a command's seek.
+	pub subtitles: Option<String>,
 }
 
 /// Decoder, filters and SVT-AV1 together: about 5 GB for 4K (project layer spec §8.2).
@@ -260,6 +264,8 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 		alpha,
 		warnings,
 		window: None,
+		overlay: None,
+		subtitles: None,
 	}
 }
 
@@ -419,6 +425,8 @@ pub(crate) fn test_plan() -> VideoPlan {
 		hdr10: false,
 		warnings: Vec::new(),
 		window: None,
+		overlay: None,
+		subtitles: None,
 	}
 }
 

@@ -308,6 +308,8 @@ impl Scorer<'_> {
 			decoder: self.plan.decoder,
 			filters: &self.plan.filters,
 			window: self.plan.window,
+			overlay: self.plan.overlay,
+			subtitles: self.plan.subtitles.as_deref(),
 		}
 	}
 

@@ -17,7 +17,7 @@ use cryarchiver_engine::commit::{OutputSink, check_space};
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::naming::cli_output_path;
-use cryarchiver_engine::options::{JobOptions, Trim, parse_time};
+use cryarchiver_engine::options::{BurnSubs, JobOptions, SubtitlePick, Trim, parse_time};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::sink::CliSink;
@@ -141,6 +141,23 @@ struct CompressArgs {
 	strip: bool,
 	#[arg(long, help = "Mix all audio tracks into one")]
 	merge_audio: bool,
+	#[arg(
+		long,
+		value_name = "TRACK|LANG",
+		num_args = 0..=1,
+		require_equals = true,
+		default_missing_value = "",
+		help = "Burn subtitles into the picture: the default track, or --burn-subs=2 / --burn-subs=eng"
+	)]
+	burn_subs: Option<String>,
+	#[arg(
+		long,
+		value_name = "PERCENT",
+		default_value_t = 5,
+		value_parser = clap::value_parser!(u8).range(1..=50),
+		help = "Height of burned text subtitles, in percent of the video height"
+	)]
+	sub_size: u8,
 	#[arg(long = "ss", value_name = "TIME", value_parser = parse_time, help = "Start at this time: 90, 1:30 or 00:01:30.500")]
 	start: Option<f64>,
 	#[arg(long = "to", value_name = "TIME", value_parser = parse_time, help = "End at this time")]
@@ -663,6 +680,10 @@ async fn compress(args: CompressArgs) -> u8 {
 				format: target.format,
 				strip: args.strip,
 				merge_audio: args.merge_audio,
+				burn_subs: args.burn_subs.as_deref().map(|pick| BurnSubs {
+					pick: SubtitlePick::parse(pick),
+					size_percent: args.sub_size,
+				}),
 			},
 		})
 		.collect();
