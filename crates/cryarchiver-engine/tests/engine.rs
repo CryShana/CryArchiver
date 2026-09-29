@@ -2212,6 +2212,40 @@ async fn mp4_output_has_mov_text_chapters_and_its_index_in_front() {
 }
 
 #[tokio::test]
+async fn keep_metadata_leaves_the_source_metadata_out_of_webm_and_mp4() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+	let tools = support::toolchain().await;
+
+	for format in [OutputFormat::Webm, OutputFormat::Mp4] {
+		let keeping = Job {
+			keep_metadata: true,
+			..requested(&clip, format)
+		};
+
+		let outcome = run(&keeping, dir.path()).await;
+
+		let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+			panic!("{format}: {outcome:?}")
+		};
+		assert!(
+			warnings
+				.iter()
+				.any(|warning| warning.contains("the source metadata attachment was left out")),
+			"{format}: {warnings:?}"
+		);
+		let info = probe(&tools, &output, &CancellationToken::new()).await.unwrap();
+		assert!(
+			info.streams
+				.iter()
+				.all(|stream| stream.codec_type != "attachment" && !stream.is_attached_pic()),
+			"{format}: {:?}",
+			info.streams
+		);
+	}
+}
+
+#[tokio::test]
 async fn transparent_video_can_not_be_written_as_mp4() {
 	let dir = tempfile::tempdir().unwrap();
 	let alpha = dir.path().join("alpha.webm");

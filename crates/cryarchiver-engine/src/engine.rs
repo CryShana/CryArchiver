@@ -151,6 +151,7 @@ struct VideoJob<'a> {
 	main: &'a Stream,
 	video: &'a VideoPlan,
 	streams: &'a StreamPlan,
+	container: Container,
 }
 
 struct Temp {
@@ -639,6 +640,7 @@ impl Engine {
 			main,
 			video: &video,
 			streams: &streams,
+			container: rules.container,
 		};
 		Ok(match Box::pin(self.mux_and_verify(cx, workspace, &job, temps)).await? {
 			Produced::Output(staged) => Produced::Output(Staged {
@@ -971,7 +973,7 @@ impl Engine {
 		warnings.extend(temps.warnings);
 
 		(cx.on_event)(JobEvent::Stage(Stage::Mux));
-		let container = video_container(cx.job);
+		let container = job.container;
 		let keeps_files = container == MATROSKA_VIDEO;
 		if cx.job.keep_metadata && !keeps_files {
 			warnings.push(format!(
