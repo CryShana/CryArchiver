@@ -1,6 +1,7 @@
 use indicatif::DecimalBytes;
 
 use crate::format::OutputFormat;
+use crate::images::plan::ImageRoute;
 
 const DURATION_SLACK_S: f64 = 0.05;
 const SHORTEST_TRIM_S: f64 = 0.1;
@@ -47,6 +48,20 @@ pub struct BurnSubs {
 	pub size_percent: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum VideoEncoderChoice {
+	SvtAv1,
+	Aom,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Advanced {
+	pub crf: Option<f64>,
+	pub video_encoder: Option<VideoEncoderChoice>,
+	pub image_encoder: Option<ImageRoute>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobOptions {
 	pub trim: Option<Trim>,
@@ -54,6 +69,7 @@ pub struct JobOptions {
 	pub strip: bool,
 	pub merge_audio: bool,
 	pub burn_subs: Option<BurnSubs>,
+	pub advanced: Advanced,
 }
 
 impl JobOptions {

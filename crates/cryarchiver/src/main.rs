@@ -16,8 +16,9 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use cryarchiver_engine::commit::{OutputSink, check_space};
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
+use cryarchiver_engine::images::plan::ImageRoute;
 use cryarchiver_engine::naming::cli_output_path;
-use cryarchiver_engine::options::{BurnSubs, JobOptions, SubtitlePick, Trim, parse_time};
+use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, SubtitlePick, Trim, VideoEncoderChoice, parse_time};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::sink::CliSink;
@@ -178,6 +179,29 @@ struct CompressArgs {
 	ffmpeg: Option<PathBuf>,
 	#[arg(short, long, help = "Only print failures and the summary")]
 	quiet: bool,
+	#[arg(
+		long,
+		value_name = "CRF",
+		value_parser = parse_crf,
+		conflicts_with = "video_vmaf",
+		hide_short_help = true,
+		help = "Video: encode at this CRF (1 to 63) without the quality search; the quality is not measured"
+	)]
+	crf: Option<f64>,
+	#[arg(
+		long,
+		value_enum,
+		hide_short_help = true,
+		help = "Video encoder instead of the automatic choice"
+	)]
+	video_encoder: Option<VideoEncoderChoice>,
+	#[arg(
+		long,
+		value_enum,
+		hide_short_help = true,
+		help = "Image encoder instead of the automatic choice"
+	)]
+	image_encoder: Option<ImageRoute>,
 }
 
 #[derive(Args, Clone, Copy)]
@@ -240,6 +264,16 @@ fn parse_video_vmaf(text: &str) -> Result<VmafOverride, String> {
 	Ok(overrides.video.unwrap_or(video))
 }
 
+fn parse_crf(text: &str) -> Result<f64, String> {
+	let crf: f64 = number(text)?;
+
+	if (1.0..=63.0).contains(&crf) {
+		Ok(crf)
+	} else {
+		Err("the CRF must be between 1 and 63".to_owned())
+	}
+}
+
 fn parse_image_target(text: &str) -> Result<f64, String> {
 	let target = number(text)?;
 
@@ -279,6 +313,14 @@ fn quality_label(speed: Speed, overrides: &Overrides) -> Option<String> {
 	}
 
 	Some(format!("{preset} · custom: {}", values.join(", ")))
+}
+
+fn image_route_conflict(format: Option<OutputFormat>, route: Option<ImageRoute>) -> Option<&'static str> {
+	match (format, route) {
+		(Some(OutputFormat::Avif), Some(ImageRoute::Jxl | ImageRoute::JxlLossless))
+		| (Some(OutputFormat::Jxl), Some(ImageRoute::Avif)) => Some("--image-encoder and -f ask for different image formats"),
+		_ => None,
+	}
 }
 
 struct OutputTarget {
@@ -618,6 +660,11 @@ async fn compress(args: CompressArgs) -> u8 {
 		}
 	};
 
+	if let Some(message) = image_route_conflict(target.format, args.image_encoder) {
+		eprintln!("error: {message}");
+		return 2;
+	}
+
 	let cancel = CancellationToken::new();
 	let tools = match Toolchain::detect(&ToolConfig { ffmpeg: args.ffmpeg }, &cancel).await {
 		Ok(tools) => tools,
@@ -684,6 +731,11 @@ async fn compress(args: CompressArgs) -> u8 {
 					pick: SubtitlePick::parse(pick),
 					size_percent: args.sub_size,
 				}),
+				advanced: Advanced {
+					crf: args.crf,
+					video_encoder: args.video_encoder,
+					image_encoder: args.image_encoder,
+				},
 			},
 		})
 		.collect();
@@ -1070,6 +1122,27 @@ mod tests {
 			.is_ok()
 		);
 		assert!(parse(args(&["a.mp4", "--speed", "slow", "--video-vmaf", "93/89"])).is_ok());
+	}
+
+	#[test]
+	fn advanced_overrides_are_checked_before_anything_runs() {
+		for (given, text) in [
+			(&["a.mp4", "--crf", "99"][..], "between 1 and 63"),
+			(&["a.mp4", "--crf", "0.5"][..], "between 1 and 63"),
+			(&["a.mp4", "--crf", "30", "--video-vmaf", "93/89"][..], "--video-vmaf"),
+		] {
+			let err = refusal(given);
+
+			assert_eq!(err.exit_code(), 2, "{given:?}");
+			assert!(err.to_string().contains(text), "{given:?}: {err}");
+		}
+
+		assert!(
+			refusal(&["project", "create", "src", "dst", "--crf", "30"])
+				.to_string()
+				.contains("--crf")
+		);
+		assert!(parse(args(&["a.mp4", "--crf", "30.5", "--video-encoder", "aom"])).is_ok());
 	}
 
 	#[test]

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::plan::worst_case_memory;
-use cryarchiver_engine::options::{BurnSubs, JobOptions, SubtitlePick, Trim};
+use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, SubtitlePick, Trim, VideoEncoderChoice};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{self, Stream, probe};
@@ -4653,4 +4653,56 @@ async fn burned_bitmap_subtitles_are_searched_and_checked_against_the_same_burn(
 	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
 	assert_eq!(stages(&events, Stage::Verify), 2, "{events:?}");
 	assert_eq!(subtitle_count(output).await, 0);
+}
+
+fn advanced(job: Job, advanced: Advanced) -> Job {
+	with_options(
+		job,
+		JobOptions {
+			advanced,
+			..JobOptions::default()
+		},
+	)
+}
+
+#[tokio::test]
+async fn a_crf_override_skips_the_search_the_check_and_the_learning() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let fixed = advanced(
+		job(&clip),
+		Advanced {
+			crf: Some(40.0),
+			..Advanced::default()
+		},
+	);
+
+	let (outcome, events) = run_recording(&engine, &fixed, dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Encoded { warnings, .. }
+			if warnings.iter().any(|warning| warning.contains("--crf fixed the CRF at 40"))),
+		"{outcome:?}"
+	);
+	assert_eq!(stages(&events, Stage::Sample), 0, "{events:?}");
+	assert!(memory.entries().is_empty());
+}
+
+#[tokio::test]
+async fn an_aom_override_encodes_with_libaom() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+	let aom = advanced(
+		fast(&clip),
+		Advanced {
+			video_encoder: Some(VideoEncoderChoice::Aom),
+			..Advanced::default()
+		},
+	);
+
+	let outcome = run(&aom, dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
 }

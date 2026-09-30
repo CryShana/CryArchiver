@@ -1,4 +1,4 @@
-use crate::options::TrimWindow;
+use crate::options::{TrimWindow, VideoEncoderChoice};
 use crate::outcome::KeepReason;
 use crate::preset::Speed;
 use crate::probe::{Frame, MediaInfo, Stream};
@@ -282,6 +282,33 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 		starts: VideoStarts::default(),
 		overlay: None,
 		subtitles: None,
+	}
+}
+
+pub fn force_encoder(plan: &mut VideoPlan, choice: VideoEncoderChoice, speed: Speed) -> Result<(), String> {
+	if plan.alpha {
+		return Err("transparent video is always VP9, so --video-encoder doesn't apply".into());
+	}
+
+	match choice {
+		VideoEncoderChoice::SvtAv1 if too_large_for_svt(plan.width, plan.height) => Err(format!(
+			"{}×{} is larger than SVT-AV1 supports",
+			plan.width, plan.height
+		)),
+		VideoEncoderChoice::SvtAv1 => Ok(()),
+		VideoEncoderChoice::Aom => {
+			if plan.hdr10 {
+				plan.warnings
+					.push("HDR10 mastering metadata isn't passed on by libaom-av1".to_owned());
+				plan.hdr10 = false;
+			}
+
+			plan.encoder = Encoder::Aom {
+				cpu_used: pick(speed, [3, 4, 6]),
+				crf: rounded_crf(svt_crf(speed, Resolution::of(plan.width, plan.height))),
+			};
+			Ok(())
+		}
 	}
 }
 
@@ -906,6 +933,30 @@ mod tests {
 			precheck(&wide, &without_libaom),
 			Err(KeepReason::Unsupported(_))
 		));
+	}
+
+	#[test]
+	fn an_encoder_override_replaces_svt_or_refuses() {
+		let mut aom = plan(&h264(""), &[], PROGRESSIVE_CLEAN, Speed::Moderate);
+		let mut wide = VideoPlan {
+			width: 17_000,
+			height: 960,
+			..test_plan()
+		};
+		let mut alpha = VideoPlan {
+			alpha: true,
+			..test_plan()
+		};
+
+		force_encoder(&mut aom, VideoEncoderChoice::Aom, Speed::Moderate).unwrap();
+
+		assert_eq!(aom.encoder, Encoder::Aom { cpu_used: 4, crf: 29 });
+		assert!(
+			force_encoder(&mut wide, VideoEncoderChoice::SvtAv1, Speed::Moderate)
+				.unwrap_err()
+				.contains("larger than SVT-AV1")
+		);
+		assert!(force_encoder(&mut alpha, VideoEncoderChoice::Aom, Speed::Moderate).is_err());
 	}
 
 	#[test]

@@ -283,6 +283,7 @@ fn keep(reason: String) -> Gate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum ImageRoute {
 	Avif,
 	Jxl,

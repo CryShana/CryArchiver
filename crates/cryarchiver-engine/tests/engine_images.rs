@@ -12,9 +12,10 @@ use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::animated;
 use cryarchiver_engine::images::decode::oriented;
+use cryarchiver_engine::images::plan::ImageRoute;
 use cryarchiver_engine::images::ssim::score;
 use cryarchiver_engine::metadata::exif::orientation;
-use cryarchiver_engine::options::JobOptions;
+use cryarchiver_engine::options::{Advanced, JobOptions};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
@@ -921,6 +922,31 @@ async fn a_photo_can_be_asked_for_as_jpeg_xl() {
 
 	assert_eq!(output, dir.path().join("photo.cry.jxl"));
 	assert!(read_boxes(&std::fs::read(&output).unwrap()).unwrap().container);
+}
+
+#[tokio::test]
+async fn an_image_encoder_override_picks_lossless_jpeg_xl() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
+	let lossless = Job {
+		options: JobOptions {
+			advanced: Advanced {
+				image_encoder: Some(ImageRoute::JxlLossless),
+				..Advanced::default()
+			},
+			..JobOptions::default()
+		},
+		min_savings: 0.0,
+		..job(&photo)
+	};
+
+	let outcome = run(&lossless, dir.path()).await;
+
+	match outcome {
+		JobOutcome::Encoded { output, .. } => assert_eq!(output, dir.path().join("photo.cry.jxl")),
+		JobOutcome::KeptOriginal { .. } => {}
+		other => panic!("{other:?}"),
+	}
 }
 
 #[tokio::test]

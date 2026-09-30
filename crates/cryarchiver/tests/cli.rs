@@ -795,6 +795,18 @@ fn a_format_that_does_not_fit_a_file_fails_only_that_file() {
 }
 
 #[test]
+fn an_image_encoder_that_disagrees_with_the_format_is_refused() {
+	let dir = tempfile::tempdir().unwrap();
+	support::photo_png(dir.path(), "photo.png", 64, 48);
+
+	let out = cryarchiver(dir.path(), &["-f", "avif", "--image-encoder", "jxl", "photo.png"]);
+
+	assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+	assert!(stderr(&out).contains("--image-encoder and -f"), "{}", stderr(&out));
+	assert!(!dir.path().join("photo.cry.avif").exists());
+}
+
+#[test]
 fn strip_is_a_flag() {
 	let dir = tempfile::tempdir().unwrap();
 	flac(dir.path(), "song.flac", 2);

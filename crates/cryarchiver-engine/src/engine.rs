@@ -20,7 +20,7 @@ use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput,
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{JobOptions, TrimWindow, kept_as_requested, kept_as_requested_part};
+use crate::options::{JobOptions, TrimWindow, VideoEncoderChoice, kept_as_requested, kept_as_requested_part};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -491,7 +491,12 @@ impl Engine {
 			on_event: cx.on_event,
 			cancel: cx.cancel,
 			memory: self.quality.as_ref(),
-			route: image_route(cx.job.options.format),
+			route: cx
+				.job
+				.options
+				.advanced
+				.image_encoder
+				.or(image_route(cx.job.options.format)),
 			forced: cx.job.options.forced(false),
 		};
 		Ok(match image_job::produce(&image, input, workspace).await? {
@@ -672,6 +677,13 @@ impl Engine {
 		))
 		.await?;
 		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
+		if let Some(choice) = cx.job.options.advanced.video_encoder {
+			if choice == VideoEncoderChoice::Aom && !self.tools.has_libaom() {
+				return Err(ErrorKind::EncodeFailed("--video-encoder aom needs ffmpeg with libaom-av1".into()).into());
+			}
+			video_plan::force_encoder(&mut video, choice, cx.job.speed).map_err(ErrorKind::EncodeFailed)?;
+		}
+
 		if video.encoder.film_grain()
 			&& main.codec_name == "av1"
 			&& probe::av1_film_grain(&self.tools, source, main.index, cx.cancel)
@@ -697,7 +709,12 @@ impl Engine {
 
 		let mut quality = self.video_quality(cx.job, main, &analysis, &video);
 		Self::apply_learned_grain(cx.job, &mut video, &mut quality);
-		if cx.job.speed != Speed::Fast && !self.tools.has_vmaf() {
+		if let Some(crf) = cx.job.options.advanced.crf {
+			video.warnings.push(format!(
+				"--crf fixed the CRF at {}: the video quality was not measured",
+				video.encoder.with_crf(crf).crf()
+			));
+		} else if cx.job.speed != Speed::Fast && !self.tools.has_vmaf() {
 			video
 				.warnings
 				.push("libvmaf is not available: the video quality was not measured".to_owned());
@@ -719,7 +736,7 @@ impl Engine {
 		};
 		let verify =
 			match Box::pin(self.choose_crf(cx, workspace, &inputs, &analysis, &mut video, &mut quality)).await? {
-				Tuning::Keep(reason) => return Ok(self.kept_video(&quality, reason)),
+				Tuning::Keep(reason) => return Ok(self.kept_video(cx, &quality, reason)),
 				Tuning::Encode { verify } => verify,
 			};
 
@@ -759,7 +776,7 @@ impl Engine {
 					.collect(),
 				..staged
 			}),
-			Produced::Kept(reason) => self.kept_video(&quality, reason),
+			Produced::Kept(reason) => self.kept_video(cx, &quality, reason),
 		})
 	}
 
@@ -807,8 +824,8 @@ impl Engine {
 		.into())
 	}
 
-	fn kept_video(&self, quality: &VideoQuality, reason: KeepReason) -> Produced {
-		if matches!(reason, KeepReason::NotSmaller { .. }) {
+	fn kept_video(&self, cx: &Context<'_>, quality: &VideoQuality, reason: KeepReason) -> Produced {
+		if matches!(reason, KeepReason::NotSmaller { .. }) && cx.job.options.advanced.crf.is_none() {
 			self.forget_learned(quality);
 		}
 		Produced::Kept(reason)
@@ -832,9 +849,13 @@ impl Engine {
 			floor: Some(target.floor),
 		};
 		let stats = self.quality.lookup(&key);
+		let strategy = match job.options.advanced.crf {
+			Some(crf) => Strategy::Fixed { crf, verify: false },
+			None => video_quality::strategy(job.speed, stats.as_ref(), video.encoder.crf(), self.tools.has_vmaf()),
+		};
 
 		VideoQuality {
-			strategy: video_quality::strategy(job.speed, stats.as_ref(), video.encoder.crf(), self.tools.has_vmaf()),
+			strategy,
 			slope: stats.and_then(|stats| stats.slope).unwrap_or(DEFAULT_SLOPE),
 			key,
 			stats,
