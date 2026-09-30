@@ -15,6 +15,7 @@ use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{self, Stream, probe};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
+use cryarchiver_engine::toolchain::LIBAOM;
 use cryarchiver_engine::video::plan::synthesized_grain;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
 use lofty::config::ParseOptions;
@@ -4687,11 +4688,111 @@ async fn a_crf_override_skips_the_search_the_check_and_the_learning() {
 		"{outcome:?}"
 	);
 	assert_eq!(stages(&events, Stage::Sample), 0, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 1, "only the final checks: {events:?}");
 	assert!(memory.entries().is_empty());
 }
 
 #[tokio::test]
-async fn an_aom_override_encodes_with_libaom() {
+async fn a_fixed_crf_output_that_is_not_smaller_leaves_the_learned_group_alone() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let memory = Arc::new(learned_group(dir.path(), 30.0).await);
+	let before = memory.entries();
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let wasteful = Job {
+		min_savings: 0.95,
+		..advanced(
+			job(&clip),
+			Advanced {
+				crf: Some(1.0),
+				..Advanced::default()
+			},
+		)
+	};
+
+	let (outcome, events) = run_recording(&engine, &wasteful, dir.path()).await;
+
+	assert!(
+		matches!(
+			outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::NotSmaller { .. }
+			}
+		),
+		"{outcome:?}"
+	);
+	assert_eq!(stages(&events, Stage::Sample), 0, "{events:?}");
+	assert_eq!(memory.entries(), before);
+}
+
+#[tokio::test]
+async fn a_fixed_crf_ignores_a_learned_efficiency() {
+	let dir = tempfile::tempdir().unwrap();
+	let first = support::video(
+		dir.path(),
+		"first.mp4",
+		3,
+		&[
+			"-map",
+			"0:v",
+			"-map",
+			"1:a",
+			"-c:v",
+			"libsvtav1",
+			"-preset",
+			"12",
+			"-crf",
+			"5",
+			"-c:a",
+			"aac",
+		],
+	);
+	let second = dir.path().join("second.mp4");
+	let third = dir.path().join("third.mp4");
+	fs::copy(&first, &second).unwrap();
+	fs::copy(&first, &third).unwrap();
+	let learning = Arc::new(SharedMemory::default());
+	let tools = support::toolchain().await;
+	run_recording(
+		&Engine::new(tools.clone()).with_quality_memory(learning.clone()),
+		&job(&first),
+		dir.path(),
+	)
+	.await;
+	let (key, stats) = learning.entries().remove(0);
+	let memory = Arc::new(SharedMemory::with_entries([(
+		key,
+		GroupStats {
+			bpp: Some(1000.0),
+			..stats
+		},
+	)]));
+	let engine = Engine::new(tools).with_quality_memory(memory.clone());
+	let fixed = advanced(
+		job(&third),
+		Advanced {
+			crf: Some(35.0),
+			..Advanced::default()
+		},
+	);
+
+	let (learned, _) = run_recording(&engine, &job(&second), dir.path()).await;
+	let (outcome, _) = run_recording(&engine, &fixed, dir.path()).await;
+
+	assert!(
+		matches!(
+			learned,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::AlreadyEfficient(_)
+			}
+		),
+		"{learned:?}"
+	);
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn an_aom_override_still_encodes_the_video() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
 	let aom = advanced(
@@ -4705,4 +4806,30 @@ async fn an_aom_override_encodes_with_libaom() {
 	let outcome = run(&aom, dir.path()).await;
 
 	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn an_aom_override_without_libaom_fails_the_file() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+	let mut tools = support::toolchain().await;
+	tools.encoders.remove(LIBAOM);
+	let aom = advanced(
+		fast(&clip),
+		Advanced {
+			video_encoder: Some(VideoEncoderChoice::Aom),
+			..Advanced::default()
+		},
+	);
+
+	let outcome = Engine::new(tools)
+		.run(&aom, &sink(dir.path()), &|_| {}, &CancellationToken::new())
+		.await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err)
+			if err.to_string().contains("--video-encoder aom needs ffmpeg with libaom-av1")),
+		"{outcome:?}"
+	);
+	assert!(!dir.path().join("clip.cry.mkv").exists());
 }

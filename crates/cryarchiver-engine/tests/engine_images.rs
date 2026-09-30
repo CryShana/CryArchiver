@@ -927,7 +927,7 @@ async fn a_photo_can_be_asked_for_as_jpeg_xl() {
 #[tokio::test]
 async fn an_image_encoder_override_picks_lossless_jpeg_xl() {
 	let dir = tempfile::tempdir().unwrap();
-	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
+	let source = support::smooth_png(dir.path(), "gradient.png", 320, 240);
 	let lossless = Job {
 		options: JobOptions {
 			advanced: Advanced {
@@ -937,16 +937,35 @@ async fn an_image_encoder_override_picks_lossless_jpeg_xl() {
 			..JobOptions::default()
 		},
 		min_savings: 0.0,
-		..job(&photo)
+		..job(&source)
 	};
 
-	let outcome = run(&lossless, dir.path()).await;
+	let output = encoded(run(&lossless, dir.path()).await);
 
-	match outcome {
-		JobOutcome::Encoded { output, .. } => assert_eq!(output, dir.path().join("photo.cry.jxl")),
-		JobOutcome::KeptOriginal { .. } => {}
-		other => panic!("{other:?}"),
-	}
+	assert_eq!(output, dir.path().join("gradient.cry.jxl"));
+	let image = JxlImage::builder()
+		.read(std::fs::read(&output).unwrap().as_slice())
+		.unwrap();
+	let render = image.render_frame(0).unwrap();
+	let mut stream = render.stream();
+	let channels = stream.channels() as usize;
+	assert_eq!(channels, 3);
+	let mut samples = vec![0f32; 320 * 240 * channels];
+	stream.write_to_buffer(&mut samples);
+	let original = image::open(&source).unwrap().to_rgb8();
+	let differing = original
+		.enumerate_pixels()
+		.filter(|(x, y, pixel)| {
+			let at = (*y as usize * 320 + *x as usize) * channels;
+			(0..3).any(|channel| {
+				#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+				let decoded = (samples[at + channel] * 255.0).round() as u8;
+				decoded != pixel[channel]
+			})
+		})
+		.count();
+
+	assert_eq!(differing, 0, "lossless JPEG XL keeps every pixel");
 }
 
 #[tokio::test]

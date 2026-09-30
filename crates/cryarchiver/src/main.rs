@@ -1143,6 +1143,25 @@ mod tests {
 				.contains("--crf")
 		);
 		assert!(parse(args(&["a.mp4", "--crf", "30.5", "--video-encoder", "aom"])).is_ok());
+
+		let Launch::Compress(compress) = launch_from(args(&[
+			"a.mp4",
+			"--video-encoder",
+			"svt-av1",
+			"--image-encoder",
+			"jxl-lossless",
+		])) else {
+			panic!("not a compress run");
+		};
+		assert_eq!(compress.video_encoder, Some(VideoEncoderChoice::SvtAv1));
+		assert_eq!(compress.image_encoder, Some(ImageRoute::JxlLossless));
+
+		let short_help = Cli::command().render_help().to_string();
+		let long_help = Cli::command().render_long_help().to_string();
+		for flag in ["--crf", "--video-encoder", "--image-encoder"] {
+			assert!(!short_help.contains(flag), "{flag}: {short_help}");
+			assert!(long_help.contains(flag), "{flag}: {long_help}");
+		}
 	}
 
 	#[test]

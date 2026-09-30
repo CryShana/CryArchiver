@@ -223,10 +223,7 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 			crf: VP9_CRF[resolution.index()],
 		}
 	} else if too_large_for_svt(width, height) {
-		Encoder::Aom {
-			cpu_used: pick(speed, [3, 4, 6]),
-			crf: rounded_crf(svt_crf(speed, resolution)),
-		}
+		aom_encoder(speed, resolution)
 	} else {
 		Encoder::SvtAv1 {
 			preset: pick(speed, [3, 5, 8]),
@@ -303,12 +300,16 @@ pub fn force_encoder(plan: &mut VideoPlan, choice: VideoEncoderChoice, speed: Sp
 				plan.hdr10 = false;
 			}
 
-			plan.encoder = Encoder::Aom {
-				cpu_used: pick(speed, [3, 4, 6]),
-				crf: rounded_crf(svt_crf(speed, Resolution::of(plan.width, plan.height))),
-			};
+			plan.encoder = aom_encoder(speed, Resolution::of(plan.width, plan.height));
 			Ok(())
 		}
+	}
+}
+
+fn aom_encoder(speed: Speed, resolution: Resolution) -> Encoder {
+	Encoder::Aom {
+		cpu_used: pick(speed, [3, 4, 6]),
+		crf: rounded_crf(svt_crf(speed, resolution)),
 	}
 }
 

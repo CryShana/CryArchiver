@@ -677,6 +677,7 @@ impl Engine {
 		))
 		.await?;
 		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
+
 		if let Some(choice) = cx.job.options.advanced.video_encoder {
 			if choice == VideoEncoderChoice::Aom && !self.tools.has_libaom() {
 				return Err(ErrorKind::EncodeFailed("--video-encoder aom needs ffmpeg with libaom-av1".into()).into());
@@ -736,7 +737,7 @@ impl Engine {
 		};
 		let verify =
 			match Box::pin(self.choose_crf(cx, workspace, &inputs, &analysis, &mut video, &mut quality)).await? {
-				Tuning::Keep(reason) => return Ok(self.kept_video(cx, &quality, reason)),
+				Tuning::Keep(reason) => return Ok(self.kept_video(&quality, reason)),
 				Tuning::Encode { verify } => verify,
 			};
 
@@ -776,7 +777,7 @@ impl Engine {
 					.collect(),
 				..staged
 			}),
-			Produced::Kept(reason) => self.kept_video(cx, &quality, reason),
+			Produced::Kept(reason) => self.kept_video(&quality, reason),
 		})
 	}
 
@@ -824,8 +825,8 @@ impl Engine {
 		.into())
 	}
 
-	fn kept_video(&self, cx: &Context<'_>, quality: &VideoQuality, reason: KeepReason) -> Produced {
-		if matches!(reason, KeepReason::NotSmaller { .. }) && cx.job.options.advanced.crf.is_none() {
+	fn kept_video(&self, quality: &VideoQuality, reason: KeepReason) -> Produced {
+		if matches!(reason, KeepReason::NotSmaller { .. }) {
 			self.forget_learned(quality);
 		}
 		Produced::Kept(reason)
@@ -848,10 +849,13 @@ impl Engine {
 			target: target.mean,
 			floor: Some(target.floor),
 		};
-		let stats = self.quality.lookup(&key);
-		let strategy = match job.options.advanced.crf {
-			Some(crf) => Strategy::Fixed { crf, verify: false },
-			None => video_quality::strategy(job.speed, stats.as_ref(), video.encoder.crf(), self.tools.has_vmaf()),
+		let (stats, strategy) = if let Some(crf) = job.options.advanced.crf {
+			(None, Strategy::Fixed { crf, verify: false })
+		} else {
+			let stats = self.quality.lookup(&key);
+			let strategy =
+				video_quality::strategy(job.speed, stats.as_ref(), video.encoder.crf(), self.tools.has_vmaf());
+			(stats, strategy)
 		};
 
 		VideoQuality {
