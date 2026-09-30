@@ -326,7 +326,7 @@ async fn segment_noise(
 
 	let out = match process::run_streamed(&cmd, |chunk| reader.push(chunk), cancel).await {
 		Ok(out) => out,
-		Err(RunError::CaptureLimit(_)) => return Ok(Vec::new()),
+		Err(RunError::CaptureLimit(_) | RunError::Crashed { .. }) => return Ok(Vec::new()),
 		Err(err) => return Err(err.into()),
 	};
 	Ok(if out.status.success() {

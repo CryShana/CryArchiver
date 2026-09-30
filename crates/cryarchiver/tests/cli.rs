@@ -947,7 +947,7 @@ fn an_output_file_naming_the_source_by_a_different_case_is_refused() {
 #[cfg(windows)]
 #[test]
 fn a_locked_source_is_retried_automatically() {
-	use std::io::{BufRead, BufReader};
+	use std::io::{BufRead, BufReader, Read};
 	use std::os::windows::fs::OpenOptionsExt;
 	use std::process::Stdio;
 
@@ -959,9 +959,15 @@ fn a_locked_source_is_retried_automatically() {
 		.current_dir(dir.path())
 		.arg("song.flac")
 		.stdout(Stdio::piped())
-		.stderr(Stdio::null())
+		.stderr(Stdio::piped())
 		.spawn()
 		.unwrap();
+	let mut child_stderr = child.stderr.take().unwrap();
+	let errors = std::thread::spawn(move || {
+		let mut text = String::new();
+		let _ = child_stderr.read_to_string(&mut text);
+		text
+	});
 	let mut printed = String::new();
 	for line in BufReader::new(child.stdout.take().unwrap()).lines() {
 		let line = line.unwrap();
@@ -973,10 +979,11 @@ fn a_locked_source_is_retried_automatically() {
 	}
 	let status = child.wait().unwrap();
 	drop(lock);
+	let errors = errors.join().unwrap();
 
-	assert_eq!(status.code(), Some(0), "{printed}");
-	assert!(printed.contains("↻ song.flac  retrying in 5 s"), "{printed}");
-	assert!(dir.path().join("song.cry.opus").is_file());
+	assert_eq!(status.code(), Some(0), "{printed}{errors}");
+	assert!(printed.contains("↻ song.flac  retrying in 5 s"), "{printed}{errors}");
+	assert!(dir.path().join("song.cry.opus").is_file(), "{printed}{errors}");
 }
 
 #[test]

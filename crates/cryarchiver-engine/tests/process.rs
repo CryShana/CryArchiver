@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use cryarchiver_engine::outcome::{ErrorKind, JobError};
 use cryarchiver_engine::process::{RunError, StdoutMode, ToolCommand, run, run_streamed};
 use tokio_util::sync::CancellationToken;
 
@@ -286,6 +287,106 @@ async fn tools_run_in_their_working_directory() {
 
 	assert!(out.completed());
 	assert!(dir.path().join("tone.wav").is_file());
+}
+
+#[cfg(windows)]
+fn shell(script: &[&str]) -> ToolCommand {
+	let args: Vec<&str> = std::iter::once("/c").chain(script.iter().copied()).collect();
+	tool("cmd", &args, PATIENT)
+}
+
+#[cfg(unix)]
+fn shell(script: &[&str]) -> ToolCommand {
+	tool("sh", &["-c", &script.join(" ")], PATIENT)
+}
+
+#[cfg(windows)]
+const CRASHES: &[(&[&str], &str)] = &[
+	(
+		&["echo", "boom", "1>&2", "&", "exit", "-1073741819"],
+		"0xC0000005 (access violation)",
+	),
+	(
+		&["echo", "boom", "1>&2", "&", "exit", "-1073741801"],
+		"0xC0000017 (out of memory)",
+	),
+	(
+		&["echo", "boom", "1>&2", "&", "exit", "-1073740791"],
+		"0xC0000409 (aborted)",
+	),
+	(
+		&["echo", "boom", "1>&2", "&", "exit", "-12"],
+		"out of memory (exit code -12)",
+	),
+];
+
+#[cfg(unix)]
+const CRASHES: &[(&[&str], &str)] = &[
+	(&["echo", "boom", ">&2;", "kill", "-SEGV", "$$"], "segmentation fault"),
+	(&["echo", "boom", ">&2;", "kill", "-ABRT", "$$"], "aborted"),
+	(&["echo", "boom", ">&2;", "kill", "-KILL", "$$"], "out of memory"),
+	(
+		&["echo", "boom", ">&2;", "exit", "244"],
+		"out of memory (exit code 244)",
+	),
+];
+
+#[cfg(windows)]
+const ORDINARY_FAILURES: &[&[&str]] = &[
+	&["exit", "1"],
+	&["exit", "255"],
+	&["exit", "69"],
+	&["exit", "244"],
+	&["exit", "-2"],
+	&["exit", "-11"],
+	&["exit", "-13"],
+	&["exit", "-22"],
+	&["exit", "-1094995529"],
+	&["exit", "-1073741510"],
+];
+
+#[cfg(unix)]
+const ORDINARY_FAILURES: &[&[&str]] = &[
+	&["exit", "1"],
+	&["exit", "255"],
+	&["exit", "69"],
+	&["exit", "254"],
+	&["exit", "243"],
+	&["exit", "245"],
+	&["kill", "-INT", "$$"],
+	&["kill", "-TERM", "$$"],
+	&["kill", "-HUP", "$$"],
+];
+
+#[tokio::test]
+async fn a_tool_that_crashes_is_reported_as_crashed_with_its_stderr() {
+	for (script, named) in CRASHES {
+		let result = run(&shell(script), StdoutMode::Capture, |_| {}, &CancellationToken::new()).await;
+
+		let Err(err @ RunError::Crashed { .. }) = result else {
+			panic!("{script:?}: {result:?}");
+		};
+		let job = JobError::from(err);
+		let ErrorKind::ToolCrashed(description) = &job.kind else {
+			panic!("{script:?}: {job:?}");
+		};
+		assert!(description.contains(named), "{script:?}: {description}");
+		assert!(
+			job.log_tail.iter().any(|line| line.contains("boom")),
+			"{script:?}: {job:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn ordinary_failures_and_interruptions_stay_an_exit_status() {
+	for script in ORDINARY_FAILURES {
+		let out = run(&shell(script), StdoutMode::Capture, |_| {}, &CancellationToken::new())
+			.await
+			.unwrap_or_else(|err| panic!("{script:?}: {err:?}"));
+
+		assert!(!out.status.success(), "{script:?}");
+	}
 }
 
 #[tokio::test]

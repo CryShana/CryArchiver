@@ -23,7 +23,7 @@ use cryarchiver_engine::naming::cli_output_path;
 use cryarchiver_engine::options::{
 	Advanced, BurnSubs, JobOptions, Resize, SubtitlePick, Trim, VideoEncoderChoice, parse_time,
 };
-use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
+use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::process::limits::{self, Applied, Limits, Priority};
 use cryarchiver_engine::sink::CliSink;
@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::memory::SystemMemory;
 use crate::report::{Report, Totals, file_label, outcome_line_with};
+use crate::retry::Wait;
 
 #[derive(Parser)]
 #[command(
@@ -924,30 +925,22 @@ async fn run_all(
 				}
 			};
 
-			let mut attempt = 1;
-			let outcome = loop {
-				let outcome = engine.run(&job, sink.as_ref(), &on_event, &cancel).await;
-				let JobOutcome::Failed(err) = &outcome else {
-					break outcome;
-				};
-				let Some(wait) = retry::next_wait(&err.kind, attempt) else {
-					break outcome;
-				};
+			let work_root = sink.work_root(&source);
+			let (engine, sink, on_event, cancel) = (&engine, &sink, &on_event, &cancel);
 
-				report.print(
-					&format!("↻ {}  {}: {err}", file_label(&source), retry::describe(wait)),
-					false,
-				);
-				let crashed = matches!(err.kind, ErrorKind::ToolCrashed(_));
-				if !retry::wait(wait, &job.source, &sink.work_root(&job.source), &cancel).await {
-					break outcome;
-				}
-
-				if crashed {
-					job.options.threads = Some(halved(job.options.threads));
-				}
-				attempt += 1;
-			};
+			let outcome = retry::with_retries(
+				&mut job,
+				cancel,
+				move |job: Job| async move { engine.run(&job, sink.as_ref(), on_event, cancel).await },
+				|wait: Wait, err: &JobError| {
+					let waiting = retry::describe(wait);
+					report.print(&format!("↻ {}  {waiting}: {err}", file_label(&source)), false);
+					bar.set_position(0);
+					bar.set_message(waiting);
+				},
+				|wait: Wait| retry::wait(wait, &source, &work_root, cancel),
+			)
+			.await;
 
 			bar.finish_and_clear();
 			(job.source, outcome)
@@ -958,11 +951,6 @@ async fn run_all(
 		record_joined(report, &mut totals, joined);
 	}
 	totals
-}
-
-fn halved(threads: Option<usize>) -> usize {
-	let current = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from));
-	(current / 2).max(1)
 }
 
 fn output_key(source: &Path, output_dir: Option<&Path>) -> OsString {

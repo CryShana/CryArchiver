@@ -3,7 +3,9 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use cryarchiver_engine::commit::free_space;
-use cryarchiver_engine::outcome::{ErrorClass, ErrorKind};
+use cryarchiver_engine::engine::Job;
+use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError, JobOutcome};
+use indicatif::DecimalBytes;
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -38,8 +40,51 @@ pub fn describe(wait: Wait) -> String {
 	match wait {
 		Wait::Delay(delay) => format!("retrying in {} s", delay.as_secs()),
 		Wait::Stable => "retrying once the file stops changing".to_owned(),
-		Wait::Space { need } => format!("retrying once {need} bytes are free"),
+		Wait::Space { need } => format!("retrying once {} are free", DecimalBytes(need)),
 	}
+}
+
+/// `wait_out` resolves to false when the wait ended without its condition being met, by Ctrl+C or by its time limit.
+pub async fn with_retries<R, W>(
+	job: &mut Job,
+	cancel: &CancellationToken,
+	mut run: impl FnMut(Job) -> R,
+	mut on_retry: impl FnMut(Wait, &JobError),
+	mut wait_out: impl FnMut(Wait) -> W,
+) -> JobOutcome
+where
+	R: Future<Output = JobOutcome>,
+	W: Future<Output = bool>,
+{
+	let mut attempt = 1;
+
+	loop {
+		let outcome = run(job.clone()).await;
+		let JobOutcome::Failed(err) = &outcome else {
+			return outcome;
+		};
+		let Some(wait) = next_wait(&err.kind, attempt) else {
+			return outcome;
+		};
+
+		on_retry(wait, err);
+		if !wait_out(wait).await {
+			if cancel.is_cancelled() {
+				return JobOutcome::Failed(ErrorKind::Cancelled.into());
+			}
+			return outcome;
+		}
+
+		if matches!(err.kind, ErrorKind::ToolCrashed(_)) {
+			job.options.threads = Some(halved(job.options.threads));
+		}
+		attempt += 1;
+	}
+}
+
+pub fn halved(threads: Option<usize>) -> usize {
+	let current = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from));
+	(current / 2).max(1)
 }
 
 pub async fn wait(wait: Wait, source: &Path, work_root: &Path, cancel: &CancellationToken) -> bool {
@@ -174,5 +219,151 @@ mod tests {
 		.await;
 
 		assert!(stable);
+	}
+
+	fn job(threads: Option<usize>) -> Job {
+		Job {
+			source: "a.flac".into(),
+			speed: cryarchiver_engine::preset::Speed::default(),
+			keep_metadata: false,
+			drop_aux: false,
+			min_savings: 0.1,
+			overrides: cryarchiver_engine::preset::Overrides::default(),
+			options: cryarchiver_engine::options::JobOptions {
+				threads,
+				..Default::default()
+			},
+		}
+	}
+
+	fn failed(kind: ErrorKind) -> JobOutcome {
+		JobOutcome::Failed(kind.into())
+	}
+
+	fn done() -> JobOutcome {
+		JobOutcome::Skipped { reason: "done".into() }
+	}
+
+	struct Script {
+		threads: Vec<Option<usize>>,
+		waits: Vec<Wait>,
+	}
+
+	async fn scripted(
+		job: &mut Job,
+		outcomes: Vec<JobOutcome>,
+		waited: bool,
+		cancel: &CancellationToken,
+	) -> (JobOutcome, Script) {
+		let mut outcomes = outcomes.into_iter();
+		let mut threads = Vec::new();
+		let mut waits = Vec::new();
+
+		let outcome = with_retries(
+			job,
+			cancel,
+			|job: Job| {
+				threads.push(job.options.threads);
+				std::future::ready(outcomes.next().expect("no more attempts than scripted"))
+			},
+			|wait, _| waits.push(wait),
+			|_| std::future::ready(waited),
+		)
+		.await;
+
+		(outcome, Script { threads, waits })
+	}
+
+	#[tokio::test]
+	async fn a_crash_halves_the_threads_and_the_third_failure_is_final() {
+		let mut job = job(Some(8));
+		let crash = || failed(ErrorKind::ToolCrashed("exception 0xC0000017 (out of memory)".into()));
+
+		let (outcome, script) = scripted(
+			&mut job,
+			vec![crash(), crash(), crash()],
+			true,
+			&CancellationToken::new(),
+		)
+		.await;
+
+		assert!(
+			matches!(&outcome, JobOutcome::Failed(err) if matches!(err.kind, ErrorKind::ToolCrashed(_))),
+			"{outcome:?}"
+		);
+		assert_eq!(script.threads, [Some(8), Some(4), Some(2)]);
+		assert_eq!(
+			script.waits,
+			[
+				Wait::Delay(Duration::from_secs(5)),
+				Wait::Delay(Duration::from_secs(10))
+			]
+		);
+	}
+
+	#[tokio::test]
+	async fn a_retry_that_succeeds_ends_the_attempts_and_other_errors_keep_the_threads() {
+		let mut job = job(None);
+
+		let (outcome, script) = scripted(
+			&mut job,
+			vec![failed(ErrorKind::Locked), done()],
+			true,
+			&CancellationToken::new(),
+		)
+		.await;
+		let (unrecoverable, once) = scripted(
+			&mut job,
+			vec![failed(ErrorKind::SourceDamaged("x".into()))],
+			true,
+			&CancellationToken::new(),
+		)
+		.await;
+
+		assert!(matches!(outcome, JobOutcome::Skipped { .. }), "{outcome:?}");
+		assert_eq!(script.threads, [None, None]);
+		assert!(matches!(unrecoverable, JobOutcome::Failed(_)), "{unrecoverable:?}");
+		assert_eq!(once.threads.len(), 1);
+		assert!(once.waits.is_empty());
+	}
+
+	#[tokio::test]
+	async fn ctrl_c_during_a_wait_reports_cancelled_and_a_timeout_the_error() {
+		let cancelled = CancellationToken::new();
+		cancelled.cancel();
+
+		let (stopped, _) = scripted(&mut job(None), vec![failed(ErrorKind::Locked)], false, &cancelled).await;
+		let (timed_out, _) = scripted(
+			&mut job(None),
+			vec![failed(ErrorKind::SourceChanged)],
+			false,
+			&CancellationToken::new(),
+		)
+		.await;
+
+		assert!(
+			matches!(&stopped, JobOutcome::Failed(err) if err.kind == ErrorKind::Cancelled),
+			"{stopped:?}"
+		);
+		assert!(
+			matches!(&timed_out, JobOutcome::Failed(err) if err.kind == ErrorKind::SourceChanged),
+			"{timed_out:?}"
+		);
+	}
+
+	#[test]
+	fn halving_keeps_at_least_one_thread() {
+		assert_eq!(halved(Some(1)), 1);
+		assert_eq!(halved(Some(8)), 4);
+		assert_eq!(halved(Some(5)), 2);
+		assert!(halved(None) >= 1);
+	}
+
+	#[test]
+	fn the_space_wait_names_a_readable_size() {
+		assert_eq!(
+			describe(Wait::Space { need: 4_300_000_000 }),
+			"retrying once 4.30 GB are free"
+		);
 	}
 }

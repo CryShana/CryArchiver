@@ -367,8 +367,11 @@ pub async fn av1_film_grain(
 			"-",
 		]);
 
-	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
-	Ok(out.status.success() && out.counted_lines > 0)
+	match process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await {
+		Ok(out) => Ok(out.status.success() && out.counted_lines > 0),
+		Err(RunError::Crashed { .. }) => Ok(false),
+		Err(err) => Err(err.into()),
+	}
 }
 
 fn number<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

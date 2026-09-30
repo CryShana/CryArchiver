@@ -111,6 +111,12 @@ pub enum RunError {
 	Cancelled,
 	#[error("the tool wrote more than {0} bytes")]
 	CaptureLimit(usize),
+	#[error("the tool crashed: {description}")]
+	Crashed {
+		description: String,
+		status: ExitStatus,
+		stderr_tail: Vec<String>,
+	},
 }
 
 type ChunkSink<'a> = dyn FnMut(&[u8]) + Send + 'a;
@@ -208,6 +214,15 @@ async fn drive(
 	}
 
 	let (stderr_tail, counted_lines) = stderr.await.unwrap_or_default();
+
+	if let Some(description) = crash_description(status) {
+		return Err(RunError::Crashed {
+			description,
+			status,
+			stderr_tail,
+		});
+	}
+
 	Ok(ToolOutput {
 		status,
 		stdout: captured,
@@ -215,6 +230,63 @@ async fn drive(
 		counted_lines,
 		last_progress,
 	})
+}
+
+/// A system exception code: NTSTATUS error severity with the customer and reserved bits clear. ffmpeg exits with
+/// negative AVERROR values, and the errno ones (-2 is 0xFFFFFFFE) have those bits set, so they stay plain failures.
+/// Ctrl+C's own exit code is an interruption, not a crash. The one AVERROR that counts is ENOMEM (-12): a failed
+/// allocation, which fewer threads may avoid.
+#[cfg(windows)]
+fn crash_description(status: ExitStatus) -> Option<String> {
+	const TOP_BITS: u32 = 0xF000_0000;
+	const SYSTEM_ERROR: u32 = 0xC000_0000;
+	const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
+	const ENOMEM_EXIT: u32 = 0xFFFF_FFF4;
+
+	#[allow(clippy::cast_sign_loss)]
+	let code = status.code()? as u32;
+	if code == ENOMEM_EXIT {
+		return Some("out of memory (exit code -12)".to_owned());
+	}
+
+	if code & TOP_BITS != SYSTEM_ERROR || code == STATUS_CONTROL_C_EXIT {
+		return None;
+	}
+
+	let name = match code {
+		0xC000_0005 => " (access violation)",
+		0xC000_0017 | 0xC000_012D => " (out of memory)",
+		0xC000_001D => " (illegal instruction)",
+		0xC000_00FD => " (stack overflow)",
+		0xC000_0409 => " (aborted)",
+		_ => "",
+	};
+	Some(format!("exception 0x{code:08X}{name}"))
+}
+
+/// SIGINT, SIGTERM and SIGHUP are someone stopping the tool, so only the signals of a failing process count. Exit
+/// code 244 is ffmpeg's AVERROR(ENOMEM) as a byte: a failed allocation, which fewer threads may avoid.
+#[cfg(unix)]
+fn crash_description(status: ExitStatus) -> Option<String> {
+	use std::os::unix::process::ExitStatusExt;
+
+	const ENOMEM_EXIT: i32 = 244;
+
+	if status.code() == Some(ENOMEM_EXIT) {
+		return Some("out of memory (exit code 244)".to_owned());
+	}
+
+	let signal = status.signal()?;
+	let name = match signal {
+		libc::SIGSEGV => "segmentation fault",
+		libc::SIGBUS => "bus error",
+		libc::SIGILL => "illegal instruction",
+		libc::SIGFPE => "arithmetic error",
+		libc::SIGABRT => "aborted",
+		libc::SIGKILL => "killed, possibly for running out of memory",
+		_ => return None,
+	};
+	Some(format!("signal {signal}, {name}"))
 }
 
 pub fn scaled_timeout(bytes: u64) -> Duration {

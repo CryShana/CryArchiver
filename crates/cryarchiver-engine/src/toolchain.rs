@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::process::{self, StdoutMode, ToolCommand, ToolOutput};
+use crate::process::{self, RunError, StdoutMode, ToolCommand, ToolOutput};
 use crate::quality::vmaf;
 use crate::text::display_path;
 
@@ -626,10 +626,20 @@ async fn run_ffmpeg(ffmpeg: &Path, args: &[&str], cancel: &CancellationToken) ->
 	run_command(&cmd, cancel).await
 }
 
+/// A feature probe that crashes shows that the feature is missing, not that the tool is unusable.
 async fn run_command(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<ToolOutput, ToolchainError> {
-	process::run(cmd, StdoutMode::Capture, |_| {}, cancel)
-		.await
-		.map_err(|err| ToolchainError::Unusable(cmd.program.clone(), err.to_string()))
+	match process::run(cmd, StdoutMode::Capture, |_| {}, cancel).await {
+		Err(RunError::Crashed {
+			status, stderr_tail, ..
+		}) => Ok(ToolOutput {
+			status,
+			stdout: Vec::new(),
+			stderr_tail,
+			counted_lines: 0,
+			last_progress: None,
+		}),
+		result => result.map_err(|err| ToolchainError::Unusable(cmd.program.clone(), err.to_string())),
+	}
 }
 
 async fn succeeds(ffmpeg: &Path, args: &[&str], cancel: &CancellationToken) -> Result<bool, ToolchainError> {
