@@ -1648,13 +1648,21 @@ async fn a_missed_check_encodes_the_video_once_more_at_most() {
 	let second = support::mpeg4(dir.path(), "second.mp4", 3);
 	let tools = support::toolchain().await;
 	let learned = Arc::new(SharedMemory::default());
-	run_recording(
+	let (learning, _) = run_recording(
 		&Engine::new(tools.clone()).with_quality_memory(learned.clone()),
 		&job(&first),
 		dir.path(),
 	)
 	.await;
-	let (key, stats) = learned.entries().remove(0);
+	assert!(
+		matches!(learning, JobOutcome::Encoded { .. }),
+		"the first file must be committed to teach its group: {learning:?}"
+	);
+	let (key, stats) = learned
+		.entries()
+		.into_iter()
+		.next()
+		.expect("the committed first file teaches its group");
 	let careless = Arc::new(SharedMemory::with_entries([(
 		key,
 		GroupStats { setting: 55.0, ..stats },

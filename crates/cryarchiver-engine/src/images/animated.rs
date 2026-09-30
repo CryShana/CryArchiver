@@ -443,7 +443,7 @@ async fn check_delays(
 	}
 }
 
-/// Enough of a file to tell a GIF: the frames prepared from a video can be gigabytes.
+/// Enough of a file to tell a GIF.
 fn head(path: &Path) -> std::io::Result<Vec<u8>> {
 	let mut head = Vec::new();
 	std::fs::File::open(path)?.take(HEAD_BYTES).read_to_end(&mut head)?;

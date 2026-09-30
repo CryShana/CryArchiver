@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
+use cryarchiver_engine::images::animated;
 use cryarchiver_engine::options::{BurnSubs, JobOptions, Resize, SubtitlePick, Trim};
 use cryarchiver_engine::outcome::JobOutcome;
 use cryarchiver_engine::preset::{Overrides, Speed};
@@ -152,6 +153,11 @@ async fn a_60p_video_becomes_an_animated_avif_with_every_frame_at_its_rate() {
 	assert!(delays.iter().all(|delay| [16.0, 17.0].contains(delay)), "{delays:?}");
 	assert!((tracks[0].fps().unwrap() - 60.0).abs() < 0.5, "{:?}", tracks[0]);
 	assert_eq!(warnings, [AUDIO_DROPPED], "{warnings:?}");
+	assert_eq!(
+		animated::plays(&fs::read(&output).unwrap()),
+		Some(None),
+		"loops forever"
+	);
 }
 
 #[tokio::test]
@@ -241,15 +247,21 @@ async fn a_resize_scales_every_frame_keeping_the_aspect_ratio() {
 			width: Some(161),
 			height: None,
 		}),
+		strip: true,
 		..JobOptions::default()
 	};
 
 	let (outcome, _) = run(&as_avif(&source, resized), dir.path()).await;
 
-	let tracks = sequences(&written(&outcome).0).await;
+	let (output, warnings) = written(&outcome);
+	let tracks = sequences(&output).await;
 	assert_eq!(tracks.len(), 1, "{tracks:?}");
 	assert_eq!((tracks[0].width, tracks[0].height), (Some(161), Some(121)));
 	assert_eq!(tracks[0].nb_frames, Some(25));
+	assert!(
+		warnings.contains(&"--strip doesn't apply to a video written as an animated AVIF".to_owned()),
+		"{warnings:?}"
+	);
 }
 
 #[tokio::test]
@@ -292,6 +304,35 @@ async fn a_transparent_video_keeps_its_alpha() {
 	let row = &alpha[..width];
 	assert!(row[..70].iter().all(|&value| value > 245), "{row:?}");
 	assert!(row[90..].iter().all(|&value| value < 10), "{row:?}");
+}
+
+#[tokio::test]
+async fn a_resized_transparent_video_keeps_its_alpha_at_the_new_size() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = clip(
+		dir.path(),
+		"half.webm",
+		"testsrc2=s=160x120:r=10:d=1,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(lt(X,80),255,0)'",
+		&["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-crf", "20", "-b:v", "0"],
+	);
+	let resized = JobOptions {
+		resize: Some(Resize {
+			width: Some(80),
+			height: None,
+		}),
+		..JobOptions::default()
+	};
+
+	let (outcome, _) = run(&as_avif(&source, resized), dir.path()).await;
+
+	let output = written(&outcome).0;
+	let tracks = sequences(&output).await;
+	let sizes: Vec<_> = tracks.iter().map(|track| (track.width, track.height)).collect();
+	assert_eq!(sizes, [(Some(80), Some(60)); 2]);
+	let (alpha, width) = first_frame(&output, tracks[1].index, "gray");
+	let row = &alpha[..width];
+	assert!(row[..35].iter().all(|&value| value > 245), "{row:?}");
+	assert!(row[45..].iter().all(|&value| value < 10), "{row:?}");
 }
 
 #[tokio::test]

@@ -795,6 +795,19 @@ fn a_format_that_does_not_fit_a_file_fails_only_that_file() {
 }
 
 #[test]
+fn a_video_named_as_an_avif_output_becomes_an_animated_avif() {
+	let dir = tempfile::tempdir().unwrap();
+	support::mpeg4(dir.path(), "clip.mp4", 1);
+
+	let out = cryarchiver(dir.path(), &["clip.mp4", "-s", "fast", "-o", "clip.avif"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	assert!(stdout(&out).contains("an audio track was dropped"), "{}", stdout(&out));
+	let bytes = fs::read(dir.path().join("clip.avif")).unwrap();
+	assert_eq!(&bytes[4..12], b"ftypavis", "an image sequence");
+}
+
+#[test]
 fn a_bitrate_cap_is_refused_for_avif_output() {
 	let dir = tempfile::tempdir().unwrap();
 	support::mpeg4(dir.path(), "clip.mp4", 1);

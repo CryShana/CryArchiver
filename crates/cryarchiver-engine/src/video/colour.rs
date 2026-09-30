@@ -1,5 +1,7 @@
+use crate::images::decode::deep_pix_fmt;
 use crate::probe::Stream;
 
+const HDR_TRANSFERS: &[&str] = &["smpte2084", "arib-std-b67"];
 const SCALE_MATRICES: &[&str] = &["bt709", "bt470bg", "smpte170m", "fcc", "smpte240m", "bt2020nc"];
 const UNSET: &[&str] = &["unknown", "unspecified", "reserved"];
 const RGB_PREFIXES: &[&str] = &[
@@ -94,31 +96,59 @@ pub fn resize(stream: &Stream, tags: &ColourTags, (width, height): (u32, u32), a
 	}
 }
 
-/// Full-range 16-bit RGB tagged with the picture's primaries and transfer, as an animation's frames are stored. A
-/// YUV picture is read with its own range, matrix and chroma location.
-pub fn rgb_frames(stream: &Stream, tags: &ColourTags, alpha: bool) -> String {
-	let format = if alpha { "gbrap16le" } else { "gbrp16le" };
+/// How an animation's frames are stored: full-range RGB, 8-bit for an 8-bit SDR picture and 16-bit for a deeper or
+/// HDR one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameFormat {
+	pub pix_fmt: &'static str,
+	/// What FFV1 codes per pixel before any compression.
+	pub bytes_per_pixel: u64,
+}
+
+impl FrameFormat {
+	pub fn of(stream: &Stream, tags: &ColourTags, alpha: bool) -> Self {
+		let deep =
+			stream.pix_fmt.as_deref().is_some_and(deep_pix_fmt) || HDR_TRANSFERS.contains(&tags.transfer.as_str());
+		let (pix_fmt, bytes_per_pixel) = match (deep, alpha) {
+			(false, false) => ("bgr0", 3),
+			(false, true) => ("bgra", 4),
+			(true, false) => ("gbrp16le", 6),
+			(true, true) => ("gbrap16le", 8),
+		};
+		Self {
+			pix_fmt,
+			bytes_per_pixel,
+		}
+	}
+}
+
+/// The conversion to `format`, tagged with the picture's primaries and transfer. A YUV picture is read with its own
+/// range, matrix and chroma location; one whose matrix `scale` can't name is refused rather than miscoloured.
+pub fn rgb_frames(stream: &Stream, tags: &ColourTags, format: FrameFormat) -> Result<String, String> {
 	let tagged = format!(
-		"format={format},setparams=field_mode=prog:range=pc:color_primaries={}:color_trc={}:colorspace=gbr",
-		tags.primaries, tags.transfer
+		"format={},setparams=field_mode=prog:range=pc:color_primaries={}:color_trc={}:colorspace=gbr",
+		format.pix_fmt, tags.primaries, tags.transfer
 	);
 	if is_rgb(stream) {
-		return tagged;
+		return Ok(tagged);
 	}
 
-	let matrix = if SCALE_MATRICES.contains(&tags.matrix.as_str()) {
-		format!(":in_color_matrix={}", tags.matrix)
-	} else {
-		String::new()
-	};
+	if !SCALE_MATRICES.contains(&tags.matrix.as_str()) {
+		return Err(format!(
+			"the video's colour matrix ({}) can't be converted to RGB, so it can't become an animated AVIF",
+			tags.matrix
+		));
+	}
+
 	let chroma = tags
 		.chroma_location
 		.as_deref()
 		.map_or_else(String::new, |location| format!(":in_chroma_loc={location}"));
-	format!(
-		"scale=in_range={}{matrix}{chroma}:out_range=pc,{tagged}",
-		tags.range.name()
-	)
+	Ok(format!(
+		"scale=in_range={}:in_color_matrix={}{chroma}:out_range=pc,{tagged}",
+		tags.range.name(),
+		tags.matrix
+	))
 }
 
 /// The `scale` options that keep a YUV picture's range, matrix and chroma location; `None` for RGB.
@@ -333,25 +363,76 @@ mod tests {
 		);
 		let hlg = stream(
 			r#"{"index":0,"codec_type":"video","width":3840,"height":2160,"pix_fmt":"yuv420p10le","color_range":"tv",
-			"color_space":"bt2020c","color_transfer":"arib-std-b67","color_primaries":"bt2020"}"#,
+			"color_space":"bt2020nc","color_transfer":"arib-std-b67","color_primaries":"bt2020"}"#,
 		);
 		let argb = stream(r#"{"index":0,"codec_type":"video","width":640,"height":360,"pix_fmt":"argb"}"#);
+		let rgb = |stream: &Stream, alpha: bool| {
+			let tags = output_tags(stream);
+			rgb_frames(stream, &tags, FrameFormat::of(stream, &tags, alpha)).unwrap()
+		};
 
 		assert_eq!(
-			rgb_frames(&limited, &output_tags(&limited), false),
-			"scale=in_range=tv:in_color_matrix=bt709:in_chroma_loc=topleft:out_range=pc,format=gbrp16le,\
+			rgb(&limited, false),
+			"scale=in_range=tv:in_color_matrix=bt709:in_chroma_loc=topleft:out_range=pc,format=bgr0,\
 			 setparams=field_mode=prog:range=pc:color_primaries=bt709:color_trc=bt709:colorspace=gbr"
 		);
 		assert_eq!(
-			rgb_frames(&hlg, &output_tags(&hlg), false),
-			"scale=in_range=tv:out_range=pc,format=gbrp16le,\
+			rgb(&hlg, false),
+			"scale=in_range=tv:in_color_matrix=bt2020nc:out_range=pc,format=gbrp16le,\
 			 setparams=field_mode=prog:range=pc:color_primaries=bt2020:color_trc=arib-std-b67:colorspace=gbr"
 		);
 		assert_eq!(
-			rgb_frames(&argb, &output_tags(&argb), true),
-			"format=gbrap16le,setparams=field_mode=prog:range=pc:color_primaries=smpte170m:color_trc=smpte170m:\
+			rgb(&argb, true),
+			"format=bgra,setparams=field_mode=prog:range=pc:color_primaries=smpte170m:color_trc=smpte170m:\
 			 colorspace=gbr"
 		);
+	}
+
+	#[test]
+	fn animation_frames_keep_the_source_depth_and_hdr() {
+		let format = |json: &str, alpha: bool| {
+			let stream = stream(json);
+			FrameFormat::of(&stream, &output_tags(&stream), alpha)
+		};
+
+		let sdr = format(
+			r#"{"index":0,"codec_type":"video","height":1080,"pix_fmt":"yuv420p"}"#,
+			false,
+		);
+		let sdr_alpha = format(
+			r#"{"index":0,"codec_type":"video","height":1080,"pix_fmt":"yuva420p"}"#,
+			true,
+		);
+		let ten_bit = format(
+			r#"{"index":0,"codec_type":"video","height":1080,"pix_fmt":"yuv420p10le"}"#,
+			false,
+		);
+		let pq_8bit = format(
+			r#"{"index":0,"codec_type":"video","height":1080,"pix_fmt":"yuv420p","color_transfer":"smpte2084"}"#,
+			true,
+		);
+
+		assert_eq!((sdr.pix_fmt, sdr.bytes_per_pixel), ("bgr0", 3));
+		assert_eq!((sdr_alpha.pix_fmt, sdr_alpha.bytes_per_pixel), ("bgra", 4));
+		assert_eq!((ten_bit.pix_fmt, ten_bit.bytes_per_pixel), ("gbrp16le", 6));
+		assert_eq!((pq_8bit.pix_fmt, pq_8bit.bytes_per_pixel), ("gbrap16le", 8));
+	}
+
+	#[test]
+	fn animation_frames_refuse_a_matrix_scale_cannot_read() {
+		let constant_luminance = stream(
+			r#"{"index":0,"codec_type":"video","width":3840,"height":2160,"pix_fmt":"yuv420p10le","color_range":"tv",
+			"color_space":"bt2020c","color_transfer":"smpte2084","color_primaries":"bt2020"}"#,
+		);
+		let tags = output_tags(&constant_luminance);
+
+		let refused = rgb_frames(
+			&constant_luminance,
+			&tags,
+			FrameFormat::of(&constant_luminance, &tags, false),
+		);
+
+		assert!(refused.is_err_and(|reason| reason.contains("bt2020c")));
 	}
 
 	#[test]
