@@ -20,7 +20,7 @@ use cryarchiver_engine::video::plan::synthesized_grain;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
 use lofty::config::ParseOptions;
 use lofty::file::AudioFile;
-use lofty::ogg::{OggPictureStorage, OpusFile};
+use lofty::ogg::{OggPictureStorage, OpusFile, VorbisFile};
 use tokio_util::sync::CancellationToken;
 
 fn job(source: &Path) -> Job {
@@ -5464,6 +5464,47 @@ async fn id3_musicbrainz_tags_arrive_with_vorbis_names() {
 	.unwrap();
 	assert!(
 		opus.vorbis_comments()
+			.items()
+			.any(|(key, value)| key == "MUSICBRAINZ_ALBUMID" && value == "abc")
+	);
+}
+
+#[tokio::test]
+async fn a_vorbis_ogg_output_gets_vorbis_names_without_a_warning() {
+	let dir = tempfile::tempdir().unwrap();
+	let ogg = support::tone(
+		dir.path(),
+		"tagged.ogg",
+		"mono",
+		1,
+		3,
+		&[
+			"-c:a",
+			"libvorbis",
+			"-b:a",
+			"32k",
+			"-metadata",
+			"MusicBrainz Album Id=abc",
+		],
+	);
+
+	let outcome = run(&requested(&ogg, OutputFormat::Ogg), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		!warnings.iter().any(|warning| warning.contains("music tags")),
+		"{warnings:?}"
+	);
+	let vorbis = VorbisFile::read_from(
+		&mut File::open(output).unwrap(),
+		ParseOptions::new().read_properties(false),
+	)
+	.unwrap();
+	assert!(
+		vorbis
+			.vorbis_comments()
 			.items()
 			.any(|(key, value)| key == "MUSICBRAINZ_ALBUMID" && value == "abc")
 	);

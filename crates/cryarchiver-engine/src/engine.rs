@@ -719,6 +719,7 @@ impl Engine {
 		}
 
 		if plan.container.cover == Cover::VorbisPicture
+			&& !plan.options.strip
 			&& let Err(err) = tags::rename_keys(&output)
 		{
 			let warning = format!("music tags keep their ID3 names: {err}");
