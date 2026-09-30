@@ -378,7 +378,7 @@ impl Engine {
 				let rules = stream_rules(job, &info)?;
 				self.check_burn_tools(rules.burn, &info)?;
 				let planned = self
-					.video_main(&info, job.options.forced(mergeable(&info)))
+					.video_main(&info, job.options.forced_video(mergeable(&info)))
 					.map_err(Refusal::from)
 					.and_then(|_| plan_streams(&info, &rules));
 				match planned {
@@ -647,7 +647,7 @@ impl Engine {
 			.await
 			.map_err(video_probe_error)?;
 		let planned = self
-			.video_main(&info, cx.job.options.forced(mergeable(&info)))
+			.video_main(&info, cx.job.options.forced_video(mergeable(&info)))
 			.map_err(Refusal::from)
 			.and_then(|main| plan_streams(&info, &rules).map(|streams| (main, streams)));
 		let (main, streams) = match planned {
@@ -709,6 +709,7 @@ impl Engine {
 			}
 			video_plan::force_encoder(&mut video, choice, cx.job.speed).map_err(ErrorKind::EncodeFailed)?;
 		}
+
 		video.max_bitrate_kbps = cx.job.options.max_bitrate_kbps;
 
 		if video.encoder.film_grain()
@@ -748,7 +749,7 @@ impl Engine {
 		}
 
 		let learned_bpp = quality.stats.and_then(|stats| stats.bpp);
-		if !cx.job.options.forced(mergeable(&info))
+		if !cx.job.options.forced_video(mergeable(&info))
 			&& let Some(reason) = learned_bpp.and_then(|bpp| video_plan::efficient_at(&info, main, bpp))
 		{
 			return Ok(Produced::Kept(KeepReason::AlreadyEfficient(reason)));
@@ -953,7 +954,7 @@ impl Engine {
 		};
 
 		video.encoder = video.encoder.with_crf(quality.start());
-		if cx.job.options.forced(mergeable(inputs.info)) {
+		if cx.job.options.forced_video(mergeable(inputs.info)) {
 			return Ok(Tuning::Encode { verify });
 		}
 
@@ -1044,11 +1045,11 @@ impl Engine {
 
 		let found = match searched {
 			Searched::Found(found) => found,
-			Searched::Unreachable { crf, score } if cx.job.options.forced(mergeable(inputs.info)) => {
+			Searched::Unreachable { crf, score } if cx.job.options.forced_video(mergeable(inputs.info)) => {
 				video.encoder = video.encoder.with_crf(crf);
 				video.warnings.push(format!(
 					"{}; encoded at CRF {crf} without a full check because it was requested",
-					under_cap(
+					with_cap_note(
 						&video_quality::short_text(crf, score, quality.target),
 						video.max_bitrate_kbps
 					)
@@ -1066,7 +1067,7 @@ impl Engine {
 		video.encoder = video.encoder.with_crf(found.crf);
 		quality.slope = found.slope;
 
-		if !cx.job.options.forced(mergeable(inputs.info))
+		if !cx.job.options.forced_video(mergeable(inputs.info))
 			&& let Some(duration_s) = inputs
 				.declared_s
 				.filter(|duration| *duration >= video_encode::MIN_PREDICTED_DURATION_S)
@@ -1117,7 +1118,7 @@ impl Engine {
 				None
 			};
 			let Some(lower) = lower else {
-				if cx.job.options.forced(mergeable(inputs.info)) {
+				if cx.job.options.forced_video(mergeable(inputs.info)) {
 					temps.warnings.push(short_note(
 						&video_quality::short_text(crf, score, quality.target),
 						video.max_bitrate_kbps,
@@ -1318,7 +1319,7 @@ impl Engine {
 		let declared_s = job.main.declared_duration().or(job.info.format.duration);
 		let share = source_share(cx.source_bytes, job.video.window, declared_s);
 		if !saves_enough(share.unwrap_or(cx.source_bytes), bytes, cx.job.min_savings) {
-			if !cx.job.options.forced(mergeable(job.info)) {
+			if !cx.job.options.forced_video(mergeable(job.info)) {
 				return Ok(Produced::Kept(KeepReason::NotSmaller {
 					src_bytes: share.unwrap_or(cx.source_bytes),
 					out_bytes: bytes,
@@ -1780,11 +1781,11 @@ fn unsearched_warning(declared_s: Option<f64>, crf: f64) -> String {
 fn short_note(reason: &str, cap_kbps: Option<u32>) -> String {
 	format!(
 		"{}; it was written because it was requested",
-		under_cap(reason, cap_kbps)
+		with_cap_note(reason, cap_kbps)
 	)
 }
 
-fn under_cap(reason: &str, cap_kbps: Option<u32>) -> String {
+fn with_cap_note(reason: &str, cap_kbps: Option<u32>) -> String {
 	match cap_kbps {
 		Some(kbps) => format!("{reason} under the {} Mbit/s cap", f64::from(kbps) / 1000.0),
 		None => reason.to_owned(),
@@ -1850,5 +1851,23 @@ mod tests {
 		assert_eq!(thread_budget(Some(4), Some(8), 16), 4);
 		assert_eq!(thread_budget(None, Some(8), 16), 8);
 		assert_eq!(thread_budget(None, Some(0), 16), 1);
+	}
+
+	#[test]
+	fn capped_notes_name_the_cap_in_megabits() {
+		assert_eq!(with_cap_note("missed", None), "missed");
+		assert_eq!(
+			with_cap_note("missed", Some(12_500)),
+			"missed under the 12.5 Mbit/s cap"
+		);
+		assert_eq!(with_cap_note("missed", Some(60)), "missed under the 0.06 Mbit/s cap");
+		assert_eq!(
+			short_note("missed", None),
+			"missed; it was written because it was requested"
+		);
+		assert_eq!(
+			short_note("missed", Some(12_500)),
+			"missed under the 12.5 Mbit/s cap; it was written because it was requested"
+		);
 	}
 }

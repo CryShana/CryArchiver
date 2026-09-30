@@ -141,8 +141,6 @@ fn encode_command(
 }
 
 fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder, threads: Option<Threads>, max_kbps: Option<u32>) {
-	let rate = max_kbps.map_or_else(|| "0".to_owned(), |kbps| format!("{kbps}k"));
-
 	match encoder {
 		Encoder::SvtAv1 {
 			preset,
@@ -163,7 +161,7 @@ fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder, threads: Option<Thread
 			cmd.args(["-c:v", "libaom-av1", "-crf"])
 				.arg(crf.to_string())
 				.arg("-b:v")
-				.arg(&rate)
+				.arg(video_rate(max_kbps))
 				.arg("-cpu-used")
 				.arg(cpu_used.to_string())
 				.args(["-row-mt", "1"]);
@@ -172,7 +170,7 @@ fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder, threads: Option<Thread
 			cmd.args(["-c:v", "libvpx-vp9", "-crf"])
 				.arg(crf.to_string())
 				.arg("-b:v")
-				.arg(&rate)
+				.arg(video_rate(max_kbps))
 				.args(["-row-mt", "1", "-deadline", "good", "-cpu-used"])
 				.arg(cpu_used.to_string());
 		}
@@ -181,6 +179,11 @@ fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder, threads: Option<Thread
 	if let (Some(threads), Encoder::Aom { .. } | Encoder::Vp9Alpha { .. }) = (threads, encoder) {
 		cmd.arg("-threads").arg(threads.tool.to_string());
 	}
+}
+
+/// `-b:v` for libaom-av1 and libvpx-vp9: 0 is plain CRF, a bitrate with `-crf` is constrained quality.
+fn video_rate(max_kbps: Option<u32>) -> String {
+	max_kbps.map_or_else(|| "0".to_owned(), |kbps| format!("{kbps}k"))
 }
 
 pub fn samples(declared_s: Option<f64>) -> Vec<Sample> {

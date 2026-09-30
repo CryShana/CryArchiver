@@ -2587,6 +2587,7 @@ async fn a_bitrate_cap_makes_a_smaller_video() {
 			out_bytes: free_bytes, ..
 		},
 		JobOutcome::Encoded {
+			output,
 			out_bytes: capped_bytes,
 			..
 		},
@@ -2595,6 +2596,177 @@ async fn a_bitrate_cap_makes_a_smaller_video() {
 		panic!("{free:?} {capped:?}")
 	};
 	assert!(capped_bytes < free_bytes, "{capped_bytes} ≥ {free_bytes}");
+	let kbps = video_kbps(output, 3.0);
+	assert!(kbps < 2.0 * 60.0, "{kbps} kbps under a 60 kbps cap");
+}
+
+fn capped(kbps: u32) -> JobOptions {
+	JobOptions {
+		max_bitrate_kbps: Some(kbps),
+		..JobOptions::default()
+	}
+}
+
+/// The first video stream's bitrate over `seconds`, from its packet sizes.
+#[allow(clippy::cast_precision_loss)]
+fn video_kbps(path: &Path, seconds: f64) -> f64 {
+	let out = std::process::Command::new("ffprobe")
+		.args([
+			"-v",
+			"error",
+			"-select_streams",
+			"v:0",
+			"-show_entries",
+			"packet=size",
+			"-of",
+			"csv=p=0",
+		])
+		.arg(path)
+		.output()
+		.unwrap();
+	let bytes: u64 = String::from_utf8_lossy(&out.stdout)
+		.lines()
+		.filter_map(|line| line.trim().trim_end_matches(',').parse::<u64>().ok())
+		.sum();
+
+	bytes as f64 * 8.0 / 1000.0 / seconds
+}
+
+#[tokio::test]
+async fn a_bitrate_cap_leaves_audio_and_images_as_they_are() {
+	let dir = tempfile::tempdir().unwrap();
+	let opus = support::tone(
+		dir.path(),
+		"low.opus",
+		"mono",
+		1,
+		3,
+		&["-c:a", "libopus", "-b:a", "32k"],
+	);
+	let tiny = dir.path().join("tiny.png");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=red:s=3x3",
+		"-frames:v",
+		"1",
+		tiny.to_str().unwrap(),
+	]);
+
+	let (free_dir, capped_dir) = (dir.path().join("free"), dir.path().join("capped"));
+	fs::create_dir(&free_dir).unwrap();
+	fs::create_dir(&capped_dir).unwrap();
+	let demanding = |source: &Path| Job {
+		min_savings: 0.9,
+		..job(source)
+	};
+
+	for source in [&opus, &tiny] {
+		let free = run(&demanding(source), &free_dir).await;
+		let with_cap = run(&with_options(demanding(source), capped(60)), &capped_dir).await;
+
+		let (JobOutcome::KeptOriginal { reason: free }, JobOutcome::KeptOriginal { reason: with_cap }) =
+			(&free, &with_cap)
+		else {
+			panic!("{free:?} {with_cap:?}")
+		};
+		assert_eq!(free, with_cap);
+	}
+}
+
+#[tokio::test]
+async fn a_capped_pass_learns_under_its_own_key() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, _) = run_recording(&engine, &with_options(job(&clip), capped(50_000)), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	let entries = memory.entries();
+	assert_eq!(entries.len(), 1, "{entries:?}");
+	assert!(entries[0].0.contains("+mbr50000|p5|"), "{entries:?}");
+}
+
+#[tokio::test]
+async fn a_capped_video_that_misses_its_check_is_written_without_a_retry() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
+	let capped_key = key
+		.replace("|t93.0/89.0", "|t99.0/98.0")
+		.replacen("|p5|", "+mbr60|p5|", 1);
+	assert_ne!(capped_key, key.replace("|t93.0/89.0", "|t99.0/98.0"), "{key}");
+	let memory = Arc::new(SharedMemory::with_entries([(capped_key, stats)]));
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+	let strict = Job {
+		overrides: Overrides {
+			video: Some(VmafOverride {
+				mean: 99.0,
+				floor: 98.0,
+			}),
+			..Overrides::default()
+		},
+		options: capped(60),
+		..job(&clip)
+	};
+
+	let (outcome, events) = run_recording(&engine, &strict, dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Encoded { output, .. } if *output == dir.path().join("clip.cry.mkv")),
+		"{outcome:?}"
+	);
+	let warning = quality_warning(&outcome);
+	assert!(
+		warning.starts_with("quality target not reached (VMAF ")
+			&& warning.ends_with(") under the 0.06 Mbit/s cap; it was written because it was requested"),
+		"{warning}"
+	);
+	assert!(!warned(&outcome, "encoded again"), "{outcome:?}");
+	assert_eq!(
+		stages(&events, Stage::Sample),
+		0,
+		"the capped key's CRF was used: {events:?}"
+	);
+	assert_eq!(stages(&events, Stage::Encode), 1, "no retry under a cap: {events:?}");
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn a_capped_search_that_cannot_reach_the_target_still_writes_the_video() {
+	let dir = tempfile::tempdir().unwrap();
+	let faint_noise = dir.path().join("faint-noise.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=gray:s=320x240:r=25:d=3,noise=alls=10:allf=t",
+		"-pix_fmt",
+		"yuv420p",
+		"-c:v",
+		"ffv1",
+		faint_noise.to_str().unwrap(),
+	]);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, _) = run_recording(&engine, &with_options(job(&faint_noise), capped(60)), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Encoded { output, .. } if *output == dir.path().join("faint-noise.cry.mkv")),
+		"{outcome:?}"
+	);
+	let warning = quality_warning(&outcome);
+	assert!(
+		warning.starts_with("quality target not reached (VMAF ")
+			&& warning.contains(") under the 0.06 Mbit/s cap; encoded at CRF ")
+			&& warning.ends_with(" without a full check because it was requested"),
+		"{warning}"
+	);
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
 }
 
 #[tokio::test]

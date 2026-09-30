@@ -83,7 +83,11 @@ impl JobOptions {
 			|| self.strip
 			|| (self.merge_audio && merge_possible)
 			|| self.burn_subs.is_some()
-			|| self.max_bitrate_kbps.is_some()
+	}
+
+	/// `forced`, and also a bitrate cap, which asks only for a video output: audio and image jobs ignore it.
+	pub fn forced_video(&self, merge_possible: bool) -> bool {
+		self.forced(merge_possible) || self.max_bitrate_kbps.is_some()
 	}
 }
 
@@ -395,6 +399,23 @@ mod tests {
 		assert!(!merge.forced(false));
 		assert!(merge.forced(true));
 		assert!(!JobOptions::default().forced(true));
+	}
+
+	#[test]
+	fn a_bitrate_cap_forces_only_a_video_output() {
+		let capped = JobOptions {
+			max_bitrate_kbps: Some(12_500),
+			..JobOptions::default()
+		};
+		let stripped = JobOptions {
+			strip: true,
+			..JobOptions::default()
+		};
+
+		assert!(!capped.forced(false));
+		assert!(capped.forced_video(false));
+		assert!(stripped.forced_video(false));
+		assert!(!JobOptions::default().forced_video(true));
 	}
 
 	#[test]

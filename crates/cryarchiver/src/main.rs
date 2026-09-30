@@ -311,6 +311,7 @@ const MAX_CAP_MBPS: f64 = 1000.0;
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn parse_max_bitrate(text: &str) -> Result<u32, String> {
 	let mbps: f64 = number(text)?;
+
 	if !(MIN_CAP_MBPS..=MAX_CAP_MBPS).contains(&mbps) {
 		return Err(format!(
 			"the bitrate cap must be between {MIN_CAP_MBPS} and {MAX_CAP_MBPS} Mbit/s"
