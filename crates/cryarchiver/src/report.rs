@@ -9,15 +9,19 @@ use cryarchiver_engine::text::{display_name, fit_middle};
 use indicatif::{DecimalBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 const NAME_WIDTH: usize = 40;
+const SHORT_TAIL: usize = 3;
+const VERBOSE_TAIL: usize = 20;
 
+#[derive(Clone)]
 pub struct Report {
 	multi: MultiProgress,
 	style: ProgressStyle,
 	quiet: bool,
+	verbose: bool,
 }
 
 impl Report {
-	pub fn new(quiet: bool) -> Self {
+	pub fn new(quiet: bool, verbose: bool) -> Self {
 		let multi = MultiProgress::new();
 		if quiet {
 			multi.set_draw_target(ProgressDrawTarget::hidden());
@@ -26,7 +30,20 @@ impl Report {
 		let style = ProgressStyle::with_template("{prefix} {bar:24.cyan/blue} {msg}")
 			.expect("valid template")
 			.progress_chars("━━─");
-		Self { multi, style, quiet }
+		Self {
+			multi,
+			style,
+			quiet,
+			verbose,
+		}
+	}
+
+	pub fn verbose(&self) -> bool {
+		self.verbose
+	}
+
+	pub fn tail_lines(&self) -> usize {
+		if self.verbose { VERBOSE_TAIL } else { SHORT_TAIL }
 	}
 
 	pub fn bar(&self, source: &Path) -> ProgressBar {
@@ -93,7 +110,12 @@ pub fn apply(bar: &ProgressBar, event: &JobEvent) {
 	}
 }
 
+#[cfg(test)]
 pub fn outcome_line(source: &Path, outcome: &JobOutcome) -> String {
+	outcome_line_with(source, outcome, SHORT_TAIL)
+}
+
+pub fn outcome_line_with(source: &Path, outcome: &JobOutcome, tail_lines: usize) -> String {
 	let name = file_label(source);
 
 	match outcome {
@@ -124,7 +146,7 @@ pub fn outcome_line(source: &Path, outcome: &JobOutcome) -> String {
 		JobOutcome::Skipped { reason } => format!("· {name}  skipped: {reason}"),
 		JobOutcome::Failed(err) => {
 			let mut line = format!("✗ {name}  failed: {err}");
-			for log in &err.log_tail[err.log_tail.len().saturating_sub(3)..] {
+			for log in &err.log_tail[err.log_tail.len().saturating_sub(tail_lines)..] {
 				let _ = write!(line, "\n    {}", display_name(OsStr::new(log)));
 			}
 			line
@@ -248,6 +270,24 @@ mod tests {
 			"= 02. 夜明け.flac  kept: encoding would save too little (5.80 MB → predicted 7.10 MB)"
 		);
 		assert!(outcome_line(source, &failed).starts_with("✗ 02. 夜明け.flac  failed: source damaged"));
+	}
+
+	#[test]
+	fn verbose_failures_show_more_of_the_tool_output() {
+		let err = JobError::with_log(
+			ErrorKind::EncodeFailed("x".into()),
+			(0..30).map(|line| format!("line {line}")).collect(),
+		);
+		let failed = JobOutcome::Failed(err);
+
+		let short = outcome_line(Path::new("a.mp4"), &failed);
+		let long = outcome_line_with(Path::new("a.mp4"), &failed, 20);
+
+		assert_eq!(short.lines().count(), 4);
+		assert_eq!(long.lines().count(), 21);
+		assert!(long.ends_with("line 29"), "{long}");
+		assert_eq!(Report::new(false, true).tail_lines(), 20);
+		assert_eq!(Report::new(false, false).tail_lines(), 3);
 	}
 
 	#[test]

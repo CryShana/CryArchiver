@@ -36,7 +36,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::memory::SystemMemory;
-use crate::report::{Report, Totals, outcome_line};
+use crate::report::{Report, Totals, file_label, outcome_line_with};
 
 #[derive(Parser)]
 #[command(
@@ -221,6 +221,20 @@ struct CompressArgs {
 	#[arg(short, long, help = "Only print failures and the summary")]
 	quiet: bool,
 	#[arg(
+		short,
+		long,
+		value_enum,
+		default_value_t,
+		help = "Codec family; compat (H.264, AAC, JPEG, PNG) comes later"
+	)]
+	codec: Codec,
+	#[arg(
+		short,
+		long,
+		help = "Show warnings as they happen and 20 lines of a failed tool's output"
+	)]
+	verbose: bool,
+	#[arg(
 		long,
 		value_name = "CRF",
 		value_parser = parse_crf,
@@ -243,6 +257,13 @@ struct CompressArgs {
 		help = "Image encoder instead of the automatic choice"
 	)]
 	image_encoder: Option<ImageRoute>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum Codec {
+	#[default]
+	Latest,
+	Compat,
 }
 
 #[derive(Args, Clone, Copy)]
@@ -701,6 +722,13 @@ async fn doctor(ffmpeg: Option<PathBuf>) -> u8 {
 
 #[allow(clippy::too_many_lines)]
 async fn compress(args: CompressArgs) -> u8 {
+	if args.codec == Codec::Compat {
+		eprintln!(
+			"error: the COMPATIBILITY codec family (H.264/AAC/JPEG/PNG) is not available yet; use --codec latest"
+		);
+		return 2;
+	}
+
 	let inputs = inputs::expand(&args.inputs);
 	for note in &inputs.notes {
 		eprintln!("note: {note}");
@@ -823,7 +851,7 @@ async fn compress(args: CompressArgs) -> u8 {
 	if let Some(threads) = threads {
 		engine = engine.with_threads(threads);
 	}
-	let report = Report::new(args.quiet);
+	let report = Report::new(args.quiet, args.verbose);
 
 	let totals = run_all(&Arc::new(engine), &sink, jobs, parallel, &report, &cancel).await;
 
@@ -880,10 +908,17 @@ async fn run_all(
 		let bar = report.bar(&job.source);
 		let seat = QueueSeat::new(videos.clone());
 		let (engine, sink, cancel) = (engine.clone(), sink.clone(), cancel.clone());
+		let report = report.clone();
 		running.spawn(async move {
 			let on_event = |event: JobEvent| {
 				seat.observe(&event);
 				report::apply(&bar, &event);
+
+				if report.verbose()
+					&& let JobEvent::Warning(warning) = &event
+				{
+					report.print(&format!("  ⚠ {}: {warning}", file_label(&job.source)), false);
+				}
 			};
 			let outcome = engine.run(&job, sink.as_ref(), &on_event, &cancel).await;
 			bar.finish_and_clear();
@@ -911,7 +946,10 @@ fn absolute(path: PathBuf) -> PathBuf {
 }
 
 fn record(report: &Report, totals: &mut Totals, source: &Path, outcome: &JobOutcome) {
-	report.print(&outcome_line(source, outcome), matches!(outcome, JobOutcome::Failed(_)));
+	report.print(
+		&outcome_line_with(source, outcome, report.tail_lines()),
+		matches!(outcome, JobOutcome::Failed(_)),
+	);
 	totals.add(outcome);
 }
 

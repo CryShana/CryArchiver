@@ -993,3 +993,64 @@ fn low_priority_runs_the_batch() {
 	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 	assert!(dir.path().join("song.cry.opus").is_file());
 }
+
+#[test]
+fn compat_is_not_available_yet() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "song.flac", 2);
+
+	let out = cryarchiver(dir.path(), &["-c", "compat", "song.flac"]);
+
+	assert_eq!(out.status.code(), Some(2));
+	assert!(stderr(&out).contains("COMPATIBILITY"), "{}", stderr(&out));
+	assert!(!dir.path().join("song.cry.opus").exists());
+}
+
+#[test]
+fn a_verbose_run_with_a_failure_writes_nothing_but_the_outputs() {
+	let dir = tempfile::tempdir().unwrap();
+	let home = tempfile::tempdir().unwrap();
+	flac(dir.path(), "good.flac", 2);
+	let cut = flac(dir.path(), "cut.flac", 10);
+	let bytes = fs::read(&cut).unwrap();
+	fs::write(&cut, &bytes[..bytes.len() * 2 / 5]).unwrap();
+
+	let mut command = Command::new(env!("CARGO_BIN_EXE_cryarchiver"));
+	for variable in [
+		"HOME",
+		"APPDATA",
+		"LOCALAPPDATA",
+		"XDG_CACHE_HOME",
+		"XDG_CONFIG_HOME",
+		"XDG_STATE_HOME",
+	] {
+		command.env(variable, home.path());
+	}
+	let out = command
+		.current_dir(dir.path())
+		.args(["-v", "good.flac", "cut.flac", "-o", "out"])
+		.output()
+		.unwrap();
+
+	assert_eq!(out.status.code(), Some(1), "{}{}", stdout(&out), stderr(&out));
+	assert!(
+		stdout(&out).contains("✗ cut.flac  failed: source damaged"),
+		"{}",
+		stdout(&out)
+	);
+	assert!(
+		fs::read_dir(home.path()).unwrap().next().is_none(),
+		"the home folder gained files"
+	);
+	let mut names: Vec<String> = fs::read_dir(dir.path())
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+	names.sort();
+	assert_eq!(names, ["cut.flac", "good.flac", "out"]);
+	let produced: Vec<String> = fs::read_dir(dir.path().join("out"))
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+	assert_eq!(produced, ["good.cry.opus"]);
+}
