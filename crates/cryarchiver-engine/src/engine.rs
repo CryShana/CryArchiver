@@ -378,7 +378,7 @@ impl Engine {
 				let rules = stream_rules(job, &info)?;
 				self.check_burn_tools(rules.burn, &info)?;
 				let planned = self
-					.video_main(&info, job.options.forced_video(mergeable(&info)))
+					.video_main(&info, job)
 					.map_err(Refusal::from)
 					.and_then(|_| plan_streams(&info, &rules));
 				match planned {
@@ -552,9 +552,9 @@ impl Engine {
 		}
 	}
 
-	fn video_main<'a>(&self, info: &'a MediaInfo, forced: bool) -> Result<&'a Stream, KeepReason> {
-		if forced {
-			usable_main(info, &self.video_caps())
+	fn video_main<'a>(&self, info: &'a MediaInfo, job: &Job) -> Result<&'a Stream, KeepReason> {
+		if job.options.forced_video(mergeable(info)) {
+			usable_main(info, &self.video_caps(), job.options.resize)
 		} else {
 			precheck(info, &self.video_caps())
 		}
@@ -656,7 +656,7 @@ impl Engine {
 			.await
 			.map_err(video_probe_error)?;
 		let planned = self
-			.video_main(&info, cx.job.options.forced_video(mergeable(&info)))
+			.video_main(&info, cx.job)
 			.map_err(Refusal::from)
 			.and_then(|main| plan_streams(&info, &rules).map(|streams| (main, streams)));
 		let (main, streams) = match planned {

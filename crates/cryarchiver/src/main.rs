@@ -1441,7 +1441,7 @@ mod tests {
 				height: None
 			})
 		);
-		for bad in ["-1:-1", ":", "0:720", "1280", "1:2:3", "-2:720", "abc:720"] {
+		for bad in ["-1:-1", ":", "0:720", "1280", "1:2:3", "-2:720", "abc:720", "65537:-1"] {
 			assert_eq!(refusal(&["a.mp4", "--resize", bad]).exit_code(), 2, "{bad}");
 		}
 		assert!(

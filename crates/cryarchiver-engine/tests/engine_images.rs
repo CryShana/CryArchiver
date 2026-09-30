@@ -1177,6 +1177,115 @@ async fn a_resized_photo_is_scaled_upright_with_its_aspect_ratio_as_avif_and_jpe
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
 }
 
+/// The left half opaque red, the right half transparent black, as most tools save transparency.
+fn red_edge_png(dir: &Path) -> PathBuf {
+	let path = dir.join("edge.png");
+	image::RgbaImage::from_fn(64, 64, |x, _| {
+		if x < 32 {
+			image::Rgba([255, 0, 0, 255])
+		} else {
+			image::Rgba([0, 0, 0, 0])
+		}
+	})
+	.save(&path)
+	.unwrap();
+	path
+}
+
+/// Every pixel at least `min_alpha` opaque, as 8-bit RGBA.
+fn visible(pixels: &[u8], min_alpha: u8) -> Vec<[u8; 4]> {
+	pixels
+		.as_chunks::<4>()
+		.0
+		.iter()
+		.filter(|pixel| pixel[3] >= min_alpha)
+		.copied()
+		.collect()
+}
+
+#[tokio::test]
+async fn a_resized_transparent_photo_keeps_the_colour_of_its_edges() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = red_edge_png(dir.path());
+	let lossless = Job {
+		options: JobOptions {
+			advanced: Advanced {
+				image_encoder: Some(ImageRoute::JxlLossless),
+				..Advanced::default()
+			},
+			..JobOptions::default()
+		},
+		..job(&source)
+	};
+
+	let output = encoded(run(&resized(lossless, Some(22), None), dir.path()).await);
+
+	let image = JxlImage::builder()
+		.read(std::fs::read(&output).unwrap().as_slice())
+		.unwrap();
+	let render = image.render_frame(0).unwrap();
+	let mut stream = render.stream();
+	assert_eq!((stream.width(), stream.height(), stream.channels()), (22, 22, 4));
+	let mut samples = vec![0f32; 22 * 22 * 4];
+	stream.write_to_buffer(&mut samples);
+	#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+	let pixels: Vec<u8> = samples.iter().map(|sample| (sample * 255.0).round() as u8).collect();
+	let edge = visible(&pixels, 8);
+	assert!(edge.iter().any(|pixel| pixel[3] < 247), "{edge:?}");
+	for pixel in edge {
+		assert!(pixel[0] >= 250 && pixel[1] <= 5 && pixel[2] <= 5, "{pixel:?}");
+	}
+}
+
+#[tokio::test]
+async fn a_resized_transparent_animation_keeps_the_colour_of_its_edges() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("edge.apng");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=red:s=32x64:r=10:d=0.3,format=rgba",
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=black@0:s=32x64:r=10:d=0.3,format=rgba",
+		"-filter_complex",
+		"[0][1]hstack,format=rgba",
+		"-f",
+		"apng",
+		source.to_str().unwrap(),
+	]);
+
+	let output = encoded(run(&resized(job(&source), Some(22), None), dir.path()).await);
+
+	let info = cryarchiver_engine::probe::probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let tracks: Vec<u32> = info
+		.streams
+		.iter()
+		.filter(|stream| stream.nb_frames.is_some_and(|frames| frames > 1))
+		.map(|stream| stream.index)
+		.collect();
+	let decoded = std::process::Command::new("ffmpeg")
+		.args(["-v", "error", "-i"])
+		.arg(&output)
+		.arg("-filter_complex")
+		.arg(format!("[0:{}][0:{}]alphamerge,format=rgba", tracks[0], tracks[1]))
+		.args(["-frames:v", "1", "-f", "rawvideo", "-"])
+		.output()
+		.unwrap();
+	let edge: Vec<[u8; 4]> = visible(&decoded.stdout, 8)
+		.into_iter()
+		.filter(|pixel| pixel[3] <= 247)
+		.collect();
+	assert!(!edge.is_empty(), "no partly transparent pixel");
+	for pixel in edge {
+		assert!(pixel[0] >= 220, "{pixel:?}");
+	}
+}
+
 #[tokio::test]
 async fn a_resized_sixteen_bit_png_holding_eight_bit_data_still_becomes_avif() {
 	let dir = tempfile::tempdir().unwrap();

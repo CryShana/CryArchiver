@@ -81,10 +81,17 @@ pub fn conversion(stream: &Stream, tags: &ColourTags, target_pix_fmt: &str) -> O
 	Some(format!("{scale},format={target_pix_fmt}"))
 }
 
-/// Scales the picture to `width`×`height` with square pixels, leaving its colour as it is.
-pub fn resize(stream: &Stream, tags: &ColourTags, (width, height): (u32, u32)) -> String {
+/// Scales the picture to `width`×`height` with square pixels, leaving its colour as it is. A transparent picture is
+/// scaled premultiplied, or the colour hidden under transparent pixels would darken the partly transparent edges.
+pub fn resize(stream: &Stream, tags: &ColourTags, (width, height): (u32, u32), alpha: bool) -> String {
 	let kept = kept_colour(stream, tags).map_or_else(String::new, |kept| format!(":{kept}"));
-	format!("scale=w={width}:h={height}:flags=lanczos+accurate_rnd{kept},setsar=1")
+	let scale = format!("scale=w={width}:h={height}:flags=lanczos+accurate_rnd{kept}");
+
+	if alpha {
+		format!("premultiply=inplace=1,{scale},unpremultiply=inplace=1,setsar=1")
+	} else {
+		format!("{scale},setsar=1")
+	}
 }
 
 /// The `scale` options that keep a YUV picture's range, matrix and chroma location; `None` for RGB.
@@ -272,16 +279,21 @@ mod tests {
 		let argb = stream(r#"{"index":0,"codec_type":"video","width":640,"height":360,"pix_fmt":"argb"}"#);
 
 		assert_eq!(
-			resize(&full, &output_tags(&full), (640, 360)),
+			resize(&full, &output_tags(&full), (640, 360), false),
 			"scale=w=640:h=360:flags=lanczos+accurate_rnd:in_range=pc:out_range=pc:in_color_matrix=bt709:\
 			 out_color_matrix=bt709:in_chroma_loc=topleft:out_chroma_loc=topleft,setsar=1"
 		);
 		assert_eq!(
-			resize(&constant_luminance, &output_tags(&constant_luminance), (1280, 720)),
+			resize(
+				&constant_luminance,
+				&output_tags(&constant_luminance),
+				(1280, 720),
+				false
+			),
 			"scale=w=1280:h=720:flags=lanczos+accurate_rnd:in_range=tv:out_range=tv,setsar=1"
 		);
 		assert_eq!(
-			resize(&argb, &output_tags(&argb), (320, 180)),
+			resize(&argb, &output_tags(&argb), (320, 180), false),
 			"scale=w=320:h=180:flags=lanczos+accurate_rnd,setsar=1"
 		);
 	}

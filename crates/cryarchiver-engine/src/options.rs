@@ -8,6 +8,7 @@ const SHORTEST_TRIM_S: f64 = 0.1;
 const SHORTEST_SPAN_S: f64 = 0.001;
 const TIME_EPSILON_S: f64 = 1e-9;
 const SIXTY: f64 = 60.0;
+const MAX_SIDE: u32 = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Trim {
@@ -86,24 +87,31 @@ impl Resize {
 	#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 	pub fn size(self, (shown_width, shown_height): (f64, f64), even: bool) -> Result<(u32, u32), String> {
 		let computed = |length: f64| {
-			if even {
-				((length / 2.0).round() as u32).max(1) * 2
+			let rounded = if even {
+				((length / 2.0).round() * 2.0).max(2.0)
 			} else {
-				(length.round() as u32).max(1)
+				length.round().max(1.0)
+			};
+			if rounded > f64::from(MAX_SIDE) {
+				return Err(format!(
+					"--resize keeps the aspect ratio at more than {MAX_SIDE} pixels on a side ({rounded:.0})"
+				));
 			}
+			Ok(rounded as u32)
 		};
 		let aspect = shown_width / shown_height;
 
 		let size = match (self.width, self.height) {
 			(Some(width), Some(height)) => (width, height),
-			(Some(width), None) => (width, computed(f64::from(width) / aspect)),
-			(None, Some(height)) => (computed(f64::from(height) * aspect), height),
-			(None, None) => (shown_width.round() as u32, shown_height.round() as u32),
+			(Some(width), None) => (width, computed(f64::from(width) / aspect)?),
+			(None, Some(height)) => (computed(f64::from(height) * aspect)?, height),
+			(None, None) => (computed(shown_width)?, computed(shown_height)?),
 		};
 		let given_odd = [self.width, self.height].iter().flatten().any(|side| side % 2 == 1);
 		if even && given_odd {
 			return Err(format!(
-				"--resize gives {}×{}, but 4:2:0 video needs an even width and height",
+				"--resize gives {}×{}, but 4:2:0 video needs an even width and height (use an even size, or -1 for \
+				 one side)",
 				size.0, size.1
 			));
 		}
@@ -132,6 +140,11 @@ fn side(text: &str) -> Result<Option<u32>, String> {
 		})?;
 	if pixels == 0 {
 		return Err("a side must be at least 1 pixel".to_owned());
+	}
+	if pixels > MAX_SIDE {
+		return Err(format!(
+			"a side can be at most {MAX_SIDE} pixels, the largest AV1 holds"
+		));
 	}
 	Ok(Some(pixels))
 }
@@ -546,6 +559,43 @@ mod tests {
 		assert!(Resize::parse("-1:-1").unwrap_err().contains("at least one side"));
 		assert!(Resize::parse("0:720").unwrap_err().contains("at least 1 pixel"));
 		assert!(Resize::parse("1:2:3").unwrap_err().contains("W:H"));
+		assert_eq!(Resize::parse("65536:-1"), resize(Some(65_536), None));
+		assert!(Resize::parse("65537:-1").unwrap_err().contains("at most 65536"));
+		assert!(Resize::parse("-1:4000000000").unwrap_err().contains("at most 65536"));
+		assert!(Resize::parse("99999999999:-1").is_err());
+	}
+
+	#[test]
+	fn a_computed_side_past_the_largest_is_refused_rather_than_overflowing() {
+		let wide = Resize {
+			width: Some(65_536),
+			height: None,
+		};
+		let tall = Resize {
+			width: None,
+			height: Some(65_536),
+		};
+
+		for even in [true, false] {
+			assert!(
+				wide.size((10.0, 4000.0), even).unwrap_err().contains("more than 65536"),
+				"{even}"
+			);
+			assert!(tall.size((4000.0, 10.0), even).is_err(), "{even}");
+		}
+		assert_eq!(wide.size((4000.0, 10.0), true), Ok((65_536, 164)));
+	}
+
+	#[test]
+	fn an_odd_side_for_video_says_how_to_fix_it() {
+		let odd = Resize {
+			width: Some(161),
+			height: Some(90),
+		}
+		.size((320.0, 240.0), true)
+		.unwrap_err();
+
+		assert!(odd.ends_with("(use an even size, or -1 for one side)"), "{odd}");
 	}
 
 	#[test]

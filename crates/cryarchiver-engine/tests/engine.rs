@@ -5212,6 +5212,105 @@ async fn a_resized_video_is_checked_against_the_scaled_source_and_learns_nothing
 }
 
 #[tokio::test]
+async fn a_resized_transparent_video_keeps_the_colour_of_its_edges() {
+	let dir = tempfile::tempdir().unwrap();
+	let edge = dir.path().join("edge.mov");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=black:s=128x64:r=25:d=1,format=rgba,geq=r='if(lt(X,64),255,0)':g=0:b=0:a='if(lt(X,64),255,0)'",
+		"-c:v",
+		"qtrle",
+		edge.to_str().unwrap(),
+	]);
+
+	let outcome = run(&resized(fast(&edge), Some(44), None), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	let decoded = std::process::Command::new("ffmpeg")
+		.args(["-v", "error", "-c:v", "libvpx-vp9", "-i"])
+		.arg(output)
+		.args(["-vf", "format=rgba", "-frames:v", "1", "-f", "rawvideo", "-"])
+		.output()
+		.unwrap();
+	let edge: Vec<&[u8; 4]> = decoded
+		.stdout
+		.as_chunks::<4>()
+		.0
+		.iter()
+		.filter(|pixel| (16..=239).contains(&pixel[3]))
+		.collect();
+	assert!(!edge.is_empty(), "no partly transparent pixel");
+	// A barely visible edge pixel shares its 4:2:0 chroma with the transparent black one beside it, so only its
+	// brightness and hue are asserted there; unpremultiplied scaling leaves it nearly black.
+	for pixel in edge {
+		let (red, other) = (u16::from(pixel[0]), u16::from(pixel[1].max(pixel[2])));
+		assert!(red >= 100 && red >= 2 * other, "{pixel:?}");
+		if pixel[3] >= 128 {
+			assert!(pixel[0] >= 240 && pixel[1].max(pixel[2]) <= 10, "{pixel:?}");
+		}
+	}
+}
+
+#[tokio::test]
+async fn audio_extracted_from_a_video_ignores_the_resize() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+
+	let outcome = run(
+		&resized(requested(&clip, OutputFormat::Opus), Some(160), None),
+		dir.path(),
+	)
+	.await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(*output, dir.path().join("clip.cry.opus"));
+	assert!(
+		!warnings.iter().any(|warning| warning.contains("upscaled")),
+		"{warnings:?}"
+	);
+	let info = probe(&support::toolchain().await, output, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!(
+		info.streams.iter().all(|stream| stream.codec_type == "audio"),
+		"{:?}",
+		info.streams
+	);
+}
+
+#[tokio::test]
+async fn a_stripped_video_is_resized_too() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+	let stripped = JobOptions {
+		strip: true,
+		..JobOptions::default()
+	};
+
+	let outcome = run(
+		&resized(with_options(fast(&clip), stripped), Some(160), None),
+		dir.path(),
+	)
+	.await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(square_picture(output).await, (160, 120));
+	let info = probe(&support::toolchain().await, output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let kinds: Vec<&str> = info.streams.iter().map(|stream| stream.codec_type.as_str()).collect();
+	assert_eq!(kinds, ["video", "audio"]);
+}
+
+#[tokio::test]
 async fn a_resize_leaves_audio_as_it_is() {
 	let dir = tempfile::tempdir().unwrap();
 	let opus = support::tone(

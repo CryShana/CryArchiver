@@ -85,8 +85,6 @@ struct Still {
 	plan: StillPlan,
 	metadata: OutputMetadata,
 	warnings: Vec<String>,
-	/// `image` was scaled by `--resize`, so libjxl has to encode it rather than the source.
-	resized: bool,
 }
 
 #[derive(Debug, Default)]
@@ -323,7 +321,6 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		plan,
 		metadata,
 		warnings,
-		resized: cx.resize.is_some(),
 	}))
 }
 
@@ -341,11 +338,46 @@ async fn resized(
 		return Err(ErrorKind::EncodeFailed(format!("{}×{} is too large to verify", size.0, size.1)).into());
 	}
 
-	let scaled = blocking(cx.cancel, move || {
-		image.resize_exact(size.0, size.1, FilterType::Lanczos3)
-	})
-	.await?;
+	let scaled = blocking(cx.cancel, move || scaled(&image, size)).await?;
 	Ok((Arc::new(scaled), upscaled(shown, size)))
+}
+
+/// Lanczos on premultiplied colour: filtering straight alpha would pull the colour hidden under transparent pixels
+/// (usually black) into every partly transparent edge.
+fn scaled(image: &DynamicImage, (width, height): (u32, u32)) -> DynamicImage {
+	if !image.color().has_alpha() {
+		return image.resize_exact(width, height, FilterType::Lanczos3);
+	}
+
+	let mut premultiplied = image.to_rgba32f();
+	for pixel in premultiplied.pixels_mut() {
+		let alpha = pixel.0[3];
+		for channel in &mut pixel.0[..3] {
+			*channel *= alpha;
+		}
+	}
+
+	let mut scaled = image::imageops::resize(&premultiplied, width, height, FilterType::Lanczos3);
+	for pixel in scaled.pixels_mut() {
+		let alpha = pixel.0[3].clamp(0.0, 1.0);
+		pixel.0[3] = alpha;
+		for channel in &mut pixel.0[..3] {
+			*channel = if alpha > 0.0 {
+				(*channel / alpha).clamp(0.0, 1.0)
+			} else {
+				0.0
+			};
+		}
+	}
+
+	let scaled = DynamicImage::ImageRgba32F(scaled);
+	match image {
+		DynamicImage::ImageLumaA8(_) => DynamicImage::ImageLumaA8(scaled.to_luma_alpha8()),
+		DynamicImage::ImageLumaA16(_) => DynamicImage::ImageLumaA16(scaled.to_luma_alpha16()),
+		DynamicImage::ImageRgba16(_) => DynamicImage::ImageRgba16(scaled.to_rgba16()),
+		DynamicImage::ImageRgba32F(_) => scaled,
+		_ => DynamicImage::ImageRgba8(scaled.to_rgba8()),
+	}
 }
 
 async fn encode_and_choose(
@@ -398,7 +430,7 @@ async fn encode_and_choose(
 				choice.note(size);
 				choice.offer(path, size, short.then_some(score));
 				if !short
-					&& !still.resized
+					&& cx.resize.is_none()
 					&& let Some(key) = key
 					&& let Some(setting) = candidate.needed_setting(score, still.plan.target, cx.speed)
 				{
@@ -595,7 +627,7 @@ async fn upright_for_libjxl(
 		.candidates
 		.iter()
 		.any(|candidate| !matches!(candidate, Candidate::Ravif(_)));
-	if !still.resized || !libjxl {
+	if cx.resize.is_none() || !libjxl {
 		return Ok(None);
 	}
 
@@ -878,6 +910,51 @@ fn saves_enough(src_bytes: u64, out_bytes: u64, min_savings: f64) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// 64×64, the left half opaque red and the right half transparent black, as most tools save transparency.
+	fn red_edge() -> image::RgbaImage {
+		image::RgbaImage::from_fn(64, 64, |x, _| {
+			if x < 32 {
+				image::Rgba([255, 0, 0, 255])
+			} else {
+				image::Rgba([0, 0, 0, 0])
+			}
+		})
+	}
+
+	#[test]
+	fn partly_transparent_edges_keep_their_colour_when_scaled() {
+		let grey = DynamicImage::ImageLumaA16(DynamicImage::ImageRgba8(red_edge()).to_luma_alpha16());
+		let level = grey.to_luma_alpha16().get_pixel(0, 0).0[0];
+
+		let red = scaled(&DynamicImage::ImageRgba8(red_edge()), (22, 22));
+		let grey = scaled(&grey, (22, 22));
+		let opaque = scaled(&DynamicImage::ImageRgb8(image::RgbImage::new(4, 4)), (2, 2));
+
+		let DynamicImage::ImageRgba8(red) = red else {
+			panic!("{red:?}")
+		};
+		let edge: Vec<[u8; 4]> = red
+			.pixels()
+			.map(|pixel| pixel.0)
+			.filter(|pixel| pixel[3] >= 8)
+			.collect();
+		assert!(
+			edge.iter().any(|pixel| pixel[3] < 247),
+			"no partly transparent pixel: {edge:?}"
+		);
+		for pixel in &edge {
+			assert!(pixel[0] >= 250 && pixel[1] <= 5 && pixel[2] <= 5, "{pixel:?}");
+		}
+
+		let DynamicImage::ImageLumaA16(grey) = grey else {
+			panic!("{grey:?}")
+		};
+		for pixel in grey.pixels().filter(|pixel| pixel.0[1] >= 2048) {
+			assert!(pixel.0[0].abs_diff(level) <= 512, "{pixel:?}, level {level}");
+		}
+		assert!(matches!(opaque, DynamicImage::ImageRgb8(_)));
+	}
 
 	fn failed_verification() -> (Candidate, JobError) {
 		(

@@ -48,10 +48,17 @@ pub struct Animation {
 
 impl Animation {
 	/// The scale for the encode and for the frames it is scored against: the same filter on the same 16-bit RGB
-	/// frames, so both are scaled alike.
+	/// frames, so both are scaled alike. Transparent frames are scaled premultiplied, or the colour hidden under
+	/// transparent pixels would darken the partly transparent edges.
 	fn scale(&self) -> Option<String> {
-		self.size
-			.map(|(width, height)| format!("format=rgba64le,scale=w={width}:h={height}:flags=lanczos+accurate_rnd"))
+		let (width, height) = self.size?;
+		let scale = format!("scale=w={width}:h={height}:flags=lanczos+accurate_rnd");
+
+		Some(if self.alpha {
+			format!("format=rgba64le,premultiply=inplace=1,{scale},unpremultiply=inplace=1")
+		} else {
+			format!("format=rgba64le,{scale}")
+		})
 	}
 }
 
@@ -359,7 +366,6 @@ async fn check_delays(
 	}
 }
 
-/// What `decode_frames` reads the sampled frames from.
 enum Sampled<'a> {
 	/// The source, scaled by the encode's scale, if any.
 	Source(Option<String>),

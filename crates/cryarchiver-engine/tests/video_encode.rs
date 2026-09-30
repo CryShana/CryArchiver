@@ -166,7 +166,7 @@ async fn an_av1_source_with_film_grain_gets_no_more_grain() {
 		vp9_alpha: false,
 		libaom: false,
 	};
-	let main = usable_main(&info, &caps).unwrap();
+	let main = usable_main(&info, &caps, None).unwrap();
 	let frames = first_frames(&tools, &grained, main.index, 5, &cancel).await.unwrap();
 	let analysis = Box::pin(analyze(
 		&tools,

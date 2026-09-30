@@ -373,15 +373,20 @@ pub fn memory_estimate(width: u32, height: u32, candidates: &[Candidate]) -> u64
 	let encoder = candidates
 		.iter()
 		.map(|candidate| match candidate {
-			Candidate::Ravif(_) => pixels * RAVIF_BYTES_PER_PIXEL,
-			Candidate::JxlLossy(_) | Candidate::JxlLossless(_) => LIBJXL_BASE_BYTES + pixels * LIBJXL_BYTES_PER_PIXEL,
+			Candidate::Ravif(_) => pixels.saturating_mul(RAVIF_BYTES_PER_PIXEL),
+			Candidate::JxlLossy(_) | Candidate::JxlLossless(_) => pixels
+				.saturating_mul(LIBJXL_BYTES_PER_PIXEL)
+				.saturating_add(LIBJXL_BASE_BYTES),
 		})
 		.max()
 		.unwrap_or(0);
 	let (verify_width, verify_height) = padded_size((width, height));
 	let verify_pixels = u64::from(verify_width) * u64::from(verify_height);
 
-	pixels * DECODE_BYTES_PER_PIXEL + verify_pixels * VERIFY_BYTES_PER_PIXEL + encoder
+	pixels
+		.saturating_mul(DECODE_BYTES_PER_PIXEL)
+		.saturating_add(verify_pixels.saturating_mul(VERIFY_BYTES_PER_PIXEL))
+		.saturating_add(encoder)
 }
 
 #[cfg(test)]

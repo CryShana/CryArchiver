@@ -1,4 +1,4 @@
-use crate::options::{TrimWindow, VideoEncoderChoice};
+use crate::options::{Resize, TrimWindow, VideoEncoderChoice};
 use crate::outcome::KeepReason;
 use crate::preset::Speed;
 use crate::probe::{Frame, MediaInfo, Stream};
@@ -191,7 +191,9 @@ pub struct VideoPlan {
 
 /// Decoder, filters and SVT-AV1 together: about 5 GB for 4K (project layer spec §8.2).
 pub fn memory_estimate(width: u32, height: u32) -> u64 {
-	VIDEO_BASE_BYTES + u64::from(width) * u64::from(height) * VIDEO_BYTES_PER_PIXEL
+	(u64::from(width) * u64::from(height))
+		.saturating_mul(VIDEO_BYTES_PER_PIXEL)
+		.saturating_add(VIDEO_BASE_BYTES)
 }
 
 pub fn main_stream(info: &MediaInfo) -> Option<&Stream> {
@@ -206,14 +208,20 @@ pub fn main_stream(info: &MediaInfo) -> Option<&Stream> {
 }
 
 pub fn precheck<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream, KeepReason> {
-	let main = usable_main(info, caps)?;
+	let main = usable_main(info, caps, None)?;
 	if let Some(reason) = already_efficient(info, main) {
 		return Err(KeepReason::AlreadyEfficient(reason));
 	}
 	Ok(main)
 }
 
-pub fn usable_main<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream, KeepReason> {
+/// Under `resize`, the size limits apply to the output size; a resize the video can't take fails later, with its own
+/// reason.
+pub fn usable_main<'a>(
+	info: &'a MediaInfo,
+	caps: &VideoCaps,
+	resize: Option<Resize>,
+) -> Result<&'a Stream, KeepReason> {
 	let main = main_stream(info).ok_or_else(|| KeepReason::Unsupported("no video stream to encode".into()))?;
 
 	if let Some((profile, compatibility)) = dolby_vision(main)
@@ -230,7 +238,9 @@ pub fn usable_main<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stre
 		));
 	}
 
-	let (width, height) = display_size(main);
+	let (width, height) = resize
+		.and_then(|resize| resize.size(shown_size(main), true).ok())
+		.unwrap_or_else(|| display_size(main));
 	if too_large_for_svt(width, height) && !has_alpha(main) && !caps.libaom {
 		return Err(KeepReason::Unsupported(format!(
 			"{width}×{height} is larger than SVT-AV1 supports and libaom-av1 is not available"
@@ -279,7 +289,7 @@ pub fn plan_video(
 		ScanType::Telecined => shape.push("fieldmatch,decimate".into()),
 	}
 	if let Some(size) = resize {
-		shape.push(colour::resize(main, &colour, size));
+		shape.push(colour::resize(main, &colour, size, alpha));
 	}
 
 	let mut filters: Vec<String> = conversion(main, &colour, target).into_iter().collect();
@@ -613,6 +623,36 @@ mod tests {
 			}
 		);
 		assert_eq!(resized.expected_frames, Some(500));
+	}
+
+	#[test]
+	fn transparent_video_is_resized_premultiplied() {
+		let alpha = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"vp9","width":640,"height":360,
+			"pix_fmt":"yuv420p","tags":{"ALPHA_MODE":"1"}}]}"#,
+		);
+
+		let resized = plan_video(
+			&alpha,
+			&alpha.streams[0],
+			&[],
+			&PROGRESSIVE_CLEAN,
+			Speed::Moderate,
+			Some((320, 180)),
+		);
+
+		assert!(
+			resized
+				.shape
+				.starts_with("premultiply=inplace=1,scale=w=320:h=180:flags=lanczos+accurate_rnd:"),
+			"{}",
+			resized.shape
+		);
+		assert!(
+			resized.shape.ends_with(",unpremultiply=inplace=1,setsar=1"),
+			"{}",
+			resized.shape
+		);
 	}
 
 	#[test]
@@ -1066,6 +1106,35 @@ mod tests {
 			precheck(&wide, &without_libaom),
 			Err(KeepReason::Unsupported(_))
 		));
+	}
+
+	#[test]
+	fn the_svt_size_limit_applies_to_the_resized_size() {
+		let wide = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"mjpeg","width":17000,"height":960,
+			"pix_fmt":"yuvj420p","avg_frame_rate":"5/1"}]}"#,
+		);
+		let without_libaom = VideoCaps {
+			vp9_alpha: true,
+			libaom: false,
+		};
+		let width = |width| {
+			Some(Resize {
+				width: Some(width),
+				height: None,
+			})
+		};
+
+		assert!(usable_main(&wide, &without_libaom, width(1920)).is_ok());
+		assert!(matches!(
+			usable_main(&wide, &without_libaom, None),
+			Err(KeepReason::Unsupported(reason)) if reason.starts_with("17000×960 ")
+		));
+		assert!(matches!(
+			usable_main(&h264(""), &without_libaom, width(20_000)),
+			Err(KeepReason::Unsupported(reason)) if reason.starts_with("20000×11250 is larger than SVT-AV1")
+		));
+		assert!(usable_main(&h264(""), &CAPS, width(20_000)).is_ok());
 	}
 
 	#[test]
