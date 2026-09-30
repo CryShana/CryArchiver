@@ -709,6 +709,7 @@ impl Engine {
 			}
 			video_plan::force_encoder(&mut video, choice, cx.job.speed).map_err(ErrorKind::EncodeFailed)?;
 		}
+		video.max_bitrate_kbps = cx.job.options.max_bitrate_kbps;
 
 		if video.encoder.film_grain()
 			&& main.codec_name == "av1"
@@ -869,7 +870,10 @@ impl Engine {
 		let target = video_quality::target(job.speed, video.encoder.film_grain(), &job.overrides);
 		let key = CacheKey {
 			group: Group::Video(VideoGroup::of(main, analysis, video)),
-			encoder: self.encoder_id(&video.encoder),
+			encoder: match video.max_bitrate_kbps {
+				Some(kbps) => format!("{}+mbr{kbps}", self.encoder_id(&video.encoder)),
+				None => self.encoder_id(&video.encoder),
+			},
 			preset: video.encoder.preset(),
 			target: target.mean,
 			floor: Some(target.floor),
@@ -1044,7 +1048,10 @@ impl Engine {
 				video.encoder = video.encoder.with_crf(crf);
 				video.warnings.push(format!(
 					"{}; encoded at CRF {crf} without a full check because it was requested",
-					video_quality::short_text(crf, score, quality.target)
+					under_cap(
+						&video_quality::short_text(crf, score, quality.target),
+						video.max_bitrate_kbps
+					)
 				));
 				return Ok(Tuning::Encode { verify: false });
 			}
@@ -1104,16 +1111,16 @@ impl Engine {
 				}));
 			}
 
-			let lower = if attempt <= MAX_RETRIES {
+			let lower = if attempt <= MAX_RETRIES && video.max_bitrate_kbps.is_none() {
 				search::retry_crf(crf, score, quality.target, quality.slope, bounds)
 			} else {
 				None
 			};
 			let Some(lower) = lower else {
 				if cx.job.options.forced(mergeable(inputs.info)) {
-					temps.warnings.push(format!(
-						"{}; it was written because it was requested",
-						video_quality::short_text(crf, score, quality.target)
+					temps.warnings.push(short_note(
+						&video_quality::short_text(crf, score, quality.target),
+						video.max_bitrate_kbps,
 					));
 					return Ok(Checked::Short);
 				}
@@ -1768,6 +1775,20 @@ fn unsearched_warning(declared_s: Option<f64>, crf: f64) -> String {
 		"the video's duration is unknown"
 	};
 	format!("the CRF was not searched because {why}; the video was encoded at CRF {crf} and checked")
+}
+
+fn short_note(reason: &str, cap_kbps: Option<u32>) -> String {
+	format!(
+		"{}; it was written because it was requested",
+		under_cap(reason, cap_kbps)
+	)
+}
+
+fn under_cap(reason: &str, cap_kbps: Option<u32>) -> String {
+	match cap_kbps {
+		Some(kbps) => format!("{reason} under the {} Mbit/s cap", f64::from(kbps) / 1000.0),
+		None => reason.to_owned(),
+	}
 }
 
 #[allow(clippy::cast_precision_loss)]

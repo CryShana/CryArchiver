@@ -133,14 +133,16 @@ fn encode_command(
 		cmd.arg(format!("-filter:v:{ordinal}")).arg(chain);
 	}
 
-	encoder_args(&mut cmd, &plan.encoder, plan.threads);
+	encoder_args(&mut cmd, &plan.encoder, plan.threads, plan.max_bitrate_kbps);
 
 	cmd.args(["-fps_mode", "passthrough", "-f", "matroska"])
 		.arg(process::tool_path(output));
 	cmd
 }
 
-fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder, threads: Option<Threads>) {
+fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder, threads: Option<Threads>, max_kbps: Option<u32>) {
+	let rate = max_kbps.map_or_else(|| "0".to_owned(), |kbps| format!("{kbps}k"));
+
 	match encoder {
 		Encoder::SvtAv1 {
 			preset,
@@ -150,19 +152,28 @@ fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder, threads: Option<Thread
 			cmd.args(["-c:v", "libsvtav1", "-preset"])
 				.arg(preset.to_string())
 				.args(["-err_detect", "explode", "-dolbyvision", "0", "-svtav1-params"])
-				.arg(svt_params(*crf, *film_grain, threads.map(|threads| threads.svt_lp)));
+				.arg(svt_params(
+					*crf,
+					*film_grain,
+					threads.map(|threads| threads.svt_lp),
+					max_kbps,
+				));
 		}
 		Encoder::Aom { cpu_used, crf } => {
 			cmd.args(["-c:v", "libaom-av1", "-crf"])
 				.arg(crf.to_string())
-				.args(["-b:v", "0", "-cpu-used"])
+				.arg("-b:v")
+				.arg(&rate)
+				.arg("-cpu-used")
 				.arg(cpu_used.to_string())
 				.args(["-row-mt", "1"]);
 		}
 		Encoder::Vp9Alpha { cpu_used, crf } => {
 			cmd.args(["-c:v", "libvpx-vp9", "-crf"])
 				.arg(crf.to_string())
-				.args(["-b:v", "0", "-row-mt", "1", "-deadline", "good", "-cpu-used"])
+				.arg("-b:v")
+				.arg(&rate)
+				.args(["-row-mt", "1", "-deadline", "good", "-cpu-used"])
 				.arg(cpu_used.to_string());
 		}
 	}
@@ -753,6 +764,31 @@ mod tests {
 			vp9.contains("-c:v libvpx-vp9 -crf 33 -b:v 0 -row-mt 1 -deadline good -cpu-used 2"),
 			"{vp9}"
 		);
+	}
+
+	#[test]
+	fn a_bitrate_cap_turns_libaom_and_libvpx_into_constrained_quality() {
+		let capped = |encoder| VideoPlan {
+			encoder,
+			max_bitrate_kbps: Some(12_500),
+			..crate::video::plan::test_plan()
+		};
+		let args = |plan: &VideoPlan| {
+			joined(&video_command(
+				Path::new("ffmpeg"),
+				Path::new("in.mp4"),
+				Path::new("v.mkv"),
+				plan,
+			))
+		};
+
+		let aom = args(&capped(Encoder::Aom { cpu_used: 4, crf: 29 }));
+		let vp9 = args(&capped(Encoder::Vp9Alpha { cpu_used: 2, crf: 31 }));
+		let free = args(&crate::video::plan::test_plan());
+
+		assert!(aom.contains("-c:v libaom-av1 -crf 29 -b:v 12500k"), "{aom}");
+		assert!(vp9.contains("-c:v libvpx-vp9 -crf 31 -b:v 12500k"), "{vp9}");
+		assert!(!free.contains("mbr="), "{free}");
 	}
 
 	#[test]

@@ -71,6 +71,7 @@ pub struct JobOptions {
 	pub burn_subs: Option<BurnSubs>,
 	pub advanced: Advanced,
 	pub threads: Option<usize>,
+	pub max_bitrate_kbps: Option<u32>,
 }
 
 impl JobOptions {
@@ -82,6 +83,7 @@ impl JobOptions {
 			|| self.strip
 			|| (self.merge_audio && merge_possible)
 			|| self.burn_subs.is_some()
+			|| self.max_bitrate_kbps.is_some()
 	}
 }
 

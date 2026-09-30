@@ -42,6 +42,7 @@ fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan 
 		overlay: None,
 		subtitles: None,
 		threads: None,
+		max_bitrate_kbps: None,
 	}
 }
 

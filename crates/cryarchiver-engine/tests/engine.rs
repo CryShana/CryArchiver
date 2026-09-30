@@ -2570,6 +2570,34 @@ fn with_options(job: Job, options: JobOptions) -> Job {
 }
 
 #[tokio::test]
+async fn a_bitrate_cap_makes_a_smaller_video() {
+	let dir = tempfile::tempdir().unwrap();
+	let free = support::mpeg4(dir.path(), "free.mp4", 3);
+	let capped = support::mpeg4(dir.path(), "capped.mp4", 3);
+	let cap = JobOptions {
+		max_bitrate_kbps: Some(60),
+		..JobOptions::default()
+	};
+
+	let free = run(&fast_keeping_any_saving(&free), dir.path()).await;
+	let capped = run(&with_options(fast_keeping_any_saving(&capped), cap), dir.path()).await;
+
+	let (
+		JobOutcome::Encoded {
+			out_bytes: free_bytes, ..
+		},
+		JobOutcome::Encoded {
+			out_bytes: capped_bytes,
+			..
+		},
+	) = (&free, &capped)
+	else {
+		panic!("{free:?} {capped:?}")
+	};
+	assert!(capped_bytes < free_bytes, "{capped_bytes} ≥ {free_bytes}");
+}
+
+#[tokio::test]
 async fn merged_video_audio_is_one_stereo_track() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = dir.path().join("two-tracks.mkv");

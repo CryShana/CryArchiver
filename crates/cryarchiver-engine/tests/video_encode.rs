@@ -49,6 +49,7 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 		overlay: None,
 		subtitles: None,
 		threads: None,
+		max_bitrate_kbps: None,
 	}
 }
 

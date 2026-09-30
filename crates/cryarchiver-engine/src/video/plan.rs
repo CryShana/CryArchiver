@@ -182,6 +182,7 @@ pub struct VideoPlan {
 	/// The text/ASS subtitle filter for the main video, before it is shifted to a command's seek.
 	pub subtitles: Option<String>,
 	pub threads: Option<Threads>,
+	pub max_bitrate_kbps: Option<u32>,
 }
 
 /// Decoder, filters and SVT-AV1 together: about 5 GB for 4K (project layer spec §8.2).
@@ -302,6 +303,7 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 		overlay: None,
 		subtitles: None,
 		threads: None,
+		max_bitrate_kbps: None,
 	}
 }
 
@@ -369,10 +371,11 @@ fn frame_tolerance(scan: ScanType) -> u64 {
 	}
 }
 
-pub fn svt_params(crf: f64, grain: Option<u8>, lp: Option<u8>) -> String {
+pub fn svt_params(crf: f64, grain: Option<u8>, lp: Option<u8>, max_kbps: Option<u32>) -> String {
 	let grain = grain.map_or_else(String::new, |level| format!(":film-grain={level}:film-grain-denoise=1"));
 	let parallelism = lp.map(|lp| format!(":lp={lp}")).unwrap_or_default();
-	format!("tune=0:keyint=5s:crf={crf}{grain}{parallelism}")
+	let cap = max_kbps.map(|kbps| format!(":mbr={kbps}")).unwrap_or_default();
+	format!("tune=0:keyint=5s:crf={crf}{grain}{parallelism}{cap}")
 }
 
 pub fn source_grain(analysis: &Analysis) -> Option<u8> {
@@ -509,6 +512,7 @@ pub(crate) fn test_plan() -> VideoPlan {
 		overlay: None,
 		subtitles: None,
 		threads: None,
+		max_bitrate_kbps: None,
 	}
 }
 
@@ -877,10 +881,19 @@ mod tests {
 	#[test]
 	fn svt_parameters_carry_the_grain_level() {
 		assert_eq!(
-			svt_params(30.0, Some(14), None),
+			svt_params(30.0, Some(14), None, None),
 			"tune=0:keyint=5s:crf=30:film-grain=14:film-grain-denoise=1"
 		);
-		assert_eq!(svt_params(30.0, None, None), "tune=0:keyint=5s:crf=30");
+		assert_eq!(svt_params(30.0, None, None, None), "tune=0:keyint=5s:crf=30");
+	}
+
+	#[test]
+	fn a_bitrate_cap_becomes_svt_capped_crf() {
+		assert_eq!(
+			svt_params(38.0, Some(12), None, Some(12_500)),
+			"tune=0:keyint=5s:crf=38:film-grain=12:film-grain-denoise=1:mbr=12500"
+		);
+		assert_eq!(svt_params(30.0, None, Some(2), None), "tune=0:keyint=5s:crf=30:lp=2");
 	}
 
 	#[test]
@@ -890,9 +903,9 @@ mod tests {
 		assert_eq!(svt_lp(1, 32), 1);
 		assert_eq!(svt_lp(4, 4), 6);
 		assert_eq!(threads_for(8, 32), Threads { tool: 8, svt_lp: 2 });
-		assert_eq!(svt_params(30.0, None, Some(2)), "tune=0:keyint=5s:crf=30:lp=2");
+		assert_eq!(svt_params(30.0, None, Some(2), None), "tune=0:keyint=5s:crf=30:lp=2");
 		assert_eq!(
-			svt_params(38.0, Some(12), Some(2)),
+			svt_params(38.0, Some(12), Some(2), None),
 			"tune=0:keyint=5s:crf=38:film-grain=12:film-grain-denoise=1:lp=2"
 		);
 	}
@@ -1095,10 +1108,10 @@ mod tests {
 		);
 		assert_eq!((svt.preset(), vp9.preset()), (5, 2));
 		assert_eq!(
-			svt_params(29.25, Some(8), None),
+			svt_params(29.25, Some(8), None, None),
 			"tune=0:keyint=5s:crf=29.25:film-grain=8:film-grain-denoise=1"
 		);
-		assert_eq!(svt_params(29.0, None, None), "tune=0:keyint=5s:crf=29");
+		assert_eq!(svt_params(29.0, None, None, None), "tune=0:keyint=5s:crf=29");
 	}
 
 	#[test]

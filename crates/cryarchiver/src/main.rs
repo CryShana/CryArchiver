@@ -199,6 +199,13 @@ struct CompressArgs {
 		help = "Use at most this share of the CPU"
 	)]
 	cpu_limit: Option<u8>,
+	#[arg(
+		long,
+		value_name = "MBPS",
+		value_parser = parse_max_bitrate,
+		help = "Cap the video bitrate for sharing, in Mbit/s such as 12.5; a capped output is always written"
+	)]
+	max_bitrate: Option<u32>,
 	#[arg(long, value_name = "PATH", help = "ffmpeg binary or the folder containing it")]
 	ffmpeg: Option<PathBuf>,
 	#[arg(short, long, help = "Only print failures and the summary")]
@@ -296,6 +303,21 @@ fn parse_crf(text: &str) -> Result<f64, String> {
 	} else {
 		Err("the CRF must be between 1 and 63".to_owned())
 	}
+}
+
+const MIN_CAP_MBPS: f64 = 0.1;
+const MAX_CAP_MBPS: f64 = 1000.0;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn parse_max_bitrate(text: &str) -> Result<u32, String> {
+	let mbps: f64 = number(text)?;
+	if !(MIN_CAP_MBPS..=MAX_CAP_MBPS).contains(&mbps) {
+		return Err(format!(
+			"the bitrate cap must be between {MIN_CAP_MBPS} and {MAX_CAP_MBPS} Mbit/s"
+		));
+	}
+
+	Ok((mbps * 1000.0).round() as u32)
 }
 
 fn parse_image_target(text: &str) -> Result<f64, String> {
@@ -770,6 +792,7 @@ async fn compress(args: CompressArgs) -> u8 {
 					image_encoder: args.image_encoder,
 				},
 				threads: None,
+				max_bitrate_kbps: args.max_bitrate,
 			},
 		})
 		.collect();
@@ -1356,6 +1379,24 @@ mod tests {
 
 		let err = refusal(&["a.flac", "--threads", "0"]);
 		assert_eq!(err.exit_code(), 2);
+	}
+
+	#[test]
+	fn the_bitrate_cap_is_a_plain_run_flag_in_megabits() {
+		let Launch::Compress(compress) = launch_from(args(&["a.mp4", "--max-bitrate", "12.5"])) else {
+			panic!("not a compress run");
+		};
+
+		assert_eq!(compress.max_bitrate, Some(12_500));
+		assert!(
+			refusal(&["a.mp4", "--max-bitrate", "0"])
+				.to_string()
+				.contains("between 0.1 and 1000")
+		);
+		assert_eq!(
+			refusal(&["project", "create", "src", "dst", "--max-bitrate", "5"]).exit_code(),
+			2
+		);
 	}
 
 	#[tokio::test]
