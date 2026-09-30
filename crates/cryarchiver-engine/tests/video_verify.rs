@@ -6,7 +6,9 @@ use cryarchiver_engine::video::VideoStarts;
 use cryarchiver_engine::video::colour::{ColourTags, Range};
 use cryarchiver_engine::video::plan::{Encoder, VideoPlan};
 use cryarchiver_engine::video::streams::StreamPlan;
-use cryarchiver_engine::video::verify::{Expected, Synced, alpha_ssim, check_alpha, check_sync, verify_output};
+use cryarchiver_engine::video::verify::{
+	Expected, Retiming, Synced, alpha_ssim, check_alpha, check_frame_times, check_sync, verify_output,
+};
 use tokio_util::sync::CancellationToken;
 
 fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan {
@@ -220,4 +222,43 @@ async fn an_output_whose_audio_lags_its_video_fails_the_sync_check() {
 	let err = check(lagging).await.unwrap_err();
 
 	assert!(err.to_string().contains("stream 1 starts"), "{err}");
+}
+
+#[tokio::test]
+async fn a_variable_rate_output_merged_onto_the_declared_rate_fails_the_frame_time_check() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = support::variable_rate(dir.path(), "variable.mkv", 2);
+	let encode = |name: &str, time_base: &[&str]| {
+		let output = dir.path().join(name);
+		let mut args = vec!["-i", source.to_str().unwrap(), "-c:v", "libsvtav1", "-preset", "12"];
+		args.extend_from_slice(time_base);
+		args.extend(["-fps_mode", "passthrough", output.to_str().unwrap()]);
+		support::ffmpeg(&args);
+		output
+	};
+	let kept = encode("kept.mkv", &["-enc_time_base:v", "1/1000"]);
+	let merged = encode("merged.mkv", &[]);
+	let tools = support::toolchain().await;
+	let check = |output: std::path::PathBuf| {
+		let (tools, source) = (&tools, &source);
+		async move {
+			check_frame_times(
+				tools,
+				(source, &output),
+				0,
+				None,
+				Retiming::Kept,
+				&CancellationToken::new(),
+			)
+			.await
+		}
+	};
+
+	check(kept).await.unwrap();
+	let err = check(merged).await.unwrap_err();
+
+	assert!(
+		err.to_string().contains("two video frames are shown at 0.100 s"),
+		"{err}"
+	);
 }

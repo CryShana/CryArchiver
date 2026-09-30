@@ -26,7 +26,8 @@ pub const DECODE_ERRORS: &[&str] = &[
 ];
 pub const MIN_PREDICTED_DURATION_S: f64 = 120.0;
 
-const DURATION_TOLERANCE_S: f64 = 0.1;
+/// A whole 10 fps frame, which the encode's last time falls short of the declared end by, with room for float rounding.
+const DURATION_TOLERANCE_S: f64 = 0.1 + 1e-9;
 const PREDICTION_MARGIN: f64 = 0.05;
 const MATROSKA_TIME_BASE: &str = "1/1000";
 const AUDIO_TEMP: Container = Container {
@@ -143,15 +144,22 @@ fn encode_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan,
 	}
 
 	if matches!(run, Run::Frames) {
-		// On Matroska's millisecond clock: the encoder's default, one tick per frame at the declared rate, would put
-		// the frames of a variable-rate video on the same times.
-		cmd.args(["-c:v", "ffv1", "-level", "3", "-enc_time_base:v", MATROSKA_TIME_BASE]);
+		cmd.args(["-c:v", "ffv1", "-level", "3"]);
 	} else {
 		encoder_args(&mut cmd, &plan.encoder, plan.threads, plan.max_bitrate_kbps);
 	}
 
-	cmd.args(["-fps_mode", "passthrough", "-f", "matroska"])
-		.arg(process::tool_path(output));
+	// On Matroska's millisecond clock: the encoder's default, one tick per frame at the declared rate, would put the
+	// frames of a variable-rate video on the same times.
+	cmd.args([
+		"-enc_time_base:v",
+		MATROSKA_TIME_BASE,
+		"-fps_mode",
+		"passthrough",
+		"-f",
+		"matroska",
+	])
+	.arg(process::tool_path(output));
 	cmd
 }
 
@@ -889,6 +897,43 @@ mod tests {
 	}
 
 	#[test]
+	fn every_encode_keeps_the_frame_times_on_the_matroska_clock() {
+		let sample = Sample {
+			start_s: 12.5,
+			length_s: 3.0,
+		};
+		let encoders = [
+			svt(),
+			Encoder::Aom { cpu_used: 6, crf: 38 },
+			Encoder::Vp9Alpha { cpu_used: 2, crf: 33 },
+		];
+
+		for encoder in encoders {
+			let video = plan(encoder, None);
+			let whole = joined(&video_command(
+				Path::new("ffmpeg"),
+				Path::new("in.mkv"),
+				Path::new("v.mkv"),
+				&video,
+			));
+			let sampled = joined(&sample_command(
+				Path::new("ffmpeg"),
+				Path::new("in.mkv"),
+				Path::new("s.mkv"),
+				&video,
+				&sample,
+			));
+
+			for args in [&whole, &sampled] {
+				assert!(
+					args.contains(" -enc_time_base:v 1/1000 -fps_mode passthrough -f matroska "),
+					"{args}"
+				);
+			}
+		}
+	}
+
+	#[test]
 	fn a_bitrate_cap_turns_libaom_and_libvpx_into_constrained_quality() {
 		let capped = |encoder| VideoPlan {
 			encoder,
@@ -1095,6 +1140,10 @@ mod tests {
 		);
 		assert_eq!(
 			check_video_temp(&video, &encoded(75, 3.5, 0), Some(3.5), 0.5).unwrap(),
+			None
+		);
+		assert_eq!(
+			check_video_temp(&video, &encoded(20, 1.4, 0), Some(1.5), 0.0).unwrap(),
 			None
 		);
 		let err = check_video_temp(&video, &encoded(100, 4.4, 0), Some(4.7), 0.0).unwrap_err();

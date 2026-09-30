@@ -1068,6 +1068,94 @@ async fn silent_variable_rate_and_misnamed_videos_are_encoded() {
 	}
 }
 
+fn assert_same_times(output: &[f64], source: &[f64]) {
+	assert_eq!(output.len(), source.len(), "{output:?}\n{source:?}");
+	assert!(output.windows(2).all(|pair| pair[0] < pair[1]), "{output:?}");
+	assert!(
+		output
+			.iter()
+			.zip(source)
+			.all(|(output, source)| (output - source).abs() <= 0.001),
+		"{output:?}\n{source:?}"
+	);
+}
+
+#[tokio::test]
+async fn variable_rate_video_keeps_every_frame_time_in_each_container() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = support::variable_rate(dir.path(), "variable.mkv", 2);
+	let times = support::frame_times(&source, 0);
+
+	for format in [OutputFormat::Mkv, OutputFormat::Webm, OutputFormat::Mp4] {
+		let job = Job {
+			min_savings: 0.0,
+			..requested(&source, format)
+		};
+
+		let outcome = run(&job, dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{format:?}: {outcome:?}")
+		};
+		assert_same_times(&support::frame_times(&output, 0), &times);
+	}
+}
+
+#[tokio::test]
+async fn constant_rate_video_keeps_its_frame_times() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("film.mp4");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:r=24000/1001:d=3",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		source.to_str().unwrap(),
+	]);
+	let times = support::frame_times(&source, 0);
+
+	let outcome = run(&fast_keeping_any_saving(&source), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(times.len(), 72);
+	assert_same_times(&support::frame_times(&output, 0), &times);
+}
+
+#[tokio::test]
+async fn a_trimmed_variable_rate_video_keeps_its_frame_times_in_the_window() {
+	let dir = tempfile::tempdir().unwrap();
+	let mkv = support::variable_rate(dir.path(), "variable.mkv", 4);
+	let ts = support::converted(
+		dir.path(),
+		"variable-ts.ts",
+		&[],
+		&mkv,
+		&["-c", "copy", "-bsf:v", "dump_extra"],
+	);
+
+	for source in [&mkv, &ts] {
+		let times = support::frame_times(source, 0);
+		let window: Vec<f64> = times
+			.iter()
+			.map(|time| time - times[0] - 1.2)
+			.filter(|time| (-0.0005..1.2).contains(time))
+			.collect();
+
+		let outcome = run(&trimmed(fast_keeping_any_saving(source), 1.2, 2.4), dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{}: {outcome:?}", source.display())
+		};
+		assert_same_times(&support::frame_times(&output, 0), &window);
+	}
+}
+
 #[tokio::test]
 async fn truncated_matroska_and_webm_fail_before_encoding() {
 	let dir = tempfile::tempdir().unwrap();

@@ -2,10 +2,12 @@ use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
 use crate::toolchain::Toolchain;
+use crate::video::analyze::ScanType;
 use crate::video::mux::{MuxInput, OutputStream};
 use crate::video::plan::{Encoder, VideoPlan};
 use crate::video::streams::StreamPlan;
@@ -16,6 +18,17 @@ const MIN_START_TOLERANCE_S: f64 = 0.05;
 const MIN_SYNC_TOLERANCE_S: f64 = 0.02;
 /// Packets read to find the ones that don't decode: they all come before the first decodable GOP.
 const LEAD_PACKETS: &str = "%+#1000";
+/// The Matroska clock ticks every millisecond: frames closer than half a tick share a time.
+const SAME_TIME_S: f64 = 0.0005;
+/// Rounding the source's and the output's times onto that clock, and the offset measured between them.
+const FRAME_TIME_TOLERANCE_S: f64 = 0.002;
+/// Read around a trim, so that its first and last frames are among the source's times.
+const WINDOW_MARGIN_S: f64 = 1.0;
+/// Enough to skip a TS or PS cut's leading packets that never decode, which `LEAD_PACKETS` bounds too.
+const ALIGNMENT_CANDIDATES: usize = 1000;
+/// ffmpeg's `-dts_delta_threshold`: a longer jump between packets is a discontinuity.
+const DISCONTINUITY_S: f64 = 10.0;
+const FRAME_TIMES_UNLISTED: &str = "the video's frame times can't be listed";
 const MASTERING_DISPLAY: &str = "Mastering display metadata";
 const DOVI_RECORD: &str = "DOVI configuration record";
 
@@ -270,21 +283,15 @@ pub async fn undecoded_lead(
 		return Ok(0);
 	};
 
-	let mut cmd = ToolCommand::new(&tools.ffprobe, STALL_TIMEOUT);
-	cmd.args(["-v", "error", "-select_streams"])
-		.arg(stream.to_string())
-		.args(["-show_entries", "packet=pts_time", "-read_intervals", LEAD_PACKETS])
-		.args(["-of", "csv=p=0", "-i"])
-		.arg(process::tool_path(path));
-	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
-	if !out.status.success() {
-		return Err(JobError::with_log(
-			ErrorKind::EncodeFailed("the source's first video packets can't be listed".into()),
-			out.stderr_tail,
-		));
-	}
-
-	Ok(undecoded_count(&String::from_utf8_lossy(&out.stdout), first_s))
+	let packets = packet_times(
+		tools,
+		(path, &stream.to_string()),
+		Some(LEAD_PACKETS),
+		"the source's first video packets can't be listed",
+		cancel,
+	)
+	.await?;
+	Ok(undecoded_count(&packets, first_s))
 }
 
 /// `packets` is ffprobe's `pts_time` list, one per line.
@@ -295,6 +302,200 @@ pub fn undecoded_count(packets: &str, first_decoded_s: f64) -> u64 {
 		.filter(|pts_s| delay(first_decoded_s - pts_s).is_some())
 		.count();
 	u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// How the video's shape maps the source's frame times onto the output's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retiming {
+	/// Each output frame is shown at a source frame's time.
+	Kept,
+	/// Deinterlaced to one frame per field: each source frame is also shown again halfway to the next.
+	Doubled,
+	/// Inverse telecine shows the frames at new times, so only their order is checked.
+	New,
+}
+
+impl Retiming {
+	pub fn of(scan: ScanType) -> Self {
+		match scan {
+			ScanType::Progressive => Self::Kept,
+			ScanType::Interlaced { .. } => Self::Doubled,
+			ScanType::Telecined => Self::New,
+		}
+	}
+}
+
+/// `source` and `output` are ffprobe `pts_time` lists of the source's main video and the output's. `window` is the
+/// trim on the source's own timestamps.
+///
+/// Each output frame must have a time of its own which, moved by one offset for the whole video, is a source frame's
+/// time that no other output frame took. Source frames may go unmatched: those outside a trim, and the leading ones of
+/// a TS or PS cut mid-GOP that never decode. A source is not compared when a packet has no time, or when its times
+/// jump as at a TS or PS discontinuity, which ffmpeg closes up in the output.
+pub fn frame_times_error(source: &str, output: &str, window: Option<TrimWindow>, retiming: Retiming) -> Option<String> {
+	let Some(mut output) = packet_list(output) else {
+		return Some("a video frame has no time".into());
+	};
+	output.sort_by(f64::total_cmp);
+	if let Some([time, _]) = output.windows(2).find(|pair| pair[1] - pair[0] < SAME_TIME_S) {
+		return Some(format!("two video frames are shown at {time:.3} s"));
+	}
+
+	if retiming == Retiming::New {
+		return None;
+	}
+
+	let mut expected = packet_list(source).filter(|times| !times.is_empty() && continuous(times))?;
+	expected.sort_by(f64::total_cmp);
+	if let Some(window) = window {
+		let (from, to) = (
+			window.start_s - WINDOW_MARGIN_S,
+			window.start_s + window.length_s + WINDOW_MARGIN_S,
+		);
+		expected.retain(|time| (from..=to).contains(time));
+	}
+	if retiming == Retiming::Doubled {
+		expected = with_fields(&expected);
+	}
+
+	let unmatched = best_alignment(&expected, &output)?;
+	Some(format!(
+		"the video frame at {:.3} s is at no frame time of the source",
+		output[unmatched]
+	))
+}
+
+/// Fails when the output's main video doesn't show its frames at the source's frame times (`frame_times_error`).
+pub async fn check_frame_times(
+	tools: &Toolchain,
+	(source, output): (&Path, &Path),
+	stream: u32,
+	window: Option<TrimWindow>,
+	retiming: Retiming,
+	cancel: &CancellationToken,
+) -> Result<(), JobError> {
+	let interval = window.map(|window| {
+		format!(
+			"{:.3}%{:.3}",
+			(window.start_s - WINDOW_MARGIN_S).max(0.0),
+			window.start_s + window.length_s + WINDOW_MARGIN_S
+		)
+	});
+	let stream = stream.to_string();
+	let (source_times, output_times) = tokio::try_join!(
+		Box::pin(packet_times(
+			tools,
+			(source, &stream),
+			interval.as_deref(),
+			FRAME_TIMES_UNLISTED,
+			cancel
+		)),
+		Box::pin(packet_times(tools, (output, "v:0"), None, FRAME_TIMES_UNLISTED, cancel)),
+	)?;
+
+	match frame_times_error(&source_times, &output_times, window, retiming) {
+		Some(reason) => Err(ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into()),
+		None => Ok(()),
+	}
+}
+
+/// ffprobe's `pts_time` list of `stream`'s packets in `path`, one per line.
+async fn packet_times(
+	tools: &Toolchain,
+	(path, stream): (&Path, &str),
+	interval: Option<&str>,
+	failure: &str,
+	cancel: &CancellationToken,
+) -> Result<String, JobError> {
+	let mut cmd = ToolCommand::new(&tools.ffprobe, STALL_TIMEOUT);
+	cmd.args([
+		"-v",
+		"error",
+		"-select_streams",
+		stream,
+		"-show_entries",
+		"packet=pts_time",
+	]);
+	if let Some(interval) = interval {
+		cmd.arg("-read_intervals").arg(interval);
+	}
+	cmd.args(["-of", "csv=p=0", "-i"]).arg(process::tool_path(path));
+
+	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
+	if !out.status.success() {
+		return Err(JobError::with_log(
+			ErrorKind::EncodeFailed(failure.to_owned()),
+			out.stderr_tail,
+		));
+	}
+	Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The packets' times in file order; `None` when a packet has no time.
+fn packet_list(packets: &str) -> Option<Vec<f64>> {
+	packets
+		.lines()
+		.map(|line| line.trim().trim_end_matches(','))
+		.filter(|line| !line.is_empty())
+		.map(|line| line.parse().ok())
+		.collect()
+}
+
+fn continuous(times: &[f64]) -> bool {
+	times.windows(2).all(|pair| (pair[1] - pair[0]).abs() < DISCONTINUITY_S)
+}
+
+/// The times of `frames` and of the fields between them, the last one as far after it as the one before.
+fn with_fields(frames: &[f64]) -> Vec<f64> {
+	let mut times = Vec::with_capacity(frames.len() * 2);
+	for (index, &time) in frames.iter().enumerate() {
+		let next = frames
+			.get(index + 1)
+			.copied()
+			.or_else(|| Some(time + (time - frames.get(index.checked_sub(1)?)?)));
+		times.push(time);
+		times.extend(next.map(|next| f64::midpoint(time, next)));
+	}
+	times
+}
+
+/// `None` when every output frame lines up with its own expected time under one offset; otherwise the output frame
+/// where the alignment that got furthest broke off. The offsets tried put the first output frame on each of the first
+/// `ALIGNMENT_CANDIDATES` expected times.
+fn best_alignment(expected: &[f64], output: &[f64]) -> Option<usize> {
+	let first = *output.first()?;
+	if expected.is_empty() {
+		return None;
+	}
+
+	let mut furthest = 0;
+	for start in 0..expected.len().min(ALIGNMENT_CANDIDATES) {
+		let offset = first - expected[start];
+		furthest = furthest.max(first_unmatched(&expected[start..], output, offset)?);
+	}
+	Some(furthest)
+}
+
+fn first_unmatched(expected: &[f64], output: &[f64], offset: f64) -> Option<usize> {
+	let mut next = 0;
+	for (index, &time) in output.iter().enumerate() {
+		let wanted = time - offset;
+		while expected
+			.get(next)
+			.is_some_and(|&candidate| candidate < wanted - FRAME_TIME_TOLERANCE_S)
+		{
+			next += 1;
+		}
+
+		if expected
+			.get(next)
+			.is_none_or(|&candidate| (candidate - wanted).abs() > FRAME_TIME_TOLERANCE_S)
+		{
+			return Some(index);
+		}
+		next += 1;
+	}
+	None
 }
 
 /// Fails when an output stream doesn't start as far from the main video as it does in the source (`sync_error`).
@@ -836,6 +1037,115 @@ mod tests {
 		assert_eq!(undecoded_count(packets, 3.4), 4);
 		assert_eq!(undecoded_count(packets, 3.24), 0);
 		assert_eq!(undecoded_count("", 3.4), 0);
+	}
+
+	fn packets(times: &[f64]) -> String {
+		times
+			.iter()
+			.map(|time| format!("{time:.6},"))
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	/// 10 frames 50 ms apart, then 10 frames 100 ms apart.
+	fn variable_rate() -> Vec<f64> {
+		(0..20)
+			.map(|frame| {
+				if frame < 10 {
+					f64::from(frame) * 0.05
+				} else {
+					0.5 + f64::from(frame - 10) * 0.1
+				}
+			})
+			.collect()
+	}
+
+	fn shifted(times: &[f64], by: f64) -> Vec<f64> {
+		times
+			.iter()
+			.map(|time| ((time + by) * 1000.0).round() / 1000.0)
+			.collect()
+	}
+
+	#[test]
+	fn frames_merged_onto_the_declared_rate_fail_and_kept_times_pass() {
+		let source = packets(&variable_rate());
+		let merged: Vec<f64> = variable_rate()
+			.iter()
+			.map(|time| (time * 10.0).round() / 10.0)
+			.collect();
+		let check = |output: &[f64]| frame_times_error(&source, &packets(output), None, Retiming::Kept);
+
+		assert_eq!(check(&variable_rate()), None);
+		assert_eq!(check(&shifted(&variable_rate(), 2.9091)), None);
+		assert_eq!(check(&merged), Some("two video frames are shown at 0.100 s".into()));
+		assert_eq!(
+			check(&[0.0, 0.06, 0.1]),
+			Some("the video frame at 0.060 s is at no frame time of the source".into())
+		);
+	}
+
+	#[test]
+	fn a_trim_and_a_cut_mid_gop_compare_only_the_frames_they_keep() {
+		let source: Vec<f64> = (0..60).map(|frame| 1.4 + f64::from(frame) * 0.05).collect();
+		let window = TrimWindow {
+			start_s: 2.4,
+			length_s: 0.5,
+		};
+		let kept: Vec<f64> = shifted(&source[20..30], -2.4);
+		let undecoded_lead = [1.38, 1.39].iter().chain(&source).copied().collect::<Vec<f64>>();
+		let whole = shifted(&source, -1.4);
+
+		assert_eq!(
+			frame_times_error(&packets(&source), &packets(&kept), Some(window), Retiming::Kept),
+			None
+		);
+		assert_eq!(
+			frame_times_error(&packets(&undecoded_lead), &packets(&whole), None, Retiming::Kept),
+			None
+		);
+		assert!(
+			frame_times_error(
+				&packets(&source),
+				&packets(&[0.0, 0.05, 0.08]),
+				Some(window),
+				Retiming::Kept
+			)
+			.is_some()
+		);
+	}
+
+	#[test]
+	fn a_deinterlace_to_field_rate_shows_frames_halfway_too_and_inverse_telecine_only_keeps_them_apart() {
+		let frames = packets(&[0.0, 0.04, 0.08]);
+		let fields = packets(&[0.0, 0.02, 0.04, 0.06, 0.08, 0.1]);
+		let telecined = packets(&[0.0, 0.041, 0.083]);
+
+		assert_eq!(frame_times_error(&frames, &fields, None, Retiming::Doubled), None);
+		assert!(frame_times_error(&frames, &fields, None, Retiming::Kept).is_some());
+		assert_eq!(frame_times_error(&frames, &telecined, None, Retiming::New), None);
+		assert!(frame_times_error(&frames, &packets(&[0.0, 0.041, 0.041]), None, Retiming::New).is_some());
+	}
+
+	#[test]
+	fn untimed_and_discontinuous_sources_are_not_compared_but_merged_output_times_still_fail() {
+		let untimed = "0.000000,\nN/A,\n0.080000,\n";
+		let discontinuous = packets(&[25.0, 25.04, 25.08, 0.2, 0.24]);
+		let closed_up = packets(&[0.0, 0.04, 0.08, 0.12, 0.16]);
+
+		assert_eq!(
+			frame_times_error(untimed, &packets(&[0.0, 0.03]), None, Retiming::Kept),
+			None
+		);
+		assert_eq!(
+			frame_times_error(&discontinuous, &closed_up, None, Retiming::Kept),
+			None
+		);
+		assert!(frame_times_error(untimed, &packets(&[0.0, 0.0]), None, Retiming::Kept).is_some());
+		assert_eq!(
+			frame_times_error(&closed_up, "0.000000,\nN/A,\n", None, Retiming::Kept),
+			Some("a video frame has no time".into())
+		);
 	}
 
 	#[test]

@@ -43,8 +43,8 @@ use crate::video::plan::{
 use crate::video::quality::{self as video_quality, GrainChoice, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
-	Expected, Timelines, alpha_ssim, check_alpha, check_sync, earliest_video_start, probe_temp, start_offsets,
-	sync_tolerance_s, synced_streams, undecoded_lead, verify_output,
+	Expected, Retiming, Timelines, alpha_ssim, check_alpha, check_frame_times, check_sync, earliest_video_start,
+	probe_temp, start_offsets, sync_tolerance_s, synced_streams, undecoded_lead, verify_output,
 };
 use crate::video::{VideoStarts, analyze, chapters, colour, cues, encode as video_encode, titles};
 use crate::workspace::Workspace;
@@ -173,6 +173,7 @@ struct VideoJob<'a> {
 	probe_json: &'a [u8],
 	first_frame: Option<&'a Frame>,
 	main: &'a Stream,
+	scan: ScanType,
 	video: &'a VideoPlan,
 	streams: &'a StreamPlan,
 	container: Container,
@@ -886,6 +887,7 @@ impl Engine {
 			probe_json: &probe_json,
 			first_frame: frames.first(),
 			main,
+			scan: analysis.scan,
 			video: &video,
 			streams: &streams,
 			container: rules.container,
@@ -1630,16 +1632,26 @@ impl Engine {
 			source_fps: job.main.fps(),
 		};
 		verify_output(&self.tools, &output, &expected, cx.cancel).await?;
+		let file_start_s = job.info.format.start_time.unwrap_or(0.0);
 		let window_start_s = job.video.window.map(|window| window.start_s);
 		check_sync(
 			&self.tools,
 			(source, &output),
 			&synced_streams(&outputs, job.info, &job.streams.merge_from),
-			(
-				job.info.format.start_time.unwrap_or(0.0) + window_start_s.unwrap_or(0.0),
-				window_start_s.is_some(),
-			),
+			(file_start_s + window_start_s.unwrap_or(0.0), window_start_s.is_some()),
 			sync_tolerance_s(job.main.fps()),
+			cx.cancel,
+		)
+		.await?;
+		check_frame_times(
+			&self.tools,
+			(source, &output),
+			job.main.index,
+			job.video.window.map(|window| TrimWindow {
+				start_s: file_start_s + window.start_s,
+				..window
+			}),
+			Retiming::of(job.scan),
 			cx.cancel,
 		)
 		.await?;

@@ -436,6 +436,32 @@ pub fn converted(dir: &Path, name: &str, before: &[&str], source: &Path, after: 
 	out
 }
 
+/// A variable-rate MPEG-4 video declared at 10 fps: every 1.5 s, 10 frames 50 ms apart, then 10 frames 100 ms apart.
+pub fn variable_rate(dir: &Path, name: &str, seconds: u32) -> PathBuf {
+	let graph = format!(
+		"testsrc2=s=160x120:r=10:d={seconds},settb=1/1000,\
+		 setpts='floor(N/20)*1500+if(lt(mod(N,20),10),mod(N,20)*50,500+(mod(N,20)-10)*100)'"
+	);
+	let path = dir.join(name);
+
+	ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		&graph,
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		"-enc_time_base:v",
+		"1/1000",
+		"-fps_mode",
+		"passthrough",
+		path.to_str().unwrap(),
+	]);
+	path
+}
+
 /// Every video frame time of stream `stream`, in order.
 pub fn frame_times(path: &Path, stream: usize) -> Vec<f64> {
 	let out = Command::new("ffprobe")
