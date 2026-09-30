@@ -795,6 +795,22 @@ fn a_format_that_does_not_fit_a_file_fails_only_that_file() {
 }
 
 #[test]
+fn a_bitrate_cap_is_refused_for_avif_output() {
+	let dir = tempfile::tempdir().unwrap();
+	support::mpeg4(dir.path(), "clip.mp4", 1);
+
+	let by_format = cryarchiver(dir.path(), &["clip.mp4", "-f", "avif", "--max-bitrate", "2"]);
+	let by_name = cryarchiver(dir.path(), &["clip.mp4", "-o", "clip.avif", "--max-bitrate", "2"]);
+
+	for out in [by_format, by_name] {
+		assert_eq!(out.status.code(), Some(2), "{}{}", stdout(&out), stderr(&out));
+		assert!(stderr(&out).contains("--max-bitrate"), "{}", stderr(&out));
+	}
+	assert!(!dir.path().join("clip.cry.avif").exists());
+	assert!(!dir.path().join("clip.avif").exists());
+}
+
+#[test]
 fn an_image_encoder_that_disagrees_with_the_format_is_refused() {
 	let dir = tempfile::tempdir().unwrap();
 	support::photo_png(dir.path(), "photo.png", 64, 48);

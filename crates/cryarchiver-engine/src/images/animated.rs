@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::num::NonZeroU32;
 use std::path::Path;
 
@@ -22,9 +22,10 @@ use crate::toolchain::Toolchain;
 use crate::video::run_ffmpeg;
 
 pub const MAX_SAMPLED_FRAMES: u32 = 10;
-const MAX_FRAMES: u32 = 100_000;
+pub const MAX_FRAMES: u32 = 100_000;
 const GIF_DEFAULT_DELAY_MS: u32 = 100;
 const DELAY_TOLERANCE_MS: u32 = 1;
+const HEAD_BYTES: u64 = 16;
 const TRANSPARENT_FRAMES: &str = r"format=rgba,alphaextract,signalstats,metadata=mode=select:key=lavfi.signalstats.YMIN:value=255:function=expr:expr='lt(VALUE1\,VALUE2)'";
 const ALPHA_SPLIT: &str =
 	"format=yuva444p10le,split[c][a];[c]format=yuv444p10le[color];[a]alphaextract,format=gray10le[alpha]";
@@ -135,6 +136,82 @@ fn walk_frames(frames: Frames<'_>, plays: Option<u32>) -> Result<Timeline, ScanE
 		timeline.frames += 1;
 	}
 	Ok(timeline)
+}
+
+pub fn too_many_frames(frames: u64) -> Option<String> {
+	(frames > u64::from(MAX_FRAMES)).then(|| {
+		format!(
+			"the clip has {frames} frames, more than the {MAX_FRAMES} an animation can have; use --ss/--to to make a \
+			 shorter clip"
+		)
+	})
+}
+
+/// The timeline of frames stored as a video, from ffprobe's `pts_time,duration_time` of each packet: each frame
+/// lasts until the next one's time, and the last one its own duration, or the one before it when it has none.
+pub fn video_timeline(packets: &str, (width, height): (u32, u32)) -> Timeline {
+	let mut frames: Vec<(i64, Option<i64>)> = packets
+		.lines()
+		.filter_map(|line| {
+			let mut fields = line.split(',');
+			let pts = fields.next()?.trim().parse::<f64>().ok()?;
+			let duration = fields.next().and_then(|field| field.trim().parse::<f64>().ok());
+			Some((whole_ms(pts), duration.map(whole_ms)))
+		})
+		.collect();
+	frames.sort_by_key(|&(pts, _)| pts);
+
+	let mut delays_ms: Vec<u32> = frames
+		.windows(2)
+		.map(|pair| u32::try_from(pair[1].0 - pair[0].0).unwrap_or(0))
+		.collect();
+	if let Some(&(_, duration)) = frames.last() {
+		let last = duration
+			.and_then(|duration| u32::try_from(duration).ok())
+			.filter(|&duration| duration > 0)
+			.or(delays_ms.last().copied())
+			.unwrap_or(0);
+		delays_ms.push(last);
+	}
+
+	Timeline {
+		frames: u32::try_from(frames.len()).unwrap_or(u32::MAX),
+		delays_ms,
+		plays: None,
+		width,
+		height,
+	}
+}
+
+pub async fn read_video_timeline(
+	tools: &Toolchain,
+	frames: &Path,
+	size: (u32, u32),
+	cancel: &CancellationToken,
+) -> Result<Timeline, JobError> {
+	let mut cmd = ToolCommand::new(&tools.ffprobe, STALL_TIMEOUT);
+	cmd.args([
+		"-v",
+		"error",
+		"-select_streams",
+		"0",
+		"-show_entries",
+		"packet=pts_time,duration_time",
+		"-of",
+		"csv=p=0",
+		"-i",
+	])
+	.arg(process::tool_path(frames));
+
+	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
+	if !out.status.success() {
+		return Err(ErrorKind::EncodeFailed(format!(
+			"ffprobe could not read the prepared frames: {}",
+			process::failure_reason(&out.stderr_tail)
+		))
+		.into());
+	}
+	Ok(video_timeline(&String::from_utf8_lossy(&out.stdout), size))
 }
 
 pub async fn has_alpha(tools: &Toolchain, source: &Path, cancel: &CancellationToken) -> Result<bool, JobError> {
@@ -351,7 +428,7 @@ async fn check_delays(
 		.filter_map(|line| line.trim().parse::<f64>().ok())
 		.map(milliseconds)
 		.collect();
-	let gif = std::fs::read(source).is_ok_and(|bytes| sniff(&bytes) == ImageFormat::Gif);
+	let gif = head(source).is_ok_and(|bytes| sniff(&bytes) == ImageFormat::Gif);
 	let expected = expected_delays(timeline, gif);
 
 	let matches = delays.len() == expected.len()
@@ -364,6 +441,13 @@ async fn check_delays(
 	} else {
 		Err(failed("the frame timing differs from the source"))
 	}
+}
+
+/// Enough of a file to tell a GIF: the frames prepared from a video can be gigabytes.
+fn head(path: &Path) -> std::io::Result<Vec<u8>> {
+	let mut head = Vec::new();
+	std::fs::File::open(path)?.take(HEAD_BYTES).read_to_end(&mut head)?;
+	Ok(head)
 }
 
 enum Sampled<'a> {
@@ -449,6 +533,11 @@ pub fn split_pams(bytes: &[u8]) -> Result<Vec<DynamicImage>, String> {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn milliseconds(seconds: f64) -> u32 {
 	(seconds * 1000.0).round().max(0.0) as u32
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn whole_ms(seconds: f64) -> i64 {
+	(seconds * 1000.0).round() as i64
 }
 
 fn failed(reason: impl std::fmt::Display) -> JobError {

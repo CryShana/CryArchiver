@@ -28,6 +28,7 @@ pub const MIN_PREDICTED_DURATION_S: f64 = 120.0;
 
 const DURATION_TOLERANCE_S: f64 = 0.1;
 const PREDICTION_MARGIN: f64 = 0.05;
+const MATROSKA_TIME_BASE: &str = "1/1000";
 const AUDIO_TEMP: Container = Container {
 	cover: Cover::Attachment,
 	..MATROSKA_AUDIO
@@ -46,21 +47,32 @@ pub struct Sample {
 	pub length_s: f64,
 }
 
+#[derive(Clone, Copy)]
+enum Run<'a> {
+	Whole,
+	Sample(&'a Sample),
+	/// The main video's frames through the same chain, stored losslessly for an animation.
+	Frames,
+}
+
 pub fn video_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan) -> ToolCommand {
-	encode_command(ffmpeg, source, output, plan, None)
+	encode_command(ffmpeg, source, output, plan, Run::Whole)
 }
 
 pub fn sample_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan, sample: &Sample) -> ToolCommand {
-	encode_command(ffmpeg, source, output, plan, Some(sample))
+	encode_command(ffmpeg, source, output, plan, Run::Sample(sample))
 }
 
-fn encode_command(
-	ffmpeg: &Path,
-	source: &Path,
-	output: &Path,
-	plan: &VideoPlan,
-	sample: Option<&Sample>,
-) -> ToolCommand {
+pub fn frames_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan) -> ToolCommand {
+	encode_command(ffmpeg, source, output, plan, Run::Frames)
+}
+
+fn encode_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan, run: Run<'_>) -> ToolCommand {
+	let sample = match run {
+		Run::Sample(sample) => Some(sample),
+		Run::Whole | Run::Frames => None,
+	};
+	let main_only = !matches!(run, Run::Whole);
 	let workspace = output.parent().unwrap_or(Path::new(""));
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	if plan.subtitles.is_some() && !workspace.as_os_str().is_empty() {
@@ -76,11 +88,7 @@ fn encode_command(
 			.arg(threads.tool.to_string());
 	}
 
-	let start = if sample.is_some() {
-		plan.starts.main
-	} else {
-		plan.starts.every
-	};
+	let start = if main_only { plan.starts.main } else { plan.starts.every };
 	let cut = sample
 		.map(|sample| (sample.start_s, sample.length_s))
 		.or(plan.window.map(|window| (window.start_s, window.length_s)))
@@ -105,7 +113,7 @@ fn encode_command(
 			.arg(process::tool_path(&workspace.join(burn::BITMAP_FILE)));
 	}
 
-	let streams = if sample.is_some() {
+	let streams = if main_only {
 		plan.streams.get(..1).unwrap_or_default()
 	} else {
 		plan.streams.as_slice()
@@ -134,7 +142,13 @@ fn encode_command(
 		cmd.arg(format!("-filter:v:{ordinal}")).arg(chain);
 	}
 
-	encoder_args(&mut cmd, &plan.encoder, plan.threads, plan.max_bitrate_kbps);
+	if matches!(run, Run::Frames) {
+		// On Matroska's millisecond clock: the encoder's default, one tick per frame at the declared rate, would put
+		// the frames of a variable-rate video on the same times.
+		cmd.args(["-c:v", "ffv1", "-level", "3", "-enc_time_base:v", MATROSKA_TIME_BASE]);
+	} else {
+		encoder_args(&mut cmd, &plan.encoder, plan.threads, plan.max_bitrate_kbps);
+	}
 
 	cmd.args(["-fps_mode", "passthrough", "-f", "matroska"])
 		.arg(process::tool_path(output));
@@ -543,6 +557,52 @@ mod tests {
 
 		assert!(args.contains("-threads 4 -filter_threads 4 -i "), "{args}");
 		assert!(args.contains("-svtav1-params tune=0:keyint=5s:crf=32:lp=2"), "{args}");
+	}
+
+	#[test]
+	fn animation_frames_are_the_main_video_through_the_same_chain_stored_losslessly() {
+		let animated = VideoPlan {
+			shape: "bwdif=mode=send_field:parity=tff:deint=all".into(),
+			subtitles: Some("subtitles=subs.ass".into()),
+			filters: "format=gbrp16le".into(),
+			window: Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 2.0,
+			}),
+			starts: VideoStarts {
+				main: InputStart {
+					file_s: 1.4,
+					streams_s: Some(1.75),
+				},
+				every: InputStart {
+					file_s: 1.4,
+					streams_s: Some(1.7),
+				},
+			},
+			..plan(svt(), None)
+		};
+
+		let cmd = frames_command(
+			Path::new("ffmpeg"),
+			Path::new("in.ts"),
+			Path::new("work/frames.mkv"),
+			&animated,
+		);
+
+		let args = joined(&cmd);
+		assert_eq!(cmd.current_dir.as_deref(), Some(Path::new("work")));
+		assert!(args.contains(" -ss 0.000 -t 6.000 -itsoffset 0.350000 -i "), "{args}");
+		assert!(
+			args.contains(
+				"-map 0:0 -filter:v:0 trim=start=4.000000:end=6.000000,setpts=PTS-4.000000/TB,\
+				 bwdif=mode=send_field:parity=tff:deint=all,settb=AVTB,setpts=PTS+4.000/TB,subtitles=subs.ass,\
+				 setpts=PTS-4.000/TB,format=gbrp16le -c:v ffv1 -level 3 -enc_time_base:v 1/1000 -fps_mode passthrough \
+				 -f matroska "
+			),
+			"{args}"
+		);
+		assert!(!args.contains("0:2") && !args.contains("libsvtav1"), "{args}");
+		assert_eq!(cmd.counted, DECODE_ERRORS);
 	}
 
 	#[test]

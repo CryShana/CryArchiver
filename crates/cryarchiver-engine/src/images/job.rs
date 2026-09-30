@@ -7,6 +7,7 @@ use image::{DynamicImage, GenericImageView};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{JobEvent, Stage};
+use crate::format::ANIMATED_JXL;
 use crate::images::animated::{self, Animation, ScanError};
 use crate::images::avif::{self, AvifColour};
 use crate::images::decode::{self, Decoded, SourceLayout, Undecodable};
@@ -27,7 +28,6 @@ use crate::toolchain::Toolchain;
 use crate::video::run_ffmpeg;
 use crate::workspace::Workspace;
 
-const ANIMATED_JXL: &str = "animated JPEG XL output isn't supported; use -f avif";
 const UPRIGHT_PNG: &str = "upright.png";
 
 #[derive(Debug, Clone)]
@@ -806,24 +806,39 @@ async fn produce_animation(
 		timeline,
 		size,
 	};
-	let settings = match animated::plan_animation(cx.speed, cx.caps.libaom) {
-		Ok(settings) => settings,
-		Err(reason) => return Ok(Some(ImageOutcome::Kept(reason))),
-	};
 
 	let mut warnings = animation_warnings(cx, input);
 	warnings.extend(size.and_then(|size| upscaled(shown, size)));
 
+	Box::pin(encode_animation(cx, cx.source, &animation, workspace, warnings))
+		.await
+		.map(Some)
+}
+
+/// Encodes `frames` (an animated image, or the frames prepared from a video) as an animated AVIF and checks it
+/// against them. `cx.source_bytes` is what the output is weighed against.
+pub async fn encode_animation(
+	cx: &ImageContext<'_>,
+	frames: &Path,
+	animation: &Animation,
+	workspace: &Workspace,
+	mut warnings: Vec<String>,
+) -> Result<ImageOutcome, JobError> {
+	let settings = match animated::plan_animation(cx.speed, cx.caps.libaom) {
+		Ok(settings) => settings,
+		Err(reason) => return Ok(ImageOutcome::Kept(reason)),
+	};
+
 	(cx.on_event)(JobEvent::Stage(Stage::Encode));
 	let output = workspace.file("out.avif");
-	let cmd = animated::encode_command(&cx.tools.ffmpeg, cx.source, &output, &animation, settings);
-	let frames = f64::from(animation.timeline.frames);
+	let cmd = animated::encode_command(&cx.tools.ffmpeg, frames, &output, animation, settings);
+	let total = f64::from(animation.timeline.frames);
 	run_ffmpeg(
 		&cmd,
 		|progress| {
 			if let Some(frame) = progress.frame {
 				#[allow(clippy::cast_precision_loss)]
-				(cx.on_event)(JobEvent::Progress((frame as f64 / frames).clamp(0.0, 1.0)));
+				(cx.on_event)(JobEvent::Progress((frame as f64 / total).clamp(0.0, 1.0)));
 			}
 		},
 		cx.cancel,
@@ -835,23 +850,23 @@ async fn produce_animation(
 		.len();
 	if !saves_enough(cx.source_bytes, bytes, cx.min_savings) {
 		if !cx.forced {
-			return Ok(Some(ImageOutcome::Kept(KeepReason::NotSmaller {
+			return Ok(ImageOutcome::Kept(KeepReason::NotSmaller {
 				src_bytes: cx.source_bytes,
 				out_bytes: bytes,
-			})));
+			}));
 		}
 
 		warnings.push(kept_as_requested(cx.source_bytes, bytes));
 	}
 
 	(cx.on_event)(JobEvent::Stage(Stage::Verify));
-	let score = animated::verify_animation(cx.tools, cx.source, &output, &animation, cx.cancel).await?;
+	let score = animated::verify_animation(cx.tools, frames, &output, animation, cx.cancel).await?;
 	let target = plan::image_target(cx.speed, &cx.overrides);
 	if score < target {
 		if !cx.forced {
-			return Ok(Some(ImageOutcome::Kept(KeepReason::QualityUnreachable(format!(
+			return Ok(ImageOutcome::Kept(KeepReason::QualityUnreachable(format!(
 				"quality target not reached at a smaller size (SSIMULACRA2 {score:.1}, target {target:.0})"
-			)))));
+			))));
 		}
 
 		warnings.push(short_warning(score, target));
@@ -860,12 +875,12 @@ async fn produce_animation(
 	for warning in &warnings {
 		(cx.on_event)(JobEvent::Warning(warning.clone()));
 	}
-	Ok(Some(ImageOutcome::Output {
+	Ok(ImageOutcome::Output {
 		path: output,
 		bytes,
 		warnings,
 		learned: Vec::new(),
-	}))
+	})
 }
 
 fn animation_warnings(cx: &ImageContext<'_>, input: &ImageInput) -> Vec<String> {

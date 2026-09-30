@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::images::animated::{
 	Animation, ScanError, Timeline, encode_command, expected_delays, has_alpha, plan_animation, plays, sampled_frames,
-	scan, split_pams, verify_animation,
+	scan, split_pams, too_many_frames, verify_animation, video_timeline,
 };
 use cryarchiver_engine::outcome::KeepReason;
 use cryarchiver_engine::preset::Speed;
@@ -101,6 +101,39 @@ fn frames_are_sampled_evenly_and_zero_gif_delays_use_ffmpegs_default() {
 	assert!(huge.windows(2).all(|pair| pair[0] < pair[1]) && huge[9] < u32::MAX);
 	assert_eq!(expected_delays(&timeline, true), [100, 50, 100]);
 	assert_eq!(expected_delays(&timeline, false), [0, 50, 0]);
+}
+
+#[test]
+fn a_video_timeline_follows_the_frame_times_and_the_last_frame_keeps_its_duration() {
+	let packets = "0.000000,0.033000\n0.033000,0.033000\n0.067000,0.033000\n0.117000,0.050000\n";
+	let unordered = "1.100000,N/A\n1.000000,N/A\n1.250000,N/A\n";
+
+	let timeline = video_timeline(packets, (320, 240));
+	let without_durations = video_timeline(unordered, (2, 2));
+
+	assert_eq!(
+		timeline,
+		Timeline {
+			frames: 4,
+			delays_ms: vec![33, 34, 50, 50],
+			plays: None,
+			width: 320,
+			height: 240,
+		}
+	);
+	assert_eq!(without_durations.delays_ms, [100, 150, 150]);
+	assert_eq!(video_timeline("", (2, 2)).frames, 0);
+}
+
+#[test]
+fn only_clips_past_the_frame_limit_are_refused() {
+	assert_eq!(too_many_frames(100_000), None);
+	assert_eq!(
+		too_many_frames(100_001).as_deref(),
+		Some(
+			"the clip has 100001 frames, more than the 100000 an animation can have; use --ss/--to to make a shorter clip"
+		)
+	);
 }
 
 #[test]

@@ -94,6 +94,33 @@ pub fn resize(stream: &Stream, tags: &ColourTags, (width, height): (u32, u32), a
 	}
 }
 
+/// Full-range 16-bit RGB tagged with the picture's primaries and transfer, as an animation's frames are stored. A
+/// YUV picture is read with its own range, matrix and chroma location.
+pub fn rgb_frames(stream: &Stream, tags: &ColourTags, alpha: bool) -> String {
+	let format = if alpha { "gbrap16le" } else { "gbrp16le" };
+	let tagged = format!(
+		"format={format},setparams=field_mode=prog:range=pc:color_primaries={}:color_trc={}:colorspace=gbr",
+		tags.primaries, tags.transfer
+	);
+	if is_rgb(stream) {
+		return tagged;
+	}
+
+	let matrix = if SCALE_MATRICES.contains(&tags.matrix.as_str()) {
+		format!(":in_color_matrix={}", tags.matrix)
+	} else {
+		String::new()
+	};
+	let chroma = tags
+		.chroma_location
+		.as_deref()
+		.map_or_else(String::new, |location| format!(":in_chroma_loc={location}"));
+	format!(
+		"scale=in_range={}{matrix}{chroma}:out_range=pc,{tagged}",
+		tags.range.name()
+	)
+}
+
 /// The `scale` options that keep a YUV picture's range, matrix and chroma location; `None` for RGB.
 fn kept_colour(stream: &Stream, tags: &ColourTags) -> Option<String> {
 	if is_rgb(stream) {
@@ -295,6 +322,35 @@ mod tests {
 		assert_eq!(
 			resize(&argb, &output_tags(&argb), (320, 180), false),
 			"scale=w=320:h=180:flags=lanczos+accurate_rnd,setsar=1"
+		);
+	}
+
+	#[test]
+	fn animation_frames_are_full_range_rgb_from_the_source_range_and_matrix_with_its_primaries_and_transfer() {
+		let limited = stream(
+			r#"{"index":0,"codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuv420p","color_space":"bt709",
+			"chroma_location":"topleft"}"#,
+		);
+		let hlg = stream(
+			r#"{"index":0,"codec_type":"video","width":3840,"height":2160,"pix_fmt":"yuv420p10le","color_range":"tv",
+			"color_space":"bt2020c","color_transfer":"arib-std-b67","color_primaries":"bt2020"}"#,
+		);
+		let argb = stream(r#"{"index":0,"codec_type":"video","width":640,"height":360,"pix_fmt":"argb"}"#);
+
+		assert_eq!(
+			rgb_frames(&limited, &output_tags(&limited), false),
+			"scale=in_range=tv:in_color_matrix=bt709:in_chroma_loc=topleft:out_range=pc,format=gbrp16le,\
+			 setparams=field_mode=prog:range=pc:color_primaries=bt709:color_trc=bt709:colorspace=gbr"
+		);
+		assert_eq!(
+			rgb_frames(&hlg, &output_tags(&hlg), false),
+			"scale=in_range=tv:out_range=pc,format=gbrp16le,\
+			 setparams=field_mode=prog:range=pc:color_primaries=bt2020:color_trc=arib-std-b67:colorspace=gbr"
+		);
+		assert_eq!(
+			rgb_frames(&argb, &output_tags(&argb), true),
+			"format=gbrap16le,setparams=field_mode=prog:range=pc:color_primaries=smpte170m:color_trc=smpte170m:\
+			 colorspace=gbr"
 		);
 	}
 

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use cryarchiver_engine::commit::{OutputSink, check_space};
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
-use cryarchiver_engine::format::OutputFormat;
+use cryarchiver_engine::format::{OutputFormat, check_bitrate_cap};
 use cryarchiver_engine::images::plan::ImageRoute;
 use cryarchiver_engine::naming::cli_output_path;
 use cryarchiver_engine::options::{
@@ -719,6 +719,14 @@ async fn compress(args: CompressArgs) -> u8 {
 	};
 
 	if let Some(message) = image_route_conflict(target.format, args.image_encoder) {
+		eprintln!("error: {message}");
+		return 2;
+	}
+
+	if args.max_bitrate.is_some()
+		&& let Some(format) = target.format
+		&& let Err(message) = check_bitrate_cap(format)
+	{
 		eprintln!("error: {message}");
 		return 2;
 	}

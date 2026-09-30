@@ -15,12 +15,15 @@ use crate::audio::{cover, encode, verify};
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
 use crate::detect::{self, Detection, MediaClass};
-use crate::format::{OutputFormat, check_kind};
+use crate::format::{OutputFormat, check_bitrate_cap, check_kind};
+use crate::images::animated::{self, Animation};
 use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{JobOptions, TrimWindow, VideoEncoderChoice, kept_as_requested, kept_as_requested_part, upscaled};
+use crate::options::{
+	JobOptions, Resize, TrimWindow, VideoEncoderChoice, kept_as_requested, kept_as_requested_part, upscaled,
+};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -29,7 +32,7 @@ use crate::quality::memory::{GroupStats, Observation, QualityMemory, SharedMemor
 use crate::quality::search::{self, DEFAULT_SLOPE, MAX_PROBES, Target};
 use crate::text::{display_path, fold_repeats};
 use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
-use crate::video::analyze::Analysis;
+use crate::video::analyze::{Analysis, ScanType};
 use crate::video::burn::{self, Burn};
 use crate::video::encode::{EncodedVideo, Sample};
 use crate::video::mux::{self, Attachment, ChapterSource, CueFile, MuxInputs, MuxPlan};
@@ -42,12 +45,17 @@ use crate::video::verify::{
 	Expected, Timelines, alpha_ssim, check_alpha, check_sync, earliest_video_start, probe_temp, start_offsets,
 	sync_tolerance_s, synced_streams, undecoded_lead, verify_output,
 };
-use crate::video::{VideoStarts, analyze, chapters, cues, encode as video_encode, titles};
+use crate::video::{VideoStarts, analyze, chapters, colour, cues, encode as video_encode, titles};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
 const CHAPTER_FILE: &str = "chapters.txt";
 const MEMORY_POLL: Duration = Duration::from_millis(250);
+const ANIMATION_FRAMES: &str = "frames.mkv";
+const SQUARE_PIXEL_SLACK: f64 = 1e-3;
+const AUDIO_DROPPED: &str = "an audio track was dropped: animated AVIF has no sound";
+const SUBTITLES_DROPPED: &str =
+	"a subtitle track was dropped: animated AVIF can't hold subtitles, but --burn-subs draws one into the picture";
 
 #[derive(Debug, Clone)]
 pub struct Job {
@@ -152,6 +160,8 @@ enum Planned {
 		from_video: bool,
 	},
 	Video(StreamRules),
+	/// A video written as an animated AVIF, with the subtitle track to burn in, if any.
+	Animation(Option<Burn>),
 	Image(Box<ImageInput>),
 }
 
@@ -370,6 +380,23 @@ impl Engine {
 					AudioPlan::Keep(reason) => return Err(ErrorKind::EncodeFailed(extraction_refusal(&reason)).into()),
 				}
 			}
+			MediaClass::Video(info)
+				if job
+					.options
+					.format
+					.is_some_and(|format| format.kind() == MediaKind::Image) =>
+			{
+				self.check_animation(job)?;
+				check_damage(&job.source)?;
+
+				on_event(JobEvent::Stage(Stage::Plan));
+				let burn = burn_pick(job, &info)?;
+				self.check_burn_tools(burn, &info)?;
+				match self.video_main(&info, job) {
+					Ok(_) => Planned::Animation(burn),
+					Err(reason) => return Ok(JobOutcome::KeptOriginal { reason }),
+				}
+			}
 			MediaClass::Video(info) => {
 				self.require(MediaKind::Video)?;
 				check_damage(&job.source)?;
@@ -420,7 +447,7 @@ impl Engine {
 
 		let _memory = match &planned {
 			Planned::Image(input) => self.reserve_memory(input.memory_bytes, on_event, cancel).await?,
-			Planned::Audio { .. } | Planned::Video(_) => None,
+			Planned::Audio { .. } | Planned::Video(_) | Planned::Animation(_) => None,
 		};
 
 		let before =
@@ -440,6 +467,7 @@ impl Engine {
 				self.produce_audio(&cx, info, plan, *from_video, &workspace).await
 			}
 			Planned::Video(rules) => Box::pin(self.produce_video(&cx, &workspace, *rules)).await,
+			Planned::Animation(burn) => Box::pin(self.produce_video_animation(&cx, &workspace, *burn)).await,
 			Planned::Image(input) => Box::pin(self.produce_image(&cx, input, &workspace)).await,
 		};
 		let mut staged = match produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes))? {
@@ -872,6 +900,182 @@ impl Engine {
 			missing.join(" and ")
 		))
 		.into())
+	}
+
+	fn check_animation(&self, job: &Job) -> Result<(), JobError> {
+		if let (Some(_), Some(format)) = (job.options.max_bitrate_kbps, job.options.format) {
+			check_bitrate_cap(format).map_err(ErrorKind::EncodeFailed)?;
+		}
+
+		self.require(MediaKind::Image)?;
+		if !self.tools.has_libaom() {
+			return Err(ErrorKind::Toolchain("an animated AVIF needs ffmpeg with libaom-av1".into()).into());
+		}
+		Ok(())
+	}
+
+	/// The main video, trimmed, deinterlaced, resized and with any subtitles burned in as the video path does it, is
+	/// stored as lossless RGB frames, which the animation path encodes and checks the AVIF against.
+	async fn produce_video_animation(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		burn: Option<Burn>,
+	) -> Result<Produced, JobError> {
+		let source = cx.job.source.as_path();
+
+		(cx.on_event)(JobEvent::Stage(Stage::Probe));
+		let (info, _) = probe::probe_video(&self.tools, source, cx.source_bytes, cx.cancel)
+			.await
+			.map_err(video_probe_error)?;
+		let main = match self.video_main(&info, cx.job) {
+			Ok(main) => main,
+			Err(reason) => return Ok(Produced::Kept(reason)),
+		};
+
+		let declared_s = main.declared_duration().or(info.format.duration);
+		let window = cx
+			.job
+			.options
+			.trim
+			.map(|trim| trim.video_window(declared_s, main.fps()))
+			.transpose()
+			.map_err(ErrorKind::EncodeFailed)?;
+		let span_s = window.map_or(declared_s, |window| Some(window.length_s));
+		check_frame_count(span_s, main.fps(), ScanType::Progressive)?;
+
+		let shown = video_plan::shown_size(main);
+		let size = animation_size(cx.job.options.resize, main).map_err(ErrorKind::EncodeFailed)?;
+		let frames = probe::first_frames(&self.tools, source, main.index, 5, cx.cancel)
+			.await
+			.map_err(video_probe_error)?;
+
+		(cx.on_event)(JobEvent::Stage(Stage::Queued));
+		let _slot = tokio::select! {
+			slot = self.video_slots.acquire() => slot.expect("the semaphore is never closed"),
+			() = cx.cancel.cancelled() => return Err(ErrorKind::Cancelled.into()),
+		};
+		let decoded = video_plan::memory_estimate(main.width.unwrap_or(0), main.height.unwrap_or(0));
+		let estimate = size.map_or(decoded, |(width, height)| {
+			decoded.max(video_plan::memory_estimate(width, height))
+		});
+		let _memory = self.reserve_memory(estimate, cx.on_event, cx.cancel).await?;
+
+		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
+		let segments = video_quality::analysis_segments(cx.job.speed);
+		let analysis = Box::pin(analyze::analyze(
+			&self.tools,
+			source,
+			main,
+			declared_s,
+			segments,
+			window,
+			cx.cancel,
+		))
+		.await?;
+		check_frame_count(span_s, main.fps(), analysis.scan)?;
+
+		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed, size);
+		video.filters = colour::rgb_frames(main, &video.colour, video.alpha);
+		video.warnings = video_plan::animation_warnings(main, &frames);
+		video.streams.truncate(1);
+		video.window = window;
+		video.starts = VideoStarts::of(&info, &video.streams);
+
+		let cores = std::thread::available_parallelism().map_or(1, usize::from);
+		if self.video_threads.is_some() || cx.job.options.threads.is_some() {
+			video.threads = Some(threads_for(self.job_threads(cx.job, cores), cores));
+		}
+
+		if window.is_some() {
+			video.expected_frames = None;
+		} else if video.expected_frames.is_some() {
+			let undecoded = undecoded_lead(&self.tools, source, main.index, cx.cancel).await?;
+			video.expected_frames = video_plan::decodable_frames(main, declared_s, analysis.scan, undecoded);
+		}
+		if let Some(chosen) = burn {
+			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, chosen)).await?;
+		}
+
+		let mut warnings = dropped_streams(&info, burn);
+		warnings.extend(video.warnings.iter().cloned());
+		warnings.extend(size.and_then(|size| upscaled(shown, size)));
+		if cx.job.keep_metadata {
+			warnings.push("metadata is not carried into animated AVIF yet".to_owned());
+		}
+
+		let share = source_share(cx.source_bytes, window, declared_s);
+		Box::pin(self.animate(cx, workspace, &video, span_s, share, warnings)).await
+	}
+
+	async fn animate(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		video: &VideoPlan,
+		span_s: Option<f64>,
+		share: Option<u64>,
+		mut warnings: Vec<String>,
+	) -> Result<Produced, JobError> {
+		(cx.on_event)(JobEvent::Stage(Stage::Encode));
+		let path = workspace.file(ANIMATION_FRAMES);
+		let cmd = video_encode::frames_command(&self.tools.ffmpeg, &cx.job.source, &path, video);
+		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
+		let encoded = Box::pin(video_encode::encode_video(&cmd, video, span_s, on_fraction, cx.cancel)).await?;
+		let (frames, warning) = self.video_temp(path, video, &encoded, span_s, cx.cancel).await?;
+		warnings.extend(warning);
+
+		let prepared = frames.info.streams.first();
+		let size = (
+			prepared.and_then(|stream| stream.width).unwrap_or(video.width),
+			prepared.and_then(|stream| stream.height).unwrap_or(video.height),
+		);
+		let timeline = animated::read_video_timeline(&self.tools, &frames.path, size, cx.cancel).await?;
+		if let Some(reason) = animated::too_many_frames(u64::from(timeline.frames)) {
+			return Err(ErrorKind::EncodeFailed(reason).into());
+		}
+		if timeline.frames < 2 {
+			return Err(ErrorKind::EncodeFailed(
+				"the clip has a single frame, too few for an animation; use a longer range".into(),
+			)
+			.into());
+		}
+
+		let animation = Animation {
+			alpha: video.alpha && animated::has_alpha(&self.tools, &frames.path, cx.cancel).await?,
+			timeline,
+			size: None,
+		};
+		let image = ImageContext {
+			tools: &self.tools,
+			source: &frames.path,
+			source_bytes: share.unwrap_or(cx.source_bytes),
+			speed: cx.job.speed,
+			overrides: cx.job.overrides,
+			min_savings: cx.job.min_savings,
+			mode: metadata_mode(cx.job),
+			threads: self.job_threads(cx.job, self.image_threads),
+			caps: self.image_caps(),
+			on_event: cx.on_event,
+			cancel: cx.cancel,
+			memory: self.quality.as_ref(),
+			route: Some(ImageRoute::Avif),
+			forced: true,
+			resize: None,
+		};
+		let encoded = image_job::encode_animation(&image, &frames.path, &animation, workspace, fold_repeats(warnings));
+		Ok(match Box::pin(encoded).await? {
+			ImageOutcome::Output {
+				path, bytes, warnings, ..
+			} => Produced::Output(Staged {
+				path,
+				bytes,
+				source_share: share,
+				warnings,
+				learned: Vec::new(),
+			}),
+			ImageOutcome::Kept(reason) => Produced::Kept(reason),
+		})
 	}
 
 	fn kept_video(&self, quality: &VideoQuality, reason: KeepReason) -> Produced {
@@ -1524,14 +1728,68 @@ fn video_container(job: &Job) -> Container {
 		.unwrap_or(MATROSKA_VIDEO)
 }
 
-fn stream_rules(job: &Job, info: &MediaInfo) -> Result<StreamRules, JobError> {
-	let burn = job
-		.options
+/// `--resize`, or the size the picture is shown at when its pixels aren't square: players show an animated AVIF's
+/// pixels square.
+fn animation_size(resize: Option<Resize>, main: &Stream) -> Result<Option<(u32, u32)>, String> {
+	let shown = video_plan::shown_size(main);
+	let square = main
+		.sample_aspect_ratio
+		.is_none_or(|ratio| (ratio - 1.0).abs() < SQUARE_PIXEL_SLACK);
+
+	match resize {
+		Some(resize) => resize.size(shown, false).map(Some),
+		None if square => Ok(None),
+		None => Resize {
+			width: None,
+			height: None,
+		}
+		.size(shown, false)
+		.map(Some),
+	}
+}
+
+/// Refuses a clip with more frames than an animation can have, from its length and rate, before any work on it.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn check_frame_count(span_s: Option<f64>, fps: Option<f64>, scan: ScanType) -> Result<(), JobError> {
+	let (Some(span_s), Some(fps)) = (span_s, fps) else {
+		return Ok(());
+	};
+
+	let per_source_frame = match scan {
+		ScanType::Progressive => 1.0,
+		ScanType::Interlaced { .. } => 2.0,
+		ScanType::Telecined => 0.8,
+	};
+	let frames = (span_s * fps * per_source_frame).round().max(0.0) as u64;
+	match animated::too_many_frames(frames) {
+		Some(reason) => Err(ErrorKind::EncodeFailed(reason).into()),
+		None => Ok(()),
+	}
+}
+
+fn dropped_streams(info: &MediaInfo, burned: Option<Burn>) -> Vec<String> {
+	info.streams
+		.iter()
+		.filter_map(|stream| match stream.codec_type.as_str() {
+			"audio" => Some(AUDIO_DROPPED),
+			"subtitle" if burned.is_none_or(|burn| burn.stream != stream.index) => Some(SUBTITLES_DROPPED),
+			_ => None,
+		})
+		.map(str::to_owned)
+		.collect()
+}
+
+fn burn_pick(job: &Job, info: &MediaInfo) -> Result<Option<Burn>, JobError> {
+	job.options
 		.burn_subs
 		.as_ref()
 		.map(|burn_subs| burn::pick(info, &burn_subs.pick))
 		.transpose()
-		.map_err(ErrorKind::EncodeFailed)?;
+		.map_err(|reason| ErrorKind::EncodeFailed(reason).into())
+}
+
+fn stream_rules(job: &Job, info: &MediaInfo) -> Result<StreamRules, JobError> {
+	let burn = burn_pick(job, info)?;
 
 	Ok(StreamRules {
 		container: video_container(job),

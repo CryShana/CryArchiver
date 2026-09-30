@@ -24,6 +24,7 @@ const VP9_CRF: [u8; 6] = [33, 32, 31, 30, 28, 28];
 const MASTERING_DISPLAY: &str = "Mastering display metadata";
 const HDR10_PLUS: &str = "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)";
 const FILM_GRAIN_PARAMETERS: &str = "Film grain parameters";
+const DOLBY_VISION_DROPPED: &str = "Dolby Vision metadata dropped; the compatible base layer is kept";
 const RATE_AGREEMENT: f64 = 0.001;
 const PACKET_AGREEMENT: f64 = 0.002;
 const MIN_PACKET_SLACK: f64 = 2.0;
@@ -297,7 +298,7 @@ pub fn plan_video(
 
 	let mut warnings = Vec::new();
 	if dolby_vision(main).is_some() {
-		warnings.push("Dolby Vision metadata dropped; the compatible base layer is kept".to_owned());
+		warnings.push(DOLBY_VISION_DROPPED.to_owned());
 	}
 	if has_side_data(frames, HDR10_PLUS) {
 		warnings.push("HDR10+ dynamic metadata dropped; the static HDR10 metadata is kept".to_owned());
@@ -332,6 +333,18 @@ pub fn plan_video(
 		threads: None,
 		max_bitrate_kbps: None,
 	}
+}
+
+/// What a video loses as an animated AVIF, which keeps only its colour primaries and transfer.
+pub fn animation_warnings(main: &Stream, frames: &[Frame]) -> Vec<String> {
+	let mut warnings = Vec::new();
+	if dolby_vision(main).is_some() {
+		warnings.push(DOLBY_VISION_DROPPED.to_owned());
+	}
+	if has_side_data(frames, MASTERING_DISPLAY) || has_side_data(frames, HDR10_PLUS) {
+		warnings.push("HDR metadata dropped: animated AVIF keeps only the colour primaries and transfer".to_owned());
+	}
+	warnings
 }
 
 pub fn force_encoder(plan: &mut VideoPlan, choice: VideoEncoderChoice, speed: Speed) -> Result<(), String> {

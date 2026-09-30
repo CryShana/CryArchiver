@@ -80,10 +80,17 @@ impl fmt::Display for OutputFormat {
 	}
 }
 
+pub const ANIMATED_JXL: &str = "animated JPEG XL output isn't supported; use -f avif";
+
 pub fn check_kind(format: OutputFormat, kind: MediaKind) -> Result<(), String> {
 	let extracts_audio = format.kind() == MediaKind::Audio && kind == MediaKind::Video;
-	if format.kind() == kind || extracts_audio {
+	let animates = format == OutputFormat::Avif && kind == MediaKind::Video;
+	if format.kind() == kind || extracts_audio || animates {
 		return Ok(());
+	}
+
+	if format == OutputFormat::Jxl && kind == MediaKind::Video {
+		return Err(ANIMATED_JXL.to_owned());
 	}
 
 	let what = match kind {
@@ -92,6 +99,15 @@ pub fn check_kind(format: OutputFormat, kind: MediaKind) -> Result<(), String> {
 		MediaKind::Image => "an image",
 	};
 	Err(format!("{what} can't be written as {format}"))
+}
+
+pub fn check_bitrate_cap(format: OutputFormat) -> Result<(), String> {
+	if format.kind() == MediaKind::Image {
+		return Err(format!(
+			"--max-bitrate caps a video's bitrate, so it can't be used for {format} output"
+		));
+	}
+	Ok(())
 }
 
 #[cfg(test)]
@@ -131,5 +147,21 @@ mod tests {
 		assert_eq!(OutputFormat::Ogg.audio_container().map(|c| c.muxer), Some("ogg"));
 		assert_eq!(OutputFormat::Mp4.video_container().map(|c| c.muxer), Some("mp4"));
 		assert_eq!(OutputFormat::Avif.video_container(), None);
+	}
+
+	#[test]
+	fn a_video_can_be_an_animated_avif_but_never_an_animated_jpeg_xl_or_capped() {
+		assert_eq!(check_kind(OutputFormat::Avif, MediaKind::Video), Ok(()));
+		assert_eq!(
+			check_kind(OutputFormat::Jxl, MediaKind::Video),
+			Err(ANIMATED_JXL.into())
+		);
+		assert_eq!(
+			check_bitrate_cap(OutputFormat::Avif),
+			Err("--max-bitrate caps a video's bitrate, so it can't be used for .avif output".into())
+		);
+		assert!(check_bitrate_cap(OutputFormat::Jxl).is_err());
+		assert_eq!(check_bitrate_cap(OutputFormat::Webm), Ok(()));
+		assert_eq!(check_bitrate_cap(OutputFormat::Opus), Ok(()));
 	}
 }
