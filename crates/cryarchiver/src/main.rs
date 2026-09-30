@@ -22,7 +22,7 @@ use cryarchiver_engine::naming::cli_output_path;
 use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, SubtitlePick, Trim, VideoEncoderChoice, parse_time};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
-use cryarchiver_engine::process::limits::{self, Limits, Priority};
+use cryarchiver_engine::process::limits::{self, Applied, Limits, Priority};
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::toolchain::{Status, ToolConfig, Toolchain};
@@ -178,7 +178,12 @@ struct CompressArgs {
 	min_savings: u8,
 	#[arg(short, long, value_name = "N", help = "Files processed in parallel")]
 	jobs: Option<usize>,
-	#[arg(long, value_name = "N", help = "Threads per file [default: automatic]")]
+	#[arg(
+		long,
+		value_name = "N",
+		value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+		help = "Threads per file [default: automatic]"
+	)]
 	threads: Option<usize>,
 	#[arg(
 		long,
@@ -685,11 +690,13 @@ async fn compress(args: CompressArgs) -> u8 {
 		return 2;
 	}
 
-	let applied = limits::apply(Limits {
+	let applied = apply_limits(Limits {
 		priority: args.priority,
 		cpu_cap: args.cpu_limit,
 	});
-	let threads = file_threads(args.threads, args.cpu_limit, applied.cpu_cap_live);
+	let parallel = args.jobs.unwrap_or_else(default_jobs).max(1);
+	let cores = std::thread::available_parallelism().map_or(1, usize::from);
+	let threads = file_threads(args.threads, args.cpu_limit, applied.cpu_cap_live, parallel, cores);
 
 	let cancel = CancellationToken::new();
 	let tools = match Toolchain::detect(&ToolConfig { ffmpeg: args.ffmpeg }, &cancel).await {
@@ -766,7 +773,6 @@ async fn compress(args: CompressArgs) -> u8 {
 			},
 		})
 		.collect();
-	let parallel = args.jobs.unwrap_or_else(default_jobs).max(1);
 	let mut engine = Engine::new(tools)
 		.with_video_jobs(args.jobs.unwrap_or(1))
 		.with_image_threads(image_threads(parallel))
@@ -915,11 +921,32 @@ fn image_threads(parallel: usize) -> usize {
 	std::thread::available_parallelism().map_or(1, |cores| cores.get().div_ceil(parallel))
 }
 
-fn file_threads(threads: Option<usize>, cpu_limit: Option<u8>, cap_is_live: bool) -> Option<usize> {
-	let cores = std::thread::available_parallelism().map_or(1, usize::from);
-	let capped = cpu_limit
-		.filter(|_| !cap_is_live)
-		.map(|percent| (cores * usize::from(percent)).div_ceil(100).max(1));
+/// Leaves the process as it was started when nothing is asked for, so a priority it inherited (`start /low`) still
+/// reaches the tools: on Windows, joining the limit's job object would reset it to normal.
+fn apply_limits(requested: Limits) -> Applied {
+	if requested == Limits::default() {
+		return Applied {
+			priority_live: true,
+			cpu_cap_live: true,
+		};
+	}
+
+	limits::apply(requested)
+}
+
+/// Threads per file. A cap the system can't apply live becomes the capped share of the cores, split between the files
+/// that run in parallel, so it never gives a file more threads than it would get without the cap.
+fn file_threads(
+	threads: Option<usize>,
+	cpu_limit: Option<u8>,
+	cap_is_live: bool,
+	parallel: usize,
+	cores: usize,
+) -> Option<usize> {
+	let capped = cpu_limit.filter(|_| !cap_is_live).map(|percent| {
+		let share = cores * usize::from(percent) / 100;
+		(share / parallel.max(1)).max(1)
+	});
 
 	match (threads, capped) {
 		(Some(threads), Some(capped)) => Some(threads.min(capped)),
@@ -1283,6 +1310,52 @@ mod tests {
 			),
 			None
 		);
+	}
+
+	#[test]
+	fn a_live_cap_leaves_the_threads_alone() {
+		assert_eq!(file_threads(None, Some(50), true, 4, 16), None);
+		assert_eq!(file_threads(Some(3), Some(50), true, 4, 16), Some(3));
+		assert_eq!(file_threads(None, None, false, 4, 16), None);
+		assert_eq!(file_threads(Some(6), None, false, 4, 16), Some(6));
+	}
+
+	#[test]
+	fn a_cap_that_is_not_live_shares_the_capped_cores_between_the_files() {
+		assert_eq!(file_threads(None, Some(50), false, 4, 16), Some(2));
+		assert_eq!(file_threads(None, Some(50), false, 1, 16), Some(8));
+		assert_eq!(file_threads(None, Some(10), false, 4, 16), Some(1));
+		assert_eq!(file_threads(Some(1), Some(50), false, 4, 16), Some(1));
+		assert_eq!(file_threads(Some(8), Some(50), false, 4, 16), Some(2));
+	}
+
+	#[test]
+	fn a_cap_that_is_not_live_never_raises_the_threads_per_file() {
+		for cores in 1..=64_usize {
+			for parallel in 1..=8_usize {
+				let uncapped = cores.div_ceil(parallel);
+				for percent in 1..=100 {
+					let capped = file_threads(None, Some(percent), false, parallel, cores).unwrap();
+
+					assert!(capped >= 1);
+					assert!(
+						capped <= uncapped,
+						"{cores} cores, {parallel} files, {percent} %: {capped} > {uncapped}"
+					);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn threads_must_be_at_least_one() {
+		let Launch::Compress(compress) = launch_from(args(&["a.flac", "--threads", "2"])) else {
+			panic!("not a compress run");
+		};
+		assert_eq!(compress.threads, Some(2));
+
+		let err = refusal(&["a.flac", "--threads", "0"]);
+		assert_eq!(err.exit_code(), 2);
 	}
 
 	#[tokio::test]

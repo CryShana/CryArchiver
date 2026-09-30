@@ -273,8 +273,7 @@ impl Engine {
 	}
 
 	fn job_threads(&self, job: &Job, fallback: usize) -> usize {
-		let engine = self.video_threads.unwrap_or(fallback);
-		job.options.threads.map_or(engine, |cap| cap.min(engine)).max(1)
+		thread_budget(self.video_threads, job.options.threads, fallback)
 	}
 
 	pub async fn run(
@@ -1810,5 +1809,25 @@ fn source_changed(source: &Path, size: u64, before: &SourceTimes) -> bool {
 fn skipped(reason: &str) -> JobOutcome {
 	JobOutcome::Skipped {
 		reason: reason.to_owned(),
+	}
+}
+
+fn thread_budget(engine: Option<usize>, job_cap: Option<usize>, fallback: usize) -> usize {
+	let engine = engine.unwrap_or(fallback);
+	job_cap.map_or(engine, |cap| cap.min(engine)).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn the_engine_budget_replaces_the_fallback_and_a_job_cap_only_lowers_it() {
+		assert_eq!(thread_budget(None, None, 16), 16);
+		assert_eq!(thread_budget(Some(4), None, 16), 4);
+		assert_eq!(thread_budget(Some(4), Some(2), 16), 2);
+		assert_eq!(thread_budget(Some(4), Some(8), 16), 4);
+		assert_eq!(thread_budget(None, Some(8), 16), 8);
+		assert_eq!(thread_budget(None, Some(0), 16), 1);
 	}
 }
