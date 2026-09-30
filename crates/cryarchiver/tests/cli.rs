@@ -944,6 +944,41 @@ fn an_output_file_naming_the_source_by_a_different_case_is_refused() {
 	);
 }
 
+#[cfg(windows)]
+#[test]
+fn a_locked_source_is_retried_automatically() {
+	use std::io::{BufRead, BufReader};
+	use std::os::windows::fs::OpenOptionsExt;
+	use std::process::Stdio;
+
+	let dir = tempfile::tempdir().unwrap();
+	let song = flac(dir.path(), "song.flac", 2);
+	let mut lock = Some(fs::OpenOptions::new().read(true).share_mode(0).open(&song).unwrap());
+
+	let mut child = Command::new(env!("CARGO_BIN_EXE_cryarchiver"))
+		.current_dir(dir.path())
+		.arg("song.flac")
+		.stdout(Stdio::piped())
+		.stderr(Stdio::null())
+		.spawn()
+		.unwrap();
+	let mut printed = String::new();
+	for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+		let line = line.unwrap();
+		if line.starts_with('↻') {
+			lock = None;
+		}
+		printed.push_str(&line);
+		printed.push('\n');
+	}
+	let status = child.wait().unwrap();
+	drop(lock);
+
+	assert_eq!(status.code(), Some(0), "{printed}");
+	assert!(printed.contains("↻ song.flac  retrying in 5 s"), "{printed}");
+	assert!(dir.path().join("song.cry.opus").is_file());
+}
+
 #[test]
 fn trims_take_the_three_time_spellings() {
 	let dir = tempfile::tempdir().unwrap();

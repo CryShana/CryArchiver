@@ -3,6 +3,7 @@ mod inputs;
 mod memory;
 mod projects;
 mod report;
+mod retry;
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -838,7 +839,7 @@ async fn compress(args: CompressArgs) -> u8 {
 					video_encoder: args.video_encoder,
 					image_encoder: args.image_encoder,
 				},
-				threads: None,
+				threads,
 				max_bitrate_kbps: args.max_bitrate,
 				resize: args.resize,
 			},
@@ -910,6 +911,8 @@ async fn run_all(
 		let (engine, sink, cancel) = (engine.clone(), sink.clone(), cancel.clone());
 		let report = report.clone();
 		running.spawn(async move {
+			let mut job = job;
+			let source = job.source.clone();
 			let on_event = |event: JobEvent| {
 				seat.observe(&event);
 				report::apply(&bar, &event);
@@ -917,10 +920,35 @@ async fn run_all(
 				if report.verbose()
 					&& let JobEvent::Warning(warning) = &event
 				{
-					report.print(&format!("  ⚠ {}: {warning}", file_label(&job.source)), false);
+					report.print(&format!("  ⚠ {}: {warning}", file_label(&source)), false);
 				}
 			};
-			let outcome = engine.run(&job, sink.as_ref(), &on_event, &cancel).await;
+
+			let mut attempt = 1;
+			let outcome = loop {
+				let outcome = engine.run(&job, sink.as_ref(), &on_event, &cancel).await;
+				let JobOutcome::Failed(err) = &outcome else {
+					break outcome;
+				};
+				let Some(wait) = retry::next_wait(&err.kind, attempt) else {
+					break outcome;
+				};
+
+				report.print(
+					&format!("↻ {}  {}: {err}", file_label(&source), retry::describe(wait)),
+					false,
+				);
+				let crashed = matches!(err.kind, ErrorKind::ToolCrashed(_));
+				if !retry::wait(wait, &job.source, &sink.work_root(&job.source), &cancel).await {
+					break outcome;
+				}
+
+				if crashed {
+					job.options.threads = Some(halved(job.options.threads));
+				}
+				attempt += 1;
+			};
+
 			bar.finish_and_clear();
 			(job.source, outcome)
 		});
@@ -930,6 +958,11 @@ async fn run_all(
 		record_joined(report, &mut totals, joined);
 	}
 	totals
+}
+
+fn halved(threads: Option<usize>) -> usize {
+	let current = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from));
+	(current / 2).max(1)
 }
 
 fn output_key(source: &Path, output_dir: Option<&Path>) -> OsString {
