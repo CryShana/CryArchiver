@@ -33,7 +33,9 @@ use crate::video::analyze::Analysis;
 use crate::video::burn::{self, Burn};
 use crate::video::encode::{EncodedVideo, Sample};
 use crate::video::mux::{self, Attachment, ChapterSource, CueFile, MuxInputs, MuxPlan};
-use crate::video::plan::{self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, usable_main};
+use crate::video::plan::{
+	self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, threads_for, usable_main,
+};
 use crate::video::quality::{self as video_quality, GrainChoice, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
@@ -116,6 +118,7 @@ pub struct Engine {
 	video_slots: Semaphore,
 	image_threads: usize,
 	metric_threads: usize,
+	video_threads: Option<usize>,
 	memory_gate: Option<Arc<dyn MemoryGate>>,
 	quality: Arc<dyn QualityMemory>,
 }
@@ -222,6 +225,7 @@ impl Engine {
 			video_slots: Semaphore::new(1),
 			image_threads: cores,
 			metric_threads: cores,
+			video_threads: None,
 			memory_gate: None,
 			quality: Arc::new(SharedMemory::default()),
 		}
@@ -254,6 +258,23 @@ impl Engine {
 			image_threads: threads.max(1),
 			..self
 		}
+	}
+
+	#[must_use]
+	pub fn with_threads(self, threads: usize) -> Self {
+		let threads = threads.max(1);
+
+		Self {
+			image_threads: threads,
+			metric_threads: threads,
+			video_threads: Some(threads),
+			..self
+		}
+	}
+
+	fn job_threads(&self, job: &Job, fallback: usize) -> usize {
+		let engine = self.video_threads.unwrap_or(fallback);
+		job.options.threads.map_or(engine, |cap| cap.min(engine)).max(1)
 	}
 
 	pub async fn run(
@@ -486,7 +507,7 @@ impl Engine {
 			overrides: cx.job.overrides,
 			min_savings: cx.job.min_savings,
 			mode: metadata_mode(cx.job),
-			threads: self.image_threads,
+			threads: self.job_threads(cx.job, self.image_threads),
 			caps: self.image_caps(),
 			on_event: cx.on_event,
 			cancel: cx.cancel,
@@ -677,6 +698,11 @@ impl Engine {
 		))
 		.await?;
 		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
+
+		let cores = std::thread::available_parallelism().map_or(1, usize::from);
+		if self.video_threads.is_some() || cx.job.options.threads.is_some() {
+			video.threads = Some(threads_for(self.job_threads(cx.job, cores), cores));
+		}
 
 		if let Some(choice) = cx.job.options.advanced.video_encoder {
 			if choice == VideoEncoderChoice::Aom && !self.tools.has_libaom() {
@@ -891,7 +917,7 @@ impl Engine {
 			source: &cx.job.source,
 			workspace,
 			plan: video,
-			threads: self.metric_threads,
+			threads: self.job_threads(cx.job, self.metric_threads),
 			cancel: cx.cancel,
 		}
 	}

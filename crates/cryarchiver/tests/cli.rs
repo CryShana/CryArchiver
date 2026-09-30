@@ -939,3 +939,28 @@ fn help_and_doctor_mention_images() {
 	assert!(stdout(&doctor).contains("image filters"), "{}", stdout(&doctor));
 	assert!(stdout(&doctor).contains("libjxl"), "{}", stdout(&doctor));
 }
+
+#[test]
+fn resource_flags_run_the_batch() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "song.flac", 2);
+
+	let out = cryarchiver(
+		dir.path(),
+		&["--threads", "2", "--priority", "idle", "--cpu-limit", "50", "song.flac"],
+	);
+
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	assert!(dir.path().join("song.cry.opus").is_file());
+}
+
+#[test]
+fn low_priority_runs_the_batch() {
+	let dir = tempfile::tempdir().unwrap();
+	flac(dir.path(), "song.flac", 2);
+
+	let out = cryarchiver(dir.path(), &["--priority", "low", "song.flac"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+	assert!(dir.path().join("song.cry.opus").is_file());
+}

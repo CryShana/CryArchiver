@@ -1,7 +1,7 @@
-use cryarchiver_engine::process::limits::{self, Limits};
+use cryarchiver_engine::process::limits::{self, Limits, Priority};
 
 const LIMITED: Limits = Limits {
-	low_priority: true,
+	priority: Priority::Idle,
 	cpu_cap: Some(25),
 };
 
@@ -9,13 +9,17 @@ const LIMITED: Limits = Limits {
 mod windows_limits {
 	use std::os::windows::io::AsRawHandle;
 	use std::process::{Child, Command, Stdio};
+	use std::sync::{Mutex, PoisonError};
 
 	use windows::Win32::Foundation::HANDLE;
 	use windows::Win32::System::Threading::{
-		GetCurrentProcess, GetPriorityClass, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+		BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
 	};
 
 	use super::*;
+
+	/// The limits are process-wide, so the tests take turns.
+	static SERIAL: Mutex<()> = Mutex::new(());
 
 	fn priority_class(process: HANDLE) -> u32 {
 		// SAFETY: the handle is valid for the call.
@@ -43,6 +47,7 @@ mod windows_limits {
 
 	#[test]
 	fn the_limit_reaches_running_processes_and_lifts_again() {
+		let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
 		limits::apply(Limits::default());
 		let mut running = sleeper();
 		let mut outside = limits::spawn_outside_limits(&mut sleeping()).unwrap();
@@ -70,6 +75,19 @@ mod windows_limits {
 		running.kill().unwrap();
 		running.wait().unwrap();
 	}
+
+	#[test]
+	fn low_priority_is_the_below_normal_class() {
+		let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+		let applied = limits::apply(Limits {
+			priority: Priority::BelowNormal,
+			cpu_cap: None,
+		});
+
+		assert!(applied.priority_live, "{applied:?}");
+		assert_eq!(own_priority_class(), BELOW_NORMAL_PRIORITY_CLASS.0);
+		limits::apply(Limits::default());
+	}
 }
 
 #[cfg(target_os = "linux")]
@@ -78,12 +96,17 @@ mod linux_limits {
 	use std::time::Duration;
 
 	use cryarchiver_engine::process::{StdoutMode, ToolCommand, run};
+	use tokio::sync::Mutex;
 	use tokio_util::sync::CancellationToken;
 
 	use super::*;
 
+	/// The limits are process-wide, so the tests take turns.
+	static SERIAL: Mutex<()> = Mutex::const_new(());
+
 	#[tokio::test]
 	async fn new_tools_start_at_low_priority() {
+		let _serial = SERIAL.lock().await;
 		let applied = limits::apply(LIMITED);
 		let cmd = ToolCommand::new(Path::new("nice"), Duration::from_secs(10));
 
@@ -93,5 +116,22 @@ mod linux_limits {
 
 		assert!(!applied.cpu_cap_live);
 		assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "19");
+	}
+
+	#[tokio::test]
+	async fn low_priority_tools_start_at_nice_10() {
+		let _serial = SERIAL.lock().await;
+		limits::apply(Limits {
+			priority: Priority::BelowNormal,
+			cpu_cap: None,
+		});
+		let cmd = ToolCommand::new(Path::new("nice"), Duration::from_secs(10));
+
+		let output = run(&cmd, StdoutMode::Capture, |_| {}, &CancellationToken::new())
+			.await
+			.unwrap();
+
+		assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "10");
+		limits::apply(Limits::default());
 	}
 }

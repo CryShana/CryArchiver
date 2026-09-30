@@ -16,6 +16,7 @@ cryarchiver-project = { path = "../cryarchiver-project" }
 cryarchiver-tui = { path = "../cryarchiver-tui" }
 globset.workspace = true
 indicatif.workspace = true
+sysinfo.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 

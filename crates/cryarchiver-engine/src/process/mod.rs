@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 #[cfg(windows)]
 use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
+#[cfg(target_os = "linux")]
+use limits::Priority;
 use lines::{LineSplitter, RingBuffer};
 pub use progress::Progress;
 use progress::{HighWater, ProgressParser};
@@ -238,7 +240,7 @@ fn spawn(cmd: &ToolCommand, mode: StdoutMode) -> io::Result<Box<dyn ChildWrapper
 		}
 
 		#[cfg(target_os = "linux")]
-		die_with_parent(command, limits::current().low_priority);
+		die_with_parent(command, limits::current().priority);
 	});
 	command.wrap(KillOnDrop);
 
@@ -257,7 +259,7 @@ fn spawn(cmd: &ToolCommand, mode: StdoutMode) -> io::Result<Box<dyn ChildWrapper
 // PR_SET_PDEATHSIG fires when the spawning *thread* exits, not the process: spawn children from the runtime's
 // long-lived worker threads, never from `spawn_blocking`.
 #[cfg(target_os = "linux")]
-fn die_with_parent(command: &mut tokio::process::Command, low_priority: bool) {
+fn die_with_parent(command: &mut tokio::process::Command, priority: Priority) {
 	// SAFETY: getpid has no preconditions.
 	let parent = unsafe { libc::getpid() };
 
@@ -271,8 +273,8 @@ fn die_with_parent(command: &mut tokio::process::Command, low_priority: bool) {
 				libc::_exit(1);
 			}
 
-			if low_priority {
-				limits::lower_this_process();
+			if priority != Priority::Normal {
+				limits::lower_this_process(priority);
 			}
 			Ok(())
 		});

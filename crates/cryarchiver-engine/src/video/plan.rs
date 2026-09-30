@@ -32,6 +32,27 @@ const VIDEO_BASE_BYTES: u64 = 512 << 20;
 const VIDEO_BYTES_PER_PIXEL: u64 = 540;
 /// (noise deviation from which the level applies, film-grain level), noisiest first.
 const GRAIN_LEVELS: [(f64, u8); 3] = [(1.8, 10), (1.0, 8), (NOISY_SIGMA, 6)];
+const SVT_MAX_LP: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Threads {
+	pub tool: usize,
+	pub svt_lp: u8,
+}
+
+pub fn threads_for(count: usize, cores: usize) -> Threads {
+	Threads {
+		tool: count.max(1),
+		svt_lp: svt_lp(count, cores),
+	}
+}
+
+#[allow(clippy::cast_possible_truncation)]
+pub fn svt_lp(threads: usize, cores: usize) -> u8 {
+	(threads.max(1) * SVT_MAX_LP)
+		.div_ceil(cores.max(1))
+		.clamp(1, SVT_MAX_LP) as u8
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoCaps {
@@ -160,6 +181,7 @@ pub struct VideoPlan {
 	pub overlay: Option<Overlay>,
 	/// The text/ASS subtitle filter for the main video, before it is shifted to a command's seek.
 	pub subtitles: Option<String>,
+	pub threads: Option<Threads>,
 }
 
 /// Decoder, filters and SVT-AV1 together: about 5 GB for 4K (project layer spec §8.2).
@@ -279,6 +301,7 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 		starts: VideoStarts::default(),
 		overlay: None,
 		subtitles: None,
+		threads: None,
 	}
 }
 
@@ -346,9 +369,10 @@ fn frame_tolerance(scan: ScanType) -> u64 {
 	}
 }
 
-pub fn svt_params(crf: f64, grain: Option<u8>) -> String {
+pub fn svt_params(crf: f64, grain: Option<u8>, lp: Option<u8>) -> String {
 	let grain = grain.map_or_else(String::new, |level| format!(":film-grain={level}:film-grain-denoise=1"));
-	format!("tune=0:keyint=5s:crf={crf}{grain}")
+	let parallelism = lp.map(|lp| format!(":lp={lp}")).unwrap_or_default();
+	format!("tune=0:keyint=5s:crf={crf}{grain}{parallelism}")
 }
 
 pub fn source_grain(analysis: &Analysis) -> Option<u8> {
@@ -484,6 +508,7 @@ pub(crate) fn test_plan() -> VideoPlan {
 		starts: VideoStarts::default(),
 		overlay: None,
 		subtitles: None,
+		threads: None,
 	}
 }
 
@@ -852,10 +877,24 @@ mod tests {
 	#[test]
 	fn svt_parameters_carry_the_grain_level() {
 		assert_eq!(
-			svt_params(30.0, Some(14)),
+			svt_params(30.0, Some(14), None),
 			"tune=0:keyint=5s:crf=30:film-grain=14:film-grain-denoise=1"
 		);
-		assert_eq!(svt_params(30.0, None), "tune=0:keyint=5s:crf=30");
+		assert_eq!(svt_params(30.0, None, None), "tune=0:keyint=5s:crf=30");
+	}
+
+	#[test]
+	fn svt_parallelism_follows_the_thread_budget() {
+		assert_eq!(svt_lp(32, 32), 6);
+		assert_eq!(svt_lp(8, 32), 2);
+		assert_eq!(svt_lp(1, 32), 1);
+		assert_eq!(svt_lp(4, 4), 6);
+		assert_eq!(threads_for(8, 32), Threads { tool: 8, svt_lp: 2 });
+		assert_eq!(svt_params(30.0, None, Some(2)), "tune=0:keyint=5s:crf=30:lp=2");
+		assert_eq!(
+			svt_params(38.0, Some(12), Some(2)),
+			"tune=0:keyint=5s:crf=38:film-grain=12:film-grain-denoise=1:lp=2"
+		);
 	}
 
 	#[test]
@@ -1056,10 +1095,10 @@ mod tests {
 		);
 		assert_eq!((svt.preset(), vp9.preset()), (5, 2));
 		assert_eq!(
-			svt_params(29.25, Some(8)),
+			svt_params(29.25, Some(8), None),
 			"tune=0:keyint=5s:crf=29.25:film-grain=8:film-grain-denoise=1"
 		);
-		assert_eq!(svt_params(29.0, None), "tune=0:keyint=5s:crf=29");
+		assert_eq!(svt_params(29.0, None, None), "tune=0:keyint=5s:crf=29");
 	}
 
 	#[test]

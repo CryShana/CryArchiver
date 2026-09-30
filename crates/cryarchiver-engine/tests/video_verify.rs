@@ -41,6 +41,7 @@ fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan 
 		starts: VideoStarts::default(),
 		overlay: None,
 		subtitles: None,
+		threads: None,
 	}
 }
 

@@ -1,5 +1,6 @@
 mod headless;
 mod inputs;
+mod memory;
 mod projects;
 mod report;
 
@@ -21,6 +22,7 @@ use cryarchiver_engine::naming::cli_output_path;
 use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, SubtitlePick, Trim, VideoEncoderChoice, parse_time};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
+use cryarchiver_engine::process::limits::{self, Limits, Priority};
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_engine::toolchain::{Status, ToolConfig, Toolchain};
@@ -31,6 +33,7 @@ use tokio::sync::Notify;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::memory::SystemMemory;
 use crate::report::{Report, Totals, outcome_line};
 
 #[derive(Parser)]
@@ -175,6 +178,22 @@ struct CompressArgs {
 	min_savings: u8,
 	#[arg(short, long, value_name = "N", help = "Files processed in parallel")]
 	jobs: Option<usize>,
+	#[arg(long, value_name = "N", help = "Threads per file [default: automatic]")]
+	threads: Option<usize>,
+	#[arg(
+		long,
+		value_enum,
+		default_value_t,
+		help = "Process priority: normal, low (below normal) or idle"
+	)]
+	priority: Priority,
+	#[arg(
+		long,
+		value_name = "PERCENT",
+		value_parser = clap::value_parser!(u8).range(1..=100),
+		help = "Use at most this share of the CPU"
+	)]
+	cpu_limit: Option<u8>,
 	#[arg(long, value_name = "PATH", help = "ffmpeg binary or the folder containing it")]
 	ffmpeg: Option<PathBuf>,
 	#[arg(short, long, help = "Only print failures and the summary")]
@@ -642,6 +661,7 @@ async fn doctor(ffmpeg: Option<PathBuf>) -> u8 {
 	u8::from(lines.iter().any(|line| line.status == Status::Missing)) * 2
 }
 
+#[allow(clippy::too_many_lines)]
 async fn compress(args: CompressArgs) -> u8 {
 	let inputs = inputs::expand(&args.inputs);
 	for note in &inputs.notes {
@@ -664,6 +684,12 @@ async fn compress(args: CompressArgs) -> u8 {
 		eprintln!("error: {message}");
 		return 2;
 	}
+
+	let applied = limits::apply(Limits {
+		priority: args.priority,
+		cpu_cap: args.cpu_limit,
+	});
+	let threads = file_threads(args.threads, args.cpu_limit, applied.cpu_cap_live);
 
 	let cancel = CancellationToken::new();
 	let tools = match Toolchain::detect(&ToolConfig { ffmpeg: args.ffmpeg }, &cancel).await {
@@ -736,13 +762,18 @@ async fn compress(args: CompressArgs) -> u8 {
 					video_encoder: args.video_encoder,
 					image_encoder: args.image_encoder,
 				},
+				threads: None,
 			},
 		})
 		.collect();
 	let parallel = args.jobs.unwrap_or_else(default_jobs).max(1);
-	let engine = Engine::new(tools)
+	let mut engine = Engine::new(tools)
 		.with_video_jobs(args.jobs.unwrap_or(1))
-		.with_image_threads(image_threads(parallel));
+		.with_image_threads(image_threads(parallel))
+		.with_memory_gate(Arc::new(SystemMemory::default()));
+	if let Some(threads) = threads {
+		engine = engine.with_threads(threads);
+	}
 	let report = Report::new(args.quiet);
 
 	let totals = run_all(&Arc::new(engine), &sink, jobs, parallel, &report, &cancel).await;
@@ -882,6 +913,18 @@ fn cancel_on_ctrl_c(cancel: &CancellationToken) {
 
 fn image_threads(parallel: usize) -> usize {
 	std::thread::available_parallelism().map_or(1, |cores| cores.get().div_ceil(parallel))
+}
+
+fn file_threads(threads: Option<usize>, cpu_limit: Option<u8>, cap_is_live: bool) -> Option<usize> {
+	let cores = std::thread::available_parallelism().map_or(1, usize::from);
+	let capped = cpu_limit
+		.filter(|_| !cap_is_live)
+		.map(|percent| (cores * usize::from(percent)).div_ceil(100).max(1));
+
+	match (threads, capped) {
+		(Some(threads), Some(capped)) => Some(threads.min(capped)),
+		(threads, capped) => threads.or(capped),
+	}
 }
 
 fn default_jobs() -> usize {

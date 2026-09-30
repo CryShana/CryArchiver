@@ -9,7 +9,7 @@ use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
 use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
-use crate::video::plan::{Encoder, VideoPlan, svt_params};
+use crate::video::plan::{Encoder, Threads, VideoPlan, svt_params};
 use crate::video::streams::{Extracted, StreamPlan};
 use crate::video::{InputStart, Seek, analyze, burn, run_ffmpeg};
 use crate::workspace::Workspace;
@@ -69,6 +69,13 @@ fn encode_command(
 	cmd.count_lines_containing(DECODE_ERRORS);
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "repeat+info"]);
 
+	if let Some(threads) = plan.threads {
+		cmd.arg("-threads")
+			.arg(threads.tool.to_string())
+			.arg("-filter_threads")
+			.arg(threads.tool.to_string());
+	}
+
 	let start = if sample.is_some() {
 		plan.starts.main
 	} else {
@@ -126,14 +133,14 @@ fn encode_command(
 		cmd.arg(format!("-filter:v:{ordinal}")).arg(chain);
 	}
 
-	encoder_args(&mut cmd, &plan.encoder);
+	encoder_args(&mut cmd, &plan.encoder, plan.threads);
 
 	cmd.args(["-fps_mode", "passthrough", "-f", "matroska"])
 		.arg(process::tool_path(output));
 	cmd
 }
 
-fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder) {
+fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder, threads: Option<Threads>) {
 	match encoder {
 		Encoder::SvtAv1 {
 			preset,
@@ -143,7 +150,7 @@ fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder) {
 			cmd.args(["-c:v", "libsvtav1", "-preset"])
 				.arg(preset.to_string())
 				.args(["-err_detect", "explode", "-dolbyvision", "0", "-svtav1-params"])
-				.arg(svt_params(*crf, *film_grain));
+				.arg(svt_params(*crf, *film_grain, threads.map(|threads| threads.svt_lp)));
 		}
 		Encoder::Aom { cpu_used, crf } => {
 			cmd.args(["-c:v", "libaom-av1", "-crf"])
@@ -158,6 +165,10 @@ fn encoder_args(cmd: &mut ToolCommand, encoder: &Encoder) {
 				.args(["-b:v", "0", "-row-mt", "1", "-deadline", "good", "-cpu-used"])
 				.arg(cpu_used.to_string());
 		}
+	}
+
+	if let (Some(threads), Encoder::Aom { .. } | Encoder::Vp9Alpha { .. }) = (threads, encoder) {
+		cmd.arg("-threads").arg(threads.tool.to_string());
 	}
 }
 
@@ -499,6 +510,24 @@ mod tests {
 		assert!(!args.contains("variance-boost"), "{args}");
 		assert!(args.contains("-fps_mode passthrough -f matroska"), "{args}");
 		assert_eq!(cmd.counted, DECODE_ERRORS);
+	}
+
+	#[test]
+	fn a_thread_budget_reaches_the_decoder_the_filters_and_svt() {
+		let budgeted = VideoPlan {
+			threads: Some(Threads { tool: 4, svt_lp: 2 }),
+			..plan(svt(), None)
+		};
+
+		let args = joined(&video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mp4"),
+			Path::new("v.mkv"),
+			&budgeted,
+		));
+
+		assert!(args.contains("-threads 4 -filter_threads 4 -i "), "{args}");
+		assert!(args.contains("-svtav1-params tune=0:keyint=5s:crf=32:lp=2"), "{args}");
 	}
 
 	#[test]

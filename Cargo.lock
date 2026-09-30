@@ -673,6 +673,7 @@ dependencies = [
  "globset",
  "image",
  "indicatif",
+ "sysinfo",
  "tempfile",
  "tokio",
  "tokio-util",

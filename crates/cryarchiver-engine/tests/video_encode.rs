@@ -48,6 +48,7 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 		starts: VideoStarts::default(),
 		overlay: None,
 		subtitles: None,
+		threads: None,
 	}
 }
 

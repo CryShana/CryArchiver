@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::detect::read_header;
-use cryarchiver_engine::process::limits::{self, Applied, Limits};
+use cryarchiver_engine::process::limits::{self, Applied, Limits, Priority};
 use infer::MatcherType;
 
 use super::owner::Owner;
@@ -41,7 +41,11 @@ impl LiveState {
 /// Applies the project's limit to this process and the tools it runs. Called on open, before any tool starts.
 pub(crate) fn apply_limit(cap: Option<u8>) -> Applied {
 	limits::apply(Limits {
-		low_priority: cap.is_some(),
+		priority: if cap.is_some() {
+			Priority::Idle
+		} else {
+			Priority::Normal
+		},
 		cpu_cap: cap,
 	})
 }

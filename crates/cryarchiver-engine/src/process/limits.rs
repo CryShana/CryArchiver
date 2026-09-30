@@ -10,8 +10,18 @@ use std::process::{Child, Command};
 use std::sync::{Mutex, PoisonError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum Priority {
+	#[default]
+	Normal,
+	#[cfg_attr(feature = "clap", value(name = "low"))]
+	BelowNormal,
+	Idle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Limits {
-	pub low_priority: bool,
+	pub priority: Priority,
 	/// Percent of the whole machine.
 	pub cpu_cap: Option<u8>,
 }
@@ -24,7 +34,7 @@ pub struct Applied {
 }
 
 static CURRENT: Mutex<Limits> = Mutex::new(Limits {
-	low_priority: false,
+	priority: Priority::Normal,
 	cpu_cap: None,
 });
 
@@ -94,11 +104,12 @@ mod native {
 		JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, SetInformationJobObject,
 	};
 	use windows::Win32::System::Threading::{
-		CREATE_BREAKAWAY_FROM_JOB, GetCurrentProcess, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+		BELOW_NORMAL_PRIORITY_CLASS, CREATE_BREAKAWAY_FROM_JOB, GetCurrentProcess, IDLE_PRIORITY_CLASS,
+		NORMAL_PRIORITY_CLASS,
 	};
 	use windows::core::PCWSTR;
 
-	use super::{Applied, Limits};
+	use super::{Applied, Limits, Priority};
 
 	static JOB: OnceLock<Option<usize>> = OnceLock::new();
 
@@ -118,7 +129,7 @@ mod native {
 		};
 
 		Applied {
-			priority_live: set_priority(job, limits.low_priority).is_ok(),
+			priority_live: set_priority(job, limits.priority).is_ok(),
 			cpu_cap_live: set_cpu_cap(job, limits.cpu_cap).is_ok(),
 		}
 	}
@@ -146,11 +157,11 @@ mod native {
 	// Clearing the limit flag would leave running processes at the idle class, so lifting sets the normal class. The
 	// limits are set as a whole, so each call keeps leaving the job allowed: only for children started with
 	// CREATE_BREAKAWAY_FROM_JOB, which our tools never are.
-	fn set_priority(job: HANDLE, low: bool) -> windows::core::Result<()> {
-		let class = if low {
-			IDLE_PRIORITY_CLASS
-		} else {
-			NORMAL_PRIORITY_CLASS
+	fn set_priority(job: HANDLE, priority: Priority) -> windows::core::Result<()> {
+		let class = match priority {
+			Priority::Normal => NORMAL_PRIORITY_CLASS,
+			Priority::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
+			Priority::Idle => IDLE_PRIORITY_CLASS,
 		};
 		let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
 			BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
@@ -201,12 +212,15 @@ mod native {
 	use std::process::{Child, Command};
 	use std::sync::{Mutex, PoisonError};
 
-	use super::{Applied, Limits};
+	use super::{Applied, Limits, Priority};
 
 	const LOW_NICE: libc::c_int = 19;
+	const BELOW_NORMAL_NICE: libc::c_int = 10;
 	const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
 	const IOPRIO_CLASS_NONE: libc::c_int = 0;
+	const IOPRIO_CLASS_BEST_EFFORT: libc::c_int = 2;
 	const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+	const IOPRIO_LOWEST_LEVEL: libc::c_int = 7;
 	const IOPRIO_WHO_PROCESS: libc::c_int = 1;
 	const IOPRIO_WHO_PGRP: libc::c_int = 2;
 
@@ -237,7 +251,7 @@ mod native {
 		let groups = GROUPS.lock().unwrap_or_else(PoisonError::into_inner);
 		let failed = groups
 			.iter()
-			.filter(|&&group| !set_priority(Who::Group(group), limits.low_priority))
+			.filter(|&&group| !set_priority(Who::Group(group), limits.priority))
 			.count();
 		drop(groups);
 
@@ -248,15 +262,18 @@ mod native {
 	}
 
 	/// Runs in a freshly forked tool before `exec`: only async-signal-safe calls.
-	pub fn lower_this_process() {
-		set_priority(Who::ThisProcess, true);
+	pub fn lower_this_process(priority: Priority) {
+		set_priority(Who::ThisProcess, priority);
 	}
 
-	fn set_priority(who: Who, low: bool) -> bool {
-		let (nice, class) = if low {
-			(LOW_NICE, IOPRIO_CLASS_IDLE)
-		} else {
-			(0, IOPRIO_CLASS_NONE)
+	fn set_priority(who: Who, priority: Priority) -> bool {
+		let (nice, io) = match priority {
+			Priority::Normal => (0, IOPRIO_CLASS_NONE << IOPRIO_CLASS_SHIFT),
+			Priority::BelowNormal => (
+				BELOW_NORMAL_NICE,
+				(IOPRIO_CLASS_BEST_EFFORT << IOPRIO_CLASS_SHIFT) | IOPRIO_LOWEST_LEVEL,
+			),
+			Priority::Idle => (LOW_NICE, IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT),
 		};
 		let (who_kind, id) = match who {
 			Who::Group(group) => (IOPRIO_WHO_PGRP, group),
@@ -271,8 +288,8 @@ mod native {
 				Who::Group(_) => libc::setpriority(libc::PRIO_PGRP, unsigned_id, nice),
 				Who::ThisProcess => libc::setpriority(libc::PRIO_PROCESS, unsigned_id, nice),
 			} == 0;
-			let io = libc::syscall(libc::SYS_ioprio_set, who_kind, id, class << IOPRIO_CLASS_SHIFT) == 0;
-			niced && io
+			let io_set = libc::syscall(libc::SYS_ioprio_set, who_kind, id, io) == 0;
+			niced && io_set
 		}
 	}
 }

@@ -70,6 +70,7 @@ pub struct JobOptions {
 	pub merge_audio: bool,
 	pub burn_subs: Option<BurnSubs>,
 	pub advanced: Advanced,
+	pub threads: Option<usize>,
 }
 
 impl JobOptions {
