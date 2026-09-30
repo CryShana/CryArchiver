@@ -26,8 +26,8 @@ const MAX_FRAMES: u32 = 100_000;
 const GIF_DEFAULT_DELAY_MS: u32 = 100;
 const DELAY_TOLERANCE_MS: u32 = 1;
 const TRANSPARENT_FRAMES: &str = r"format=rgba,alphaextract,signalstats,metadata=mode=select:key=lavfi.signalstats.YMIN:value=255:function=expr:expr='lt(VALUE1\,VALUE2)'";
-const ALPHA_GRAPH: &str =
-	"[0:v]format=yuva444p10le,split[c][a];[c]format=yuv444p10le[color];[a]alphaextract,format=gray10le[alpha]";
+const ALPHA_SPLIT: &str =
+	"format=yuva444p10le,split[c][a];[c]format=yuv444p10le[color];[a]alphaextract,format=gray10le[alpha]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timeline {
@@ -42,6 +42,17 @@ pub struct Timeline {
 pub struct Animation {
 	pub timeline: Timeline,
 	pub alpha: bool,
+	/// The output size, when `--resize` scales the frames.
+	pub size: Option<(u32, u32)>,
+}
+
+impl Animation {
+	/// The scale for the encode and for the frames it is scored against: the same filter on the same 16-bit RGB
+	/// frames, so both are scaled alike.
+	fn scale(&self) -> Option<String> {
+		self.size
+			.map(|(width, height)| format!("format=rgba64le,scale=w={width}:h={height}:flags=lanczos+accurate_rnd"))
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,17 +168,16 @@ pub fn encode_command(
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
 		.arg(process::tool_path(source));
 
+	let scale = animation.scale();
 	if animation.alpha {
-		cmd.args([
-			"-filter_complex",
-			ALPHA_GRAPH,
-			"-map",
-			"[color]",
-			"-map",
-			"[alpha]",
-			"-fps_mode:v",
-		]);
+		let scaled = scale.map(|scale| format!("{scale},")).unwrap_or_default();
+		cmd.arg("-filter_complex")
+			.arg(format!("[0:v]{scaled}{ALPHA_SPLIT}"))
+			.args(["-map", "[color]", "-map", "[alpha]", "-fps_mode:v"]);
 	} else {
+		if let Some(scale) = scale {
+			cmd.arg("-vf").arg(scale);
+		}
 		cmd.args(["-pix_fmt", "yuv444p10le", "-fps_mode"]);
 	}
 	cmd.args(["passthrough", "-enc_time_base:v", "demux", "-c:v", "libaom-av1", "-crf"])
@@ -256,8 +266,15 @@ pub async fn verify_animation(
 	}
 
 	let frames = sampled_frames(timeline.frames);
-	let reference = decode_frames(&tools.ffmpeg, source, &frames, None, cancel).await?;
-	let decoded = decode_frames(&tools.ffmpeg, output, &frames, Some(&tracks), cancel).await?;
+	let reference = decode_frames(
+		&tools.ffmpeg,
+		source,
+		&frames,
+		Sampled::Source(animation.scale()),
+		cancel,
+	)
+	.await?;
+	let decoded = decode_frames(&tools.ffmpeg, output, &frames, Sampled::Output(&tracks), cancel).await?;
 	if reference.len() != frames.len() || decoded.len() != frames.len() {
 		return Err(failed("fewer frames decoded than sampled"));
 	}
@@ -300,8 +317,9 @@ fn sequence_tracks(info: &MediaInfo, animation: &Animation) -> Result<Vec<u32>, 
 			color.nb_frames, timeline.frames
 		)));
 	}
-	if (color.width, color.height) != (Some(timeline.width), Some(timeline.height)) {
-		return Err(failed("the output frame size differs from the source"));
+	let (width, height) = animation.size.unwrap_or((timeline.width, timeline.height));
+	if (color.width, color.height) != (Some(width), Some(height)) {
+		return Err(failed(format!("the output frames are not {width}×{height}")));
 	}
 	Ok(tracks)
 }
@@ -341,11 +359,19 @@ async fn check_delays(
 	}
 }
 
+/// What `decode_frames` reads the sampled frames from.
+enum Sampled<'a> {
+	/// The source, scaled by the encode's scale, if any.
+	Source(Option<String>),
+	/// The output's colour track, and its alpha track after it, if any.
+	Output(&'a [u32]),
+}
+
 async fn decode_frames(
 	ffmpeg: &Path,
 	input: &Path,
 	frames: &[u32],
-	tracks: Option<&[u32]>,
+	sampled: Sampled<'_>,
 	cancel: &CancellationToken,
 ) -> Result<Vec<DynamicImage>, JobError> {
 	let select = frames
@@ -357,20 +383,21 @@ async fn decode_frames(
 	cmd.args(["-hide_banner", "-nostdin", "-v", "error", "-i"])
 		.arg(process::tool_path(input));
 
-	match tracks {
-		Some([color, alpha]) => {
+	match sampled {
+		Sampled::Output([color, alpha]) => {
 			cmd.arg("-filter_complex").arg(format!(
 				"[0:{color}][0:{alpha}]alphamerge,select='{select}',format=rgba64be"
 			));
 		}
-		Some(tracks) => {
+		Sampled::Output(tracks) => {
 			cmd.arg("-map")
 				.arg(format!("0:{}", tracks[0]))
 				.arg("-vf")
 				.arg(format!("select='{select}',format=rgba64be"));
 		}
-		None => {
-			cmd.arg("-vf").arg(format!("select='{select}',format=rgba"));
+		Sampled::Source(scale) => {
+			let scaled = scale.map(|scale| format!("{scale},")).unwrap_or_default();
+			cmd.arg("-vf").arg(format!("select='{select}',{scaled}format=rgba"));
 		}
 	}
 	cmd.args(["-fps_mode", "passthrough", "-c:v", "pam", "-f", "image2pipe", "-"]);

@@ -20,7 +20,7 @@ use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput,
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{JobOptions, TrimWindow, VideoEncoderChoice, kept_as_requested, kept_as_requested_part};
+use crate::options::{JobOptions, TrimWindow, VideoEncoderChoice, kept_as_requested, kept_as_requested_part, upscaled};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -396,7 +396,15 @@ impl Engine {
 
 				self.require(MediaKind::Image)?;
 				on_event(JobEvent::Stage(Stage::Plan));
-				match image_job::prepare(&job.source, &info, animated, job.drop_aux, metadata_mode(job))? {
+				let prepared = image_job::prepare(
+					&job.source,
+					&info,
+					animated,
+					job.drop_aux,
+					metadata_mode(job),
+					job.options.resize,
+				)?;
+				match prepared {
 					Ok(input) => Planned::Image(Box::new(input)),
 					Err(reason) => return Ok(JobOutcome::KeptOriginal { reason }),
 				}
@@ -517,7 +525,8 @@ impl Engine {
 				.advanced
 				.image_encoder
 				.or(image_route(cx.job.options.format)),
-			forced: cx.job.options.forced(false),
+			forced: cx.job.options.forced_image(),
+			resize: cx.job.options.resize,
 		};
 		Ok(match image_job::produce(&image, input, workspace).await? {
 			ImageOutcome::Output {
@@ -666,6 +675,15 @@ impl Engine {
 			.map_err(ErrorKind::EncodeFailed)?;
 		let span_s = window.map_or(declared_s, |window| Some(window.length_s));
 
+		let shown = video_plan::shown_size(main);
+		let size = cx
+			.job
+			.options
+			.resize
+			.map(|resize| resize.size(shown, true))
+			.transpose()
+			.map_err(ErrorKind::EncodeFailed)?;
+
 		if rules.container == MP4_VIDEO && video_plan::has_alpha(main) {
 			return Err(
 				ErrorKind::EncodeFailed("transparent video can't be stored in MP4; use MKV or WebM".into()).into(),
@@ -681,7 +699,10 @@ impl Engine {
 			slot = self.video_slots.acquire() => slot.expect("the semaphore is never closed"),
 			() = cx.cancel.cancelled() => return Err(ErrorKind::Cancelled.into()),
 		};
-		let estimate = video_plan::memory_estimate(main.width.unwrap_or(0), main.height.unwrap_or(0));
+		let decoded = video_plan::memory_estimate(main.width.unwrap_or(0), main.height.unwrap_or(0));
+		let estimate = size.map_or(decoded, |(width, height)| {
+			decoded.max(video_plan::memory_estimate(width, height))
+		});
 		let _memory = self.reserve_memory(estimate, cx.on_event, cx.cancel).await?;
 
 		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
@@ -696,7 +717,8 @@ impl Engine {
 			cx.cancel,
 		))
 		.await?;
-		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed);
+		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed, size);
+		video.warnings.extend(size.and_then(|size| upscaled(shown, size)));
 
 		let cores = std::thread::available_parallelism().map_or(1, usize::from);
 		if self.video_threads.is_some() || cx.job.options.threads.is_some() {
@@ -772,7 +794,7 @@ impl Engine {
 		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &inputs)).await?;
 		let learned = if verify {
 			match Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await? {
-				Checked::Passed(_) if window.is_some() => None,
+				Checked::Passed(_) if window.is_some() || size.is_some() => None,
 				Checked::Passed(observation) => Some(observation),
 				Checked::Short => {
 					self.forget_learned(&quality);

@@ -19,7 +19,9 @@ use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::plan::ImageRoute;
 use cryarchiver_engine::naming::cli_output_path;
-use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, SubtitlePick, Trim, VideoEncoderChoice, parse_time};
+use cryarchiver_engine::options::{
+	Advanced, BurnSubs, JobOptions, Resize, SubtitlePick, Trim, VideoEncoderChoice, parse_time,
+};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::process::limits::{self, Applied, Limits, Priority};
@@ -206,6 +208,14 @@ struct CompressArgs {
 		help = "Cap the video bitrate for sharing, in Mbit/s such as 12.5; a capped output is always written"
 	)]
 	max_bitrate: Option<u32>,
+	#[arg(
+		long,
+		value_name = "W:H",
+		value_parser = Resize::parse,
+		allow_hyphen_values = true,
+		help = "Scale video, animations and images to W:H; W:-1 or -1:H keeps the aspect ratio. A resized output is always written"
+	)]
+	resize: Option<Resize>,
 	#[arg(long, value_name = "PATH", help = "ffmpeg binary or the folder containing it")]
 	ffmpeg: Option<PathBuf>,
 	#[arg(short, long, help = "Only print failures and the summary")]
@@ -794,6 +804,7 @@ async fn compress(args: CompressArgs) -> u8 {
 				},
 				threads: None,
 				max_bitrate_kbps: args.max_bitrate,
+				resize: args.resize,
 			},
 		})
 		.collect();
@@ -1396,6 +1407,50 @@ mod tests {
 		);
 		assert_eq!(
 			refusal(&["project", "create", "src", "dst", "--max-bitrate", "5"]).exit_code(),
+			2
+		);
+	}
+
+	#[test]
+	fn resize_is_a_plain_run_flag_written_like_ffmpeg_scale() {
+		let resize = |text: &str| {
+			let Launch::Compress(compress) = launch_from(args(&["a.mp4", "--resize", text])) else {
+				panic!("not a compress run");
+			};
+			compress.resize
+		};
+
+		assert_eq!(
+			resize("1280:720"),
+			Some(Resize {
+				width: Some(1280),
+				height: Some(720)
+			})
+		);
+		assert_eq!(
+			resize("-1:720"),
+			Some(Resize {
+				width: None,
+				height: Some(720)
+			})
+		);
+		assert_eq!(
+			resize("1280:"),
+			Some(Resize {
+				width: Some(1280),
+				height: None
+			})
+		);
+		for bad in ["-1:-1", ":", "0:720", "1280", "1:2:3", "-2:720", "abc:720"] {
+			assert_eq!(refusal(&["a.mp4", "--resize", bad]).exit_code(), 2, "{bad}");
+		}
+		assert!(
+			refusal(&["a.mp4", "--resize", "-1:-1"])
+				.to_string()
+				.contains("at least one side")
+		);
+		assert_eq!(
+			refusal(&["project", "create", "src", "dst", "--resize", "1280:720"]).exit_code(),
 			2
 		);
 	}

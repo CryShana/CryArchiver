@@ -15,7 +15,7 @@ use cryarchiver_engine::images::decode::oriented;
 use cryarchiver_engine::images::plan::ImageRoute;
 use cryarchiver_engine::images::ssim::score;
 use cryarchiver_engine::metadata::exif::orientation;
-use cryarchiver_engine::options::{Advanced, JobOptions};
+use cryarchiver_engine::options::{Advanced, JobOptions, Resize};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
@@ -1137,4 +1137,179 @@ async fn a_tiny_image_asked_for_as_avif_is_written_even_when_larger() {
 		}
 		other => panic!("{other:?}"),
 	}
+}
+
+fn resized(job: Job, width: Option<u32>, height: Option<u32>) -> Job {
+	Job {
+		options: JobOptions {
+			resize: Some(Resize { width, height }),
+			..job.options.clone()
+		},
+		..job
+	}
+}
+
+fn jxl_size(path: &Path) -> (u32, u32) {
+	let image = JxlImage::builder()
+		.read(std::fs::read(path).unwrap().as_slice())
+		.unwrap();
+	(image.width(), image.height())
+}
+
+#[tokio::test]
+async fn a_resized_photo_is_scaled_upright_with_its_aspect_ratio_as_avif_and_jpeg_xl() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = rotated_png(dir.path(), "photo.png");
+
+	let avif = run(&resized(job(&source), Some(120), None), dir.path()).await;
+	let jxl = run(
+		&resized(requested(&source, OutputFormat::Jxl), None, Some(161)),
+		dir.path(),
+	)
+	.await;
+
+	let (JobOutcome::Encoded { output: avif, .. }, JobOutcome::Encoded { output: jxl, .. }) = (&avif, &jxl) else {
+		panic!("{avif:?} {jxl:?}")
+	};
+	let bytes = std::fs::read(avif).unwrap();
+	assert_eq!(parse_meta(&bytes).unwrap().primary_size(), Some((120, 160)));
+	assert_eq!(jxl_size(jxl), (121, 161));
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn a_resized_sixteen_bit_png_holding_eight_bit_data_still_becomes_avif() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = image::open(support::photo_png(dir.path(), "photo.png", 320, 240))
+		.unwrap()
+		.to_rgb8();
+	let source = dir.path().join("padded.png");
+	image::ImageBuffer::from_fn(320, 240, |x, y| {
+		image::Rgb(photo.get_pixel(x, y).0.map(|sample| u16::from(sample) * 257))
+	})
+	.save(&source)
+	.unwrap();
+
+	let output = encoded(run(&resized(job(&source), Some(160), None), dir.path()).await);
+
+	assert_eq!(output, dir.path().join("padded.cry.avif"));
+	let bytes = std::fs::read(&output).unwrap();
+	assert_eq!(parse_meta(&bytes).unwrap().primary_size(), Some((160, 120)));
+}
+
+#[tokio::test]
+async fn a_resized_grey_profiled_photo_keeps_its_profile_in_lossless_jpeg_xl() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("scan.png");
+	let profile = ColorProfile::new_gray_with_gamma(2.2).encode().unwrap();
+	let mut encoder = PngEncoder::new(std::fs::File::create(&source).unwrap());
+	encoder.set_icc_profile(profile.clone()).unwrap();
+	image::ImageBuffer::from_fn(320, 240, |x, y| {
+		image::Luma([u8::try_from((x * 7 + y * 13 + (x * y) % 17) % 256).unwrap()])
+	})
+	.write_with_encoder(encoder)
+	.unwrap();
+	let lossless = Job {
+		options: JobOptions {
+			advanced: Advanced {
+				image_encoder: Some(ImageRoute::JxlLossless),
+				..Advanced::default()
+			},
+			..JobOptions::default()
+		},
+		..job(&source)
+	};
+
+	let output = encoded(run(&resized(lossless, Some(160), None), dir.path()).await);
+
+	assert_eq!(output, dir.path().join("scan.cry.jxl"));
+	assert_eq!(jxl_size(&output), (160, 120));
+	let image = JxlImage::builder()
+		.read(std::fs::read(&output).unwrap().as_slice())
+		.unwrap();
+	assert!(matches!(image.pixel_format(), PixelFormat::Gray));
+	assert_eq!(image.original_icc(), Some(profile.as_slice()));
+}
+
+#[tokio::test]
+async fn an_upscaled_photo_is_written_with_a_warning_and_learns_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = support::photo_png(dir.path(), "photo.png", 160, 120);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await)
+		.with_image_threads(4)
+		.with_quality_memory(memory.clone());
+
+	let outcome = engine
+		.run(
+			&resized(job(&photo), Some(320), None),
+			&sink(dir.path()),
+			&|_| {},
+			&CancellationToken::new(),
+		)
+		.await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	let bytes = std::fs::read(output).unwrap();
+	assert_eq!(parse_meta(&bytes).unwrap().primary_size(), Some((320, 240)));
+	assert!(warnings.contains(&"upscaled from 160x120".to_owned()), "{warnings:?}");
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn a_resized_animation_is_scaled_frame_by_frame_and_checked_at_its_new_size() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("anim.apng");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:d=1:r=10",
+		"-f",
+		"apng",
+		source.to_str().unwrap(),
+	]);
+
+	let output = encoded(run(&resized(job(&source), Some(81), None), dir.path()).await);
+
+	let info = cryarchiver_engine::probe::probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let sequence = info
+		.streams
+		.iter()
+		.find(|stream| stream.nb_frames.is_some_and(|frames| frames > 1))
+		.unwrap();
+	assert_eq!((sequence.width, sequence.height), (Some(81), Some(61)));
+	assert_eq!(sequence.nb_frames, Some(10));
+}
+
+#[tokio::test]
+async fn a_resized_transparent_animation_keeps_its_alpha_at_the_new_size() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("fade.apng");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:d=1:r=10,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='X*255/W'",
+		"-f",
+		"apng",
+		source.to_str().unwrap(),
+	]);
+
+	let output = encoded(run(&resized(job(&source), None, Some(60)), dir.path()).await);
+
+	let info = cryarchiver_engine::probe::probe(&support::toolchain().await, &output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let sequences: Vec<_> = info
+		.streams
+		.iter()
+		.filter(|stream| stream.nb_frames.is_some_and(|frames| frames > 1))
+		.map(|stream| (stream.width, stream.height))
+		.collect();
+	assert_eq!(sequences, [(Some(80), Some(60)); 2]);
 }

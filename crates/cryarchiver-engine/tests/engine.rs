@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::plan::worst_case_memory;
-use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, SubtitlePick, Trim, VideoEncoderChoice};
+use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, Resize, SubtitlePick, Trim, VideoEncoderChoice};
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{self, Stream, probe};
@@ -5032,4 +5032,208 @@ async fn an_aom_override_without_libaom_fails_the_file() {
 		"{outcome:?}"
 	);
 	assert!(!dir.path().join("clip.cry.mkv").exists());
+}
+
+fn resized(job: Job, width: Option<u32>, height: Option<u32>) -> Job {
+	let options = JobOptions {
+		resize: Some(Resize { width, height }),
+		..job.options.clone()
+	};
+	with_options(job, options)
+}
+
+/// The main video's width, height and sample aspect ratio.
+async fn picture(path: &Path) -> (Option<u32>, Option<u32>, Option<f64>) {
+	let info = probe(&support::toolchain().await, path, &CancellationToken::new())
+		.await
+		.unwrap();
+	let video = info.streams.iter().find(|stream| stream.is_real_video()).unwrap();
+	(video.width, video.height, video.sample_aspect_ratio)
+}
+
+fn square(aspect: Option<f64>) -> bool {
+	aspect.is_none_or(|aspect| (aspect - 1.0).abs() < 1e-9)
+}
+
+/// The main video's size, which must be in square pixels.
+async fn square_picture(path: &Path) -> (u32, u32) {
+	let (width, height, aspect) = picture(path).await;
+	assert!(square(aspect), "{aspect:?}");
+	(width.unwrap(), height.unwrap())
+}
+
+#[tokio::test]
+async fn a_resized_video_keeps_its_aspect_ratio_on_even_sides_or_takes_the_size_given() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+
+	for ((width, height), expected) in [
+		((Some(202), None), (202, 152)),
+		((None, Some(100)), (134, 100)),
+		((Some(160), Some(90)), (160, 90)),
+	] {
+		let outcome = run(&resized(fast(&clip), width, height), dir.path()).await;
+
+		let JobOutcome::Encoded { output, warnings, .. } = &outcome else {
+			panic!("{outcome:?}")
+		};
+		assert_eq!(square_picture(output).await, expected, "{width:?}:{height:?}");
+		assert!(
+			!warnings.iter().any(|warning| warning.contains("upscaled")),
+			"{warnings:?}"
+		);
+		fs::remove_file(output).unwrap();
+	}
+}
+
+#[tokio::test]
+async fn an_anamorphic_video_is_written_with_square_pixels_in_its_shown_shape() {
+	let dir = tempfile::tempdir().unwrap();
+	let wide = support::video(
+		dir.path(),
+		"wide.mkv",
+		2,
+		&[
+			"-map", "0:v", "-map", "1:a", "-vf", "setsar=2", "-c:v", "mpeg4", "-q:v", "2", "-c:a", "aac",
+		],
+	);
+	assert_eq!(picture(&wide).await, (Some(320), Some(240), Some(2.0)));
+
+	for ((width, height), expected) in [((None, Some(240)), (640, 240)), ((Some(320), None), (320, 120))] {
+		let outcome = run(&resized(fast(&wide), width, height), dir.path()).await;
+
+		let JobOutcome::Encoded { output, warnings, .. } = &outcome else {
+			panic!("{outcome:?}")
+		};
+		assert_eq!(square_picture(output).await, expected);
+		assert!(
+			!warnings.iter().any(|warning| warning.contains("upscaled")),
+			"{warnings:?}"
+		);
+		fs::remove_file(output).unwrap();
+	}
+}
+
+#[tokio::test]
+async fn an_upscaled_video_is_written_with_a_warning() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+
+	let outcome = run(&resized(fast(&clip), Some(640), None), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(square_picture(output).await, (640, 480));
+	assert!(warnings.contains(&"upscaled from 320x240".to_owned()), "{warnings:?}");
+}
+
+#[tokio::test]
+async fn an_odd_side_given_for_video_fails_the_file() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+
+	let outcome = run(&resized(fast(&clip), Some(161), Some(90)), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err) if err.to_string().contains("161×90")),
+		"{outcome:?}"
+	);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn a_resized_trim_is_cut_and_scaled() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 6);
+
+	let outcome = run(&resized(trimmed(fast(&clip), 1.0, 3.0), Some(160), None), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(square_picture(output).await, (160, 120));
+	let info = probe(&support::toolchain().await, output, &CancellationToken::new())
+		.await
+		.unwrap();
+	let duration = info.format.duration.unwrap();
+	assert!((duration - 2.0).abs() < 0.1, "{duration}");
+}
+
+#[tokio::test]
+async fn burned_bitmap_subtitles_are_scaled_with_the_resized_picture() {
+	let dir = tempfile::tempdir().unwrap();
+	let pgs = support::pgs_box(dir.path(), 5_000, 6_000);
+	let boxed = support::black_clip(dir.path(), "boxed.mkv", &pgs, "copy", false);
+
+	let outcome = run(&resized(with_burn(fast(&boxed)), Some(640), Some(480)), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(square_picture(output).await, (640, 480));
+	let scaled_box = support::lit_span_in(output, 0, "crop=200:30:220:370").unwrap();
+	assert!(near(scaled_box, (5.0, 5.96)), "{scaled_box:?}");
+	assert_eq!(support::lit_span_in(output, 0, "crop=100:20:110:185"), None);
+}
+
+#[tokio::test]
+async fn resized_webm_and_mp4_outputs_have_the_size_asked_for() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
+
+	for format in [OutputFormat::Webm, OutputFormat::Mp4] {
+		let outcome = run(&resized(requested(&clip, format), Some(160), None), dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = &outcome else {
+			panic!("{outcome:?}")
+		};
+		assert_eq!(square_picture(output).await, (160, 120), "{format:?}");
+	}
+}
+
+#[tokio::test]
+async fn a_resized_video_is_checked_against_the_scaled_source_and_learns_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, events) = run_recording(&engine, &resized(job(&clip), Some(160), None), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(square_picture(output).await, (160, 120));
+	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 2, "{events:?}");
+	assert!(!warned(&outcome, "quality target not reached"), "{outcome:?}");
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn a_resize_leaves_audio_as_it_is() {
+	let dir = tempfile::tempdir().unwrap();
+	let opus = support::tone(
+		dir.path(),
+		"low.opus",
+		"mono",
+		1,
+		3,
+		&["-c:a", "libopus", "-b:a", "32k"],
+	);
+	let demanding = Job {
+		min_savings: 0.9,
+		..job(&opus)
+	};
+
+	let free = run(&demanding, dir.path()).await;
+	let with_resize = run(&resized(demanding.clone(), Some(160), None), dir.path()).await;
+
+	let (JobOutcome::KeptOriginal { reason: free }, JobOutcome::KeptOriginal { reason: with_resize }) =
+		(&free, &with_resize)
+	else {
+		panic!("{free:?} {with_resize:?}")
+	};
+	assert_eq!(free, with_resize);
 }

@@ -41,6 +41,8 @@ pub struct Reference<'a> {
 	pub source: &'a Path,
 	pub stream: u32,
 	pub decoder: Option<&'static str>,
+	/// `VideoPlan::shape` and `VideoPlan::filters`.
+	pub shape: &'a str,
 	pub filters: &'a str,
 	pub window: Option<TrimWindow>,
 	/// Where ffmpeg starts the source when it reads only `stream`.
@@ -213,12 +215,13 @@ fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Sc
 fn reference_branch(reference: &Reference<'_>, chain: &str, cut: Option<Seek>) -> String {
 	let video = format!("[1:{}]", reference.stream);
 	let trim = cut.and_then(Seek::trim_filter).unwrap_or_default();
+	let shaped = burn::chained(&[&trim, reference.shape]);
 	let seek_s = cut.map(|cut| cut.start_s);
 	match reference.overlay {
-		Some(overlay) => burn::overlay_graph((&video, &trim), "[2:0]", overlay, seek_s, chain, "[r]"),
+		Some(overlay) => burn::overlay_graph((&video, &shaped), "[2:0]", overlay, seek_s, chain, "[r]"),
 		None => format!(
 			"{video}{}[r]",
-			burn::main_chain(&trim, reference.subtitles, chain, seek_s)
+			burn::main_chain(&shaped, reference.subtitles, chain, seek_s)
 		),
 	}
 }
@@ -301,7 +304,8 @@ mod tests {
 			source: Path::new("in.webm"),
 			stream: 0,
 			decoder: Some("libvpx-vp9"),
-			filters: "bwdif=mode=send_field:parity=tff:deint=all,setparams=field_mode=prog",
+			shape: "bwdif=mode=send_field:parity=tff:deint=all",
+			filters: "setparams=field_mode=prog",
 			window: None,
 			start: InputStart::default(),
 			overlay: None,
@@ -338,6 +342,7 @@ mod tests {
 			source: Path::new("in.mkv"),
 			stream: 3,
 			decoder: None,
+			shape: "",
 			filters: "scale=in_range=tv:out_range=tv,format=yuv420p10le",
 			window: None,
 			start: InputStart::default(),
@@ -381,6 +386,7 @@ mod tests {
 			source: Path::new("in.mkv"),
 			stream: 0,
 			decoder: None,
+			shape: "",
 			filters: "format=yuv420p10le",
 			window: Some(TrimWindow {
 				start_s: 4.0,
@@ -408,6 +414,7 @@ mod tests {
 			source: Path::new("in.mkv"),
 			stream: 0,
 			decoder: None,
+			shape: "",
 			filters: "format=yuv420p10le",
 			window: None,
 			start: InputStart {
@@ -454,6 +461,7 @@ mod tests {
 			source: Path::new("in.mkv"),
 			stream: 0,
 			decoder: None,
+			shape: "",
 			filters: "format=yuv420p10le",
 			window: None,
 			start: InputStart::default(),
@@ -475,11 +483,60 @@ mod tests {
 	}
 
 	#[test]
+	fn the_reference_is_shaped_like_the_encode_before_its_subtitles_are_drawn() {
+		let shaped = |subtitles: Option<&'static str>, overlay: Option<Overlay>| Reference {
+			source: Path::new("in.mkv"),
+			stream: 0,
+			decoder: None,
+			shape: "scale=w=640:h=480,setsar=1",
+			filters: "format=yuv420p10le",
+			window: None,
+			start: InputStart::default(),
+			overlay,
+			subtitles,
+		};
+		let command = |reference: &Reference<'_>| {
+			joined(&window_command(
+				Path::new("ffmpeg"),
+				Path::new("video.a1.mkv"),
+				reference,
+				&[FrameWindow { first: 0, last: 99 }],
+				&scoring(),
+			))
+		};
+
+		let text = command(&shaped(Some("subtitles=subs.ass"), None));
+		let bitmap = command(&shaped(
+			None,
+			Some(Overlay {
+				offset_s: 0.0,
+				canvas: None,
+				ten_bit: false,
+			}),
+		));
+		let plain = command(&shaped(None, None));
+
+		assert!(
+			text.contains("[1:0]scale=w=640:h=480,setsar=1,subtitles=subs.ass,format=yuv420p10le,select="),
+			"{text}"
+		);
+		assert!(
+			bitmap.contains("[1:0]scale=w=640:h=480,setsar=1,settb=AVTB[bv];[2:0]setpts=PTS-0.002/TB[bs];"),
+			"{bitmap}"
+		);
+		assert!(
+			plain.contains("[1:0]scale=w=640:h=480,setsar=1,format=yuv420p10le,select="),
+			"{plain}"
+		);
+	}
+
+	#[test]
 	fn burned_text_in_the_reference_follows_its_seek() {
 		let burned = |window: Option<TrimWindow>| Reference {
 			source: Path::new("in.mkv"),
 			stream: 0,
 			decoder: None,
+			shape: "",
 			filters: "format=yuv420p10le",
 			window,
 			start: InputStart::default(),

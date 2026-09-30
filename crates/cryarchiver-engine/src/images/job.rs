@@ -2,13 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{JobEvent, Stage};
 use crate::images::animated::{self, Animation, ScanError};
 use crate::images::avif::{self, AvifColour};
-use crate::images::decode::{self, Decoded, Undecodable};
+use crate::images::decode::{self, Decoded, SourceLayout, Undecodable};
 use crate::images::jxl::{self, JxlJob, JxlPixels};
 use crate::images::plan::{self, Candidate, Gate, ImageRoute, PrecheckInput, StillFacts, StillPlan};
 use crate::images::props::{self, Effective};
@@ -16,7 +17,7 @@ use crate::images::verify::{self, Expected};
 use crate::images::{blocking, structure};
 use crate::metadata::icc::{self, Cicp};
 use crate::metadata::{self, ImageFormat, MetadataMode, OutputMetadata, SourceMetadata, exif, sniff};
-use crate::options::kept_as_requested;
+use crate::options::{Resize, kept_as_requested, upscaled};
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::MediaInfo;
@@ -27,6 +28,7 @@ use crate::video::run_ffmpeg;
 use crate::workspace::Workspace;
 
 const ANIMATED_JXL: &str = "animated JPEG XL output isn't supported; use -f avif";
+const UPRIGHT_PNG: &str = "upright.png";
 
 #[derive(Debug, Clone)]
 pub struct ImageInput {
@@ -59,6 +61,7 @@ pub struct ImageContext<'a> {
 	pub memory: &'a dyn QualityMemory,
 	pub route: Option<ImageRoute>,
 	pub forced: bool,
+	pub resize: Option<Resize>,
 }
 
 #[derive(Debug)]
@@ -82,6 +85,8 @@ struct Still {
 	plan: StillPlan,
 	metadata: OutputMetadata,
 	warnings: Vec<String>,
+	/// `image` was scaled by `--resize`, so libjxl has to encode it rather than the source.
+	resized: bool,
 }
 
 #[derive(Debug, Default)]
@@ -105,6 +110,8 @@ struct Env<'a> {
 	colour: AvifColour<'a>,
 	expected: Expected<'a>,
 	reference: Option<Arc<DynamicImage>>,
+	/// A resized image written out losslessly for libjxl (`jxl::upright_png`).
+	upright: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +182,7 @@ pub fn prepare(
 	animated: bool,
 	drop_aux: bool,
 	mode: MetadataMode,
+	resize: Option<Resize>,
 ) -> Result<Result<ImageInput, KeepReason>, JobError> {
 	let bytes = fs::read(source).map_err(|err| JobError::io(IoSide::Source(source), &err))?;
 	let structure = structure::check(&bytes);
@@ -210,8 +218,22 @@ pub fn prepare(
 		warnings,
 		pix_fmt: video.and_then(|stream| stream.pix_fmt.clone()),
 		animated: animated || sequence,
-		memory_bytes: dimensions.map_or(0, |(width, height)| plan::worst_case_memory(width, height)),
+		memory_bytes: dimensions.map_or(0, |dimensions| memory_bytes(dimensions, resize)),
 	}))
+}
+
+/// The larger of the estimates at the source's size and at the resized one, whichever way the image is turned.
+fn memory_bytes((width, height): (u32, u32), resize: Option<Resize>) -> u64 {
+	let source = plan::worst_case_memory(width, height);
+	let Some(resize) = resize else {
+		return source;
+	};
+
+	[(width, height), (height, width)]
+		.into_iter()
+		.filter_map(|(width, height)| resize.size((f64::from(width), f64::from(height)), false).ok())
+		.map(|(width, height)| plan::worst_case_memory(width, height))
+		.fold(source, u64::max)
 }
 
 pub async fn produce(
@@ -266,6 +288,11 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		.await?
 	};
 
+	let (image, resize_warning) = match cx.resize {
+		Some(resize) => resized(cx, image, resize).await?,
+		None => (image, None),
+	};
+
 	let (width, height) = image.dimensions();
 	let facts = StillFacts {
 		width,
@@ -286,6 +313,7 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 	if decode_errors > 0 {
 		warnings.push(format!("{decode_errors} decoding errors were concealed"));
 	}
+	warnings.extend(resize_warning);
 	Ok(Ok(Still {
 		image,
 		icc,
@@ -295,7 +323,29 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		plan,
 		metadata,
 		warnings,
+		resized: cx.resize.is_some(),
 	}))
+}
+
+/// The upright image scaled with Lanczos, the same pixels every candidate encodes and is scored against, and the
+/// upscale warning. The source's own traits (alpha, depth, graphic or photo) are measured before, on its pixels.
+async fn resized(
+	cx: &ImageContext<'_>,
+	image: Arc<DynamicImage>,
+	resize: Resize,
+) -> Result<(Arc<DynamicImage>, Option<String>), JobError> {
+	let (width, height) = image.dimensions();
+	let shown = (f64::from(width), f64::from(height));
+	let size = resize.size(shown, false).map_err(ErrorKind::EncodeFailed)?;
+	if u64::from(size.0) * u64::from(size.1) > plan::MAX_VERIFY_PIXELS {
+		return Err(ErrorKind::EncodeFailed(format!("{}×{} is too large to verify", size.0, size.1)).into());
+	}
+
+	let scaled = blocking(cx.cancel, move || {
+		image.resize_exact(size.0, size.1, FilterType::Lanczos3)
+	})
+	.await?;
+	Ok((Arc::new(scaled), upscaled(shown, size)))
 }
 
 async fn encode_and_choose(
@@ -320,6 +370,7 @@ async fn encode_and_choose(
 			metadata: &still.metadata,
 		},
 		reference: eight_bit_reference(cx, &still).await?,
+		upright: upright_for_libjxl(cx, workspace, &still).await?,
 	};
 	let mut choice = Choice::default();
 	let mut learned = Vec::new();
@@ -347,6 +398,7 @@ async fn encode_and_choose(
 				choice.note(size);
 				choice.offer(path, size, short.then_some(score));
 				if !short
+					&& !still.resized
 					&& let Some(key) = key
 					&& let Some(setting) = candidate.needed_setting(score, still.plan.target, cx.speed)
 				{
@@ -404,16 +456,7 @@ async fn try_candidate(
 	loop {
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let path = workspace.file(&format!("candidate{}.{}", slot.index, candidate.extension()));
-		let bytes = encode_candidate(
-			cx,
-			input,
-			workspace,
-			still,
-			candidate,
-			env.colour,
-			env.reference.as_ref(),
-		)
-		.await?;
+		let bytes = encode_candidate(cx, input, workspace, still, env, candidate).await?;
 		fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
 
 		let size = bytes.len() as u64;
@@ -542,26 +585,55 @@ async fn eight_bit_reference(cx: &ImageContext<'_>, still: &Still) -> Result<Opt
 	Ok(Some(Arc::new(reference)))
 }
 
+async fn upright_for_libjxl(
+	cx: &ImageContext<'_>,
+	workspace: &Workspace,
+	still: &Still,
+) -> Result<Option<PathBuf>, JobError> {
+	let libjxl = still
+		.plan
+		.candidates
+		.iter()
+		.any(|candidate| !matches!(candidate, Candidate::Ravif(_)));
+	if !still.resized || !libjxl {
+		return Ok(None);
+	}
+
+	let image = Arc::clone(&still.image);
+	let pixels = JxlPixels::for_source(still.effective, grey_profile(still.icc.as_deref()));
+	let (icc, cicp) = (still.icc.clone(), still.cicp);
+	let png = blocking(cx.cancel, move || jxl::upright_png(&image, pixels, icc, cicp))
+		.await?
+		.map_err(ErrorKind::EncodeFailed)?;
+
+	let path = workspace.file(UPRIGHT_PNG);
+	fs::write(&path, png).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
+	Ok(Some(path))
+}
+
 async fn encode_candidate(
 	cx: &ImageContext<'_>,
 	input: &ImageInput,
 	workspace: &Workspace,
 	still: &Still,
+	env: &Env<'_>,
 	candidate: Candidate,
-	colour: AvifColour<'_>,
-	reference: Option<&Arc<DynamicImage>>,
 ) -> Result<Vec<u8>, JobError> {
 	match candidate {
 		Candidate::Ravif(settings) => {
-			let pixels = Arc::clone(reference.expect("prepared for AVIF candidates"));
+			let pixels = Arc::clone(env.reference.as_ref().expect("prepared for AVIF candidates"));
 			let (alpha, threads) = (still.effective.alpha, cx.threads);
 			let encoded = blocking(cx.cancel, move || avif::encode(&pixels, alpha, settings, threads))
 				.await?
 				.map_err(ErrorKind::EncodeFailed)?;
-			Ok(avif::finish(&encoded, colour, &still.metadata).map_err(ErrorKind::EncodeFailed)?)
+			Ok(avif::finish(&encoded, env.colour, &still.metadata).map_err(ErrorKind::EncodeFailed)?)
 		}
 		Candidate::JxlLossy(_) | Candidate::JxlLossless(_) => {
-			let job = jxl_job(cx, input, still, candidate);
+			let (source, layout) = match env.upright.as_deref() {
+				Some(upright) => (upright, jxl::UPRIGHT),
+				None => (cx.source, decode::layout(&input.bytes, &input.metadata)),
+			};
+			let job = jxl_job(source, layout, still, candidate);
 			jxl::encode(
 				&cx.tools.ffmpeg,
 				&job,
@@ -574,14 +646,14 @@ async fn encode_candidate(
 	}
 }
 
-fn jxl_job<'a>(cx: &ImageContext<'a>, input: &ImageInput, still: &Still, candidate: Candidate) -> JxlJob<'a> {
+fn jxl_job<'a>(source: &'a Path, layout: SourceLayout, still: &Still, candidate: Candidate) -> JxlJob<'a> {
 	let settings = match candidate {
 		Candidate::JxlLossy(settings) | Candidate::JxlLossless(settings) => settings,
 		Candidate::Ravif(_) => unreachable!("only JPEG XL candidates run through libjxl"),
 	};
 	JxlJob {
-		source: cx.source,
-		layout: decode::layout(&input.bytes, &input.metadata),
+		source,
+		layout,
 		settings,
 		pixels: JxlPixels::for_source(still.effective, grey_profile(still.icc.as_deref())),
 	}
@@ -690,23 +762,25 @@ async fn produce_animation(
 		return Err(ErrorKind::EncodeFailed(ANIMATED_JXL.into()).into());
 	}
 
+	let shown = (f64::from(timeline.width), f64::from(timeline.height));
+	let size = cx
+		.resize
+		.map(|resize| resize.size(shown, false))
+		.transpose()
+		.map_err(ErrorKind::EncodeFailed)?;
+
 	let animation = Animation {
 		alpha: animated::has_alpha(cx.tools, cx.source, cx.cancel).await?,
 		timeline,
+		size,
 	};
 	let settings = match animated::plan_animation(cx.speed, cx.caps.libaom) {
 		Ok(settings) => settings,
 		Err(reason) => return Ok(Some(ImageOutcome::Kept(reason))),
 	};
 
-	let mut warnings = input.warnings.clone();
-	let personal = input.metadata.exif.is_some() || input.metadata.xmp.is_some() || !input.metadata.comments.is_empty();
-	if cx.mode == MetadataMode::Full && personal {
-		warnings.push("metadata is not carried into animated AVIF yet".into());
-	}
-	if input.metadata.icc.is_some() {
-		warnings.push("the colour profile is not carried into animated AVIF yet".into());
-	}
+	let mut warnings = animation_warnings(cx, input);
+	warnings.extend(size.and_then(|size| upscaled(shown, size)));
 
 	(cx.on_event)(JobEvent::Stage(Stage::Encode));
 	let output = workspace.file("out.avif");
@@ -760,6 +834,18 @@ async fn produce_animation(
 		warnings,
 		learned: Vec::new(),
 	}))
+}
+
+fn animation_warnings(cx: &ImageContext<'_>, input: &ImageInput) -> Vec<String> {
+	let mut warnings = input.warnings.clone();
+	let personal = input.metadata.exif.is_some() || input.metadata.xmp.is_some() || !input.metadata.comments.is_empty();
+	if cx.mode == MetadataMode::Full && personal {
+		warnings.push("metadata is not carried into animated AVIF yet".into());
+	}
+	if input.metadata.icc.is_some() {
+		warnings.push("the colour profile is not carried into animated AVIF yet".into());
+	}
+	warnings
 }
 
 fn animation_refusal(route: ImageRoute, avif_reason: &str) -> JobError {

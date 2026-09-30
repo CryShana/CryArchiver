@@ -9,7 +9,7 @@ use crate::toolchain::Toolchain;
 use crate::video::mux::{MuxInput, OutputStream};
 use crate::video::plan::{Encoder, VideoPlan};
 use crate::video::streams::StreamPlan;
-use crate::video::{delay, run_ffmpeg};
+use crate::video::{burn, delay, run_ffmpeg};
 
 const MIN_ALPHA_SSIM: f64 = 0.98;
 const MIN_START_TOLERANCE_S: f64 = 0.05;
@@ -350,7 +350,8 @@ pub async fn alpha_ssim(
 		.arg("-filter_complex")
 		.arg(format!(
 			"[0:v:0]alphaextract,format=gray[o];[1:{}]{},alphaextract,format=gray[s];[o][s]ssim",
-			video.streams[0], video.filters
+			video.streams[0],
+			burn::chained(&[&video.shape, &video.filters])
 		));
 	cmd.args(["-f", "null", "-"]);
 

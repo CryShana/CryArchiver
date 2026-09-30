@@ -23,6 +23,7 @@ fn plan(expected_frames: Option<u64>) -> VideoPlan {
 	VideoPlan {
 		streams: vec![0],
 		decoder: None,
+		shape: String::new(),
 		filters: "format=yuv420p10le,setparams=field_mode=prog:range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
 			.into(),
 		encoder: Encoder::SvtAv1 {
@@ -116,7 +117,7 @@ async fn a_noisy_clip_is_encoded_with_the_grain_level_its_noise_measures() {
 	))
 	.await
 	.unwrap();
-	let mut video = plan_video(&info, main, &[], &analysis, Speed::Moderate);
+	let mut video = plan_video(&info, main, &[], &analysis, Speed::Moderate, None);
 	video.encoder = video.encoder.with_crf(45.0);
 	let output = dir.path().join("video.a1.mkv");
 
@@ -192,7 +193,7 @@ async fn an_av1_source_with_film_grain_gets_no_more_grain() {
 		plain.to_str().unwrap(),
 	]);
 
-	let video = plan_video(&info, main, &frames, &analysis, Speed::Slow);
+	let video = plan_video(&info, main, &frames, &analysis, Speed::Slow, None);
 
 	assert!(synthesized_grain(&frames), "{frames:?}");
 	assert_eq!(analysis.noise, NoiseClass::Light, "{analysis:?}");

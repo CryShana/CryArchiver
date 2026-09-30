@@ -43,7 +43,7 @@ async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
 	))
 	.await
 	.unwrap();
-	let mut plan = plan_video(&info, main, &[], &analysis, Speed::Moderate);
+	let mut plan = plan_video(&info, main, &[], &analysis, Speed::Moderate, None);
 	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
 	let goal = target(Speed::Moderate, plan.encoder.film_grain(), &Overrides::default());
 	let span = info
@@ -116,7 +116,7 @@ async fn a_search_below_a_size_gives_up_once_a_miss_is_already_that_large() {
 		noise_sigma: None,
 		detail: Vec::new(),
 	};
-	let plan = plan_video(&info, main, &[], &analysis, Speed::Fast);
+	let plan = plan_video(&info, main, &[], &analysis, Speed::Fast, None);
 	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
 	let unreachable = Target {
 		mean: 99.9,
@@ -170,7 +170,7 @@ async fn burning_plan(
 
 	VideoPlan {
 		subtitles: burn::subtitle_filter(chosen.kind, 20),
-		..plan_video(&info, main, &[], &analysis, Speed::Moderate)
+		..plan_video(&info, main, &[], &analysis, Speed::Moderate, None)
 	}
 }
 

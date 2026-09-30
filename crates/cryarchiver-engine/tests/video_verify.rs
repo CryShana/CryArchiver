@@ -13,6 +13,7 @@ fn plan(alpha: bool, filters: &str, decoder: Option<&'static str>) -> VideoPlan 
 	VideoPlan {
 		streams: vec![0],
 		decoder,
+		shape: String::new(),
 		filters: filters.into(),
 		encoder: if alpha {
 			Encoder::Vp9Alpha { cpu_used: 4, crf: 33 }

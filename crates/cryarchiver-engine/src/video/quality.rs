@@ -347,6 +347,7 @@ impl Scorer<'_> {
 			source: self.source,
 			stream: self.plan.streams[0],
 			decoder: self.plan.decoder,
+			shape: &self.plan.shape,
 			filters: &self.plan.filters,
 			window: self.plan.window,
 			start: self.plan.starts.main,

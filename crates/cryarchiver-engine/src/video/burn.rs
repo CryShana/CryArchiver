@@ -314,7 +314,7 @@ pub fn overlay_graph(
 	)
 }
 
-fn chained(parts: &[&str]) -> String {
+pub fn chained(parts: &[&str]) -> String {
 	parts
 		.iter()
 		.filter(|part| !part.is_empty())

@@ -55,6 +55,87 @@ pub enum VideoEncoderChoice {
 	Aom,
 }
 
+/// `--resize W:H`; a side left out keeps the aspect ratio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resize {
+	pub width: Option<u32>,
+	pub height: Option<u32>,
+}
+
+impl Resize {
+	pub fn parse(text: &str) -> Result<Self, String> {
+		let parts: Vec<&str> = text.trim().split(':').collect();
+		let [width, height] = parts[..] else {
+			return Err(format!(
+				"\"{text}\" is not a size: use W:H, W:-1 or -1:H, such as 1280:720 or 1280:-1"
+			));
+		};
+
+		let resize = Self {
+			width: side(width)?,
+			height: side(height)?,
+		};
+		if resize.width.is_none() && resize.height.is_none() {
+			return Err("give at least one side: 1280:-1 or -1:720 keeps the aspect ratio".to_owned());
+		}
+		Ok(resize)
+	}
+
+	/// The output size for a picture shown `shown` (its display width and height, which can be fractional under a
+	/// sample aspect ratio). `even` rounds a computed side to even, as 4:2:0 needs, and refuses an odd side given.
+	#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+	pub fn size(self, (shown_width, shown_height): (f64, f64), even: bool) -> Result<(u32, u32), String> {
+		let computed = |length: f64| {
+			if even {
+				((length / 2.0).round() as u32).max(1) * 2
+			} else {
+				(length.round() as u32).max(1)
+			}
+		};
+		let aspect = shown_width / shown_height;
+
+		let size = match (self.width, self.height) {
+			(Some(width), Some(height)) => (width, height),
+			(Some(width), None) => (width, computed(f64::from(width) / aspect)),
+			(None, Some(height)) => (computed(f64::from(height) * aspect), height),
+			(None, None) => (shown_width.round() as u32, shown_height.round() as u32),
+		};
+		let given_odd = [self.width, self.height].iter().flatten().any(|side| side % 2 == 1);
+		if even && given_odd {
+			return Err(format!(
+				"--resize gives {}×{}, but 4:2:0 video needs an even width and height",
+				size.0, size.1
+			));
+		}
+		Ok(size)
+	}
+}
+
+/// The warning for an output larger than the picture on either side.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn upscaled((shown_width, shown_height): (f64, f64), (width, height): (u32, u32)) -> Option<String> {
+	let shown = (shown_width.round() as u32, shown_height.round() as u32);
+	(width > shown.0 || height > shown.1).then(|| format!("upscaled from {}x{}", shown.0, shown.1))
+}
+
+fn side(text: &str) -> Result<Option<u32>, String> {
+	if text.is_empty() || text == "-1" {
+		return Ok(None);
+	}
+
+	let pixels: u32 = text
+		.parse()
+		.ok()
+		.filter(|_| text.bytes().all(|byte| byte.is_ascii_digit()))
+		.ok_or_else(|| {
+			format!("\"{text}\" is not a side: use a whole number of pixels, or -1 to keep the aspect ratio")
+		})?;
+	if pixels == 0 {
+		return Err("a side must be at least 1 pixel".to_owned());
+	}
+	Ok(Some(pixels))
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Advanced {
 	pub crf: Option<f64>,
@@ -72,6 +153,7 @@ pub struct JobOptions {
 	pub advanced: Advanced,
 	pub threads: Option<usize>,
 	pub max_bitrate_kbps: Option<u32>,
+	pub resize: Option<Resize>,
 }
 
 impl JobOptions {
@@ -85,9 +167,14 @@ impl JobOptions {
 			|| self.burn_subs.is_some()
 	}
 
-	/// `forced`, and also a bitrate cap, which asks only for a video output: audio and image jobs ignore it.
+	/// `forced`, and also a bitrate cap or a resize, which ask for a video output: audio jobs ignore both.
 	pub fn forced_video(&self, merge_possible: bool) -> bool {
-		self.forced(merge_possible) || self.max_bitrate_kbps.is_some()
+		self.forced(merge_possible) || self.max_bitrate_kbps.is_some() || self.resize.is_some()
+	}
+
+	/// `forced`, and also a resize, which scales still images and animations too.
+	pub fn forced_image(&self) -> bool {
+		self.forced(false) || self.resize.is_some()
 	}
 }
 
@@ -416,6 +503,114 @@ mod tests {
 		assert!(capped.forced_video(false));
 		assert!(stripped.forced_video(false));
 		assert!(!JobOptions::default().forced_video(true));
+	}
+
+	#[test]
+	fn a_resize_forces_video_and_image_outputs_but_not_audio() {
+		let resized = JobOptions {
+			resize: Some(Resize {
+				width: Some(1280),
+				height: None,
+			}),
+			..JobOptions::default()
+		};
+
+		assert!(!resized.forced(true));
+		assert!(resized.forced_video(false));
+		assert!(resized.forced_image());
+		assert!(!JobOptions::default().forced_image());
+		assert!(
+			JobOptions {
+				strip: true,
+				..JobOptions::default()
+			}
+			.forced_image()
+		);
+	}
+
+	#[test]
+	fn resize_sizes_are_written_like_ffmpeg_scale() {
+		let resize = |width, height| Ok(Resize { width, height });
+
+		assert_eq!(Resize::parse("1280:720"), resize(Some(1280), Some(720)));
+		assert_eq!(Resize::parse("1280:-1"), resize(Some(1280), None));
+		assert_eq!(Resize::parse("1280:"), resize(Some(1280), None));
+		assert_eq!(Resize::parse("-1:720"), resize(None, Some(720)));
+		assert_eq!(Resize::parse(" :720 "), resize(None, Some(720)));
+		for bad in [
+			":", "-1:-1", ":-1", "-1:", "0:720", "1280:0", "-2:720", "1280:-5", "a:720", "1280:7.5", "1280", "1:2:3",
+			"", "+5:720", "1280x720",
+		] {
+			assert!(Resize::parse(bad).is_err(), "{bad}");
+		}
+		assert!(Resize::parse("-1:-1").unwrap_err().contains("at least one side"));
+		assert!(Resize::parse("0:720").unwrap_err().contains("at least 1 pixel"));
+		assert!(Resize::parse("1:2:3").unwrap_err().contains("W:H"));
+	}
+
+	#[test]
+	fn a_missing_side_follows_the_shown_aspect_ratio_and_video_rounds_it_to_even() {
+		let width = |width| Resize {
+			width: Some(width),
+			height: None,
+		};
+		let height = |height| Resize {
+			width: None,
+			height: Some(height),
+		};
+
+		assert_eq!(width(202).size((320.0, 240.0), true), Ok((202, 152)));
+		assert_eq!(width(202).size((320.0, 240.0), false), Ok((202, 152)));
+		assert_eq!(width(201).size((320.0, 240.0), false), Ok((201, 151)));
+		assert_eq!(height(100).size((320.0, 240.0), true), Ok((134, 100)));
+		assert_eq!(height(100).size((320.0, 240.0), false), Ok((133, 100)));
+		assert_eq!(height(576).size((1024.0, 576.0), true), Ok((1024, 576)));
+		assert!(width(1).size((320.0, 240.0), true).unwrap_err().contains("even"));
+		assert_eq!(width(2).size((4000.0, 10.0), true), Ok((2, 2)));
+		assert_eq!(width(2).size((4000.0, 10.0), false), Ok((2, 1)));
+		assert_eq!(
+			Resize {
+				width: Some(160),
+				height: Some(90)
+			}
+			.size((320.0, 240.0), true),
+			Ok((160, 90))
+		);
+		assert!(
+			Resize {
+				width: Some(161),
+				height: Some(90)
+			}
+			.size((320.0, 240.0), true)
+			.unwrap_err()
+			.contains("161×90")
+		);
+		assert_eq!(
+			Resize {
+				width: Some(161),
+				height: Some(91)
+			}
+			.size((320.0, 240.0), false),
+			Ok((161, 91))
+		);
+	}
+
+	#[test]
+	fn a_larger_side_than_shown_is_an_upscale() {
+		assert_eq!(
+			upscaled((320.0, 240.0), (640, 480)),
+			Some("upscaled from 320x240".to_owned())
+		);
+		assert_eq!(
+			upscaled((320.0, 240.0), (321, 100)),
+			Some("upscaled from 320x240".to_owned())
+		);
+		assert_eq!(upscaled((1024.0, 576.0), (1024, 576)), None);
+		assert_eq!(upscaled((426.667, 240.0), (426, 240)), None);
+		assert_eq!(
+			upscaled((426.667, 240.0), (428, 240)),
+			Some("upscaled from 427x240".to_owned())
+		);
 	}
 
 	#[test]

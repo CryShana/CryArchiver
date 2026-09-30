@@ -93,6 +93,7 @@ fn encode_command(
 	}
 	let seek_s = cut.map(|cut| cut.start_s);
 	let trim = cut.and_then(Seek::trim_filter).unwrap_or_default();
+	let shaped = burn::chained(&[&trim, &plan.shape]);
 
 	if let Some(decoder) = plan.decoder {
 		cmd.arg("-c:v").arg(decoder);
@@ -111,7 +112,7 @@ fn encode_command(
 	};
 	let graphed = if let Some(overlay) = plan.overlay {
 		cmd.arg("-filter_complex").arg(burn::overlay_graph(
-			(&format!("[0:{}]", streams[0]), &trim),
+			(&format!("[0:{}]", streams[0]), &shaped),
 			"[1:0]",
 			overlay,
 			seek_s,
@@ -126,8 +127,8 @@ fn encode_command(
 	for index in &streams[graphed..] {
 		cmd.arg("-map").arg(format!("0:{index}"));
 	}
-	let main = burn::main_chain(&trim, plan.subtitles.as_deref(), &plan.filters, seek_s);
-	let others = burn::main_chain(&trim, None, &plan.filters, None);
+	let main = burn::main_chain(&shaped, plan.subtitles.as_deref(), &plan.filters, seek_s);
+	let others = burn::main_chain(&shaped, None, &plan.filters, None);
 	for ordinal in graphed..streams.len() {
 		let chain = if ordinal == 0 { &main } else { &others };
 		cmd.arg(format!("-filter:v:{ordinal}")).arg(chain);
@@ -713,6 +714,64 @@ mod tests {
 				"-filter:v:0 settb=AVTB,setpts=PTS+12.500/TB,subtitles=subs.ass,setpts=PTS-12.500/TB,format=yuv420p10le,"
 			),
 			"{sampled}"
+		);
+	}
+
+	#[test]
+	fn the_shape_runs_after_the_cut_and_before_burned_subtitles_on_every_stream() {
+		let shaped = |subtitles: Option<&str>, overlay: Option<burn::Overlay>| VideoPlan {
+			shape: "bwdif=mode=send_field:parity=tff:deint=all,scale=w=640:h=480,setsar=1".into(),
+			subtitles: subtitles.map(str::to_owned),
+			overlay,
+			window: Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 4.0,
+			}),
+			starts: VideoStarts {
+				every: InputStart {
+					file_s: 1.4,
+					streams_s: Some(1.7),
+				},
+				..VideoStarts::default()
+			},
+			..plan(svt(), None)
+		};
+		let args = |plan: &VideoPlan| {
+			joined(&video_command(
+				Path::new("ffmpeg"),
+				Path::new("in.mkv"),
+				Path::new("work/video.a1.mkv"),
+				plan,
+			))
+		};
+
+		let text = args(&shaped(Some("subtitles=subs.ass"), None));
+		let bitmap = args(&shaped(
+			None,
+			Some(burn::Overlay {
+				offset_s: 0.0,
+				canvas: None,
+				ten_bit: false,
+			}),
+		));
+
+		assert!(
+			text.contains(
+				"-filter:v:0 trim=start=4.000000:end=8.000000,setpts=PTS-4.000000/TB,\
+				 bwdif=mode=send_field:parity=tff:deint=all,scale=w=640:h=480,setsar=1,settb=AVTB,setpts=PTS+4.000/TB,\
+				 subtitles=subs.ass,setpts=PTS-4.000/TB,format=yuv420p10le,setparams=field_mode=prog \
+				 -filter:v:1 trim=start=4.000000:end=8.000000,setpts=PTS-4.000000/TB,\
+				 bwdif=mode=send_field:parity=tff:deint=all,scale=w=640:h=480,setsar=1,format=yuv420p10le,"
+			),
+			"{text}"
+		);
+		assert!(
+			bitmap.contains(
+				"-filter_complex [0:0]trim=start=4.000000:end=8.000000,setpts=PTS-4.000000/TB,\
+				 bwdif=mode=send_field:parity=tff:deint=all,scale=w=640:h=480,setsar=1,settb=AVTB,setpts=PTS+4.000/TB[bv];\
+				 [1:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];"
+			),
+			"{bitmap}"
 		);
 	}
 

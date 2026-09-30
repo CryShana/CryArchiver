@@ -74,19 +74,35 @@ pub fn conversion(stream: &Stream, tags: &ColourTags, target_pix_fmt: &str) -> O
 		return None;
 	}
 
+	let scale = match kept_colour(stream, tags) {
+		Some(kept) => format!("scale={kept}"),
+		None => format!("scale=out_range={}:out_color_matrix={}", tags.range.name(), tags.matrix),
+	};
+	Some(format!("{scale},format={target_pix_fmt}"))
+}
+
+/// Scales the picture to `width`×`height` with square pixels, leaving its colour as it is.
+pub fn resize(stream: &Stream, tags: &ColourTags, (width, height): (u32, u32)) -> String {
+	let kept = kept_colour(stream, tags).map_or_else(String::new, |kept| format!(":{kept}"));
+	format!("scale=w={width}:h={height}:flags=lanczos+accurate_rnd{kept},setsar=1")
+}
+
+/// The `scale` options that keep a YUV picture's range, matrix and chroma location; `None` for RGB.
+fn kept_colour(stream: &Stream, tags: &ColourTags) -> Option<String> {
+	if is_rgb(stream) {
+		return None;
+	}
+
 	let range = tags.range.name();
 	let chroma = tags.chroma_location.as_deref().map_or_else(String::new, |location| {
 		format!(":in_chroma_loc={location}:out_chroma_loc={location}")
 	});
-	let scale = if is_rgb(stream) {
-		format!("scale=out_range={range}:out_color_matrix={}", tags.matrix)
-	} else if SCALE_MATRICES.contains(&tags.matrix.as_str()) {
+	Some(if SCALE_MATRICES.contains(&tags.matrix.as_str()) {
 		let matrix = &tags.matrix;
-		format!("scale=in_range={range}:out_range={range}:in_color_matrix={matrix}:out_color_matrix={matrix}{chroma}")
+		format!("in_range={range}:out_range={range}:in_color_matrix={matrix}:out_color_matrix={matrix}{chroma}")
 	} else {
-		format!("scale=in_range={range}:out_range={range}{chroma}")
-	};
-	Some(format!("{scale},format={target_pix_fmt}"))
+		format!("in_range={range}:out_range={range}{chroma}")
+	})
 }
 
 pub fn setparams(tags: &ColourTags) -> String {
@@ -240,6 +256,33 @@ mod tests {
 		assert_eq!(
 			conversion(&constant_luminance, &tags, "yuv420p10le").as_deref(),
 			Some("scale=in_range=tv:out_range=tv,format=yuv420p10le")
+		);
+	}
+
+	#[test]
+	fn a_resize_keeps_the_range_matrix_and_chroma_location_and_writes_square_pixels() {
+		let full = stream(
+			r#"{"index":0,"codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuvj420p","color_space":"bt709",
+			"chroma_location":"topleft"}"#,
+		);
+		let constant_luminance = stream(
+			r#"{"index":0,"codec_type":"video","width":3840,"height":2160,"pix_fmt":"yuv422p10le","color_range":"tv",
+			"color_space":"bt2020c","color_transfer":"smpte2084","color_primaries":"bt2020"}"#,
+		);
+		let argb = stream(r#"{"index":0,"codec_type":"video","width":640,"height":360,"pix_fmt":"argb"}"#);
+
+		assert_eq!(
+			resize(&full, &output_tags(&full), (640, 360)),
+			"scale=w=640:h=360:flags=lanczos+accurate_rnd:in_range=pc:out_range=pc:in_color_matrix=bt709:\
+			 out_color_matrix=bt709:in_chroma_loc=topleft:out_chroma_loc=topleft,setsar=1"
+		);
+		assert_eq!(
+			resize(&constant_luminance, &output_tags(&constant_luminance), (1280, 720)),
+			"scale=w=1280:h=720:flags=lanczos+accurate_rnd:in_range=tv:out_range=tv,setsar=1"
+		);
+		assert_eq!(
+			resize(&argb, &output_tags(&argb), (320, 180)),
+			"scale=w=320:h=180:flags=lanczos+accurate_rnd,setsar=1"
 		);
 	}
 

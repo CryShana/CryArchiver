@@ -63,6 +63,9 @@ pub struct Stream {
 	pub width: Option<u32>,
 	#[serde(default)]
 	pub height: Option<u32>,
+	/// A pixel's width over its height, when the stream says.
+	#[serde(default, deserialize_with = "aspect")]
+	pub sample_aspect_ratio: Option<f64>,
 	#[serde(default)]
 	pub pix_fmt: Option<String>,
 	#[serde(default)]
@@ -202,6 +205,17 @@ where
 		.as_deref()
 		.and_then(parse_ratio)
 		.filter(|rate| *rate > 0.0))
+}
+
+/// ffprobe writes aspect ratios as `64:45`, and an unknown one as `0:1`.
+fn aspect<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	Ok(Option::<String>::deserialize(deserializer)?
+		.as_deref()
+		.and_then(|text| parse_ratio(&text.replacen(':', "/", 1)))
+		.filter(|ratio| *ratio > 0.0))
 }
 
 impl MediaInfo {
@@ -498,6 +512,20 @@ mod tests {
 
 		assert_eq!(video.tag("alpha_mode"), Some("1"));
 		assert_eq!(video.declared_duration(), Some(62.5));
+	}
+
+	#[test]
+	fn sample_aspect_ratios_are_fractions_and_unknown_ones_are_none() {
+		let info = MediaInfo::parse(
+			br#"{ "streams": [ { "index": 0, "codec_type": "video", "sample_aspect_ratio": "64:45" },
+			      { "index": 1, "codec_type": "video", "sample_aspect_ratio": "0:1" },
+			      { "index": 2, "codec_type": "video", "sample_aspect_ratio": "1:1" },
+			      { "index": 3, "codec_type": "video" } ] }"#,
+		)
+		.unwrap();
+		let aspects: Vec<Option<f64>> = info.streams.iter().map(|stream| stream.sample_aspect_ratio).collect();
+
+		assert_eq!(aspects, [Some(64.0 / 45.0), None, Some(1.0), None]);
 	}
 
 	#[test]

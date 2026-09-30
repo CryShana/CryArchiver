@@ -124,6 +124,7 @@ async fn encode_and_verify(dir: &Path, source: &Path) -> (Animation, f64) {
 	let animation = Animation {
 		timeline: scan(&std::fs::read(source).unwrap()).unwrap().unwrap(),
 		alpha: has_alpha(&tools, source, &cancel).await.unwrap(),
+		size: None,
 	};
 	let output = dir.join("out.avif");
 	let cmd = encode_command(

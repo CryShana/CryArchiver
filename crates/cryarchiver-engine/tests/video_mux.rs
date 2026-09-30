@@ -104,7 +104,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 		libaom: false,
 	};
 	let main = precheck(&info, &caps).unwrap();
-	let video = plan_video(&info, main, &[], &analysis, Speed::Fast);
+	let video = plan_video(&info, main, &[], &analysis, Speed::Fast, None);
 
 	let video_temp = dir.path().join("video.a1.mkv");
 	let audio_temp = dir.path().join("audio.mka");

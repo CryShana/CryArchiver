@@ -5,7 +5,7 @@ use crate::probe::{Frame, MediaInfo, Stream};
 use crate::video::VideoStarts;
 use crate::video::analyze::{Analysis, NOISY_SIGMA, NoiseClass, ScanType, forced_decoder};
 use crate::video::burn::Overlay;
-use crate::video::colour::{ColourTags, conversion, output_tags, setparams};
+use crate::video::colour::{self, ColourTags, conversion, output_tags, setparams};
 
 const SVT_MAX_WIDTH: u32 = 16_384;
 const SVT_MAX_HEIGHT: u32 = 8_704;
@@ -166,6 +166,10 @@ impl Encoder {
 pub struct VideoPlan {
 	pub streams: Vec<u32>,
 	pub decoder: Option<&'static str>,
+	/// Deinterlacing and the resize: what runs before burned subtitles are drawn, so they are drawn on the output's
+	/// frames at its size.
+	pub shape: String,
+	/// The colour conversion, after any burned subtitles.
 	pub filters: String,
 	pub encoder: Encoder,
 	pub expected_frames: Option<u64>,
@@ -235,8 +239,16 @@ pub fn usable_main<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stre
 	Ok(main)
 }
 
-pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &Analysis, speed: Speed) -> VideoPlan {
-	let (width, height) = display_size(main);
+/// `resize` is the output size under `--resize`; the encoder and its CRF follow the output size.
+pub fn plan_video(
+	info: &MediaInfo,
+	main: &Stream,
+	frames: &[Frame],
+	analysis: &Analysis,
+	speed: Speed,
+	resize: Option<(u32, u32)>,
+) -> VideoPlan {
+	let (width, height) = resize.unwrap_or_else(|| display_size(main));
 	let resolution = Resolution::of(width, height);
 	let alpha = has_alpha(main);
 
@@ -257,16 +269,20 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 
 	let colour = output_tags(main);
 	let target = if alpha { ALPHA_PIX_FMT } else { OUTPUT_PIX_FMT };
-	let mut filters: Vec<String> = Vec::new();
+	let mut shape: Vec<String> = Vec::new();
 	match analysis.scan {
 		ScanType::Progressive => {}
-		ScanType::Interlaced { top_first } => filters.push(format!(
+		ScanType::Interlaced { top_first } => shape.push(format!(
 			"bwdif=mode=send_field:parity={}:deint=all",
 			if top_first { "tff" } else { "bff" }
 		)),
-		ScanType::Telecined => filters.push("fieldmatch,decimate".into()),
+		ScanType::Telecined => shape.push("fieldmatch,decimate".into()),
 	}
-	filters.extend(conversion(main, &colour, target));
+	if let Some(size) = resize {
+		shape.push(colour::resize(main, &colour, size));
+	}
+
+	let mut filters: Vec<String> = conversion(main, &colour, target).into_iter().collect();
 	filters.push(setparams(&colour));
 
 	let mut warnings = Vec::new();
@@ -288,6 +304,7 @@ pub fn plan_video(info: &MediaInfo, main: &Stream, frames: &[Frame], analysis: &
 	VideoPlan {
 		streams,
 		decoder: forced_decoder(main),
+		shape: shape.join(","),
 		filters: filters.join(","),
 		hdr10: matches!(encoder, Encoder::SvtAv1 { .. }) && has_side_data(frames, MASTERING_DISPLAY),
 		encoder,
@@ -424,6 +441,18 @@ fn display_size(stream: &Stream) -> (u32, u32) {
 	}
 }
 
+/// The size the picture is shown at: its pixels with the sample aspect ratio applied to their width, then rotated
+/// upright.
+pub fn shown_size(stream: &Stream) -> (f64, f64) {
+	let width = f64::from(stream.width.unwrap_or(0)) * stream.sample_aspect_ratio.unwrap_or(1.0);
+	let height = f64::from(stream.height.unwrap_or(0));
+	if stream.rotation().rem_euclid(180) == 90 {
+		(height, width)
+	} else {
+		(width, height)
+	}
+}
+
 fn too_large_for_svt(width: u32, height: u32) -> bool {
 	width > SVT_MAX_WIDTH || height > SVT_MAX_HEIGHT
 }
@@ -487,6 +516,7 @@ pub(crate) fn test_plan() -> VideoPlan {
 	VideoPlan {
 		streams: vec![0],
 		decoder: None,
+		shape: String::new(),
 		filters: String::new(),
 		encoder: Encoder::SvtAv1 {
 			preset: 8,
@@ -547,7 +577,58 @@ mod tests {
 	#[allow(clippy::needless_pass_by_value)]
 	fn plan(info: &MediaInfo, frames: &[Frame], analysis: Analysis, speed: Speed) -> VideoPlan {
 		let main = precheck(info, &CAPS).unwrap();
-		plan_video(info, main, frames, &analysis, speed)
+		plan_video(info, main, frames, &analysis, speed, None)
+	}
+
+	#[test]
+	fn a_resize_runs_after_deinterlacing_and_the_output_size_picks_the_crf() {
+		let source = h264(r#","chroma_location":"left""#);
+		let tff = Analysis {
+			scan: ScanType::Interlaced { top_first: true },
+			..PROGRESSIVE_CLEAN
+		};
+
+		let resized = plan_video(
+			&source,
+			&source.streams[0],
+			&[],
+			&tff,
+			Speed::Moderate,
+			Some((640, 360)),
+		);
+
+		assert_eq!((resized.width, resized.height), (640, 360));
+		assert_eq!(
+			resized.shape,
+			"bwdif=mode=send_field:parity=tff:deint=all,scale=w=640:h=360:flags=lanczos+accurate_rnd:in_range=tv:\
+			 out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709:in_chroma_loc=left:out_chroma_loc=left,setsar=1"
+		);
+		assert!(resized.filters.starts_with("scale=in_range=tv:"), "{}", resized.filters);
+		assert_eq!(
+			resized.encoder,
+			Encoder::SvtAv1 {
+				preset: 5,
+				crf: 28.0,
+				film_grain: None,
+			}
+		);
+		assert_eq!(resized.expected_frames, Some(500));
+	}
+
+	#[test]
+	fn the_shown_size_applies_the_sample_aspect_ratio_before_the_rotation() {
+		let stream = |json: &str| -> Stream { serde_json::from_str(json).unwrap() };
+		let anamorphic =
+			stream(r#"{"index":0,"codec_type":"video","width":720,"height":576,"sample_aspect_ratio":"64:45"}"#);
+		let rotated = stream(
+			r#"{"index":0,"codec_type":"video","width":100,"height":50,"sample_aspect_ratio":"2:1",
+			"side_data_list":[{"side_data_type":"Display Matrix","rotation":-90}]}"#,
+		);
+		let square = stream(r#"{"index":0,"codec_type":"video","width":320,"height":240}"#);
+
+		assert_eq!(shown_size(&anamorphic), (1024.0, 576.0));
+		assert_eq!(shown_size(&rotated), (50.0, 200.0));
+		assert_eq!(shown_size(&square), (320.0, 240.0));
 	}
 
 	fn h264(extra: &str) -> MediaInfo {
@@ -573,6 +654,7 @@ mod tests {
 			source: std::path::Path::new("in.mkv"),
 			stream: 0,
 			decoder: None,
+			shape: &plan.shape,
 			filters: &plan.filters,
 			window: None,
 			start: VideoStarts::default().main,
@@ -749,14 +831,12 @@ mod tests {
 		let deinterlaced = plan(&h264(""), &[], tff, Speed::Moderate);
 		let inverse_telecined = plan(&h264(""), &[], telecined, Speed::Moderate);
 
-		assert!(
-			deinterlaced
-				.filters
-				.starts_with("bwdif=mode=send_field:parity=tff:deint=all,scale=")
-		);
+		assert_eq!(deinterlaced.shape, "bwdif=mode=send_field:parity=tff:deint=all");
+		assert!(deinterlaced.filters.starts_with("scale="), "{}", deinterlaced.filters);
 		assert_eq!(deinterlaced.expected_frames, Some(500));
 		assert_eq!(deinterlaced.frame_tolerance, 4);
-		assert!(inverse_telecined.filters.starts_with("fieldmatch,decimate,scale="));
+		assert_eq!(inverse_telecined.shape, "fieldmatch,decimate");
+		assert!(inverse_telecined.filters.starts_with("scale="));
 		assert_eq!(inverse_telecined.expected_frames, Some(200));
 		assert_eq!(inverse_telecined.frame_tolerance, 2);
 	}
