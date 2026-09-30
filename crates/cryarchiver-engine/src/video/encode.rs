@@ -26,8 +26,8 @@ pub const DECODE_ERRORS: &[&str] = &[
 ];
 pub const MIN_PREDICTED_DURATION_S: f64 = 120.0;
 
-/// A whole 10 fps frame, which the encode's last time falls short of the declared end by, with room for float rounding.
-const DURATION_TOLERANCE_S: f64 = 0.1 + 1e-9;
+const DURATION_TOLERANCE_S: f64 = 0.1;
+const ROUNDING_S: f64 = 1e-9;
 const PREDICTION_MARGIN: f64 = 0.05;
 const MATROSKA_TIME_BASE: &str = "1/1000";
 const AUDIO_TEMP: Container = Container {
@@ -361,11 +361,13 @@ pub async fn encode_video(
 	})
 }
 
+/// `fps` is the video temp's declared rate.
 pub fn check_video_temp(
 	plan: &VideoPlan,
 	encoded: &EncodedVideo,
 	declared_s: Option<f64>,
 	start_s: f64,
+	fps: Option<f64>,
 ) -> Result<Option<String>, JobError> {
 	if let Some(declared) = declared_s
 		&& declared - encoded.decoded_s > (declared * 0.02).max(1.0)
@@ -392,11 +394,13 @@ pub fn check_video_temp(
 		(Some(expected), _) if encoded.frames.abs_diff(expected) > plan.frame_tolerance => {
 			Err(ErrorKind::EncodeFailed(format!("the video has {} frames, {expected} expected", encoded.frames)).into())
 		}
-		(None, Some(declared)) if !lasts(plan, encoded, start_s, declared) => Err(ErrorKind::EncodeFailed(format!(
-			"the video lasts {:.2} s, {declared:.2} s expected",
-			encoded.decoded_s - start_s
-		))
-		.into()),
+		(None, Some(declared)) if !lasts(plan, encoded, (start_s, declared), fps) => {
+			Err(ErrorKind::EncodeFailed(format!(
+				"the video lasts {:.2} s, {declared:.2} s expected",
+				encoded.decoded_s - start_s
+			))
+			.into())
+		}
 		_ => Ok(None),
 	}
 }
@@ -404,11 +408,14 @@ pub fn check_video_temp(
 // A declared duration is a length in MP4 but the end timestamp in Matroska's DURATION tag, and the video temp keeps
 // the source's start offset, so either reading may be the one that matches. A TS/PS video's declared length counts
 // from its first packet, which the whole file's `-itsoffset` moved later on the temp, and which may not decode.
-fn lasts(plan: &VideoPlan, encoded: &EncodedVideo, start_s: f64, declared_s: f64) -> bool {
+// The decoded time is the last frame's start, a frame short of the declared end.
+fn lasts(plan: &VideoPlan, encoded: &EncodedVideo, (start_s, declared_s): (f64, f64), fps: Option<f64>) -> bool {
 	let offset_s = plan
 		.window
 		.map_or_else(|| plan.starts.every.offset_s(None), |_| None)
 		.unwrap_or(0.0);
+	let frame_s = fps.filter(|fps| *fps > 0.0).map_or(0.0, |fps| 1.0 / fps);
+	let tolerance_s = DURATION_TOLERANCE_S.max(frame_s) + ROUNDING_S;
 
 	[
 		encoded.decoded_s - start_s,
@@ -416,7 +423,7 @@ fn lasts(plan: &VideoPlan, encoded: &EncodedVideo, start_s: f64, declared_s: f64
 		encoded.decoded_s - offset_s,
 	]
 	.iter()
-	.any(|decoded| (decoded - declared_s).abs() <= DURATION_TOLERANCE_S)
+	.any(|decoded| (decoded - declared_s).abs() <= tolerance_s)
 }
 
 pub fn audio_plan(info: &MediaInfo, streams: &StreamPlan, window: Option<TrimWindow>) -> Option<FilePlan> {
@@ -1073,14 +1080,14 @@ mod tests {
 	fn short_decodes_are_source_damage() {
 		let video = plan(svt(), Some(505));
 
-		let err = check_video_temp(&video, &encoded(291, 9.7, 0), Some(16.834), 0.0).unwrap_err();
+		let err = check_video_temp(&video, &encoded(291, 9.7, 0), Some(16.834), 0.0, None).unwrap_err();
 
 		assert!(
 			matches!(err.kind, ErrorKind::SourceDamaged(ref reason) if reason.contains("9.7")),
 			"{err:?}"
 		);
 		assert_eq!(
-			check_video_temp(&video, &encoded(505, 16.7, 0), Some(16.834), 0.0).unwrap(),
+			check_video_temp(&video, &encoded(505, 16.7, 0), Some(16.834), 0.0, None).unwrap(),
 			None
 		);
 	}
@@ -1090,16 +1097,16 @@ mod tests {
 		let video = plan(svt(), Some(505));
 
 		assert!(matches!(
-			check_video_temp(&video, &encoded(496, 16.83, 0), Some(16.834), 0.0)
+			check_video_temp(&video, &encoded(496, 16.83, 0), Some(16.834), 0.0, None)
 				.unwrap_err()
 				.kind,
 			ErrorKind::EncodeFailed(_)
 		));
 		assert_eq!(
-			check_video_temp(&video, &encoded(503, 16.83, 0), Some(16.834), 0.0).unwrap(),
+			check_video_temp(&video, &encoded(503, 16.83, 0), Some(16.834), 0.0, None).unwrap(),
 			None
 		);
-		let warning = check_video_temp(&video, &encoded(496, 16.83, 41), Some(16.834), 0.0)
+		let warning = check_video_temp(&video, &encoded(496, 16.83, 41), Some(16.834), 0.0, None)
 			.unwrap()
 			.unwrap();
 		assert!(warning.contains("41 decoding errors"), "{warning}");
@@ -1119,11 +1126,11 @@ mod tests {
 		};
 
 		assert_eq!(
-			check_video_temp(&moved, &encoded(152, 6.571, 0), Some(6.24), 0.491).unwrap(),
+			check_video_temp(&moved, &encoded(152, 6.571, 0), Some(6.24), 0.491, None).unwrap(),
 			None
 		);
-		assert!(check_video_temp(&plan(svt(), None), &encoded(152, 6.571, 0), Some(6.24), 0.491).is_err());
-		assert!(check_video_temp(&moved, &encoded(140, 6.1, 0), Some(6.24), 0.491).is_err());
+		assert!(check_video_temp(&plan(svt(), None), &encoded(152, 6.571, 0), Some(6.24), 0.491, None).is_err());
+		assert!(check_video_temp(&moved, &encoded(140, 6.1, 0), Some(6.24), 0.491, None).is_err());
 	}
 
 	#[test]
@@ -1131,36 +1138,47 @@ mod tests {
 		let video = plan(svt(), None);
 
 		assert_eq!(
-			check_video_temp(&video, &encoded(117, 4.66, 0), Some(4.7), 0.0).unwrap(),
+			check_video_temp(&video, &encoded(117, 4.66, 0), Some(4.7), 0.0, None).unwrap(),
 			None
 		);
 		assert_eq!(
-			check_video_temp(&video, &encoded(117, 5.98, 0), Some(4.7), 1.32).unwrap(),
+			check_video_temp(&video, &encoded(117, 5.98, 0), Some(4.7), 1.32, None).unwrap(),
 			None
 		);
 		assert_eq!(
-			check_video_temp(&video, &encoded(75, 3.5, 0), Some(3.5), 0.5).unwrap(),
+			check_video_temp(&video, &encoded(75, 3.5, 0), Some(3.5), 0.5, None).unwrap(),
 			None
 		);
-		assert_eq!(
-			check_video_temp(&video, &encoded(20, 1.4, 0), Some(1.5), 0.0).unwrap(),
-			None
-		);
-		let err = check_video_temp(&video, &encoded(100, 4.4, 0), Some(4.7), 0.0).unwrap_err();
+		let err = check_video_temp(&video, &encoded(100, 4.4, 0), Some(4.7), 0.0, None).unwrap_err();
 		assert!(
 			matches!(err.kind, ErrorKind::EncodeFailed(ref reason) if reason == "the video lasts 4.40 s, 4.70 s expected"),
 			"{err:?}"
 		);
 		assert_eq!(
-			check_video_temp(&video, &encoded(100, 4.4, 3), Some(4.7), 0.0)
+			check_video_temp(&video, &encoded(100, 4.4, 3), Some(4.7), 0.0, None)
 				.unwrap()
 				.map(|warning| warning.contains("3 decoding errors")),
 			Some(true)
 		);
 		assert_eq!(
-			check_video_temp(&video, &encoded(100, 4.4, 0), None, 0.0).unwrap(),
+			check_video_temp(&video, &encoded(100, 4.4, 0), None, 0.0, None).unwrap(),
 			None
 		);
+	}
+
+	#[test]
+	fn a_low_rate_video_may_end_a_frame_short_of_its_declared_end() {
+		let video = plan(svt(), None);
+		let check = |decoded_s: f64, declared_s: f64, fps: Option<f64>| {
+			check_video_temp(&video, &encoded(20, decoded_s, 0), Some(declared_s), 0.0, fps)
+		};
+
+		assert_eq!(check(1.4, 1.5, Some(10.0)).unwrap(), None);
+		assert_eq!(check(1.4, 1.5, None).unwrap(), None);
+		assert_eq!(check(3.8, 4.0, Some(5.0)).unwrap(), None);
+		assert!(check(3.8, 4.0, None).is_err());
+		assert!(check(3.6, 4.0, Some(5.0)).is_err());
+		assert_eq!(check(7.5, 8.0, Some(2.0)).unwrap(), None);
 	}
 
 	#[test]
@@ -1168,7 +1186,7 @@ mod tests {
 		let video = plan(svt(), None);
 
 		assert!(matches!(
-			check_video_temp(&video, &encoded(0, 0.0, 0), None, 0.0)
+			check_video_temp(&video, &encoded(0, 0.0, 0), None, 0.0, None)
 				.unwrap_err()
 				.kind,
 			ErrorKind::EncodeFailed(_)

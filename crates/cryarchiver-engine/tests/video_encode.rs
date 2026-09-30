@@ -76,7 +76,7 @@ async fn encodes_the_video_temp_and_reports_frames_and_duration() {
 	assert_eq!(encoded.frames, 50);
 	assert!((encoded.decoded_s - 2.0).abs() < 0.1, "{encoded:?}");
 	assert_eq!(encoded.decode_errors, 0);
-	assert_eq!(check_video_temp(&video, &encoded, Some(2.0), 0.0).unwrap(), None);
+	assert_eq!(check_video_temp(&video, &encoded, Some(2.0), 0.0, None).unwrap(), None);
 	assert!(fractions.last().is_some_and(|last| *last > 0.9), "{fractions:?}");
 	let info = probe(&tools, &output, &CancellationToken::new()).await.unwrap();
 	assert_eq!(info.streams.len(), 1);
@@ -223,7 +223,7 @@ async fn a_truncated_matroska_decodes_short() {
 	.unwrap();
 
 	assert!(encoded.decoded_s < 4.0, "{encoded:?}");
-	assert!(check_video_temp(&video, &encoded, Some(6.0), 0.0).is_err());
+	assert!(check_video_temp(&video, &encoded, Some(6.0), 0.0, None).is_err());
 }
 
 #[tokio::test]

@@ -1128,6 +1128,64 @@ async fn constant_rate_video_keeps_its_frame_times() {
 }
 
 #[tokio::test]
+async fn a_trimmed_five_fps_video_ending_a_frame_before_its_window_is_encoded() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("timelapse.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:r=5:d=6",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		source.to_str().unwrap(),
+	]);
+
+	let outcome = run(&trimmed(fast_keeping_any_saving(&source), 1.0, 4.0), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let window: Vec<f64> = (0..15).map(|frame| f64::from(frame) * 0.2).collect();
+	assert_same_times(&support::frame_times(&output, 0), &window);
+}
+
+#[tokio::test]
+async fn a_ts_spliced_a_second_back_is_encoded_on_the_times_ffmpeg_closes_up() {
+	let dir = tempfile::tempdir().unwrap();
+	let segment = |name: &str, offset: &str| {
+		let path = dir.path().join(name);
+		support::ffmpeg(&[
+			"-f",
+			"lavfi",
+			"-i",
+			"testsrc2=s=160x120:r=25:d=3",
+			"-c:v",
+			"mpeg2video",
+			"-q:v",
+			"3",
+			"-output_ts_offset",
+			offset,
+			path.to_str().unwrap(),
+		]);
+		fs::read(path).unwrap()
+	};
+	let spliced = dir.path().join("spliced.ts");
+	fs::write(&spliced, [segment("a.ts", "0"), segment("b.ts", "2")].concat()).unwrap();
+
+	let outcome = run(&fast_keeping_any_saving(&spliced), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let times = support::frame_times(&output, 0);
+	assert_eq!(times.len(), 150, "{times:?}");
+	assert!(times.windows(2).all(|pair| pair[0] < pair[1]), "{times:?}");
+}
+
+#[tokio::test]
 async fn a_trimmed_variable_rate_video_keeps_its_frame_times_in_the_window() {
 	let dir = tempfile::tempdir().unwrap();
 	let mkv = support::variable_rate(dir.path(), "variable.mkv", 4);

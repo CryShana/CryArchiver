@@ -58,6 +58,14 @@ impl Seek {
 	}
 }
 
+/// A TS or PS source: one whose timestamps can jump, and which ffmpeg starts at the streams a command reads.
+pub fn discontinuous(info: &MediaInfo) -> bool {
+	info.format
+		.format_name
+		.split(',')
+		.any(|name| START_FROM_READ_STREAMS.contains(&name))
+}
+
 /// `delay_s`, when it is long enough to act on.
 pub fn delay(delay_s: f64) -> Option<f64> {
 	(delay_s > NO_DELAY_S).then_some(delay_s)
@@ -73,11 +81,7 @@ pub struct InputStart {
 
 impl InputStart {
 	pub fn of(info: &MediaInfo, streams: &[u32]) -> Self {
-		let corrected = info
-			.format
-			.format_name
-			.split(',')
-			.any(|name| START_FROM_READ_STREAMS.contains(&name));
+		let corrected = discontinuous(info);
 		let streams_s = info
 			.streams
 			.iter()

@@ -43,10 +43,10 @@ use crate::video::plan::{
 use crate::video::quality::{self as video_quality, GrainChoice, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
-	Expected, Retiming, Timelines, alpha_ssim, check_alpha, check_frame_times, check_sync, earliest_video_start,
-	probe_temp, start_offsets, sync_tolerance_s, synced_streams, undecoded_lead, verify_output,
+	Expected, FrameTiming, Retiming, Timelines, alpha_ssim, check_alpha, check_frame_times, check_sync,
+	earliest_video_start, probe_temp, start_offsets, sync_tolerance_s, synced_streams, undecoded_lead, verify_output,
 };
-use crate::video::{VideoStarts, analyze, chapters, colour, cues, encode as video_encode, titles};
+use crate::video::{VideoStarts, analyze, chapters, colour, cues, discontinuous, encode as video_encode, titles};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
@@ -1471,7 +1471,12 @@ impl Engine {
 	) -> Result<(Temp, Option<String>), JobError> {
 		let info = probe_temp(&self.tools, &path, cancel).await?;
 		let start_s = earliest_video_start(&info).unwrap_or(0.0);
-		let warning = video_encode::check_video_temp(video, encoded, declared_s, start_s)?;
+		let fps = info
+			.streams
+			.iter()
+			.find(|stream| stream.is_real_video())
+			.and_then(Stream::fps);
+		let warning = video_encode::check_video_temp(video, encoded, declared_s, start_s, fps)?;
 		Ok((Temp { path, info }, warning))
 	}
 
@@ -1656,11 +1661,14 @@ impl Engine {
 			&self.tools,
 			(source, &output),
 			job.main.index,
-			job.video.window.map(|window| TrimWindow {
-				start_s: file_start_s + window.start_s,
-				..window
-			}),
-			Retiming::of(job.scan),
+			FrameTiming {
+				retiming: Retiming::of(job.scan),
+				window: job.video.window.map(|window| TrimWindow {
+					start_s: file_start_s + window.start_s,
+					..window
+				}),
+				discontinuous: discontinuous(job.info),
+			},
 			cx.cancel,
 		)
 		.await?;

@@ -2,12 +2,14 @@ mod support;
 
 use std::path::Path;
 
+use cryarchiver_engine::outcome::JobError;
+use cryarchiver_engine::toolchain::Toolchain;
 use cryarchiver_engine::video::VideoStarts;
 use cryarchiver_engine::video::colour::{ColourTags, Range};
 use cryarchiver_engine::video::plan::{Encoder, VideoPlan};
 use cryarchiver_engine::video::streams::StreamPlan;
 use cryarchiver_engine::video::verify::{
-	Expected, Retiming, Synced, alpha_ssim, check_alpha, check_frame_times, check_sync, verify_output,
+	Expected, FrameTiming, Retiming, Synced, alpha_ssim, check_alpha, check_frame_times, check_sync, verify_output,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -228,37 +230,72 @@ async fn an_output_whose_audio_lags_its_video_fails_the_sync_check() {
 async fn a_variable_rate_output_merged_onto_the_declared_rate_fails_the_frame_time_check() {
 	let dir = tempfile::tempdir().unwrap();
 	let source = support::variable_rate(dir.path(), "variable.mkv", 2);
-	let encode = |name: &str, time_base: &[&str]| {
-		let output = dir.path().join(name);
-		let mut args = vec!["-i", source.to_str().unwrap(), "-c:v", "libsvtav1", "-preset", "12"];
-		args.extend_from_slice(time_base);
-		args.extend(["-fps_mode", "passthrough", output.to_str().unwrap()]);
-		support::ffmpeg(&args);
-		output
-	};
-	let kept = encode("kept.mkv", &["-enc_time_base:v", "1/1000"]);
-	let merged = encode("merged.mkv", &[]);
+	let kept = encoded_av1(&source, "kept.mkv", &["-enc_time_base:v", "1/1000"]);
+	let merged = encoded_av1(&source, "merged.mkv", &[]);
 	let tools = support::toolchain().await;
-	let check = |output: std::path::PathBuf| {
-		let (tools, source) = (&tools, &source);
-		async move {
-			check_frame_times(
-				tools,
-				(source, &output),
-				0,
-				None,
-				Retiming::Kept,
-				&CancellationToken::new(),
-			)
-			.await
-		}
-	};
 
-	check(kept).await.unwrap();
-	let err = check(merged).await.unwrap_err();
+	Box::pin(frame_times_of(&tools, &source, &kept)).await.unwrap();
+	let err = Box::pin(frame_times_of(&tools, &source, &merged)).await.unwrap_err();
 
 	assert!(
-		err.to_string().contains("two video frames are shown at 0.100 s"),
+		err.to_string()
+			.contains("the video frame at 0.100 s is at no frame time of the source"),
 		"{err}"
 	);
+}
+
+#[tokio::test]
+async fn a_source_that_shows_a_time_twice_passes_the_frame_time_check_when_the_output_does_too() {
+	let dir = tempfile::tempdir().unwrap();
+	let clean = dir.path().join("clean.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:r=10:d=2",
+		"-c:v",
+		"mpeg4",
+		clean.to_str().unwrap(),
+	]);
+	let repeated = support::converted(
+		dir.path(),
+		"repeated.mkv",
+		&[],
+		&clean,
+		&["-c", "copy", "-bsf:v", "setts=ts=if(eq(N\\,5)\\,PREV_OUTPTS\\,PTS)"],
+	);
+	let output = encoded_av1(&repeated, "output.mkv", &["-enc_time_base:v", "1/1000"]);
+	let tools = support::toolchain().await;
+
+	let times = support::frame_times(&output, 0);
+
+	assert!(
+		times.windows(2).any(|pair| (pair[1] - pair[0]).abs() < 0.0005),
+		"{times:?}"
+	);
+	Box::pin(frame_times_of(&tools, &repeated, &output)).await.unwrap();
+}
+
+fn encoded_av1(source: &Path, name: &str, time_base: &[&str]) -> std::path::PathBuf {
+	let output = source.with_file_name(name);
+	let mut args = vec!["-i", source.to_str().unwrap(), "-c:v", "libsvtav1", "-preset", "12"];
+	args.extend_from_slice(time_base);
+	args.extend(["-fps_mode", "passthrough", output.to_str().unwrap()]);
+	support::ffmpeg(&args);
+	output
+}
+
+async fn frame_times_of(tools: &Toolchain, source: &Path, output: &Path) -> Result<(), JobError> {
+	check_frame_times(
+		tools,
+		(source, output),
+		0,
+		FrameTiming {
+			retiming: Retiming::Kept,
+			window: None,
+			discontinuous: false,
+		},
+		&CancellationToken::new(),
+	)
+	.await
 }
