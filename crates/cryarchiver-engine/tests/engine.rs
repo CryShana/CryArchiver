@@ -5432,3 +5432,39 @@ async fn a_resize_leaves_audio_as_it_is() {
 	};
 	assert_eq!(free, with_resize);
 }
+
+#[tokio::test]
+async fn id3_musicbrainz_tags_arrive_with_vorbis_names() {
+	let dir = tempfile::tempdir().unwrap();
+	let mp3 = support::tone(
+		dir.path(),
+		"tagged.mp3",
+		"stereo",
+		2,
+		3,
+		&[
+			"-c:a",
+			"libmp3lame",
+			"-b:a",
+			"256k",
+			"-metadata",
+			"MusicBrainz Album Id=abc",
+		],
+	);
+
+	let outcome = run(&job(&mp3), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let opus = OpusFile::read_from(
+		&mut File::open(&output).unwrap(),
+		ParseOptions::new().read_properties(false),
+	)
+	.unwrap();
+	assert!(
+		opus.vorbis_comments()
+			.items()
+			.any(|(key, value)| key == "MUSICBRAINZ_ALBUMID" && value == "abc")
+	);
+}

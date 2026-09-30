@@ -11,7 +11,7 @@ use crate::audio::plan::{
 	AudioPlan, AudioRules, FilePlan, TrackJob, TrackPlan, merge_file, mergeable, mixed_languages_warning,
 	plan_file_with, retarget,
 };
-use crate::audio::{cover, encode, verify};
+use crate::audio::{cover, encode, tags, verify};
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
 use crate::detect::{self, Detection, MediaClass};
@@ -714,6 +714,14 @@ impl Engine {
 			&& !plan.options.strip
 			&& let Some(warning) = copy_cover(&cx.job.source, &output, info)
 		{
+			(cx.on_event)(JobEvent::Warning(warning.clone()));
+			warnings.push(warning);
+		}
+
+		if plan.container.cover == Cover::VorbisPicture
+			&& let Err(err) = tags::rename_keys(&output)
+		{
+			let warning = format!("music tags keep their ID3 names: {err}");
 			(cx.on_event)(JobEvent::Warning(warning.clone()));
 			warnings.push(warning);
 		}
