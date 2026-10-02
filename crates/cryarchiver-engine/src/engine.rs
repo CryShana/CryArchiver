@@ -28,8 +28,9 @@ use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusa
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::quality::keys::{CacheKey, Group, VideoGroup};
-use crate::quality::memory::{GroupStats, Observation, QualityMemory, SharedMemory};
+use crate::quality::memory::{GroupStats, Observation, Offset, QualityMemory, SharedMemory};
 use crate::quality::search::{self, DEFAULT_SLOPE, MAX_PROBES, Target};
+use crate::quality::vmaf::Score;
 use crate::text::{display_path, fold_repeats};
 use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
 use crate::video::analyze::{Analysis, ScanType};
@@ -40,7 +41,7 @@ use crate::video::mux::{self, Attachment, ChapterSource, CueFile, MuxInputs, Mux
 use crate::video::plan::{
 	self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, threads_for, usable_main,
 };
-use crate::video::quality::{self as video_quality, GrainChoice, MAX_RETRIES, Scorer, Searched, Strategy};
+use crate::video::quality::{self as video_quality, Aim, GrainChoice, MAX_RETRIES, Scorer, Searched, Strategy};
 use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
 	Expected, FrameTiming, Retiming, Timelines, alpha_ssim, check_alpha, check_frame_times, check_sync,
@@ -225,6 +226,8 @@ struct VideoQuality {
 	slope: f64,
 	/// The plan's film grain was left out, for its group's learned setting or after a search without it won.
 	without_grain: bool,
+	/// What the search samples scored at the CRF the video is encoded at.
+	predicted: Option<Score>,
 }
 
 impl VideoQuality {
@@ -232,6 +235,15 @@ impl VideoQuality {
 		match self.strategy {
 			Strategy::Search { start } => start,
 			Strategy::Fixed { crf, .. } => crf,
+		}
+	}
+
+	/// A search toward `nominal` for a full encode of `length_s`, moved by what the group learned about its samples.
+	fn aim(&self, nominal: Target, length_s: Option<f64>) -> Aim {
+		Aim {
+			nominal,
+			search: video_quality::search_target(nominal, self.stats.and_then(|stats| stats.offset)),
+			length_s,
 		}
 	}
 }
@@ -627,7 +639,7 @@ impl Engine {
 
 	async fn analyze_main(&self, cx: &Context<'_>, main: &Stream, span: Span) -> Result<Analysis, JobError> {
 		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
-		let segments = video_quality::analysis_segments(cx.job.speed);
+		let segments = video_quality::analysis_segments(cx.job.speed, span.length_s);
 		Box::pin(analyze::analyze(
 			&self.tools,
 			&cx.job.source,
@@ -1182,6 +1194,7 @@ impl Engine {
 			stats,
 			target,
 			without_grain: false,
+			predicted: None,
 		}
 	}
 
@@ -1280,13 +1293,13 @@ impl Engine {
 		};
 		let mut searched = {
 			let scorer = self.scorer(cx, workspace, video);
-			let (start, target, slope) = (quality.start(), quality.target, quality.slope);
+			let aim = quality.aim(quality.target, inputs.declared_s);
 			Box::pin(video_quality::search(
 				&scorer,
 				samples,
-				start,
-				target,
-				slope,
+				quality.start(),
+				aim,
+				quality.slope,
 				progress(0),
 			))
 			.await?
@@ -1308,7 +1321,7 @@ impl Engine {
 					&scorer,
 					samples,
 					start,
-					plain_target,
+					quality.aim(plain_target, inputs.declared_s),
 					quality.slope,
 					bytes,
 					progress(1),
@@ -1331,7 +1344,15 @@ impl Engine {
 		}
 
 		let found = match searched {
-			Searched::Found(found) => found,
+			Searched::Found(found) => {
+				quality.predicted = Some(found.score);
+				found
+			}
+			Searched::Unreachable { crf, score } if quality.target.met(score) => {
+				quality.predicted = Some(score);
+				video.encoder = video.encoder.with_crf(crf);
+				return Ok(Tuning::Encode { verify: true });
+			}
 			Searched::Unreachable { crf, score } if cx.job.options.forced_video(mergeable(inputs.info)) => {
 				video.encoder = video.encoder.with_crf(crf);
 				video.warnings.push(format!(
@@ -1353,19 +1374,23 @@ impl Engine {
 		};
 		video.encoder = video.encoder.with_crf(found.crf);
 		quality.slope = found.slope;
+		Ok(Self::predicted_size(cx, inputs, samples, found.sample_bytes))
+	}
 
+	/// Keeps the original when the found CRF's samples predict an output that isn't small enough.
+	fn predicted_size(cx: &Context<'_>, inputs: &VideoInputs<'_>, samples: &[Sample], sample_bytes: u64) -> Tuning {
 		if !cx.job.options.forced_video(mergeable(inputs.info))
 			&& let Some(duration_s) = inputs
 				.declared_s
 				.filter(|duration| *duration >= video_encode::MIN_PREDICTED_DURATION_S)
 		{
 			let other = video_encode::other_bitrate(inputs.info, inputs.streams);
-			let predicted = video_encode::predicted_bytes(found.sample_bytes, samples, duration_s, other);
+			let predicted = video_encode::predicted_bytes(sample_bytes, samples, duration_s, other);
 			if let Some(reason) = video_encode::predicted_keep(inputs.compared_bytes, predicted, cx.job.min_savings) {
-				return Ok(Tuning::Keep(reason));
+				return Tuning::Keep(reason);
 			}
 		}
-		Ok(Tuning::Encode { verify: true })
+		Tuning::Encode { verify: true }
 	}
 
 	async fn check_quality(
@@ -1380,6 +1405,7 @@ impl Engine {
 		let windows = video_quality::verify_windows(temps.encoded.frames, temps.encoded.decoded_s, cx.job.speed);
 		let bounds = video_quality::bounds(&video.encoder);
 		let mut attempt = 1;
+		let mut first_offset = None;
 
 		loop {
 			(cx.on_event)(JobEvent::Stage(Stage::Verify));
@@ -1389,13 +1415,20 @@ impl Engine {
 				Box::pin(scorer.verify(&temps.video.path, &windows, temps.encoded.frames, on_fraction)).await?
 			};
 
+			if attempt == 1 {
+				first_offset = quality.predicted.map(|predicted| Offset {
+					mean: score.mean - predicted.mean,
+					p5: score.p5 - predicted.p5,
+				});
+			}
+
 			let crf = video.encoder.crf();
 			if quality.target.met(score) {
 				return Ok(Checked::Passed(Observation {
 					setting: search::implied_crf(crf, score, quality.target, quality.slope, bounds),
 					slope: Some(quality.slope),
 					bpp: output_bpp(&temps.video.path, video, temps.encoded.frames),
-					offset: None,
+					offset: first_offset,
 					without_grain: quality.without_grain,
 				}));
 			}

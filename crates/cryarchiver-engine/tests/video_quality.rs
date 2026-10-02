@@ -14,7 +14,7 @@ use cryarchiver_engine::video::burn;
 use cryarchiver_engine::video::encode::{Sample, encode_sample, encode_video, video_command};
 use cryarchiver_engine::video::plan::{VideoCaps, VideoPlan, plan_video, precheck};
 use cryarchiver_engine::video::quality::{
-	Scorer, Searched, search, search_below, search_samples, target, verify_windows,
+	Aim, Scorer, Searched, search, search_below, search_samples, target, verify_windows,
 };
 use cryarchiver_engine::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
@@ -61,9 +61,16 @@ async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
 			threads: 4,
 			cancel: &cancel,
 		};
-		search(&scorer, &samples, plan.encoder.crf(), goal, DEFAULT_SLOPE, |_| {})
-			.await
-			.unwrap()
+		search(
+			&scorer,
+			&samples,
+			plan.encoder.crf(),
+			Aim::exact(goal),
+			DEFAULT_SLOPE,
+			|_| {},
+		)
+		.await
+		.unwrap()
 	};
 
 	let Searched::Found(found) = searched else {
@@ -136,9 +143,17 @@ async fn a_search_below_a_size_gives_up_once_a_miss_is_already_that_large() {
 	};
 
 	let mut rounds = 0;
-	let searched = search_below(&scorer, &samples, 40.0, unreachable, DEFAULT_SLOPE, Some(1), |_| {
-		rounds += 1;
-	})
+	let searched = search_below(
+		&scorer,
+		&samples,
+		40.0,
+		Aim::exact(unreachable),
+		DEFAULT_SLOPE,
+		Some(1),
+		|_| {
+			rounds += 1;
+		},
+	)
 	.await
 	.unwrap();
 
@@ -212,7 +227,9 @@ async fn a_search_sample_and_its_reference_draw_the_subtitles_on_screen_at_its_o
 		threads: 4,
 		cancel: &cancel,
 	};
-	let (score, _) = scorer.probe(20.0, &[on_screen], 0).await.unwrap();
+	let probed = scorer.probe(20.0, &[on_screen], 0).await.unwrap();
+	let score = probed.score;
+	assert!(probed.encode_s > 0.0 && probed.bytes > 0, "{probed:?}");
 
 	let lit = support::lit_span(&during, 0).unwrap();
 	assert!(lit.0.abs() < 0.02 && (lit.1 - 0.96).abs() < 0.02, "{lit:?}");

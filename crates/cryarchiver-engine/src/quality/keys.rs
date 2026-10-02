@@ -132,6 +132,8 @@ pub struct VideoGroup {
 	pub grain: Option<u8>,
 	/// Noisy to the encoder though no grain is planned (Fast, or grain the decoder makes up).
 	pub noisy: bool,
+	/// The analysis found no still flat area to measure the noise on, so neither noisy nor clean is known.
+	pub unmeasured: bool,
 	pub alpha: bool,
 }
 
@@ -151,6 +153,7 @@ impl VideoGroup {
 			scan: analysis.scan,
 			grain: plan.encoder.grain_level(),
 			noisy: analysis.noise == NoiseClass::Light,
+			unmeasured: analysis.noise_sigma.is_none(),
 			alpha: plan.alpha,
 		}
 	}
@@ -237,7 +240,7 @@ impl fmt::Display for CacheKey {
 				group.fps.name(),
 				group.range.name(),
 				scan_name(group.scan),
-				grain_name(group.grain, group.noisy),
+				grain_name(group.grain, group.noisy, group.unmeasured),
 				alpha_name(group.alpha)
 			)?,
 			Group::Image(group) => write!(
@@ -278,11 +281,12 @@ fn scan_name(scan: ScanType) -> &'static str {
 	}
 }
 
-fn grain_name(grain: Option<u8>, noisy: bool) -> String {
-	match (grain, noisy) {
-		(Some(level), _) => format!("grain{level}"),
-		(None, true) => "noisy".to_owned(),
-		(None, false) => "clean".to_owned(),
+fn grain_name(grain: Option<u8>, noisy: bool, unmeasured: bool) -> String {
+	match (grain, noisy, unmeasured) {
+		(Some(level), _, _) => format!("grain{level}"),
+		(None, true, _) => "noisy".to_owned(),
+		(None, false, true) => "unmeasured".to_owned(),
+		(None, false, false) => "clean".to_owned(),
 	}
 }
 
@@ -442,7 +446,7 @@ mod tests {
 			.to_string()
 		};
 
-		let clean = key(None, None);
+		let clean = key(Some(0.1), None);
 		let grain8 = key(Some(0.5), Some(8));
 		let grain14 = key(Some(1.2), Some(14));
 		let grain20 = key(Some(2.2), Some(20));
@@ -459,6 +463,26 @@ mod tests {
 			"{noisy_without_grain}"
 		);
 		assert_ne!(noisy_without_grain, clean);
+	}
+
+	#[test]
+	fn a_source_whose_noise_could_not_be_measured_has_its_own_group() {
+		let main = h264_25();
+		let key = |noise_sigma: Option<f64>| {
+			CacheKey {
+				group: Group::Video(VideoGroup::of(&main, &progressive(noise_sigma), &grained(None))),
+				encoder: "svt-av1-4.2".to_owned(),
+				preset: 5,
+				target: 93.0,
+				floor: Some(89.0),
+			}
+			.to_string()
+		};
+
+		let unmeasured = key(None);
+
+		assert!(unmeasured.contains("/progressive/unmeasured/"), "{unmeasured}");
+		assert!(key(Some(0.1)).contains("/progressive/clean/"));
 	}
 
 	#[test]

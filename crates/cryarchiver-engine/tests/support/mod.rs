@@ -95,6 +95,27 @@ pub fn still_home_video(dir: &Path, name: &str, scan: &str) -> PathBuf {
 	path
 }
 
+/// `still_home_video` interlaced as `scan` (`tff` or `bff`) but stored as progressive H.264, so that nothing but the
+/// picture tells its fields.
+pub fn unflagged_home_video(dir: &Path, name: &str, scan: &str) -> PathBuf {
+	let graph = format!(
+		"testsrc2=s=720x576:r=50:d=0.02,loop=loop=-1:size=1,setpts=N/50/TB,trim=duration=4,noise=alls=6:allf=t[still];\
+		 testsrc2=s=260x208:r=50:d=4[inset];[still][inset]overlay=x=200:y=200,interlace=scan={scan},setfield=prog"
+	);
+	let path = dir.join(name);
+
+	ffmpeg(&[
+		"-filter_complex",
+		&graph,
+		"-c:v",
+		"libx264",
+		"-crf",
+		"18",
+		path.to_str().unwrap(),
+	]);
+	path
+}
+
 /// idet's single-frame verdicts inside `region` (a `crop` argument): (TFF + BFF, progressive, all frames). Still
 /// areas are undetermined either way, and the multi-frame verdicts carry one guess across them.
 pub fn idet_verdicts(path: &Path, region: &str) -> (u64, u64, u64) {

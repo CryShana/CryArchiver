@@ -22,6 +22,8 @@ const FIELD_ORDER_SHARE: f64 = 0.8;
 const REJECT_SHARE: f64 = 0.5;
 const INTERLACED_FIELD_ORDERS: &[&str] = &["tt", "bb", "tb", "bt"];
 const LOW_DETAIL_SI: f64 = 15.0;
+const MIN_COMBED_BLOCKS: u64 = 40;
+const COMBED_SHARE: f64 = 0.8;
 const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:d=1,\
 	scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,\
 	format=yuv420p,siti=print_summary=1[out]";
@@ -57,7 +59,14 @@ pub struct Detail {
 	pub start_s: f64,
 	pub length_s: f64,
 	pub si: Option<f64>,
+	pub ti: Option<f64>,
+	/// The mean luma on the 8-bit scale.
+	pub luma: Option<f64>,
+	/// The segment's own noise level (`noise::level`).
+	pub noise: Option<f64>,
 	pub usable: bool,
+	/// Held for most of the segment: its frames repeat.
+	pub still: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -152,6 +161,7 @@ pub fn parse_segment(stderr: &[String], start_s: f64, length_s: f64) -> Option<S
 	};
 	let mut open_freeze: Option<f64> = None;
 	let mut spatial = false;
+	let mut temporal = false;
 
 	for line in stderr {
 		if let Some(rest) = line.split("Repeated Fields:").nth(1) {
@@ -164,6 +174,13 @@ pub fn parse_segment(stderr: &[String], start_s: f64, length_s: f64) -> Option<S
 			spatial = false;
 			if value.is_finite() {
 				stats.si = Some(value);
+			}
+		} else if line.contains("Temporal Information:") {
+			temporal = true;
+		} else if temporal && let Some(value) = field(line, "Average:") {
+			temporal = false;
+			if value.is_finite() {
+				stats.ti = Some(value);
 			}
 		} else if let Some(value) = field(line, "black_duration:") {
 			stats.black_s += value;
@@ -199,6 +216,11 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 		sum(|segment| segment.progressive),
 	);
 
+	let combed = voting.iter().fold(Combing::default(), |mut total, segment| {
+		total.add(segment.combing);
+		total
+	});
+
 	let flagged_interlaced = field_order.is_some_and(|order| INTERLACED_FIELD_ORDERS.contains(&order));
 	let scan = match fps {
 		_ if frames < 1.0 => ScanType::Progressive,
@@ -224,6 +246,21 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 			&& tff + bff > progressive =>
 		{
 			let top_share = tff / (tff + bff);
+			if top_share >= FIELD_ORDER_SHARE {
+				ScanType::Interlaced { top_first: true }
+			} else if top_share <= 1.0 - FIELD_ORDER_SHARE {
+				ScanType::Interlaced { top_first: false }
+			} else {
+				ScanType::Progressive
+			}
+		}
+		// Faint interlacing that nothing flags: idet weighs whole frames, where a small moving area drowns in the still
+		// rest, while the comb measure counts only the moving blocks.
+		_ if combed.top_first + combed.bottom_first >= MIN_COMBED_BLOCKS
+			&& (combed.top_first + combed.bottom_first) as f64
+				>= COMBED_SHARE * (combed.top_first + combed.bottom_first + combed.progressive) as f64 =>
+		{
+			let top_share = combed.top_first as f64 / (combed.top_first + combed.bottom_first) as f64;
 			if top_share >= FIELD_ORDER_SHARE {
 				ScanType::Interlaced { top_first: true }
 			} else if top_share <= 1.0 - FIELD_ORDER_SHARE {
@@ -258,7 +295,11 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 			start_s: segment.start_s,
 			length_s: segment.length_s,
 			si: segment.si,
+			ti: segment.ti,
+			luma: segment.luma,
+			noise: noise::level(&segment.noise),
 			usable: !blank(segment) && segment.si.is_none_or(|si| si >= LOW_DETAIL_SI),
+			still: segment.frozen_s >= REJECT_SHARE * segment.length_s,
 		})
 		.collect();
 	Analysis {
@@ -514,7 +555,115 @@ mod tests {
 		assert!((parsed.black_s - 1.2).abs() < 1e-9);
 		assert!((parsed.frozen_s - 1.7).abs() < 1e-9);
 		assert_eq!(parsed.si, Some(102.528_107));
+		assert_eq!(parsed.ti, Some(13.375_446));
 		assert!(parsed.noise.is_empty());
+	}
+
+	#[test]
+	fn temporal_information_is_read_after_the_spatial_summary() {
+		let log: Vec<String> = [
+			"[Parsed_idet_0 @ 0x1] Repeated Fields: Neither:    75 Top:     0 Bottom:     0",
+			"[Parsed_siti_9 @ 0x2] SITI Summary:",
+			"[Parsed_siti_9 @ 0x2] Spatial Information:",
+			"[Parsed_siti_9 @ 0x2] Average: 38.9",
+			"[Parsed_siti_9 @ 0x2] Temporal Information:",
+			"[Parsed_siti_9 @ 0x2] Average: 12.4",
+		]
+		.map(str::to_owned)
+		.to_vec();
+
+		let stats = parse_segment(&log, 0.0, 3.0).unwrap();
+
+		assert_eq!(stats.si, Some(38.9));
+		assert_eq!(stats.ti, Some(12.4));
+	}
+
+	fn combed(top_first: u64, bottom_first: u64, progressive: u64) -> SegmentStats {
+		SegmentStats {
+			combing: Combing {
+				top_first,
+				bottom_first,
+				progressive,
+			},
+			..stats([75, 0, 0], [0, 0])
+		}
+	}
+
+	#[test]
+	fn moving_blocks_that_comb_make_an_unflagged_source_interlaced() {
+		let top = [combed(91, 0, 4), combed(0, 0, 0)];
+		let bottom = [combed(1, 86, 7), combed(2, 30, 0)];
+
+		for order in [None, Some("progressive"), Some("unknown")] {
+			assert_eq!(
+				classify(&top, Some(25.0), order).scan,
+				ScanType::Interlaced { top_first: true },
+				"{order:?}"
+			);
+			assert_eq!(
+				classify(&bottom, Some(25.0), order).scan,
+				ScanType::Interlaced { top_first: false },
+				"{order:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn few_mixed_or_split_combed_blocks_and_high_frame_rates_stay_progressive() {
+		let telecine_like = [combed(75, 0, 96)];
+		let progressive_pans = [combed(2, 15, 219), combed(9, 0, 341), combed(8, 2, 110)];
+		let few = [combed(30, 0, 0)];
+		let split = [combed(60, 50, 2)];
+		let fast = [combed(37, 13, 6), combed(300, 0, 5)];
+		let mut black = combed(300, 0, 0);
+		black.black_s = 2.9;
+
+		for stats in [
+			&telecine_like[..],
+			&progressive_pans,
+			&few,
+			&split,
+			&[black, combed(0, 0, 40)],
+		] {
+			assert_eq!(
+				classify(stats, Some(25.0), None).scan,
+				ScanType::Progressive,
+				"{stats:?}"
+			);
+		}
+		assert_eq!(classify(&fast, Some(50.0), None).scan, ScanType::Progressive);
+		assert_eq!(
+			classify(&fast, Some(120.0), Some("progressive")).scan,
+			ScanType::Progressive
+		);
+	}
+
+	#[test]
+	fn each_segment_keeps_its_motion_brightness_noise_and_stillness() {
+		let dark = SegmentStats {
+			ti: Some(21.0),
+			luma: Some(18.5),
+			noise: vec![
+				Triplet {
+					bands: [Some(0.6), Some(1.4), None, None],
+				};
+				3
+			],
+			black_s: 2.9,
+			..stats([90, 0, 0], [0, 0])
+		};
+		let held = SegmentStats {
+			frozen_s: 3.0,
+			..stats([90, 0, 0], [0, 0])
+		};
+
+		let analysis = classify(&[dark, held], Some(25.0), None);
+
+		let [dark, held] = [analysis.detail[0], analysis.detail[1]];
+		assert_eq!((dark.ti, dark.luma, dark.noise), (Some(21.0), Some(18.5), Some(1.4)));
+		assert!(!dark.usable && !dark.still, "{dark:?}");
+		assert_eq!((held.ti, held.luma, held.noise), (None, None, None));
+		assert!(!held.usable && held.still, "{held:?}");
 	}
 
 	#[test]

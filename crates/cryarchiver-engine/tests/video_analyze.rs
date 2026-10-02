@@ -77,6 +77,21 @@ async fn faintly_interlaced_still_home_video_is_detected_with_its_field_order() 
 }
 
 #[tokio::test]
+async fn faintly_interlaced_video_without_a_field_flag_is_detected_from_its_combing() {
+	let dir = tempfile::tempdir().unwrap();
+
+	for (scan, top_first) in [("tff", true), ("bff", false)] {
+		let clip = support::unflagged_home_video(dir.path(), &format!("{scan}.mkv"), scan);
+
+		assert_eq!(
+			scan_and_noise(&clip).await.0,
+			ScanType::Interlaced { top_first },
+			"{scan}"
+		);
+	}
+}
+
+#[tokio::test]
 async fn progressive_video_in_an_interlaced_container_stays_progressive() {
 	let dir = tempfile::tempdir().unwrap();
 

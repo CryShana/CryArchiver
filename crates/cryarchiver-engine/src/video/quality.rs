@@ -1,13 +1,14 @@
 use std::fs;
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError, KeepReason};
 use crate::preset::{Overrides, Speed};
-use crate::quality::memory::GroupStats;
+use crate::quality::memory::{GroupStats, Offset};
 use crate::quality::search::{self as crf_search, Bounds, Choice, Next, Probe, Target};
 use crate::quality::vmaf::{self, FrameWindow, Reference, Score, Scoring};
 use crate::toolchain::Toolchain;
@@ -17,6 +18,23 @@ use crate::video::plan::{Encoder, VideoPlan};
 use crate::workspace::Workspace;
 
 pub const MAX_RETRIES: u32 = 1;
+pub const MAX_SEARCH_RAISE: f64 = 3.0;
+pub const MAX_SEARCH_LOWER: f64 = 1.0;
+
+const MAX_SEARCH_MEAN: f64 = 99.0;
+const MOTION_SHARE: usize = 3;
+/// Short windows are sampled over a quarter of their length, up to this much of it.
+const SHORT_SPAN_S: f64 = 120.0;
+const SHORT_COVERAGE: f64 = 0.25;
+/// Below this spatial detail a segment is a flat picture (black, a title card) that any CRF encodes perfectly.
+const FLAT_SI: f64 = 2.0;
+const MAX_ANALYSIS_SEGMENTS: usize = 48;
+/// The safety margin starts once the full encode is expected to take this long, and reaches `FULL_MARGIN` at
+/// `FULL_MARGIN_S`, growing with each doubling between.
+const MARGIN_FROM_S: f64 = 15.0 * 60.0;
+const FULL_MARGIN_S: f64 = 4.0 * 3600.0;
+const FULL_MARGIN: Target = Target { mean: 1.0, floor: 1.5 };
+const NO_MARGIN: Target = Target { mean: 0.0, floor: 0.0 };
 
 const TARGETS: [Target; 3] = [
 	Target {
@@ -34,6 +52,16 @@ const TARGETS: [Target; 3] = [
 ];
 const GRAIN_ALLOWANCE: Target = Target { mean: 2.0, floor: 2.5 };
 const SLOW_ANALYSIS_SEGMENTS: usize = 8;
+const MODERATE_SAMPLING: Sampling = Sampling {
+	base: 3,
+	per_sample_s: 600.0,
+	most: 12,
+};
+const SLOW_SAMPLING: Sampling = Sampling {
+	base: 6,
+	per_sample_s: 300.0,
+	most: 24,
+};
 const SEARCH_SEGMENT_S: f64 = 4.0;
 const VERIFY_WINDOW_S: f64 = 5.0;
 const EDGE_SKIP: f64 = 0.05;
@@ -69,6 +97,32 @@ pub struct Found {
 pub enum Searched {
 	Found(Found),
 	Unreachable { crf: f64, score: Score },
+}
+
+/// What a search aims at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Aim {
+	/// The target the full check holds the encode to.
+	pub nominal: Target,
+	/// What the samples must reach before the margin: the nominal target moved by the group's learned offset.
+	pub search: Target,
+	/// The source seconds the full encode covers. The margin grows with the time encoding them will take.
+	pub length_s: Option<f64>,
+}
+
+/// A probe's measurement over all the samples.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Probed {
+	pub score: Score,
+	pub bytes: u64,
+	/// The time the sample encodes took.
+	pub encode_s: f64,
+}
+
+struct Sampling {
+	base: usize,
+	per_sample_s: f64,
+	most: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,11 +161,101 @@ pub fn target(speed: Speed, film_grain: bool, overrides: &Overrides) -> Target {
 	}
 }
 
-pub fn analysis_segments(speed: Speed) -> usize {
+/// The target the samples must reach so that the full check, which lands `offset` from them, reaches `target`. It
+/// moves at most `MAX_SEARCH_RAISE` up and `MAX_SEARCH_LOWER` down.
+pub fn search_target(target: Target, offset: Option<Offset>) -> Target {
+	let Some(offset) = offset else {
+		return target;
+	};
+
+	let shift = |gap: f64| (-gap).clamp(-MAX_SEARCH_LOWER, MAX_SEARCH_RAISE);
+	let mean = (target.mean + shift(offset.mean)).min(MAX_SEARCH_MEAN);
+	Target {
+		mean,
+		floor: (target.floor + shift(offset.p5)).min(mean),
+	}
+}
+
+/// The margin for a full encode expected to take `expected_s`.
+pub fn encode_margin(expected_s: f64) -> Target {
+	if expected_s.is_nan() || expected_s <= MARGIN_FROM_S {
+		return NO_MARGIN;
+	}
+
+	let share = ((expected_s / MARGIN_FROM_S).log2() / (FULL_MARGIN_S / MARGIN_FROM_S).log2()).min(1.0);
+	Target {
+		mean: FULL_MARGIN.mean * share,
+		floor: FULL_MARGIN.floor * share,
+	}
+}
+
+impl Aim {
+	pub fn exact(target: Target) -> Self {
+		Self {
+			nominal: target,
+			search: target,
+			length_s: None,
+		}
+	}
+
+	/// The search target with the margin for the full encode, once encoding `sampled_s` seconds of samples took
+	/// `encode_s`. It stays within `MAX_SEARCH_RAISE` of the nominal target.
+	pub fn target(self, encode_s: f64, sampled_s: f64) -> Target {
+		let Some(length_s) = self.length_s.filter(|_| sampled_s > 0.0) else {
+			return self.search;
+		};
+
+		let margin = encode_margin(encode_s / sampled_s * length_s);
+		let mean = (self.search.mean + margin.mean)
+			.min(self.nominal.mean + MAX_SEARCH_RAISE)
+			.min(MAX_SEARCH_MEAN)
+			.max(self.search.mean);
+		let floor = (self.search.floor + margin.floor)
+			.min(self.nominal.floor + MAX_SEARCH_RAISE)
+			.min(mean)
+			.max(self.search.floor);
+		Target { mean, floor }
+	}
+}
+
+fn sampling(speed: Speed) -> Option<Sampling> {
 	match speed {
+		Speed::Slow => Some(SLOW_SAMPLING),
+		Speed::Moderate => Some(MODERATE_SAMPLING),
+		Speed::Fast => None,
+	}
+}
+
+/// How many search samples a span gets: a quarter of a short window, then one more for each stretch of a long one.
+#[allow(
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	clippy::cast_precision_loss
+)]
+pub fn sample_count(speed: Speed, length_s: f64) -> usize {
+	let Some(sampling) = sampling(speed) else {
+		return 0;
+	};
+
+	let covered_s = SHORT_COVERAGE * length_s.clamp(0.0, SHORT_SPAN_S)
+		+ length_s.max(0.0) / sampling.per_sample_s * SEARCH_SEGMENT_S;
+	let wanted = (covered_s / SEARCH_SEGMENT_S).ceil();
+	if wanted.is_nan() {
+		return sampling.base;
+	}
+
+	(wanted.min(sampling.most as f64) as usize).clamp(sampling.base, sampling.most)
+}
+
+/// Twice as many segments as samples, so that the hardest parts of a long span can be found.
+pub fn analysis_segments(speed: Speed, length_s: Option<f64>) -> usize {
+	let base = match speed {
 		Speed::Slow => SLOW_ANALYSIS_SEGMENTS,
 		Speed::Moderate | Speed::Fast => DEFAULT_SEGMENTS,
-	}
+	};
+
+	let samples = length_s.map_or(0, |length_s| sample_count(speed, length_s));
+	base.max(2 * samples).min(MAX_ANALYSIS_SEGMENTS)
 }
 
 pub fn bounds(encoder: &Encoder) -> Bounds {
@@ -143,13 +287,13 @@ pub fn strategy(speed: Speed, stats: Option<&GroupStats>, table_crf: f64, vmaf: 
 	}
 }
 
+/// The segments to probe: the hardest ones first (the most detailed, the busiest, the darkest and the noisiest), then
+/// the most detailed usable ones, then the rest by detail. Held frames and flat pictures are probed only when there is
+/// nothing else.
+#[allow(clippy::cast_precision_loss)]
 pub fn search_samples(analysis: &Analysis, span: Option<TrimWindow>, speed: Speed) -> Vec<Sample> {
-	let count: u8 = match speed {
-		Speed::Slow => 6,
-		Speed::Moderate => 3,
-		Speed::Fast => 0,
-	};
-	let Some(span) = span.filter(|span| span.length_s > 0.0 && count > 0) else {
+	let wanted = span.map_or(0, |span| sample_count(speed, span.length_s));
+	let Some(span) = span.filter(|span| span.length_s > 0.0 && wanted > 0) else {
 		return Vec::new();
 	};
 
@@ -157,22 +301,14 @@ pub fn search_samples(analysis: &Analysis, span: Option<TrimWindow>, speed: Spee
 		start_s: span.start_s,
 		length_s: span.length_s,
 	}];
-	if SEARCH_SEGMENT_S * f64::from(count) >= span.length_s {
+	if SEARCH_SEGMENT_S * wanted as f64 >= span.length_s {
 		return whole;
 	}
 
 	let end_s = span.start_s + span.length_s;
-	let any_usable = analysis.detail.iter().any(|detail| detail.usable);
-	let mut ranked: Vec<&Detail> = analysis
-		.detail
-		.iter()
-		.filter(|detail| detail.usable || !any_usable)
-		.collect();
-	ranked.sort_by(|a, b| b.si.unwrap_or(0.0).total_cmp(&a.si.unwrap_or(0.0)));
-
-	let mut samples: Vec<Sample> = ranked
+	let chosen = hardest_first(&analysis.detail, wanted);
+	let mut samples: Vec<Sample> = chosen
 		.into_iter()
-		.take(usize::from(count))
 		.map(|detail| Sample {
 			start_s: detail.start_s,
 			length_s: SEARCH_SEGMENT_S.min(end_s - detail.start_s),
@@ -184,6 +320,69 @@ pub fn search_samples(analysis: &Analysis, span: Option<TrimWindow>, speed: Spee
 		.windows(2)
 		.any(|pair| pair[0].start_s + pair[0].length_s > pair[1].start_s);
 	if overlapping { whole } else { samples }
+}
+
+/// At least `wanted` segments, more when the hardest ones alone are more.
+fn hardest_first(details: &[Detail], wanted: usize) -> Vec<&Detail> {
+	let by_detail = |list: &mut Vec<&Detail>| list.sort_by(|a, b| b.si.unwrap_or(0.0).total_cmp(&a.si.unwrap_or(0.0)));
+	let moving_picture = |detail: &Detail| !detail.still && detail.si.is_none_or(|si| si >= FLAT_SI);
+
+	let mut ranked: Vec<&Detail> = details.iter().filter(|detail| detail.usable).collect();
+	by_detail(&mut ranked);
+	let mut low_detail: Vec<&Detail> = details
+		.iter()
+		.filter(|detail| !detail.usable && moving_picture(detail))
+		.collect();
+	by_detail(&mut low_detail);
+	ranked.extend(low_detail);
+	if ranked.is_empty() {
+		ranked = details.iter().collect();
+		by_detail(&mut ranked);
+	}
+
+	let candidates: Vec<&Detail> = details.iter().filter(|detail| moving_picture(detail)).collect();
+	let mut busiest: Vec<&Detail> = candidates
+		.iter()
+		.copied()
+		.filter(|detail| detail.ti.is_some())
+		.collect();
+	busiest.sort_by(|a, b| b.ti.unwrap_or(0.0).total_cmp(&a.ti.unwrap_or(0.0)));
+	let darkest = candidates
+		.iter()
+		.copied()
+		.filter(|detail| detail.luma.is_some())
+		.min_by(|a, b| a.luma.unwrap_or(0.0).total_cmp(&b.luma.unwrap_or(0.0)));
+	let noisiest = candidates
+		.iter()
+		.copied()
+		.filter(|detail| detail.noise.is_some())
+		.max_by(|a, b| a.noise.unwrap_or(0.0).total_cmp(&b.noise.unwrap_or(0.0)));
+
+	let mut chosen: Vec<&Detail> = Vec::new();
+	let hardest = ranked
+		.first()
+		.copied()
+		.into_iter()
+		.chain(busiest.into_iter().take(wanted.div_ceil(MOTION_SHARE)))
+		.chain(darkest)
+		.chain(noisiest);
+	for detail in hardest {
+		add_once(&mut chosen, detail);
+	}
+
+	for detail in ranked {
+		if chosen.len() >= wanted {
+			break;
+		}
+		add_once(&mut chosen, detail);
+	}
+	chosen
+}
+
+fn add_once<'a>(chosen: &mut Vec<&'a Detail>, detail: &'a Detail) {
+	if !chosen.iter().any(|picked| std::ptr::eq(*picked, detail)) {
+		chosen.push(detail);
+	}
 }
 
 #[allow(
@@ -287,17 +486,20 @@ pub fn dropped_grain_text(level: u8, grain: Searched, plain: Searched, grain_tar
 }
 
 impl Scorer<'_> {
-	pub async fn probe(&self, crf: f64, samples: &[Sample], round: usize) -> Result<(Score, u64), JobError> {
+	pub async fn probe(&self, crf: f64, samples: &[Sample], round: usize) -> Result<Probed, JobError> {
 		let plan = VideoPlan {
 			encoder: self.plan.encoder.with_crf(crf),
 			..self.plan.clone()
 		};
 		let mut scores = Vec::new();
 		let mut bytes = 0;
+		let mut encode_s = 0.0;
 
 		for (index, sample) in samples.iter().enumerate() {
 			let output = self.workspace.file(&format!("probe{round}-{index}.mkv"));
+			let started = Instant::now();
 			bytes += encode_sample(&self.tools.ffmpeg, self.source, &output, &plan, sample, self.cancel).await?;
+			encode_s += started.elapsed().as_secs_f64();
 
 			let log = format!("vmaf-probe{round}-{index}.json");
 			let scoring = self.scoring(&log);
@@ -313,7 +515,11 @@ impl Scorer<'_> {
 			let _ = fs::remove_file(&output);
 		}
 
-		Ok((pooled(&scores)?, bytes))
+		Ok(Probed {
+			score: pooled(&scores)?,
+			bytes,
+			encode_s,
+		})
 	}
 
 	#[allow(clippy::cast_precision_loss)]
@@ -370,32 +576,43 @@ pub async fn search(
 	scorer: &Scorer<'_>,
 	samples: &[Sample],
 	start: f64,
-	target: Target,
+	aim: Aim,
 	prior_slope: f64,
 	on_round: impl FnMut(usize),
 ) -> Result<Searched, JobError> {
-	search_below(scorer, samples, start, target, prior_slope, None, on_round).await
+	search_below(scorer, samples, start, aim, prior_slope, None, on_round).await
 }
 
 /// `search`, given up as unreachable once a probe misses the target at `bytes` or more: every CRF that would pass is
-/// lower and larger still, so nothing smaller than `bytes` can be found.
+/// lower and larger still, so nothing smaller than `bytes` can be found. The target takes its margin from how long the
+/// first probe's encodes took.
 pub async fn search_below(
 	scorer: &Scorer<'_>,
 	samples: &[Sample],
 	start: f64,
-	target: Target,
+	aim: Aim,
 	prior_slope: f64,
 	bytes: Option<u64>,
 	mut on_round: impl FnMut(usize),
 ) -> Result<Searched, JobError> {
 	let bounds = bounds(&scorer.plan.encoder);
+	let sampled_s: f64 = samples.iter().map(|sample| sample.length_s).sum();
+	let mut target = aim.search;
 	let mut probes: Vec<Probe> = Vec::new();
 	let mut sample_bytes: Vec<u64> = Vec::new();
 	let mut crf = bounds.quantize(start);
 
 	loop {
 		on_round(probes.len());
-		let (score, size) = scorer.probe(crf, samples, probes.len()).await?;
+		let Probed {
+			score,
+			bytes: size,
+			encode_s,
+		} = scorer.probe(crf, samples, probes.len()).await?;
+		if probes.is_empty() {
+			target = aim.target(encode_s, sampled_s);
+		}
+
 		probes.push(Probe { crf, score });
 		sample_bytes.push(size);
 		if !target.met(score) && bytes.is_some_and(|bytes| size >= bytes) {
@@ -439,7 +656,11 @@ mod tests {
 			start_s,
 			length_s: 3.0,
 			si: Some(si),
+			ti: None,
+			luma: None,
+			noise: None,
 			usable,
+			still: false,
 		}
 	}
 
@@ -559,6 +780,7 @@ mod tests {
 			scan: ScanType::Progressive,
 			grain: None,
 			noisy: false,
+			unmeasured: false,
 			alpha: false,
 		};
 		let key = |overrides: &Overrides| {
@@ -636,15 +858,26 @@ mod tests {
 				detail(95.0, 200.0, false),
 			],
 		};
-		let four = |start_s: f64| Sample { start_s, length_s: 4.0 };
-
 		assert_eq!(
 			search_samples(&analysis, whole(100.0), Speed::Moderate),
-			vec![four(5.0), four(35.0), four(65.0)]
+			vec![four(5.0), four(35.0), four(65.0), four(95.0)]
 		);
 		assert_eq!(
 			search_samples(&analysis, whole(100.0), Speed::Slow),
-			vec![four(5.0), four(35.0), four(65.0)]
+			vec![four(5.0), four(35.0), four(65.0), four(95.0)]
+		);
+		assert_eq!(
+			search_samples(
+				&analysis_of(vec![
+					detail(2.0, 40.0, true),
+					detail(12.0, 200.0, false),
+					detail(22.0, 60.0, true),
+					detail(32.0, 50.0, true),
+				]),
+				whole(40.0),
+				Speed::Moderate
+			),
+			vec![four(2.0), four(22.0), four(32.0)]
 		);
 		assert!(search_samples(&analysis, whole(100.0), Speed::Fast).is_empty());
 		assert!(search_samples(&analysis, None, Speed::Moderate).is_empty());
@@ -733,41 +966,239 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn low_detail_segments_are_sampled_only_when_no_segment_is_usable() {
-		let analysis = |detail: Vec<Detail>| Analysis {
+	fn analysis_of(detail: Vec<Detail>) -> Analysis {
+		Analysis {
 			scan: ScanType::Progressive,
 			noise: NoiseClass::Clean,
 			noise_sigma: None,
 			detail,
-		};
-		let four = |start_s: f64| Sample { start_s, length_s: 4.0 };
-		let one_usable = analysis(vec![
+		}
+	}
+
+	fn four(start_s: f64) -> Sample {
+		Sample { start_s, length_s: 4.0 }
+	}
+
+	#[test]
+	fn low_detail_segments_fill_the_samples_up_and_flat_ones_only_when_nothing_else_is_left() {
+		let one_usable = analysis_of(vec![
 			detail(5.0, 0.0, false),
 			detail(35.0, 60.0, true),
 			detail(65.0, 12.0, false),
 			detail(95.0, 14.0, false),
 		]);
-		let none_usable = analysis(vec![
+		let none_usable = analysis_of(vec![
 			detail(5.0, 0.0, false),
 			detail(35.0, 9.0, false),
 			detail(65.0, 12.0, false),
 			detail(95.0, 14.0, false),
 		]);
+		let flat = analysis_of(vec![detail(5.0, 0.0, false), detail(35.0, 1.0, false)]);
+		let held = analysis_of(vec![
+			detail(5.0, 70.0, true),
+			Detail {
+				still: true,
+				..detail(35.0, 50.0, false)
+			},
+			detail(65.0, 40.0, true),
+		]);
+
+		for speed in [Speed::Moderate, Speed::Slow] {
+			assert_eq!(
+				search_samples(&one_usable, whole(100.0), speed),
+				vec![four(35.0), four(65.0), four(95.0)]
+			);
+			assert_eq!(
+				search_samples(&none_usable, whole(100.0), speed),
+				vec![four(35.0), four(65.0), four(95.0)]
+			);
+			assert_eq!(search_samples(&flat, whole(100.0), speed), vec![four(5.0), four(35.0)]);
+			assert_eq!(search_samples(&held, whole(100.0), speed), vec![four(5.0), four(65.0)]);
+		}
+	}
+
+	#[test]
+	fn the_busiest_segment_gets_one_of_the_search_samples() {
+		let moving = |start_s, si, ti| Detail {
+			ti: Some(ti),
+			..detail(start_s, si, true)
+		};
+		let analysis = analysis_of(vec![
+			moving(2.0, 90.0, 5.0),
+			moving(12.0, 80.0, 2.0),
+			moving(22.0, 20.0, 40.0),
+			moving(32.0, 70.0, 1.0),
+		]);
+
+		let starts: Vec<f64> = search_samples(&analysis, whole(40.0), Speed::Moderate)
+			.iter()
+			.map(|sample| sample.start_s)
+			.collect();
+
+		assert_eq!(starts, [2.0, 12.0, 22.0]);
+	}
+
+	#[test]
+	fn the_darkest_and_the_noisiest_segments_are_always_sampled() {
+		let analysis = analysis_of(vec![
+			detail(2.0, 90.0, true),
+			Detail {
+				luma: Some(14.0),
+				..detail(12.0, 6.0, false)
+			},
+			detail(22.0, 80.0, true),
+			Detail {
+				noise: Some(2.4),
+				..detail(32.0, 30.0, true)
+			},
+			Detail {
+				luma: Some(90.0),
+				noise: Some(0.4),
+				..detail(42.0, 70.0, true)
+			},
+			Detail {
+				luma: Some(3.0),
+				..detail(52.0, 1.0, false)
+			},
+		]);
+
+		let starts: Vec<f64> = search_samples(&analysis, whole(60.0), Speed::Moderate)
+			.iter()
+			.map(|sample| sample.start_s)
+			.collect();
 
 		assert_eq!(
-			search_samples(&one_usable, whole(100.0), Speed::Moderate),
-			vec![four(35.0)]
+			starts,
+			[2.0, 12.0, 22.0, 32.0],
+			"the flat black one at 52 s is left out"
 		);
-		assert_eq!(search_samples(&one_usable, whole(100.0), Speed::Slow), vec![four(35.0)]);
+	}
+
+	#[test]
+	fn a_short_window_whose_other_segments_are_dark_still_gets_several_samples() {
+		let analysis = analysis_of(
+			(0..8_u32)
+				.map(|index| {
+					let start_s = 2.0 + 7.0 * f64::from(index);
+					if index == 3 {
+						detail(start_s, 40.0, true)
+					} else {
+						Detail {
+							luma: Some(10.0 + f64::from(index)),
+							..detail(start_s, 5.0 + f64::from(index), false)
+						}
+					}
+				})
+				.collect(),
+		);
+
+		let samples = search_samples(&analysis, whole(60.0), Speed::Moderate);
+
+		assert_eq!(samples.len(), 4, "{samples:?}");
+		assert!(
+			samples.contains(&four(23.0)) && samples.contains(&four(2.0)),
+			"{samples:?}"
+		);
+	}
+
+	#[test]
+	fn samples_cover_a_quarter_of_a_short_window_and_grow_with_the_length() {
+		let counts =
+			|speed: Speed| [60.0, 100.0, 120.0, 600.0, 3600.0, 7200.0].map(|length| sample_count(speed, length));
+
+		assert_eq!(counts(Speed::Moderate), [4, 7, 8, 9, 12, 12]);
+		assert_eq!(counts(Speed::Slow), [6, 7, 8, 10, 20, 24]);
+		assert_eq!(counts(Speed::Fast), [0; 6]);
+		assert_eq!(sample_count(Speed::Moderate, 20.0), 3);
+		assert_eq!(analysis_segments(Speed::Moderate, None), 4);
+		assert_eq!(analysis_segments(Speed::Slow, None), 8);
+		assert_eq!(analysis_segments(Speed::Moderate, Some(20.0)), 6);
+		assert_eq!(analysis_segments(Speed::Moderate, Some(3600.0)), 24);
+		assert_eq!(analysis_segments(Speed::Slow, Some(7200.0)), 48);
+		assert_eq!(analysis_segments(Speed::Fast, Some(7200.0)), 4);
+	}
+
+	#[test]
+	fn the_search_aims_above_the_target_by_the_learned_shortfall_within_limits() {
+		let target = Target {
+			mean: 93.0,
+			floor: 89.0,
+		};
+		let aimed = |mean, p5| search_target(target, Some(Offset { mean, p5 }));
+		let near = |a: Target, b: Target| (a.mean - b.mean).abs() < 1e-9 && (a.floor - b.floor).abs() < 1e-9;
+
+		assert_eq!(search_target(target, None), target);
+		assert!(near(
+			aimed(-0.4, -2.7),
+			Target {
+				mean: 93.4,
+				floor: 91.7
+			}
+		));
+		assert!(near(
+			aimed(-9.0, -9.0),
+			Target {
+				mean: 96.0,
+				floor: 92.0
+			}
+		));
+		assert!(near(
+			aimed(2.0, 0.5),
+			Target {
+				mean: 92.0,
+				floor: 88.5
+			}
+		));
 		assert_eq!(
-			search_samples(&none_usable, whole(100.0), Speed::Moderate),
-			vec![four(35.0), four(65.0), four(95.0)]
+			search_target(
+				Target {
+					mean: 98.0,
+					floor: 97.0
+				},
+				Some(Offset { mean: -3.0, p5: -3.0 })
+			),
+			Target {
+				mean: 99.0,
+				floor: 99.0
+			}
 		);
-		assert_eq!(
-			search_samples(&none_usable, whole(100.0), Speed::Slow),
-			vec![four(5.0), four(35.0), four(65.0), four(95.0)]
-		);
+	}
+
+	#[test]
+	fn the_margin_grows_with_the_time_the_full_encode_will_take() {
+		let nominal = Target {
+			mean: 93.0,
+			floor: 89.0,
+		};
+		let aim = |search: Target, length_s: f64| Aim {
+			nominal,
+			search,
+			length_s: Some(length_s),
+		};
+		let near = |a: Target, mean: f64, floor: f64| (a.mean - mean).abs() < 1e-9 && (a.floor - floor).abs() < 1e-9;
+		let at_realtime = |aim: Aim| aim.target(8.0, 8.0);
+
+		assert_eq!(at_realtime(aim(nominal, 600.0)), nominal);
+		assert_eq!(aim(nominal, 1800.0).target(1.0, 2.0), nominal);
+		assert!(near(at_realtime(aim(nominal, 1800.0)), 93.25, 89.375));
+		assert!(near(at_realtime(aim(nominal, 3600.0)), 93.5, 89.75));
+		assert!(near(aim(nominal, 3600.0).target(8.0, 2.0), 94.0, 90.5));
+		assert!(near(aim(nominal, 3600.0).target(80.0, 2.0), 94.0, 90.5));
+		assert!(near(
+			aim(
+				Target {
+					mean: 95.5,
+					floor: 91.5
+				},
+				14_400.0
+			)
+			.target(1.0, 1.0),
+			96.0,
+			92.0
+		));
+		assert_eq!(Aim::exact(nominal).target(1000.0, 1.0), nominal);
+		assert_eq!(aim(nominal, 3600.0).target(f64::NAN, 2.0), nominal);
+		assert_eq!(aim(nominal, 3600.0).target(8.0, 0.0), nominal);
 	}
 
 	#[test]

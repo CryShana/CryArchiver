@@ -1756,6 +1756,29 @@ async fn moderate_video_is_searched_checked_and_learned() {
 }
 
 #[tokio::test]
+async fn a_checked_search_learns_how_far_the_full_check_was_from_the_samples() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::video(
+		dir.path(),
+		"clip.mkv",
+		16,
+		&[
+			"-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-q:v", "2", "-c:a", "flac",
+		],
+	);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, events) = run_recording(&engine, &job(&clip), dir.path()).await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	assert!(stages(&events, Stage::Sample) > 0, "{events:?}");
+	let entries = memory.entries();
+	let offset = entries[0].1.offset.expect("the check measured an offset");
+	assert!(offset.mean.is_finite() && offset.p5.is_finite(), "{offset:?}");
+}
+
+#[tokio::test]
 async fn a_learned_group_skips_the_search_at_moderate() {
 	let dir = tempfile::tempdir().unwrap();
 	let first = support::mpeg4(dir.path(), "first.mp4", 3);

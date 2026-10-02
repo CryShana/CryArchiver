@@ -89,7 +89,7 @@ pub struct Combing {
 }
 
 impl Combing {
-	fn add(&mut self, other: Self) {
+	pub fn add(&mut self, other: Self) {
 		self.top_first += other.top_first;
 		self.bottom_first += other.bottom_first;
 		self.progressive += other.progressive;
