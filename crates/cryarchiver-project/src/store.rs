@@ -1,36 +1,64 @@
 //! The project file: one redb database (project layer spec §3). Write-ahead intents are durable before their action
 //! runs; every other change waits in a batch that commits every 1000 changes or 250 ms, whichever comes first.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cryarchiver_engine::quality::memory::GroupStats;
-use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+	Database, ReadOnlyDatabase, ReadOnlyTable, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::keys::RelPath;
-use crate::record::{FailureLog, FileRecord, FolderRecord, UnknownRecord};
+use crate::record::{
+	CopyReason, FailureLog, FileRecord, FileState, FolderRecord, Hash, How, Identity, IssueKind, MediaClass, Output,
+	UnknownRecord,
+};
 use crate::settings::Settings;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 pub const BATCH_CHANGES: usize = 1000;
 pub const BATCH_INTERVAL: Duration = Duration::from_millis(250);
+pub const LOG_TAIL_LINES: usize = 100;
+pub const LOG_LINE_CHARS: usize = 400;
+pub const ATTEMPT_LOGS_KEPT: u32 = 5;
+pub const LOG_BUDGET_BYTES: u64 = 32 << 20;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const FILES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("files");
 const FOLDERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("folders");
 const LOGS: TableDefinition<(&[u8], u32), &[u8]> = TableDefinition::new("logs");
 const UNKNOWN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("unknown");
+const FOLDER_IDS: TableDefinition<u32, &[u8]> = TableDefinition::new("folder_ids");
+const ROOT_FOLDER: u32 = 0;
 
 const FORMAT_KEY: &str = "format";
 const APP_VERSION_KEY: &str = "app_version";
 const CREATED_KEY: &str = "created";
 const SETTINGS_KEY: &str = "settings";
 const QUALITY_PREFIX: &str = "quality/";
+const DICTIONARY_KEY: &str = "dictionary";
+
+const RAW: u8 = 0;
+const LZ4: u8 = 1;
+const MAX_RECORD_BYTES: usize = 16 << 20;
+const DICTIONARY_LOG_LINES: &[&str] = &[
+	"Error while decoding stream #0:0: Invalid data found when processing input",
+	"[h264 @ 0x0] error while decoding MB 0 0, bytestream -1",
+	"[matroska,webm @ 0x0] ",
+	"Svt[info]: ",
+	"frame=    0 fps=0.0 q=0.0 size=       0KiB time=00:00:00.00 bitrate=N/A speed=   0x",
+	"Stream mapping:",
+	"Input #0, ",
+	"Output #0, matroska, to ",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -87,7 +115,8 @@ from_redb!(
 	redb::TransactionError,
 	redb::TableError,
 	redb::StorageError,
-	redb::CommitError
+	redb::CommitError,
+	redb::CompactionError
 );
 
 impl From<rmp_serde::encode::Error> for StoreError {
@@ -122,6 +151,26 @@ pub struct Loaded {
 	pub quality: Vec<(String, GroupStats)>,
 	/// One line for each learned-quality entry that was left out.
 	pub ignored_quality: Vec<String>,
+	/// The file wasn't closed cleanly, and opening it repaired it.
+	pub recovered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableSize {
+	pub entries: u64,
+	pub stored_bytes: u64,
+	pub metadata_bytes: u64,
+	pub fragmented_bytes: u64,
+}
+
+fn size_of(table: &impl ReadableTableMetadata) -> Result<TableSize, StoreError> {
+	let stats = table.stats()?;
+	Ok(TableSize {
+		entries: table.len()?,
+		stored_bytes: stats.stored_bytes(),
+		metadata_bytes: stats.metadata_bytes(),
+		fragmented_bytes: stats.fragmented_bytes(),
+	})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +180,7 @@ enum Table {
 	Folders,
 	Logs(u32),
 	Unknown,
+	FolderIds,
 }
 
 #[derive(Debug)]
@@ -140,10 +190,205 @@ struct Change {
 	value: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+struct Codec {
+	dictionary: Vec<u8>,
+}
+
+impl Codec {
+	fn built_in() -> Self {
+		Self {
+			dictionary: built_in_dictionary(),
+		}
+	}
+
+	fn pack(&self, bytes: &[u8]) -> Vec<u8> {
+		let packed = (bytes.len() <= MAX_RECORD_BYTES)
+			.then(|| lz4_flex::block::compress_prepend_size_with_dict(bytes, &self.dictionary));
+		let (tag, body) = match &packed {
+			Some(packed) if packed.len() < bytes.len() => (LZ4, packed.as_slice()),
+			_ => (RAW, bytes),
+		};
+
+		let mut stored = Vec::with_capacity(body.len() + 1);
+		stored.push(tag);
+		stored.extend_from_slice(body);
+		stored
+	}
+
+	fn unpack(&self, stored: &[u8]) -> Result<Vec<u8>, StoreError> {
+		match stored.split_first() {
+			Some((&RAW, bytes)) => Ok(bytes.to_vec()),
+			Some((&LZ4, packed)) => {
+				let (size, body) = packed
+					.split_first_chunk::<4>()
+					.ok_or_else(|| damaged("a compressed record is cut short"))?;
+				let size = usize::try_from(u32::from_le_bytes(*size)).unwrap_or(usize::MAX);
+				if size > MAX_RECORD_BYTES {
+					return Err(damaged("a compressed record claims more than 16 MiB"));
+				}
+
+				lz4_flex::block::decompress_with_dict(body, size, &self.dictionary)
+					.map_err(|err| StoreError::Damaged(err.to_string()))
+			}
+			_ => Err(damaged("a record has an unknown encoding")),
+		}
+	}
+}
+
+fn damaged(reason: &str) -> StoreError {
+	StoreError::Damaged(reason.to_owned())
+}
+
+/// Samples of every record kind in their serialized form: field names and common values compress to back-references.
+/// Each project file keeps its own copy in `meta`, so a later build can change these samples freely.
+fn built_in_dictionary() -> Vec<u8> {
+	let hash = Some(Hash([0; 32]));
+	let output = Output {
+		how: How::Encoded,
+		path: RelPath::from_bytes(b"Photos/2020/IMG_0001.cry.avif".to_vec()),
+		size: 1_000_000,
+		hash,
+	};
+	let files = [
+		FileRecord {
+			identity: Some(Identity { volume: 1, index: 1 }),
+			class: MediaClass::Media,
+			window_hash: hash,
+			full_hash: hash,
+			state: FileState::Done(output.clone()),
+			..FileRecord::discovered(1_000_000, 1_600_000_000_000_000_000)
+		},
+		FileRecord {
+			state: FileState::Committing {
+				attempt: 1,
+				output: output.clone(),
+			},
+			..FileRecord::default()
+		},
+		FileRecord {
+			state: FileState::Issue {
+				kind: IssueKind::Unrecoverable { damaged: true },
+				attempt: 1,
+				reason: "source damaged: ".into(),
+				output: None,
+			},
+			..FileRecord::default()
+		},
+		FileRecord {
+			state: FileState::OriginalDeleted(Output {
+				how: How::Copied(CopyReason::KeptOriginal),
+				..output
+			}),
+			..FileRecord::default()
+		},
+	];
+	let folder = FolderRecord {
+		scanned: true,
+		timestamps_applied: true,
+		mtime_ns: Some(0),
+		..FolderRecord::default()
+	};
+	let log = FailureLog {
+		error: "encode failed: ".into(),
+		log_tail: DICTIONARY_LOG_LINES.iter().map(|line| (*line).to_owned()).collect(),
+	};
+
+	let mut dictionary = Vec::new();
+	for file in &files {
+		dictionary.extend(rmp_serde::to_vec_named(file).unwrap_or_default());
+	}
+	dictionary.extend(rmp_serde::to_vec_named(&folder).unwrap_or_default());
+	dictionary.extend(rmp_serde::to_vec_named(&log).unwrap_or_default());
+	dictionary
+}
+
+#[derive(Debug, Default)]
+struct FolderIds {
+	ids: HashMap<RelPath, u32>,
+	paths: HashMap<u32, RelPath>,
+	next: u32,
+}
+
+impl FolderIds {
+	fn with_root() -> Self {
+		let mut folders = Self::default();
+		folders.insert(ROOT_FOLDER, RelPath::root());
+		folders
+	}
+
+	fn insert(&mut self, id: u32, path: RelPath) {
+		self.next = self.next.max(id.saturating_add(1));
+		self.ids.insert(path.clone(), id);
+		self.paths.insert(id, path);
+	}
+
+	fn get(&self, folder: &RelPath) -> Option<u32> {
+		self.ids.get(folder).copied()
+	}
+
+	/// The folder's id, and whether it was new.
+	fn assign(&mut self, folder: &RelPath) -> (u32, bool) {
+		if let Some(id) = self.get(folder) {
+			return (id, false);
+		}
+
+		let id = self.next;
+		self.insert(id, folder.clone());
+		(id, true)
+	}
+
+	fn key_for(&mut self, path: &RelPath) -> Vec<u8> {
+		let (id, _) = self.assign(&path.parent().unwrap_or_default());
+		file_key(id, path.name_bytes())
+	}
+
+	fn path_of(&self, key: &[u8]) -> Result<RelPath, StoreError> {
+		let (id, name) = key
+			.split_first_chunk::<4>()
+			.ok_or_else(|| damaged("a file key is cut short"))?;
+		let folder = self
+			.paths
+			.get(&u32::from_be_bytes(*id))
+			.ok_or_else(|| damaged("a file names a folder the project doesn't know"))?;
+		Ok(folder.join_bytes(name))
+	}
+}
+
+fn file_key(folder: u32, name: &[u8]) -> Vec<u8> {
+	let mut key = folder.to_be_bytes().to_vec();
+	key.extend_from_slice(name);
+	key
+}
+
+fn folder_id(key: &[u8]) -> Result<u32, StoreError> {
+	<[u8; 4]>::try_from(key)
+		.map(u32::from_be_bytes)
+		.map_err(|_| damaged("a folder id is malformed"))
+}
+
+fn read_layout(db: &impl ReadableDatabase) -> Result<(Codec, FolderIds), StoreError> {
+	let txn = db.begin_read()?;
+	let dictionary = txn
+		.open_table(META)?
+		.get(DICTIONARY_KEY)?
+		.map(|value| value.value().to_vec())
+		.ok_or_else(|| damaged("the dictionary entry is missing"))?;
+
+	let mut folders = FolderIds::default();
+	for entry in txn.open_table(FOLDER_IDS)?.iter()? {
+		let (id, path) = entry?;
+		folders.insert(id.value(), RelPath::from_bytes(path.value().to_vec()));
+	}
+	Ok((Codec { dictionary }, folders))
+}
+
 pub struct Store {
 	db: Database,
 	pending: Vec<Change>,
 	oldest_pending: Option<Instant>,
+	codec: Codec,
+	folders: FolderIds,
 }
 
 impl Store {
@@ -160,43 +405,51 @@ impl Store {
 		};
 		refuse_other_names(&file)?;
 		let db = Database::builder().create_file(file)?;
-		write_new(&db, settings)?;
+		let codec = Codec::built_in();
+		write_new(&db, settings, &codec)?;
 
 		Ok(Self {
 			db,
 			pending: Vec::new(),
 			oldest_pending: None,
+			codec,
+			folders: FolderIds::with_root(),
 		})
 	}
 
+	/// An older format is upgraded first, into a copy that replaces the file only once it is complete, synced and
+	/// read back; until then the file stays as it was.
 	pub fn open(path: &Path) -> Result<(Self, Meta, Loaded), StoreError> {
 		require_a_file(path)?;
 		refuse_other_names(&open_in_place(path)?)?;
 
-		let db = Database::open(path)?;
-		let meta = read_meta(&db)?;
-		if meta.format > FORMAT_VERSION {
-			return Err(StoreError::TooNew(meta.format));
+		let (db, recovered) = open_database(path)?;
+		let format = read_meta(&db)?.format;
+		if format > FORMAT_VERSION {
+			return Err(StoreError::TooNew(format));
 		}
 
-		let mut store = Self {
+		remove_stale_upgrade(path)?;
+		let db = if format < FORMAT_VERSION {
+			drop(db);
+			migrate(path)?;
+			open_database(path)?.0
+		} else {
+			db
+		};
+
+		let (codec, folders) = read_layout(&db)?;
+		let meta = read_meta(&db)?;
+		let store = Self {
 			db,
 			pending: Vec::new(),
 			oldest_pending: None,
+			codec,
+			folders,
 		};
-		store.upgrade(meta.format)?;
-		let loaded = store.load()?;
+		let mut loaded = store.load()?;
+		loaded.recovered = recovered;
 		Ok((store, meta, loaded))
-	}
-
-	// Each schema change adds a step from its predecessor; format 1 is the first.
-	fn upgrade(&mut self, from: u32) -> Result<(), StoreError> {
-		if from == FORMAT_VERSION {
-			return Ok(());
-		}
-
-		self.put(Table::Meta, FORMAT_KEY.as_bytes().to_vec(), &FORMAT_VERSION)?;
-		self.flush()
 	}
 
 	fn load(&self) -> Result<Loaded, StoreError> {
@@ -207,30 +460,28 @@ impl Store {
 			let (key, value) = entry?;
 			loaded
 				.files
-				.push((RelPath::from_bytes(key.value().to_vec()), decode(value.value())?));
+				.push((self.folders.path_of(key.value())?, self.decode_value(value.value())?));
 		}
 
 		for entry in txn.open_table(FOLDERS)?.iter()? {
 			let (key, value) = entry?;
-			loaded
-				.folders
-				.push((RelPath::from_bytes(key.value().to_vec()), decode(value.value())?));
+			loaded.folders.push((
+				RelPath::from_bytes(key.value().to_vec()),
+				self.decode_value(value.value())?,
+			));
 		}
 
 		for entry in txn.open_table(UNKNOWN)?.iter()? {
 			let (key, value) = entry?;
 			loaded
 				.unknown
-				.push((RelPath::from_bytes(key.value().to_vec()), decode(value.value())?));
+				.push((self.folders.path_of(key.value())?, self.decode_value(value.value())?));
 		}
 
 		for entry in txn.open_table(LOGS)?.iter()? {
 			let (key, _) = entry?;
 			let (path, attempt) = key.value();
-			let last = loaded
-				.last_attempts
-				.entry(RelPath::from_bytes(path.to_vec()))
-				.or_default();
+			let last = loaded.last_attempts.entry(self.folders.path_of(path)?).or_default();
 			*last = (*last).max(attempt);
 		}
 
@@ -260,11 +511,14 @@ impl Store {
 	}
 
 	pub fn set_file(&mut self, path: &RelPath, record: &FileRecord) -> Result<(), StoreError> {
-		self.put(Table::Files, path.as_bytes().to_vec(), record)
+		let key = self.file_key(path);
+		self.put(Table::Files, key, record)
 	}
 
 	pub fn remove_file(&mut self, path: &RelPath) {
-		self.remove(Table::Files, path.as_bytes().to_vec());
+		if let Some(key) = self.known_file_key(path) {
+			self.remove(Table::Files, key);
+		}
 	}
 
 	pub fn set_folder(&mut self, path: &RelPath, record: &FolderRecord) -> Result<(), StoreError> {
@@ -272,15 +526,76 @@ impl Store {
 	}
 
 	pub fn set_log(&mut self, path: &RelPath, attempt: u32, log: &FailureLog) -> Result<(), StoreError> {
-		self.put(Table::Logs(attempt), path.as_bytes().to_vec(), log)
+		let key = self.file_key(path);
+		if let Some(dropped) = attempt.checked_sub(ATTEMPT_LOGS_KEPT).filter(|dropped| *dropped > 0) {
+			self.remove(Table::Logs(dropped), key.clone());
+		}
+		self.put(Table::Logs(attempt), key, &trimmed(log))
 	}
 
 	pub fn set_unknown(&mut self, path: &RelPath, record: &UnknownRecord) -> Result<(), StoreError> {
-		self.put(Table::Unknown, path.as_bytes().to_vec(), record)
+		let key = self.file_key(path);
+		self.put(Table::Unknown, key, record)
 	}
 
 	pub fn remove_unknown(&mut self, path: &RelPath) {
-		self.remove(Table::Unknown, path.as_bytes().to_vec());
+		if let Some(key) = self.known_file_key(path) {
+			self.remove(Table::Unknown, key);
+		}
+	}
+
+	pub fn compact(&mut self) -> Result<bool, StoreError> {
+		self.flush()?;
+		Ok(self.db.compact()?)
+	}
+
+	/// Removes failure logs until the log table fits `budget`: first the logs of files that aren't failing any more,
+	/// then older attempts of failing files. The newest log of a failing file always stays.
+	pub fn prune_logs(&mut self, failing: &HashSet<RelPath>, budget: u64) -> Result<usize, StoreError> {
+		self.flush()?;
+
+		let mut logs: Vec<(Vec<u8>, u32, u64)> = Vec::new();
+		{
+			let txn = self.db.begin_read()?;
+			for entry in txn.open_table(LOGS)?.iter()? {
+				let (key, value) = entry?;
+				let (path, attempt) = key.value();
+				logs.push((
+					path.to_vec(),
+					attempt,
+					u64::try_from(value.value().len()).unwrap_or(u64::MAX),
+				));
+			}
+		}
+		let mut total: u64 = logs.iter().map(|(_, _, bytes)| bytes).sum();
+		if total <= budget {
+			return Ok(0);
+		}
+
+		let kept: HashSet<Vec<u8>> = failing.iter().filter_map(|path| self.known_file_key(path)).collect();
+		let mut newest: HashMap<&[u8], u32> = HashMap::new();
+		for (key, attempt, _) in &logs {
+			let last = newest.entry(key.as_slice()).or_default();
+			*last = (*last).max(*attempt);
+		}
+		let mut removable: Vec<&(Vec<u8>, u32, u64)> = logs
+			.iter()
+			.filter(|(key, attempt, _)| !kept.contains(key) || newest.get(key.as_slice()) != Some(attempt))
+			.collect();
+		removable.sort_by_key(|(key, attempt, _)| (kept.contains(key), *attempt));
+
+		let mut removed = 0;
+		for (key, attempt, bytes) in removable {
+			if total <= budget {
+				break;
+			}
+
+			self.remove(Table::Logs(*attempt), key.clone());
+			total = total.saturating_sub(*bytes);
+			removed += 1;
+		}
+		self.flush()?;
+		Ok(removed)
 	}
 
 	pub fn set_settings(&mut self, settings: &Settings) -> Result<(), StoreError> {
@@ -303,6 +618,18 @@ impl Store {
 
 	pub fn pending_changes(&self) -> usize {
 		self.pending.len()
+	}
+
+	pub fn table_sizes(&self) -> Result<Vec<(&'static str, TableSize)>, StoreError> {
+		let txn = self.db.begin_read()?;
+		Ok(vec![
+			("meta", size_of(&txn.open_table(META)?)?),
+			("files", size_of(&txn.open_table(FILES)?)?),
+			("folders", size_of(&txn.open_table(FOLDERS)?)?),
+			("logs", size_of(&txn.open_table(LOGS)?)?),
+			("unknown", size_of(&txn.open_table(UNKNOWN)?)?),
+			("folder_ids", size_of(&txn.open_table(FOLDER_IDS)?)?),
+		])
 	}
 
 	pub fn flush_if_due(&mut self, now: Instant) -> Result<bool, StoreError> {
@@ -328,6 +655,7 @@ impl Store {
 			let mut folders = txn.open_table(FOLDERS)?;
 			let mut logs = txn.open_table(LOGS)?;
 			let mut unknown = txn.open_table(UNKNOWN)?;
+			let mut folder_ids = txn.open_table(FOLDER_IDS)?;
 
 			for change in &self.pending {
 				let key = change.key.as_slice();
@@ -362,6 +690,12 @@ impl Store {
 					(Table::Unknown, None) => {
 						unknown.remove(key)?;
 					}
+					(Table::FolderIds, Some(value)) => {
+						folder_ids.insert(folder_id(key)?, value.as_slice())?;
+					}
+					(Table::FolderIds, None) => {
+						folder_ids.remove(folder_id(key)?)?;
+					}
 				}
 			}
 		}
@@ -373,30 +707,65 @@ impl Store {
 	}
 
 	pub fn read_log(&self, path: &RelPath, attempt: u32) -> Result<Option<FailureLog>, StoreError> {
+		let Some(key) = self.known_file_key(path) else {
+			return Ok(None);
+		};
+
 		let batched = self
 			.pending
 			.iter()
 			.rev()
-			.find(|change| change.table == Table::Logs(attempt) && change.key == path.as_bytes());
+			.find(|change| change.table == Table::Logs(attempt) && change.key == key);
 		if let Some(change) = batched {
-			return change.value.as_deref().map(decode).transpose();
+			return change
+				.value
+				.as_deref()
+				.map(|value| self.decode_value(value))
+				.transpose();
 		}
 
 		let txn = self.db.begin_read()?;
 		let logs = txn.open_table(LOGS)?;
-		logs.get((path.as_bytes(), attempt))?
-			.map(|value| decode(value.value()))
+		logs.get((key.as_slice(), attempt))?
+			.map(|value| self.decode_value(value.value()))
 			.transpose()
 	}
 
+	fn file_key(&mut self, path: &RelPath) -> Vec<u8> {
+		let folder = path.parent().unwrap_or_default();
+		let (id, new) = self.folders.assign(&folder);
+		if new {
+			self.push(Change {
+				table: Table::FolderIds,
+				key: id.to_be_bytes().to_vec(),
+				value: Some(folder.as_bytes().to_vec()),
+			});
+		}
+		file_key(id, path.name_bytes())
+	}
+
+	fn known_file_key(&self, path: &RelPath) -> Option<Vec<u8>> {
+		let id = self.folders.get(&path.parent().unwrap_or_default())?;
+		Some(file_key(id, path.name_bytes()))
+	}
+
 	fn put<T: Serialize + ?Sized>(&mut self, table: Table, key: Vec<u8>, value: &T) -> Result<(), StoreError> {
-		let value = rmp_serde::to_vec_named(value)?;
+		let bytes = rmp_serde::to_vec_named(value)?;
+		let value = if table == Table::Meta {
+			bytes
+		} else {
+			self.codec.pack(&bytes)
+		};
 		self.push(Change {
 			table,
 			key,
 			value: Some(value),
 		});
 		Ok(())
+	}
+
+	fn decode_value<T: DeserializeOwned>(&self, stored: &[u8]) -> Result<T, StoreError> {
+		decode(&self.codec.unpack(stored)?)
 	}
 
 	fn remove(&mut self, table: Table, key: Vec<u8>) {
@@ -410,6 +779,17 @@ impl Store {
 	fn push(&mut self, change: Change) {
 		self.oldest_pending.get_or_insert_with(Instant::now);
 		self.pending.push(change);
+	}
+}
+
+fn trimmed(log: &FailureLog) -> FailureLog {
+	let skip = log.log_tail.len().saturating_sub(LOG_TAIL_LINES);
+	FailureLog {
+		error: log.error.clone(),
+		log_tail: log.log_tail[skip..]
+			.iter()
+			.map(|line| line.chars().take(LOG_LINE_CHARS).collect())
+			.collect(),
 	}
 }
 
@@ -504,7 +884,7 @@ fn link_count(file: &fs::File) -> io::Result<u64> {
 	Ok(file.metadata()?.nlink())
 }
 
-fn write_new(db: &Database, settings: &Settings) -> Result<(), StoreError> {
+fn write_new(db: &Database, settings: &Settings, codec: &Codec) -> Result<(), StoreError> {
 	let created = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.map_or(0, |since| since.as_secs());
@@ -518,12 +898,203 @@ fn write_new(db: &Database, settings: &Settings) -> Result<(), StoreError> {
 		)?;
 		meta.insert(CREATED_KEY, rmp_serde::to_vec_named(&created)?.as_slice())?;
 		meta.insert(SETTINGS_KEY, rmp_serde::to_vec_named(settings)?.as_slice())?;
+		meta.insert(DICTIONARY_KEY, codec.dictionary.as_slice())?;
 		txn.open_table(FILES)?;
 		txn.open_table(FOLDERS)?;
 		txn.open_table(LOGS)?;
 		txn.open_table(UNKNOWN)?;
+		txn.open_table(FOLDER_IDS)?.insert(ROOT_FOLDER, b"".as_slice())?;
 	}
 	txn.commit()?;
+	Ok(())
+}
+
+fn open_database(path: &Path) -> Result<(Database, bool), StoreError> {
+	let repaired = Arc::new(AtomicBool::new(false));
+	let flag = Arc::clone(&repaired);
+	let db = Database::builder()
+		.set_repair_callback(move |_| flag.store(true, Ordering::SeqCst))
+		.open(path)?;
+	Ok((db, repaired.load(Ordering::SeqCst)))
+}
+
+fn upgrade_path(path: &Path) -> PathBuf {
+	let mut name = path.file_name().unwrap_or_default().to_os_string();
+	name.push(".upgrade");
+	path.with_file_name(name)
+}
+
+/// Runs only once this open holds the project file for writing.
+fn remove_stale_upgrade(path: &Path) -> Result<(), StoreError> {
+	let temp = upgrade_path(path);
+	match fs::symlink_metadata(&temp) {
+		Ok(meta) if meta.is_file() => Ok(fs::remove_file(&temp)?),
+		Ok(_) => Err(StoreError::Damaged(format!(
+			"{} is in the way of the project file's upgrade",
+			cryarchiver_engine::text::display_path(&temp)
+		))),
+		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+		Err(err) => Err(err.into()),
+	}
+}
+
+/// Writes the upgraded project next to the old file and replaces it with one rename, once the copy is synced and read
+/// back. A crash before the rename leaves the old file untouched; the next open removes the copy and starts again.
+fn migrate(path: &Path) -> Result<(), StoreError> {
+	let temp = upgrade_path(path);
+	let old = ReadOnlyDatabase::open(path)?;
+	match read_meta(&old)?.format {
+		format if format > FORMAT_VERSION => return Err(StoreError::TooNew(format)),
+		FORMAT_VERSION => return Ok(()),
+		_ => {}
+	}
+
+	let file = create_new_file(&temp)?;
+	let written = Database::builder()
+		.create_file(file)
+		.map_err(StoreError::from)
+		.and_then(|new| write_migrated(&old, &new))
+		.and_then(|()| Ok(fs::OpenOptions::new().write(true).open(&temp)?.sync_all()?))
+		.and_then(|()| verify_migrated(&old, &temp));
+	drop(old);
+	if let Err(err) = written {
+		let _ = fs::remove_file(&temp);
+		return Err(err);
+	}
+
+	if let Err(err) = fs::rename(&temp, path) {
+		let _ = fs::remove_file(&temp);
+		return Err(err.into());
+	}
+
+	// On Unix the rename itself is durable only once the folder that holds it is synced.
+	#[cfg(unix)]
+	fs::File::open(parent_folder(path))?.sync_all()?;
+	Ok(())
+}
+
+/// Format-1 values are plain `MessagePack`: they are packed and re-keyed, never decoded.
+fn write_migrated(old: &ReadOnlyDatabase, new: &Database) -> Result<(), StoreError> {
+	let codec = Codec::built_in();
+	let mut folders = FolderIds::with_root();
+	let read = old.begin_read()?;
+
+	let txn = new.begin_write()?;
+	{
+		let mut meta = txn.open_table(META)?;
+		for entry in read.open_table(META)?.iter()? {
+			let (key, value) = entry?;
+			meta.insert(key.value(), value.value())?;
+		}
+		meta.insert(FORMAT_KEY, rmp_serde::to_vec_named(&FORMAT_VERSION)?.as_slice())?;
+		meta.insert(DICTIONARY_KEY, codec.dictionary.as_slice())?;
+
+		let mut rows = txn.open_table(FOLDERS)?;
+		for entry in read.open_table(FOLDERS)?.iter()? {
+			let (key, value) = entry?;
+			rows.insert(key.value(), codec.pack(value.value()).as_slice())?;
+		}
+
+		let mut files = txn.open_table(FILES)?;
+		for entry in read.open_table(FILES)?.iter()? {
+			let (key, value) = entry?;
+			let key = folders.key_for(&RelPath::from_bytes(key.value().to_vec()));
+			files.insert(key.as_slice(), codec.pack(value.value()).as_slice())?;
+		}
+
+		let mut logs = txn.open_table(LOGS)?;
+		for entry in read.open_table(LOGS)?.iter()? {
+			let (key, value) = entry?;
+			let (path, attempt) = key.value();
+			let key = folders.key_for(&RelPath::from_bytes(path.to_vec()));
+			logs.insert((key.as_slice(), attempt), codec.pack(value.value()).as_slice())?;
+		}
+
+		let mut unknown = txn.open_table(UNKNOWN)?;
+		for entry in read.open_table(UNKNOWN)?.iter()? {
+			let (key, value) = entry?;
+			let key = folders.key_for(&RelPath::from_bytes(key.value().to_vec()));
+			unknown.insert(key.as_slice(), codec.pack(value.value()).as_slice())?;
+		}
+
+		let mut ids = txn.open_table(FOLDER_IDS)?;
+		for (id, folder) in &folders.paths {
+			ids.insert(*id, folder.as_bytes())?;
+		}
+	}
+	txn.commit()?;
+	Ok(())
+}
+
+/// Reads the upgraded copy back from its file: it must hold every entry of the old file, byte for byte once
+/// unpacked, under the same paths, and nothing else.
+fn verify_migrated(old: &ReadOnlyDatabase, upgraded: &Path) -> Result<(), StoreError> {
+	let differs = || damaged("its upgraded copy didn't read back the same, so the old file was kept as it was");
+	let new = ReadOnlyDatabase::open(upgraded)?;
+	if read_meta(&new)?.format != FORMAT_VERSION {
+		return Err(differs());
+	}
+
+	let (codec, folders) = read_layout(&new)?;
+	let (old, new) = (old.begin_read()?, new.begin_read()?);
+
+	let new_meta = new.open_table(META)?;
+	for entry in old.open_table(META)?.iter()? {
+		let (key, value) = entry?;
+		let kept = key.value() == FORMAT_KEY
+			|| new_meta
+				.get(key.value())?
+				.is_some_and(|stored| stored.value() == value.value());
+		if !kept {
+			return Err(differs());
+		}
+	}
+
+	let unpacked = |table: ReadOnlyTable<&'static [u8], &'static [u8]>, by_folder: bool| {
+		let mut entries = HashMap::new();
+		for entry in table.iter()? {
+			let (key, value) = entry?;
+			let path = if by_folder {
+				folders.path_of(key.value())?
+			} else {
+				RelPath::from_bytes(key.value().to_vec())
+			};
+			entries.insert(path.as_bytes().to_vec(), codec.unpack(value.value())?);
+		}
+		Ok::<_, StoreError>(entries)
+	};
+	for (table, by_folder) in [(FILES, true), (FOLDERS, false), (UNKNOWN, true)] {
+		let mut upgraded = unpacked(new.open_table(table)?, by_folder)?;
+		for entry in old.open_table(table)?.iter()? {
+			let (key, value) = entry?;
+			if upgraded.remove(key.value()).as_deref() != Some(value.value()) {
+				return Err(differs());
+			}
+		}
+		if !upgraded.is_empty() {
+			return Err(differs());
+		}
+	}
+
+	let mut upgraded = HashMap::new();
+	for entry in new.open_table(LOGS)?.iter()? {
+		let (key, value) = entry?;
+		let (path, attempt) = key.value();
+		upgraded.insert(
+			(folders.path_of(path)?.as_bytes().to_vec(), attempt),
+			codec.unpack(value.value())?,
+		);
+	}
+	for entry in old.open_table(LOGS)?.iter()? {
+		let (key, value) = entry?;
+		let (path, attempt) = key.value();
+		if upgraded.remove(&(path.to_vec(), attempt)).as_deref() != Some(value.value()) {
+			return Err(differs());
+		}
+	}
+	if !upgraded.is_empty() {
+		return Err(differs());
+	}
 	Ok(())
 }
 
@@ -795,19 +1366,24 @@ pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 	writeln!(out, "app_version = {}", meta.app_version)?;
 	writeln!(out, "created = {}", meta.created)?;
 	writeln!(out, "settings = {:?}", meta.settings)?;
+	if meta.format < FORMAT_VERSION {
+		writeln!(out, "\n(format {}: open the project once to upgrade it)", meta.format)?;
+		return Ok(());
+	}
 
+	let (codec, folders) = read_layout(&db)?;
 	let txn = db.begin_read()?;
 	writeln!(out, "\n[files]")?;
 	for entry in txn.open_table(FILES)?.iter()? {
 		let (key, value) = entry?;
-		let record: FileRecord = decode(value.value())?;
-		writeln!(out, "{:?} = {record:?}", RelPath::from_bytes(key.value().to_vec()))?;
+		let record: FileRecord = decode(&codec.unpack(value.value())?)?;
+		writeln!(out, "{:?} = {record:?}", folders.path_of(key.value())?)?;
 	}
 
 	writeln!(out, "\n[folders]")?;
 	for entry in txn.open_table(FOLDERS)?.iter()? {
 		let (key, value) = entry?;
-		let record: FolderRecord = decode(value.value())?;
+		let record: FolderRecord = decode(&codec.unpack(value.value())?)?;
 		writeln!(out, "{:?} = {record:?}", RelPath::from_bytes(key.value().to_vec()))?;
 	}
 
@@ -815,13 +1391,8 @@ pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 	for entry in txn.open_table(LOGS)?.iter()? {
 		let (key, value) = entry?;
 		let (path, attempt) = key.value();
-		let log: FailureLog = decode(value.value())?;
-		writeln!(
-			out,
-			"{:?} attempt {attempt}: {}",
-			RelPath::from_bytes(path.to_vec()),
-			log.error
-		)?;
+		let log: FailureLog = decode(&codec.unpack(value.value())?)?;
+		writeln!(out, "{:?} attempt {attempt}: {}", folders.path_of(path)?, log.error)?;
 		for line in &log.log_tail {
 			writeln!(out, "    {line}")?;
 		}
@@ -830,8 +1401,8 @@ pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 	writeln!(out, "\n[unknown]")?;
 	for entry in txn.open_table(UNKNOWN)?.iter()? {
 		let (key, value) = entry?;
-		let record: UnknownRecord = decode(value.value())?;
-		writeln!(out, "{:?} = {record:?}", RelPath::from_bytes(key.value().to_vec()))?;
+		let record: UnknownRecord = decode(&codec.unpack(value.value())?)?;
+		writeln!(out, "{:?} = {record:?}", folders.path_of(key.value())?)?;
 	}
 
 	writeln!(out, "\n[quality]")?;
@@ -854,7 +1425,6 @@ mod tests {
 	use cryarchiver_engine::quality::memory::Offset;
 
 	use super::*;
-	use crate::record::{CopyReason, FileState, Hash, How, Output};
 
 	fn path(name: &str) -> RelPath {
 		RelPath::root().join(OsStr::new(name))
@@ -1081,7 +1651,7 @@ mod tests {
 		};
 		let memory = SharedMemory(std::sync::Arc::default());
 		let db = redb::Builder::new().create_with_backend(memory.clone()).unwrap();
-		write_new(&db, &settings).unwrap();
+		write_new(&db, &settings, &Codec::built_in()).unwrap();
 		let mut bytes = vec![0; usize::try_from(memory.len().unwrap()).unwrap()];
 		memory.read(0, &mut bytes).unwrap();
 		std::mem::forget(db);
@@ -1148,7 +1718,7 @@ mod tests {
 		dump(&project(dir.path()), &mut out).unwrap();
 		let text = String::from_utf8(out).unwrap();
 
-		assert!(text.contains("format = 1"), "{text}");
+		assert!(text.contains("format = 2"), "{text}");
 		assert!(text.contains("\"a.txt\" = FileRecord"), "{text}");
 		assert!(text.contains("Committing"), "{text}");
 		assert!(text.contains("[folders]\n\"\" = FolderRecord"), "{text}");
@@ -1298,6 +1868,264 @@ mod tests {
 		);
 		assert!(text.contains(&format!("{GOOD_PHOTO} = GroupStats")), "{text}");
 		assert!(text.contains("x = unreadable"), "{text}");
+	}
+
+	fn nested(path: &str) -> RelPath {
+		RelPath::from_bytes(path.as_bytes().to_vec())
+	}
+
+	#[test]
+	fn records_round_trip_compressed_under_folder_ids() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		let files: Vec<(RelPath, FileRecord)> = (0..300)
+			.map(|index| {
+				(
+					nested(&format!("Trip {}/Day {}/{index}.jpg", index / 100, index / 10)),
+					committing(),
+				)
+			})
+			.collect();
+		for (key, record) in &files {
+			store.set_file(key, record).unwrap();
+		}
+		store
+			.set_unknown(&nested("Trip 0/stray.bin"), &UnknownRecord::default())
+			.unwrap();
+		store.flush().unwrap();
+		let raw: u64 = files
+			.iter()
+			.map(|(key, record)| {
+				u64::try_from(key.as_bytes().len() + rmp_serde::to_vec_named(record).unwrap().len()).unwrap()
+			})
+			.sum();
+		let stored = store
+			.table_sizes()
+			.unwrap()
+			.into_iter()
+			.find(|(table, _)| *table == "files")
+			.unwrap()
+			.1
+			.stored_bytes;
+		drop(store);
+
+		let (_, _, loaded) = Store::open(&project(dir.path())).unwrap();
+
+		let mut read = loaded.files;
+		read.sort_by(|a, b| a.0.cmp(&b.0));
+		let mut written = files;
+		written.sort_by(|a, b| a.0.cmp(&b.0));
+		assert_eq!(read, written);
+		assert_eq!(loaded.unknown.len(), 1);
+		assert!(stored * 10 < raw * 9, "{stored} stored bytes for {raw} raw bytes");
+	}
+
+	#[test]
+	fn logs_keep_the_last_lines_of_the_last_five_attempts() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		let long = FailureLog {
+			error: "encode failed: x".into(),
+			log_tail: (0..500).map(|line| format!("{line} {}", "y".repeat(1000))).collect(),
+		};
+
+		for attempt in 1..=7 {
+			store.set_log(&path("a.mkv"), attempt, &long).unwrap();
+		}
+		store.flush().unwrap();
+
+		assert_eq!(store.read_log(&path("a.mkv"), 2).unwrap(), None);
+		let kept = store.read_log(&path("a.mkv"), 3).unwrap().unwrap();
+		assert_eq!(kept.log_tail.len(), LOG_TAIL_LINES);
+		assert!(kept.log_tail[0].starts_with("400 "), "{}", &kept.log_tail[0][..10]);
+		assert!(kept.log_tail.iter().all(|line| line.chars().count() <= LOG_LINE_CHARS));
+	}
+
+	#[test]
+	fn pruning_keeps_the_newest_log_of_every_failing_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		let log = |error: &str| FailureLog {
+			error: error.into(),
+			log_tail: vec!["line".into()],
+		};
+		store.set_log(&path("fixed.mkv"), 1, &log("fixed")).unwrap();
+		store.set_log(&path("failing.mkv"), 1, &log("old")).unwrap();
+		store.set_log(&path("failing.mkv"), 2, &log("new")).unwrap();
+		let failing = HashSet::from([path("failing.mkv")]);
+
+		let removed = store.prune_logs(&failing, 1).unwrap();
+
+		assert_eq!(removed, 2);
+		assert_eq!(store.read_log(&path("fixed.mkv"), 1).unwrap(), None);
+		assert_eq!(store.read_log(&path("failing.mkv"), 1).unwrap(), None);
+		assert_eq!(store.read_log(&path("failing.mkv"), 2).unwrap(), Some(log("new")));
+	}
+
+	#[test]
+	fn compaction_gives_back_the_space_of_removed_records() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		for index in 0..5_000 {
+			store.set_file(&path(&format!("{index}.txt")), &committing()).unwrap();
+		}
+		store.flush().unwrap();
+		for index in 0..5_000 {
+			store.remove_file(&path(&format!("{index}.txt")));
+		}
+		store.flush().unwrap();
+		let before = std::fs::metadata(project(dir.path())).unwrap().len();
+
+		assert!(store.compact().unwrap());
+		assert!(std::fs::metadata(project(dir.path())).unwrap().len() < before);
+	}
+
+	const OFFSET_GROUP: &str = "video/h264/1080/fps31/sdr8/progressive/clean/opaque|svt-av1-4.2.0|p5|t93.0/89.0";
+
+	fn offset_stats() -> GroupStats {
+		GroupStats {
+			setting: 29.5,
+			slope: Some(0.4),
+			bpp: Some(0.03),
+			offset: Some(Offset { mean: -0.6, p5: -2.1 }),
+			observations: 3,
+			without_grain: false,
+		}
+	}
+
+	fn write_format_1(path: &Path, files: &[(RelPath, FileRecord)], log: &(RelPath, u32, FailureLog)) {
+		let db = Database::create(path).unwrap();
+		let txn = db.begin_write().unwrap();
+		{
+			let mut meta = txn.open_table(META).unwrap();
+			meta.insert(FORMAT_KEY, rmp_serde::to_vec_named(&1u32).unwrap().as_slice())
+				.unwrap();
+			meta.insert(APP_VERSION_KEY, rmp_serde::to_vec_named("0.1.0").unwrap().as_slice())
+				.unwrap();
+			meta.insert(CREATED_KEY, rmp_serde::to_vec_named(&1u64).unwrap().as_slice())
+				.unwrap();
+			meta.insert(
+				SETTINGS_KEY,
+				rmp_serde::to_vec_named(&Settings::default()).unwrap().as_slice(),
+			)
+			.unwrap();
+			meta.insert(
+				format!("{QUALITY_PREFIX}{OFFSET_GROUP}").as_str(),
+				rmp_serde::to_vec_named(&offset_stats()).unwrap().as_slice(),
+			)
+			.unwrap();
+
+			let mut table = txn.open_table(FILES).unwrap();
+			for (key, record) in files {
+				table
+					.insert(key.as_bytes(), rmp_serde::to_vec_named(record).unwrap().as_slice())
+					.unwrap();
+			}
+			txn.open_table(FOLDERS).unwrap();
+			txn.open_table(LOGS)
+				.unwrap()
+				.insert(
+					(log.0.as_bytes(), log.1),
+					rmp_serde::to_vec_named(&log.2).unwrap().as_slice(),
+				)
+				.unwrap();
+			txn.open_table(UNKNOWN).unwrap();
+		}
+		txn.commit().unwrap();
+	}
+
+	#[test]
+	fn a_format_1_project_is_upgraded_in_place_and_keeps_every_record() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut files = vec![
+			(path("a.jpg"), committing()),
+			(nested("Trip/b.flac"), FileRecord::discovered(9, 9)),
+		];
+		let log = (
+			path("a.jpg"),
+			2,
+			FailureLog {
+				error: "first".into(),
+				log_tail: vec!["line".into()],
+			},
+		);
+		write_format_1(&project(dir.path()), &files, &log);
+		std::fs::write(upgrade_path(&project(dir.path())), b"left over from a crash").unwrap();
+		let mut dumped = Vec::new();
+		dump(&project(dir.path()), &mut dumped).unwrap();
+		let dumped = String::from_utf8(dumped).unwrap();
+		assert!(dumped.contains("format = 1"), "{dumped}");
+		assert!(
+			dumped.contains("(format 1: open the project once to upgrade it)"),
+			"{dumped}"
+		);
+
+		let (store, meta, loaded) = Store::open(&project(dir.path())).unwrap();
+
+		assert_eq!(meta.format, FORMAT_VERSION);
+		let mut read = loaded.files;
+		read.sort_by(|a, b| a.0.cmp(&b.0));
+		files.sort_by(|a, b| a.0.cmp(&b.0));
+		assert_eq!(read, files);
+		assert_eq!(loaded.last_attempts.get(&path("a.jpg")), Some(&2));
+		assert_eq!(loaded.quality, vec![(OFFSET_GROUP.to_owned(), offset_stats())]);
+		assert_eq!(store.read_log(&path("a.jpg"), 2).unwrap(), Some(log.2));
+		assert!(!upgrade_path(&project(dir.path())).exists());
+	}
+
+	#[test]
+	fn an_upgrade_that_cannot_start_leaves_the_format_1_project_as_it_was() {
+		let dir = tempfile::tempdir().unwrap();
+		let log = (path("a.jpg"), 1, FailureLog::default());
+		write_format_1(&project(dir.path()), &[(path("a.jpg"), committing())], &log);
+		std::fs::create_dir(upgrade_path(&project(dir.path()))).unwrap();
+
+		let opened = Store::open(&project(dir.path()));
+
+		assert!(
+			matches!(opened, Err(StoreError::Damaged(ref reason)) if reason.contains("in the way")),
+			"{:?}",
+			opened.err()
+		);
+		assert_eq!(read_closed(&project(dir.path())).unwrap().format, 1);
+		std::fs::remove_dir(upgrade_path(&project(dir.path()))).unwrap();
+		let (_, meta, loaded) = Store::open(&project(dir.path())).unwrap();
+		assert_eq!(meta.format, FORMAT_VERSION);
+		assert_eq!(loaded.files, vec![(path("a.jpg"), committing())]);
+	}
+
+	#[test]
+	fn an_upgrade_finds_a_project_another_open_already_upgraded_and_leaves_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		store.write_intent(&path("a.txt"), &committing()).unwrap();
+		drop(store);
+		let before = std::fs::read(project(dir.path())).unwrap();
+
+		migrate(&project(dir.path())).unwrap();
+
+		assert_eq!(std::fs::read(project(dir.path())).unwrap(), before);
+		assert!(!upgrade_path(&project(dir.path())).exists());
+	}
+
+	#[test]
+	fn a_project_opened_after_a_crash_says_so() {
+		use redb::StorageBackend;
+
+		let dir = tempfile::tempdir().unwrap();
+		let memory = SharedMemory(std::sync::Arc::default());
+		let db = redb::Builder::new().create_with_backend(memory.clone()).unwrap();
+		write_new(&db, &Settings::default(), &Codec::built_in()).unwrap();
+		let mut bytes = vec![0; usize::try_from(memory.len().unwrap()).unwrap()];
+		memory.read(0, &mut bytes).unwrap();
+		std::mem::forget(db);
+		std::fs::write(project(dir.path()), &bytes).unwrap();
+
+		let (store, _, loaded) = Store::open(&project(dir.path())).unwrap();
+		assert!(loaded.recovered);
+		drop(store);
+
+		assert!(!Store::open(&project(dir.path())).unwrap().2.recovered);
 	}
 
 	#[test]

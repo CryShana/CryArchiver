@@ -3,16 +3,20 @@
 //! and compared with the source.
 
 use std::collections::HashSet;
+use std::fs;
 
 use super::owner::{Message, Owner};
 use crate::complete::{self, ParityReport};
 use crate::keys::RelPath;
+use crate::record::FileState;
 use crate::run::apply_folder_times;
 use crate::scan::{DestinationFile, walk_destination};
+use crate::store::LOG_BUDGET_BYTES;
 use crate::tree::FolderId;
 use crate::view::{LogKind, NoticeLevel};
 
 const LISTED_GAPS: usize = 10;
+const TIDY_GROWTH_BYTES: u64 = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum Completion {
@@ -29,6 +33,7 @@ pub(crate) struct FinishState {
 	applying: HashSet<FolderId>,
 	pub(super) completion: Completion,
 	walks: u64,
+	tidied_bytes: u64,
 }
 
 impl Owner {
@@ -193,7 +198,42 @@ impl Owner {
 
 		self.remove_empty_work_folders();
 		self.finish.completion = Completion::Done(report);
+		if self.store_grew() {
+			self.tidy_store();
+		}
 		self.view.status_dirty = true;
+	}
+
+	/// Compacts the project file and caps its failure logs once it has grown by a megabyte or a tenth since the last
+	/// time. Called when a run finishes and when a project opens after a crash.
+	pub(super) fn tidy_store(&mut self) {
+		self.save_quality();
+		let failing: HashSet<RelPath> = self
+			.tree
+			.file_ids()
+			.map(|id| self.tree.file(id))
+			.filter(|file| matches!(file.record.state, FileState::Issue { .. }))
+			.map(|file| file.key.clone())
+			.collect();
+
+		let tidied = self
+			.store
+			.prune_logs(&failing, LOG_BUDGET_BYTES)
+			.and_then(|_| self.store.compact());
+		match tidied {
+			Ok(_) => self.after_flush(),
+			Err(err) => self.log(
+				LogKind::Action,
+				format!("the project file could not be compacted: {err}"),
+			),
+		}
+		self.finish.tidied_bytes = fs::metadata(&self.project_file).map_or(0, |meta| meta.len());
+	}
+
+	fn store_grew(&self) -> bool {
+		let bytes = fs::metadata(&self.project_file).map_or(0, |meta| meta.len());
+		let since = self.finish.tidied_bytes;
+		bytes > since + TIDY_GROWTH_BYTES.max(since / 10)
 	}
 
 	pub(super) fn parity(&self) -> Option<&ParityReport> {
@@ -276,6 +316,30 @@ mod tests {
 
 		owner.on_folders_changed(Vec::new());
 		assert!(owner.idle());
+	}
+
+	#[test]
+	fn the_project_file_is_tidied_again_only_once_it_has_grown() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+
+		owner.tidy_store();
+
+		assert_eq!(
+			owner.finish.tidied_bytes,
+			fs::metadata(&owner.project_file).unwrap().len()
+		);
+		assert!(!owner.store_grew());
+
+		for index in 0..30_000_u64 {
+			let record = crate::record::FileRecord::discovered(index, i64::try_from(index).unwrap());
+			owner.store.set_file(&key(&format!("{index}.txt")), &record).unwrap();
+		}
+		owner.store.flush().unwrap();
+
+		assert!(owner.store_grew());
 	}
 
 	#[test]

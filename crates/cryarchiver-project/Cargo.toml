@@ -13,6 +13,7 @@ workspace = true
 blake3.workspace = true
 cryarchiver-engine = { path = "../cryarchiver-engine" }
 infer.workspace = true
+lz4_flex.workspace = true
 notify.workspace = true
 redb.workspace = true
 rmp-serde.workspace = true

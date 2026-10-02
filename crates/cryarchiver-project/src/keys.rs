@@ -46,12 +46,26 @@ impl RelPath {
 
 	#[must_use]
 	pub fn join(&self, name: &OsStr) -> Self {
+		self.join_bytes(name.as_encoded_bytes())
+	}
+
+	#[must_use]
+	pub fn join_bytes(&self, name: &[u8]) -> Self {
 		let mut bytes = self.0.clone();
 		if !bytes.is_empty() {
 			bytes.push(SEPARATOR);
 		}
-		bytes.extend_from_slice(name.as_encoded_bytes());
+		bytes.extend_from_slice(name);
 		Self(bytes)
+	}
+
+	pub fn name_bytes(&self) -> &[u8] {
+		let start = self
+			.0
+			.iter()
+			.rposition(|&byte| byte == SEPARATOR)
+			.map_or(0, |at| at + 1);
+		&self.0[start..]
 	}
 
 	pub fn parent(&self) -> Option<Self> {
@@ -64,12 +78,7 @@ impl RelPath {
 	}
 
 	pub fn name(&self) -> OsString {
-		let start = self
-			.0
-			.iter()
-			.rposition(|&byte| byte == SEPARATOR)
-			.map_or(0, |at| at + 1);
-		os_from_bytes(&self.0[start..])
+		os_from_bytes(self.name_bytes())
 	}
 
 	pub fn depth(&self) -> usize {
@@ -307,6 +316,15 @@ mod tests {
 			"a.avif"
 		);
 		assert_eq!(target.relative_from(&RelPath::root()), "Photos/2020/a.avif");
+	}
+
+	#[test]
+	fn names_split_off_and_join_back_as_bytes() {
+		let path = RelPath::from_bytes(b"Trip/Day 1/a.jpg".to_vec());
+
+		assert_eq!(path.name_bytes(), b"a.jpg");
+		assert_eq!(path.parent().unwrap().join_bytes(path.name_bytes()), path);
+		assert_eq!(RelPath::root().join_bytes(b"top.txt").as_bytes(), b"top.txt");
 	}
 
 	#[test]

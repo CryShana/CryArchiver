@@ -1,4 +1,5 @@
 mod calibrate;
+mod project_size;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,18 +22,29 @@ enum Task {
 		#[arg(long, value_name = "FILE")]
 		out: PathBuf,
 	},
+	#[command(about = "Build a synthetic project in a temp folder and print how many bytes each table takes")]
+	ProjectSize {
+		#[arg(long, default_value_t = 100_000)]
+		files: usize,
+	},
 }
 
 fn main() -> ExitCode {
-	let Task::Calibrate { corpus, out } = Cli::parse().task;
-	if let Err(message) = calibrate::check_out(&out) {
-		eprintln!("error: {message}");
-		return ExitCode::from(2);
-	}
+	let result = match Cli::parse().task {
+		Task::Calibrate { corpus, out } => {
+			if let Err(message) = calibrate::check_out(&out) {
+				eprintln!("error: {message}");
+				return ExitCode::from(2);
+			}
 
-	let runtime = tokio::runtime::Runtime::new().expect("tokio runtime starts");
+			tokio::runtime::Runtime::new()
+				.expect("tokio runtime starts")
+				.block_on(calibrate::run(&corpus, &out))
+		}
+		Task::ProjectSize { files } => project_size::run(files),
+	};
 
-	match runtime.block_on(calibrate::run(&corpus, &out)) {
+	match result {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(message) => {
 			eprintln!("error: {message}");

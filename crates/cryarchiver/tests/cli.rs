@@ -78,7 +78,7 @@ fn project_create_writes_a_project_that_dump_prints() {
 
 	let dump = cryarchiver(dir.path(), &["project", "dump", project.to_str().unwrap()]);
 	assert_eq!(dump.status.code(), Some(0), "{}", stderr(&dump));
-	assert!(stdout(&dump).contains("format = 1"), "{}", stdout(&dump));
+	assert!(stdout(&dump).contains("format = 2"), "{}", stdout(&dump));
 	assert!(stdout(&dump).contains("watch: true"), "{}", stdout(&dump));
 	assert!(
 		stdout(&dump).contains("performance_limit: Some(30)"),

@@ -290,7 +290,7 @@ impl Owner {
 		self.publish_if_due(now);
 	}
 
-	fn save_quality(&mut self) {
+	pub(super) fn save_quality(&mut self) {
 		for (key, stats) in self.pipeline.quality.take_changed() {
 			let Some(stats) = stats else {
 				self.store.remove_quality(&key);

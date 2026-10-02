@@ -175,6 +175,7 @@ impl Owner {
 			sample: None,
 			failure: None,
 		};
+		let recovered = loaded.recovered;
 		owner.load(loaded);
 		for line in ignored_quality {
 			owner.log(LogKind::Action, line);
@@ -183,6 +184,9 @@ impl Owner {
 
 		sweep(&ArchivalSink::new(&owner.settings.destination).archive_work_root());
 		owner.store.flush()?;
+		if recovered {
+			owner.tidy_store();
+		}
 		Ok(owner)
 	}
 

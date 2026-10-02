@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 clap.workspace = true
 cryarchiver-engine = { path = "../crates/cryarchiver-engine" }
+cryarchiver-project = { path = "../crates/cryarchiver-project" }
 tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
