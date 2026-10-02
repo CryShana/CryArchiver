@@ -1134,6 +1134,11 @@ mod tests {
 	}
 
 	#[test]
+	fn a_learned_crf_is_searched_again_where_the_shipped_margin_starts() {
+		assert!((LONG_ENCODE_S - tables().video.margin_from_s).abs() < 1e-9);
+	}
+
+	#[test]
 	fn a_long_file_at_moderate_searches_from_its_learned_crf() {
 		let learned = GroupStats {
 			setting: 31.5,

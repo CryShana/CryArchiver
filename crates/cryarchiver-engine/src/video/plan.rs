@@ -411,11 +411,10 @@ pub fn svt_params(crf: f64, grain: Option<u8>, lp: Option<u8>, max_kbps: Option<
 }
 
 pub fn source_grain(analysis: &Analysis) -> Option<u8> {
-	let lightest = tables().video.grain_levels.last().copied();
+	let levels = tables().video.grain_levels;
+	let lightest = levels[levels.len() - 1];
 
-	(analysis.noise == NoiseClass::Light)
-		.then(|| grain_level(analysis.noise_sigma).or(lightest))
-		.flatten()
+	(analysis.noise == NoiseClass::Light).then(|| grain_level(analysis.noise_sigma).unwrap_or(lightest))
 }
 
 pub fn grain_level(noise_sigma: Option<f64>) -> Option<u8> {

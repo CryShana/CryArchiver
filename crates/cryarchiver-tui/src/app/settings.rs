@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use cryarchiver_engine::audio::plan::table_rate;
+use cryarchiver_engine::calibration::tables;
 use cryarchiver_engine::images::plan::ssim_target;
 use cryarchiver_engine::preset::{Overrides, Speed as PresetSpeed, VmafOverride};
 use cryarchiver_engine::video::quality;
@@ -13,7 +14,6 @@ use crate::source::{Action, ArchiveSource, SettingsChange};
 use crate::view::{ArchiveView, Settings, Speed};
 
 pub const FAST_NEVER_MEASURES_VIDEO: &str = "FAST never measures video quality";
-const GRAIN_ALLOWANCE_NOTE: &str = "noisy sources: −2 / −2.5";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
@@ -209,10 +209,18 @@ fn quality_value(field: QualityField, settings: &Settings) -> String {
 		(None, None) => FAST_NEVER_MEASURES_VIDEO.to_owned(),
 		(Some(_), Some(stored)) => format!("custom · {stored}"),
 		(Some(preset), None) if field == QualityField::Video => {
-			format!("preset · {} · {GRAIN_ALLOWANCE_NOTE}", field.shown(&preset))
+			format!("preset · {} · {}", field.shown(&preset), grain_allowance_note())
 		}
 		(Some(preset), None) => format!("preset · {}", field.shown(&preset)),
 	}
+}
+
+fn grain_allowance_note() -> String {
+	let video = &tables().video;
+	format!(
+		"noisy sources: −{} / −{}",
+		video.grain_allowance_mean, video.grain_allowance_floor
+	)
 }
 
 impl Ui {

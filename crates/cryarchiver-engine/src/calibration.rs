@@ -81,16 +81,19 @@ impl Tables {
 
 		let positive = [
 			video.default_slope,
+			video.noisy_sigma,
+			video.low_detail_si,
 			self.images.ravif_points_per_quality,
 			self.images.jxl_points_per_distance,
 		];
 		if video
 			.expected_bpp
 			.iter()
+			.chain(&video.grain_from_sigma)
 			.chain(&positive)
 			.any(|value| !(value.is_finite() && *value > 0.0))
 		{
-			return Err("bits per pixel and slopes must be positive numbers".into());
+			return Err("bits per pixel, slopes and thresholds must be positive numbers".into());
 		}
 
 		if !video.grain_from_sigma.windows(2).all(|pair| pair[0] > pair[1]) {
@@ -101,8 +104,13 @@ impl Tables {
 			return Err("grain levels must be 1–50".into());
 		}
 
-		if !(video.grain_allowance_mean >= 0.0 && video.grain_allowance_floor >= 0.0) {
-			return Err("grain allowances can't be negative".into());
+		if !video.grain_levels.windows(2).all(|pair| pair[0] >= pair[1]) {
+			return Err("grain levels can't rise as the noise falls".into());
+		}
+
+		let non_negative = |value: f64| value.is_finite() && value >= 0.0;
+		if !(non_negative(video.grain_allowance_mean) && non_negative(video.grain_allowance_floor)) {
+			return Err("grain allowances must be finite and not negative".into());
 		}
 
 		if !(video.margin_from_s > 0.0 && video.full_margin_s > video.margin_from_s && video.full_margin_s.is_finite())
@@ -110,9 +118,10 @@ impl Tables {
 			return Err("full-margin-s must come after a positive margin-from-s".into());
 		}
 
-		if !(video.full_margin_mean >= 0.0 && video.full_margin_floor >= 0.0) {
-			return Err("the full margin can't be negative".into());
+		if !(non_negative(video.full_margin_mean) && non_negative(video.full_margin_floor)) {
+			return Err("the full margin must be finite and not negative".into());
 		}
+
 		Ok(())
 	}
 }
@@ -165,6 +174,7 @@ mod tests {
 	fn tables_round_trip_and_unknown_keys_are_refused() {
 		let text = toml::to_string_pretty(tables()).unwrap();
 
+		assert_eq!(parse(SHIPPED).as_ref(), Ok(tables()));
 		assert_eq!(parse(&text).as_ref(), Ok(tables()));
 		assert!(parse(&text.replace("noisy-sigma", "noisy")).is_err());
 		assert!(
@@ -174,17 +184,29 @@ mod tests {
 		);
 	}
 
+	fn refusal(change: impl FnOnce(&mut Tables)) -> String {
+		let mut broken = tables().clone();
+		change(&mut broken);
+
+		parse(&toml::to_string_pretty(&broken).unwrap()).unwrap_err()
+	}
+
 	#[test]
 	fn out_of_range_tables_are_refused() {
-		let text = toml::to_string_pretty(tables()).unwrap();
-
-		assert!(
-			parse(&text.replace("svt-crf-fast = [\n    35.0", "svt-crf-fast = [\n    60.0"))
-				.unwrap_err()
-				.contains("60")
-		);
-		assert!(parse(&text.replace("grain-from-sigma = [\n    1.8", "grain-from-sigma = [\n    0.9")).is_err());
-		assert!(parse(&text.replace("default-slope = 0.5", "default-slope = 0.0")).is_err());
-		assert!(parse(&text.replace("full-margin-s = 14400.0", "full-margin-s = 900.0")).is_err());
+		assert!(refusal(|tables| tables.video.svt_crf_fast[0] = 60.0).contains("60"));
+		assert!(refusal(|tables| tables.video.vp9_crf[2] = 9).contains("VP9 CRF 9"));
+		assert!(refusal(|tables| tables.video.default_slope = 0.0).contains("positive"));
+		assert!(refusal(|tables| tables.video.noisy_sigma = f64::NAN).contains("positive"));
+		assert!(refusal(|tables| tables.video.low_detail_si = -1.0).contains("positive"));
+		assert!(refusal(|tables| tables.video.grain_from_sigma[0] = f64::INFINITY).contains("positive"));
+		assert!(refusal(|tables| tables.video.grain_from_sigma[0] = 0.9).contains("fall"));
+		assert!(refusal(|tables| tables.video.grain_levels[0] = 51).contains("1–50"));
+		assert!(refusal(|tables| tables.video.grain_levels = [6, 8, 10]).contains("rise"));
+		assert!(refusal(|tables| tables.video.grain_allowance_mean = -1.0).contains("allowances"));
+		assert!(refusal(|tables| tables.video.grain_allowance_floor = f64::INFINITY).contains("allowances"));
+		assert!(refusal(|tables| tables.video.margin_from_s = 0.0).contains("margin-from-s"));
+		assert!(refusal(|tables| tables.video.full_margin_s = 900.0).contains("margin-from-s"));
+		assert!(refusal(|tables| tables.video.full_margin_mean = -0.5).contains("full margin"));
+		assert!(refusal(|tables| tables.video.full_margin_floor = f64::INFINITY).contains("full margin"));
 	}
 }
