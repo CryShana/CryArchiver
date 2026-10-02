@@ -225,7 +225,9 @@ impl Owner {
 			Ok(_) => self.after_flush(),
 			Err(err) => self.log(
 				LogKind::Action,
-				format!("the project file could not be tidied (old failure logs pruned, free space given back): {err}"),
+				format!(
+					"the project file could not be tidied (pruning old failure logs and giving free space back): {err}"
+				),
 			),
 		}
 		self.finish.tidied_bytes = fs::metadata(&self.project_file).map_or(0, |meta| meta.len());

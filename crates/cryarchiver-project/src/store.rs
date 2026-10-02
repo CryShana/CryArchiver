@@ -457,9 +457,8 @@ impl Store {
 		let db = if format < FORMAT_VERSION {
 			let real = real_file(path).map_err(upgrade_failed)?;
 			remove_stale_upgrade(&real).map_err(upgrade_failed)?;
-			drop(db);
 
-			migrate(&real).map_err(upgrade_failed)?;
+			migrate(&real, db).map_err(upgrade_failed)?;
 			open_database(path)?.0
 		} else {
 			db
@@ -1015,32 +1014,41 @@ fn remove_if_ours(temp: &Path, ours: FileIdentity) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenameWindow {
-	HoldingTheFile,
-	AfterReleasingIt,
+enum UpgradeStep {
+	#[cfg(test)]
+	Started,
+	RenameHoldingTheFile,
+	RenameAfterReleasingIt,
 }
 
 #[cfg(test)]
-type RenameHook = Box<dyn FnMut(RenameWindow) -> bool>;
+type UpgradeHook = Box<dyn FnMut(UpgradeStep) -> bool>;
 
 #[cfg(test)]
 thread_local! {
-	/// Runs right before each rename attempt of an upgrade on this thread; returning true fails that attempt.
-	static BEFORE_UPGRADE_RENAME: std::cell::RefCell<Option<RenameHook>> = const { std::cell::RefCell::new(None) };
+	/// Runs at each step of an upgrade on this thread; returning true before a rename fails that attempt.
+	static UPGRADE_HOOK: std::cell::RefCell<Option<UpgradeHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn upgrade_hook(step: UpgradeStep) -> bool {
+	let Some(mut hook) = UPGRADE_HOOK.take() else {
+		return false;
+	};
+
+	let fail = hook(step);
+	UPGRADE_HOOK.set(Some(hook));
+	fail
 }
 
 fn rename_into_place(
 	temp: &Path,
 	path: &Path,
-	#[cfg_attr(not(test), expect(unused_variables))] window: RenameWindow,
+	#[cfg_attr(not(test), expect(unused_variables))] step: UpgradeStep,
 ) -> io::Result<()> {
 	#[cfg(test)]
-	if let Some(mut hook) = BEFORE_UPGRADE_RENAME.take() {
-		let fail = hook(window);
-		BEFORE_UPGRADE_RENAME.set(Some(hook));
-		if fail {
-			return Err(io::ErrorKind::PermissionDenied.into());
-		}
+	if upgrade_hook(step) {
+		return Err(io::ErrorKind::PermissionDenied.into());
 	}
 
 	retry_transient(|| fs::rename(temp, path))
@@ -1049,13 +1057,15 @@ fn rename_into_place(
 /// Writes the upgraded project next to the old file and replaces it with one rename, once the copy is synced and read
 /// back. A crash before the rename leaves the old file untouched; the next open removes the copy and starts again.
 ///
-/// The old file stays open read-only until the copy is in place, which keeps every writer out of it. Where the file
-/// system can't rename over an open file (FAT and exFAT on Windows), the rename is tried again after closing it;
-/// the copy's lock still keeps other upgrades away, and a writer that opens the old file in that moment makes the
-/// rename fail rather than lose its writes.
-fn migrate(path: &Path) -> Result<(), StoreError> {
+/// `old` is the open's own writable handle on the old file, taken before its format was read: it keeps every other
+/// open out from then until the copy is in place. Where the file system can't rename over an open file (FAT and
+/// exFAT on Windows), the rename is tried again after closing it; the copy's lock still keeps other upgrades away, and
+/// a writer that opens the old file in that moment makes the rename fail rather than lose its writes.
+fn migrate(path: &Path, old: Database) -> Result<(), StoreError> {
+	#[cfg(test)]
+	upgrade_hook(UpgradeStep::Started);
+
 	let temp = upgrade_path(path);
-	let old = ReadOnlyDatabase::open(path)?;
 	match read_meta(&old)?.format {
 		format if format > FORMAT_VERSION => return Err(StoreError::TooNew(format)),
 		FORMAT_VERSION => return Ok(()),
@@ -1088,10 +1098,10 @@ fn migrate(path: &Path) -> Result<(), StoreError> {
 		}
 	};
 
-	let renamed = match rename_into_place(&temp, path, RenameWindow::HoldingTheFile) {
+	let renamed = match rename_into_place(&temp, path, UpgradeStep::RenameHoldingTheFile) {
 		Err(_) if cfg!(any(windows, test)) => {
 			drop(old);
-			rename_into_place(&temp, path, RenameWindow::AfterReleasingIt)
+			rename_into_place(&temp, path, UpgradeStep::RenameAfterReleasingIt)
 		}
 		renamed => renamed,
 	};
@@ -1110,7 +1120,7 @@ fn migrate(path: &Path) -> Result<(), StoreError> {
 }
 
 /// Format-1 values are plain `MessagePack`: they are packed and re-keyed, never decoded.
-fn write_migrated(old: &ReadOnlyDatabase, new: &Database) -> Result<(), StoreError> {
+fn write_migrated(old: &impl ReadableDatabase, new: &Database) -> Result<(), StoreError> {
 	let codec = Codec::built_in();
 	let mut folders = FolderIds::with_root();
 	let read = old.begin_read()?;
@@ -1164,7 +1174,17 @@ fn write_migrated(old: &ReadOnlyDatabase, new: &Database) -> Result<(), StoreErr
 
 /// Reads the upgraded copy back from its file: it must hold every entry of the old file, byte for byte once
 /// unpacked, under the same paths, and nothing else.
-fn verify_migrated(old: &ReadOnlyDatabase, upgraded: &Path) -> Result<(), StoreError> {
+fn verify_migrated(old: &impl ReadableDatabase, upgraded: &Path) -> Result<(), StoreError> {
+	compare_copy(old, upgraded).map_err(|err| match err {
+		StoreError::Damaged(reason) => {
+			StoreError::UpgradeFailed(format!("the upgraded copy can't be read back: {reason}"))
+		}
+		other => other,
+	})
+}
+
+/// Only the copy is decoded here, so a damaged entry is the copy's.
+fn compare_copy(old: &impl ReadableDatabase, upgraded: &Path) -> Result<(), StoreError> {
 	let differs = || StoreError::UpgradeFailed("the upgraded copy didn't read back the same".into());
 	let new = ReadOnlyDatabase::open(upgraded)?;
 	if read_meta(&new)?.format != FORMAT_VERSION {
@@ -2276,17 +2296,18 @@ pub(crate) mod tests {
 	}
 
 	#[test]
-	fn an_upgrade_finds_a_project_another_open_already_upgraded_and_leaves_it() {
+	fn an_upgrade_of_a_project_already_in_this_format_changes_nothing() {
 		let dir = tempfile::tempdir().unwrap();
 		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
 		store.write_intent(&path("a.txt"), &committing()).unwrap();
 		drop(store);
-		let before = std::fs::read(project(dir.path())).unwrap();
 
-		migrate(&project(dir.path())).unwrap();
+		migrate(&project(dir.path()), open_database(&project(dir.path())).unwrap().0).unwrap();
 
-		assert_eq!(std::fs::read(project(dir.path())).unwrap(), before);
 		assert!(!upgrade_path(&project(dir.path())).exists());
+		let (_, meta, loaded) = Store::open(&project(dir.path())).unwrap();
+		assert_eq!(meta.format, FORMAT_VERSION);
+		assert_eq!(loaded.files, vec![(path("a.txt"), committing())]);
 	}
 
 	fn format_1_project(dir: &Path) -> Vec<(RelPath, FileRecord)> {
@@ -2305,32 +2326,41 @@ pub(crate) mod tests {
 		files
 	}
 
-	/// What a second open of the project, made right before a rename attempt of the upgrade, found.
+	/// What a second open of the project, made at a step of the upgrade, found.
 	#[derive(Debug, PartialEq, Eq)]
 	struct Intruder {
-		window: RenameWindow,
+		step: UpgradeStep,
 		refused_as_open: bool,
-		copy_still_there: bool,
+		copy_there: bool,
+	}
+
+	fn intruder(step: UpgradeStep, copy_there: bool) -> Intruder {
+		Intruder {
+			step,
+			refused_as_open: true,
+			copy_there,
+		}
 	}
 
 	type Opened = Result<(Store, Meta, Loaded), StoreError>;
 
-	/// Opens the project with a second open made before each rename attempt; `fail` decides which attempts fail.
-	fn open_with_an_intruder(file: &Path, fail: fn(RenameWindow) -> bool) -> (Opened, Vec<Intruder>) {
+	/// Opens the project with a second open made at each step of the upgrade; `fail` decides which rename attempts
+	/// fail.
+	fn open_with_an_intruder(file: &Path, fail: fn(UpgradeStep) -> bool) -> (Opened, Vec<Intruder>) {
 		let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 		let (hook_seen, hook_file) = (std::rc::Rc::clone(&seen), file.to_path_buf());
-		BEFORE_UPGRADE_RENAME.set(Some(Box::new(move |window| {
+		UPGRADE_HOOK.set(Some(Box::new(move |step| {
 			let second = Store::open(&hook_file);
 			hook_seen.borrow_mut().push(Intruder {
-				window,
+				step,
 				refused_as_open: matches!(second, Err(StoreError::AlreadyOpen)),
-				copy_still_there: upgrade_path(&hook_file).is_file(),
+				copy_there: upgrade_path(&hook_file).is_file(),
 			});
-			fail(window)
+			fail(step)
 		})));
 
 		let opened = Store::open(file);
-		BEFORE_UPGRADE_RENAME.set(None);
+		UPGRADE_HOOK.set(None);
 		let seen = seen.take();
 		(opened, seen)
 	}
@@ -2345,11 +2375,10 @@ pub(crate) mod tests {
 		let (store, meta, loaded) = opened.unwrap();
 		assert_eq!(
 			seen,
-			vec![Intruder {
-				window: RenameWindow::HoldingTheFile,
-				refused_as_open: true,
-				copy_still_there: true,
-			}]
+			vec![
+				intruder(UpgradeStep::Started, false),
+				intruder(UpgradeStep::RenameHoldingTheFile, true),
+			]
 		);
 		assert_eq!(meta.format, FORMAT_VERSION);
 		assert_eq!(sorted_files(loaded), files);
@@ -2364,22 +2393,15 @@ pub(crate) mod tests {
 		let files = format_1_project(dir.path());
 
 		let (opened, seen) =
-			open_with_an_intruder(&project(dir.path()), |window| window == RenameWindow::HoldingTheFile);
+			open_with_an_intruder(&project(dir.path()), |step| step == UpgradeStep::RenameHoldingTheFile);
 
 		let (store, meta, loaded) = opened.unwrap();
 		assert_eq!(
 			seen,
 			vec![
-				Intruder {
-					window: RenameWindow::HoldingTheFile,
-					refused_as_open: true,
-					copy_still_there: true,
-				},
-				Intruder {
-					window: RenameWindow::AfterReleasingIt,
-					refused_as_open: true,
-					copy_still_there: true,
-				},
+				intruder(UpgradeStep::Started, false),
+				intruder(UpgradeStep::RenameHoldingTheFile, true),
+				intruder(UpgradeStep::RenameAfterReleasingIt, true),
 			]
 		);
 		assert_eq!(meta.format, FORMAT_VERSION);
@@ -2400,10 +2422,13 @@ pub(crate) mod tests {
 			"{:?}",
 			opened.err()
 		);
-		assert_eq!(seen.len(), 2);
-		assert!(
-			seen.iter()
-				.all(|intruder| intruder.refused_as_open && intruder.copy_still_there)
+		assert_eq!(
+			seen,
+			vec![
+				intruder(UpgradeStep::Started, false),
+				intruder(UpgradeStep::RenameHoldingTheFile, true),
+				intruder(UpgradeStep::RenameAfterReleasingIt, true),
+			]
 		);
 		assert!(!upgrade_path(&project(dir.path())).exists());
 		assert_eq!(read_closed(&project(dir.path())).unwrap().format, 1);
@@ -2439,6 +2464,23 @@ pub(crate) mod tests {
 		let checked = verify_migrated(&old, &copy);
 
 		assert!(matches!(checked, Err(StoreError::UpgradeFailed(_))), "{checked:?}");
+
+		let new = Database::open(&copy).unwrap();
+		let txn = new.begin_write().unwrap();
+		txn.open_table(FILES)
+			.unwrap()
+			.insert(file_key(ROOT_FOLDER, b"a.jpg").as_slice(), [9, 9].as_slice())
+			.unwrap();
+		txn.commit().unwrap();
+		drop(new);
+
+		let unreadable = verify_migrated(&old, &copy).unwrap_err().to_string();
+
+		assert!(
+			unreadable.contains("the upgraded copy can't be read back"),
+			"{unreadable}"
+		);
+		assert!(!unreadable.contains("damaged"), "{unreadable}");
 	}
 
 	#[test]
