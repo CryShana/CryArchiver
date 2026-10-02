@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
@@ -327,8 +328,32 @@ pub async fn analyze(
 	window: Option<TrimWindow>,
 	cancel: &CancellationToken,
 ) -> Result<Analysis, JobError> {
+	Box::pin(analyze_reporting(
+		tools,
+		source,
+		main,
+		(duration_s, window),
+		count,
+		&|_, _| {},
+		cancel,
+	))
+	.await
+}
+
+/// `analyze`, telling `on_segments` how many of the segments are done, from none to all.
+pub async fn analyze_reporting(
+	tools: &Toolchain,
+	source: &Path,
+	main: &Stream,
+	(duration_s, window): (Option<f64>, Option<TrimWindow>),
+	count: usize,
+	on_segments: &(dyn Fn(usize, usize) + Sync),
+	cancel: &CancellationToken,
+) -> Result<Analysis, JobError> {
 	let end_s = window.map_or(duration_s, |window| Some(window.start_s + window.length_s));
 	let segments = window_segments(duration_s, count, window);
+	let (done, total) = (&AtomicUsize::new(0), segments.len());
+	on_segments(0, total);
 
 	let run = |segment: Option<Segment>| async move {
 		let Some(segment) = segment else {
@@ -341,6 +366,7 @@ pub async fn analyze(
 			segment_pixels(tools, source, main, &segment, cancel)
 		);
 		let (out, pixels) = (out?, pixels?);
+		on_segments(done.fetch_add(1, Ordering::SeqCst) + 1, total);
 
 		Ok::<_, JobError>(
 			parse_segment(&out.stderr_tail, segment.start_s, segment_length(&segment, end_s)).map(|stats| {

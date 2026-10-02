@@ -148,6 +148,25 @@ struct Sampling {
 	most: usize,
 }
 
+/// How far a search has come.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SearchStep {
+	/// Probe `round`, counted from 0, starts at `crf`.
+	Probe {
+		round: usize,
+		crf: f64,
+	},
+	/// `done` of the probe's `total` samples are scored.
+	Samples {
+		done: usize,
+		total: usize,
+	},
+	Probed {
+		crf: f64,
+		score: Score,
+	},
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrainChoice {
 	Grain,
@@ -606,7 +625,14 @@ pub fn dropped_grain_text(level: u8, grain: Searched, plain: Searched, grain_tar
 }
 
 impl Scorer<'_> {
-	pub async fn probe(&self, crf: f64, samples: &[Sample], round: usize) -> Result<Probed, JobError> {
+	/// Encodes and scores `samples` at `crf`, telling `on_samples` how many are done, from none to all.
+	pub async fn probe(
+		&self,
+		crf: f64,
+		samples: &[Sample],
+		round: usize,
+		mut on_samples: impl FnMut(usize),
+	) -> Result<Probed, JobError> {
 		let plan = VideoPlan {
 			encoder: self.plan.encoder.with_crf(crf),
 			..self.plan.clone()
@@ -615,6 +641,7 @@ impl Scorer<'_> {
 		let mut bytes = 0;
 		let mut encode_s = 0.0;
 		let mut rates = Vec::new();
+		on_samples(0);
 
 		for (index, sample) in samples.iter().enumerate() {
 			let output = self.workspace.file(&format!("probe{round}-{index}.mkv"));
@@ -638,6 +665,7 @@ impl Scorer<'_> {
 			);
 			scores.extend(vmaf::frames(&cmd, &scoring, |_| {}, self.cancel).await?);
 			let _ = fs::remove_file(&output);
+			on_samples(index + 1);
 		}
 
 		rates.sort_by(f64::total_cmp);
@@ -794,9 +822,9 @@ pub async fn search(
 	start: f64,
 	aim: Aim,
 	prior_slope: f64,
-	on_round: impl FnMut(usize),
+	on_step: impl FnMut(SearchStep),
 ) -> Result<Search, JobError> {
-	search_below(scorer, samples, start, aim, prior_slope, None, on_round).await
+	search_below(scorer, samples, start, aim, prior_slope, None, on_step).await
 }
 
 /// `search`, given up as unreachable once a probe misses the target at `bytes` or more: every CRF that would pass is
@@ -809,7 +837,7 @@ pub async fn search_below(
 	aim: Aim,
 	prior_slope: f64,
 	bytes: Option<u64>,
-	mut on_round: impl FnMut(usize),
+	mut on_step: impl FnMut(SearchStep),
 ) -> Result<Search, JobError> {
 	let bounds = bounds(&scorer.plan.encoder);
 	let mut target = aim.search;
@@ -819,8 +847,22 @@ pub async fn search_below(
 	let mut crf = bounds.quantize(start);
 
 	let searched = loop {
-		on_round(probes.len());
-		let measured = scorer.probe(crf, samples, probes.len()).await?;
+		on_step(SearchStep::Probe {
+			round: probes.len(),
+			crf,
+		});
+		let on_samples = |done| {
+			on_step(SearchStep::Samples {
+				done,
+				total: samples.len(),
+			});
+		};
+		let measured = scorer.probe(crf, samples, probes.len(), on_samples).await?;
+		on_step(SearchStep::Probed {
+			crf,
+			score: measured.score,
+		});
+
 		if probes.is_empty() {
 			rate = aim.rate.unwrap_or(measured.rate);
 			target = aim.target(rate);

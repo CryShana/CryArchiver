@@ -251,12 +251,16 @@ pub async fn encode_samples(
 	workspace: &Workspace,
 	plan: &VideoPlan,
 	samples: &[Sample],
+	mut on_samples: impl FnMut(usize),
 	cancel: &CancellationToken,
 ) -> Result<u64, JobError> {
 	let mut total = 0;
+	on_samples(0);
+
 	for (index, sample) in samples.iter().enumerate() {
 		let output = workspace.file(&format!("sample-{index}.mkv"));
 		total += encode_sample(ffmpeg, source, &output, plan, sample, cancel).await?;
+		on_samples(index + 1);
 	}
 	Ok(total)
 }

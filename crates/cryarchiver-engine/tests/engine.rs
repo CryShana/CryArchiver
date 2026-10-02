@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
+use cryarchiver_engine::engine::{Encode, EncodeAgain, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::plan::worst_case_memory;
 use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, Resize, SubtitlePick, Trim, VideoEncoderChoice};
@@ -14,6 +14,7 @@ use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason}
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{self, Stream, probe};
 use cryarchiver_engine::quality::memory::{GroupStats, Offset, SharedMemory};
+use cryarchiver_engine::quality::search::Target;
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
 use cryarchiver_engine::toolchain::LIBAOM;
 use cryarchiver_engine::video::plan::synthesized_grain;
@@ -2073,6 +2074,106 @@ async fn a_retry_never_lands_next_to_the_crf_that_missed() {
 		.parse()
 		.unwrap();
 	assert!(55.0 - again >= 2.0, "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_repeated_encode_is_announced_with_what_the_check_measured_and_the_new_crf() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
+	let strict_key = key.replace("|t93.0/89.0", "|t95.0/91.0");
+	let memory = SharedMemory::with_entries([(strict_key, GroupStats { setting: 55.0, ..stats })]);
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(Arc::new(memory));
+
+	let (outcome, events) = run_recording(&engine, &strict(&clip, 95.0, 91.0), dir.path()).await;
+
+	let announced: Vec<(usize, EncodeAgain)> = events
+		.iter()
+		.enumerate()
+		.filter_map(|(index, event)| match event {
+			JobEvent::EncodeAgain(again) => Some((index, *again)),
+			_ => None,
+		})
+		.collect();
+	let [(index, again)] = announced[..] else {
+		panic!("{outcome:?} {events:?}")
+	};
+	assert_eq!((again.attempt, again.attempts), (2, 2), "{again:?}");
+	assert_eq!(
+		again.target,
+		Target {
+			mean: 95.0,
+			floor: 91.0
+		}
+	);
+	assert!(!again.target.met(again.measured), "{again:?}");
+	assert!(again.crf < 55.0, "{again:?}");
+	assert_eq!(events[index + 1], JobEvent::Stage(Stage::Encode), "{events:?}");
+	assert_eq!(stages(&events[..index], Stage::Encode), 1, "{events:?}");
+}
+
+#[tokio::test]
+async fn the_analysis_and_the_quality_search_report_their_progress() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let engine = Engine::new(support::toolchain().await);
+
+	let (outcome, events) = run_recording(&engine, &job(&clip), dir.path()).await;
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+
+	let within = |stage: Stage| {
+		let start = events
+			.iter()
+			.position(|event| *event == JobEvent::Stage(stage))
+			.unwrap();
+		let end = events[start + 1..]
+			.iter()
+			.position(|event| matches!(event, JobEvent::Stage(_)))
+			.map_or(events.len(), |offset| start + 1 + offset);
+		&events[start + 1..end]
+	};
+	let parts = |events: &[JobEvent]| -> Vec<(usize, usize)> {
+		events
+			.iter()
+			.filter_map(|event| match event {
+				JobEvent::Parts { done, total } => Some((*done, *total)),
+				_ => None,
+			})
+			.collect()
+	};
+
+	let analysed = parts(within(Stage::Analyze));
+	let total = analysed.first().map(|&(_, total)| total).unwrap();
+	assert!(total > 0, "{analysed:?}");
+	assert_eq!(analysed, (0..=total).map(|done| (done, total)).collect::<Vec<_>>());
+
+	let sampling = within(Stage::Sample);
+	let probes: Vec<(usize, usize, f64)> = sampling
+		.iter()
+		.filter_map(|event| match event {
+			JobEvent::Probe { number, most, crf } => Some((*number, *most, *crf)),
+			_ => None,
+		})
+		.collect();
+	let scored_crfs: Vec<f64> = sampling
+		.iter()
+		.filter_map(|event| match event {
+			JobEvent::Probed { crf, .. } => Some(*crf),
+			_ => None,
+		})
+		.collect();
+	assert!(!probes.is_empty(), "{sampling:?}");
+	for (index, &(number, most, _)) in probes.iter().enumerate() {
+		assert_eq!(number, index + 1, "{probes:?}");
+		assert!(most >= number, "{probes:?}");
+	}
+	assert_eq!(scored_crfs, probes.iter().map(|&(_, _, crf)| crf).collect::<Vec<_>>());
+
+	let samples = parts(sampling);
+	let per_probe = samples.first().map(|&(_, total)| total).unwrap();
+	assert!(per_probe > 0, "{samples:?}");
+	assert_eq!(samples.len(), probes.len() * (per_probe + 1), "{samples:?}");
+	assert!(samples.contains(&(per_probe, per_probe)), "{samples:?}");
 }
 
 #[tokio::test]

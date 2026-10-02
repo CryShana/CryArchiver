@@ -15,7 +15,7 @@ use cryarchiver_engine::video::burn;
 use cryarchiver_engine::video::encode::{Sample, encode_sample, encode_video, video_command};
 use cryarchiver_engine::video::plan::{VideoCaps, VideoPlan, plan_video, precheck};
 use cryarchiver_engine::video::quality::{
-	Aim, Scorer, Searched, search, search_below, search_samples, target, verify_windows,
+	Aim, Scorer, SearchStep, Searched, search, search_below, search_samples, target, verify_windows,
 };
 use cryarchiver_engine::video::verify::Retiming;
 use cryarchiver_engine::workspace::Workspace;
@@ -353,8 +353,10 @@ async fn a_search_below_a_size_gives_up_once_a_miss_is_already_that_large() {
 		Aim::exact(unreachable),
 		DEFAULT_SLOPE,
 		Some(1),
-		|_| {
-			rounds += 1;
+		|step| {
+			if matches!(step, SearchStep::Probe { .. }) {
+				rounds += 1;
+			}
 		},
 	)
 	.await
@@ -431,7 +433,7 @@ async fn a_search_sample_and_its_reference_draw_the_subtitles_on_screen_at_its_o
 		threads: 4,
 		cancel: &cancel,
 	};
-	let probed = scorer.probe(20.0, &[on_screen], 0).await.unwrap();
+	let probed = scorer.probe(20.0, &[on_screen], 0, |_| {}).await.unwrap();
 	let score = probed.score;
 	assert!(probed.encode_s > 0.0 && probed.bytes > 0, "{probed:?}");
 

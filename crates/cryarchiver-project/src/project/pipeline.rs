@@ -485,6 +485,9 @@ impl Owner {
 				self.touch_file(file);
 			}
 			JobEvent::Warning(warning) => self.note(file, warning),
+			JobEvent::Parts { .. } | JobEvent::Probe { .. } | JobEvent::Probed { .. } | JobEvent::EncodeAgain(_) => {
+				return;
+			}
 		}
 
 		self.pipeline.workers_dirty = true;

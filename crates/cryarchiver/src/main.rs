@@ -486,7 +486,7 @@ impl QueueSeat {
 				}
 			}
 			JobEvent::Stage(_) => self.leave(),
-			JobEvent::Progress(_) | JobEvent::Warning(_) => {}
+			_ => {}
 		}
 	}
 
@@ -884,14 +884,14 @@ async fn run_all(
 		let key = output_key(&job.source, sink.output_dir.as_deref());
 		if let Some(first) = claimed.get(&key) {
 			let reason = format!("same output name as {}", display_path(first));
-			record(report, &mut totals, &job.source, &JobOutcome::Skipped { reason });
+			record(report, &mut totals, &job.source, &JobOutcome::Skipped { reason }, &[]);
 			continue;
 		}
 		claimed.insert(key, job.source.clone());
 
 		if let Some(existing) = sink.existing_output(&job.source, job.options.format) {
 			let reason = format!("output already exists: {}", display_path(&existing));
-			record(report, &mut totals, &job.source, &JobOutcome::Skipped { reason });
+			record(report, &mut totals, &job.source, &JobOutcome::Skipped { reason }, &[]);
 			continue;
 		}
 
@@ -907,7 +907,7 @@ async fn run_all(
 			break;
 		}
 
-		let bar = report.bar(&job.source);
+		let item = report.item(&job.source);
 		let seat = QueueSeat::new(videos.clone());
 		let (engine, sink, cancel) = (engine.clone(), sink.clone(), cancel.clone());
 		let report = report.clone();
@@ -916,12 +916,9 @@ async fn run_all(
 			let source = job.source.clone();
 			let on_event = |event: JobEvent| {
 				seat.observe(&event);
-				report::apply(&bar, &event);
 
-				if report.verbose()
-					&& let JobEvent::Warning(warning) = &event
-				{
-					report.print(&format!("  ⚠ {}: {warning}", file_label(&source)), false);
+				if let Some(line) = item.apply(&event) {
+					report.print(&line, false);
 				}
 			};
 
@@ -935,15 +932,14 @@ async fn run_all(
 				|wait: Wait, err: &JobError| {
 					let waiting = retry::describe(wait);
 					report.print(&format!("↻ {}  {waiting}: {err}", file_label(&source)), false);
-					bar.set_position(0);
-					bar.set_message(waiting);
+					item.wait(waiting);
 				},
 				|wait: Wait| retry::wait(wait, &source, &work_root, cancel),
 			)
 			.await;
 
-			bar.finish_and_clear();
-			(job.source, outcome)
+			let shown = item.finish();
+			(job.source, outcome, shown)
 		});
 	}
 
@@ -966,17 +962,17 @@ fn absolute(path: PathBuf) -> PathBuf {
 	std::path::absolute(&path).unwrap_or(path)
 }
 
-fn record(report: &Report, totals: &mut Totals, source: &Path, outcome: &JobOutcome) {
+fn record(report: &Report, totals: &mut Totals, source: &Path, outcome: &JobOutcome, shown: &[String]) {
 	report.print(
-		&outcome_line_with(source, outcome, report.tail_lines()),
+		&outcome_line_with(source, outcome, report.tail_lines(), shown),
 		matches!(outcome, JobOutcome::Failed(_)),
 	);
 	totals.add(outcome);
 }
 
-fn record_joined(report: &Report, totals: &mut Totals, joined: Result<(PathBuf, JobOutcome), JoinError>) {
+fn record_joined(report: &Report, totals: &mut Totals, joined: Result<(PathBuf, JobOutcome, Vec<String>), JoinError>) {
 	match joined {
-		Ok((source, outcome)) => record(report, totals, &source, &outcome),
+		Ok((source, outcome, shown)) => record(report, totals, &source, &outcome, &shown),
 		Err(err) => {
 			report.print(&format!("✗ internal error: {err}"), true);
 			totals.add(&JobOutcome::Failed(ErrorKind::EncodeFailed(err.to_string()).into()));

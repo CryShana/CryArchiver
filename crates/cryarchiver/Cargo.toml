@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 clap.workspace = true
+console.workspace = true
 cryarchiver-engine = { path = "../cryarchiver-engine", features = ["clap"] }
 cryarchiver-project = { path = "../cryarchiver-project" }
 cryarchiver-tui = { path = "../cryarchiver-tui" }

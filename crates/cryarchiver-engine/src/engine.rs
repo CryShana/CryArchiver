@@ -2,6 +2,7 @@ use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -41,7 +42,9 @@ use crate::video::mux::{self, Attachment, ChapterSource, CueFile, MuxInputs, Mux
 use crate::video::plan::{
 	self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, threads_for, usable_main,
 };
-use crate::video::quality::{self as video_quality, Aim, GrainChoice, MAX_RETRIES, Scorer, Searched, Strategy};
+use crate::video::quality::{
+	self as video_quality, Aim, GrainChoice, MAX_RETRIES, Scorer, SearchStep, Searched, Strategy,
+};
 use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
 	Expected, FrameTiming, Retiming, Timelines, alpha_ssim, check_alpha, check_frame_times, check_sync,
@@ -93,6 +96,33 @@ pub enum JobEvent {
 	Stage(Stage),
 	Progress(f64),
 	Warning(String),
+	/// `done` of the current step's `total` parts are finished: the analysis's segments, or a probe's samples.
+	Parts {
+		done: usize,
+		total: usize,
+	},
+	/// The quality search starts probe `number` of at most `most`, at `crf`.
+	Probe {
+		number: usize,
+		most: usize,
+		crf: f64,
+	},
+	/// The probe at `crf` scored `score` over its samples.
+	Probed {
+		crf: f64,
+		score: Score,
+	},
+	EncodeAgain(EncodeAgain),
+}
+
+/// The full encode is repeated because its quality check missed the target.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EncodeAgain {
+	pub attempt: u32,
+	pub attempts: u32,
+	pub measured: Score,
+	pub target: Target,
+	pub crf: f64,
 }
 
 /// The engine's job call as an object, so the project layer can run without ffmpeg in its tests.
@@ -647,13 +677,14 @@ impl Engine {
 	async fn analyze_main(&self, cx: &Context<'_>, main: &Stream, span: Span) -> Result<Analysis, JobError> {
 		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
 		let segments = video_quality::analysis_segments(cx.job.speed, span.length_s);
-		Box::pin(analyze::analyze(
+		let on_segments = |done, total| (cx.on_event)(JobEvent::Parts { done, total });
+		Box::pin(analyze::analyze_reporting(
 			&self.tools,
 			&cx.job.source,
 			main,
-			span.declared_s,
+			(span.declared_s, span.window),
 			segments,
-			span.window,
+			&on_segments,
 			cx.cancel,
 		))
 		.await
@@ -1311,14 +1342,8 @@ impl Engine {
 		(cx.on_event)(JobEvent::Stage(Stage::Sample));
 		let level = video.encoder.grain_level();
 		let passes = if level.is_some() { 2 } else { 1 };
-		let progress = |pass: usize| {
-			move |round: usize| {
-				#[allow(clippy::cast_precision_loss)]
-				(cx.on_event)(JobEvent::Progress(
-					(pass * MAX_PROBES + round) as f64 / (passes * MAX_PROBES) as f64,
-				));
-			}
-		};
+		let probes_run = &AtomicUsize::new(0);
+		let progress = |pass: usize| search_events(cx.on_event, (pass, passes), probes_run);
 		let first = {
 			let scorer = self.scorer(cx, workspace, video);
 			let aim = quality.aim(quality.target, inputs.declared_s, None);
@@ -1512,6 +1537,13 @@ impl Engine {
 			video.encoder = video.encoder.with_crf(lower);
 			attempt += 1;
 
+			(cx.on_event)(JobEvent::EncodeAgain(EncodeAgain {
+				attempt,
+				attempts: MAX_RETRIES + 1,
+				measured: score,
+				target: quality.target,
+				crf: lower,
+			}));
 			(cx.on_event)(JobEvent::Stage(Stage::Encode));
 			Box::pin(self.reencode_video(cx, workspace, inputs.declared_s, video, temps, attempt)).await?;
 		}
@@ -1578,12 +1610,19 @@ impl Engine {
 		};
 
 		(cx.on_event)(JobEvent::Stage(Stage::Sample));
+		let on_samples = |done| {
+			(cx.on_event)(JobEvent::Parts {
+				done,
+				total: samples.len(),
+			});
+		};
 		let sample_bytes = Box::pin(video_encode::encode_samples(
 			&self.tools.ffmpeg,
 			&cx.job.source,
 			workspace,
 			video,
 			&samples,
+			on_samples,
 			cx.cancel,
 		))
 		.await?;
@@ -1857,6 +1896,33 @@ impl Encode for Engine {
 		cancel: &'a CancellationToken,
 	) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>> {
 		Box::pin(self.run(job, sink, on_event, cancel))
+	}
+}
+
+/// A search pass's steps as job events. Probes are numbered across the passes, each counting on from those run
+/// before it, and `Progress` spreads the passes' most probes over the stage.
+fn search_events<'a>(
+	on_event: &'a (dyn Fn(JobEvent) + Sync),
+	(pass, passes): (usize, usize),
+	probes_run: &'a AtomicUsize,
+) -> impl FnMut(SearchStep) + 'a {
+	move |step| match step {
+		SearchStep::Probe { round, crf } => {
+			#[allow(clippy::cast_precision_loss)]
+			on_event(JobEvent::Progress(
+				(pass * MAX_PROBES + round) as f64 / (passes * MAX_PROBES) as f64,
+			));
+
+			let number = probes_run.fetch_add(1, Ordering::SeqCst) + 1;
+			let earlier_probes = number - 1 - round;
+			on_event(JobEvent::Probe {
+				number,
+				most: earlier_probes + (passes - pass) * MAX_PROBES,
+				crf,
+			});
+		}
+		SearchStep::Samples { done, total } => on_event(JobEvent::Parts { done, total }),
+		SearchStep::Probed { crf, score } => on_event(JobEvent::Probed { crf, score }),
 	}
 }
 
