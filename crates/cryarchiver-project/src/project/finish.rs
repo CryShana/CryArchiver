@@ -208,6 +208,7 @@ impl Owner {
 	/// time. Called when a run finishes and when a project opens after a crash.
 	pub(super) fn tidy_store(&mut self) {
 		self.save_quality();
+
 		let failing: HashSet<RelPath> = self
 			.tree
 			.file_ids()
@@ -224,7 +225,7 @@ impl Owner {
 			Ok(_) => self.after_flush(),
 			Err(err) => self.log(
 				LogKind::Action,
-				format!("the project file could not be compacted: {err}"),
+				format!("the project file could not be tidied (old failure logs pruned, free space given back): {err}"),
 			),
 		}
 		self.finish.tidied_bytes = fs::metadata(&self.project_file).map_or(0, |meta| meta.len());
@@ -340,6 +341,22 @@ mod tests {
 		owner.store.flush().unwrap();
 
 		assert!(owner.store_grew());
+	}
+
+	#[test]
+	fn a_project_opened_after_a_crash_is_tidied_at_once() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (owner, _updates) = owner(&source, &dir.path().join("archive"));
+		assert_eq!(owner.finish.tidied_bytes, 0);
+		let project = owner.project_file.clone();
+		drop(owner);
+		crate::store::tests::leave_unclean(&project);
+
+		let (owner, _updates) = crate::project::scanning::tests::reopen(&project);
+
+		assert_eq!(owner.finish.tidied_bytes, fs::metadata(&project).unwrap().len());
 	}
 
 	#[test]

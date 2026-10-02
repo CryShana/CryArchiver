@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cryarchiver_engine::commit::{FileIdentity, file_id, retry_transient};
 use cryarchiver_engine::quality::memory::GroupStats;
 use redb::{
 	Database, ReadOnlyDatabase, ReadOnlyTable, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -72,6 +73,8 @@ pub enum StoreError {
 	UpgradeRequired(u8),
 	#[error("the project file is damaged: {0}")]
 	Damaged(String),
+	#[error("the project file couldn't be upgraded to this version's format and was left as it was: {0}")]
+	UpgradeFailed(String),
 	#[error("the project wasn't closed cleanly; opening it recovers it")]
 	NeedsRecovery,
 	#[error("the project file is missing")]
@@ -228,8 +231,12 @@ impl Codec {
 					return Err(damaged("a compressed record claims more than 16 MiB"));
 				}
 
-				lz4_flex::block::decompress_with_dict(body, size, &self.dictionary)
-					.map_err(|err| StoreError::Damaged(err.to_string()))
+				let bytes = lz4_flex::block::decompress_with_dict(body, size, &self.dictionary)
+					.map_err(|err| StoreError::Damaged(format!("a compressed record can't be read: {err}")))?;
+				if bytes.len() != size {
+					return Err(damaged("a compressed record is shorter than it claims"));
+				}
+				Ok(bytes)
 			}
 			_ => Err(damaged("a record has an unknown encoding")),
 		}
@@ -238,6 +245,20 @@ impl Codec {
 
 fn damaged(reason: &str) -> StoreError {
 	StoreError::Damaged(reason.to_owned())
+}
+
+fn in_table(table: &'static str) -> impl FnOnce(StoreError) -> StoreError {
+	move |err| match err {
+		StoreError::Damaged(reason) => StoreError::Damaged(format!("{table}: {reason}")),
+		other => other,
+	}
+}
+
+fn in_entry<'a>(table: &'static str, path: &'a RelPath) -> impl FnOnce(StoreError) -> StoreError + 'a {
+	move |err| match err {
+		StoreError::Damaged(reason) => StoreError::Damaged(format!("{table} entry {path:?}: {reason}")),
+		other => other,
+	}
 }
 
 /// Samples of every record kind in their serialized form: field names and common values compress to back-references.
@@ -328,19 +349,23 @@ impl FolderIds {
 	}
 
 	/// The folder's id, and whether it was new.
-	fn assign(&mut self, folder: &RelPath) -> (u32, bool) {
+	fn assign(&mut self, folder: &RelPath) -> Result<(u32, bool), StoreError> {
 		if let Some(id) = self.get(folder) {
-			return (id, false);
+			return Ok((id, false));
 		}
 
 		let id = self.next;
+		if self.paths.contains_key(&id) {
+			return Err(io::Error::other("the project has more folders than it can number").into());
+		}
+
 		self.insert(id, folder.clone());
-		(id, true)
+		Ok((id, true))
 	}
 
-	fn key_for(&mut self, path: &RelPath) -> Vec<u8> {
-		let (id, _) = self.assign(&path.parent().unwrap_or_default());
-		file_key(id, path.name_bytes())
+	fn key_for(&mut self, path: &RelPath) -> Result<Vec<u8>, StoreError> {
+		let (id, _) = self.assign(&path.parent().unwrap_or_default())?;
+		Ok(file_key(id, path.name_bytes()))
 	}
 
 	fn path_of(&self, key: &[u8]) -> Result<RelPath, StoreError> {
@@ -429,10 +454,12 @@ impl Store {
 			return Err(StoreError::TooNew(format));
 		}
 
-		remove_stale_upgrade(path)?;
 		let db = if format < FORMAT_VERSION {
+			let real = real_file(path).map_err(upgrade_failed)?;
+			remove_stale_upgrade(&real).map_err(upgrade_failed)?;
 			drop(db);
-			migrate(path)?;
+
+			migrate(&real).map_err(upgrade_failed)?;
 			open_database(path)?.0
 		} else {
 			db
@@ -458,30 +485,30 @@ impl Store {
 
 		for entry in txn.open_table(FILES)?.iter()? {
 			let (key, value) = entry?;
-			loaded
-				.files
-				.push((self.folders.path_of(key.value())?, self.decode_value(value.value())?));
+			let path = self.folders.path_of(key.value()).map_err(in_table("files"))?;
+			let record = self.decode_value(value.value()).map_err(in_entry("files", &path))?;
+			loaded.files.push((path, record));
 		}
 
 		for entry in txn.open_table(FOLDERS)?.iter()? {
 			let (key, value) = entry?;
-			loaded.folders.push((
-				RelPath::from_bytes(key.value().to_vec()),
-				self.decode_value(value.value())?,
-			));
+			let path = RelPath::from_bytes(key.value().to_vec());
+			let record = self.decode_value(value.value()).map_err(in_entry("folders", &path))?;
+			loaded.folders.push((path, record));
 		}
 
 		for entry in txn.open_table(UNKNOWN)?.iter()? {
 			let (key, value) = entry?;
-			loaded
-				.unknown
-				.push((self.folders.path_of(key.value())?, self.decode_value(value.value())?));
+			let path = self.folders.path_of(key.value()).map_err(in_table("unknown"))?;
+			let record = self.decode_value(value.value()).map_err(in_entry("unknown", &path))?;
+			loaded.unknown.push((path, record));
 		}
 
 		for entry in txn.open_table(LOGS)?.iter()? {
 			let (key, _) = entry?;
 			let (path, attempt) = key.value();
-			let last = loaded.last_attempts.entry(self.folders.path_of(path)?).or_default();
+			let path = self.folders.path_of(path).map_err(in_table("logs"))?;
+			let last = loaded.last_attempts.entry(path).or_default();
 			*last = (*last).max(attempt);
 		}
 
@@ -511,7 +538,7 @@ impl Store {
 	}
 
 	pub fn set_file(&mut self, path: &RelPath, record: &FileRecord) -> Result<(), StoreError> {
-		let key = self.file_key(path);
+		let key = self.file_key(path)?;
 		self.put(Table::Files, key, record)
 	}
 
@@ -526,7 +553,7 @@ impl Store {
 	}
 
 	pub fn set_log(&mut self, path: &RelPath, attempt: u32, log: &FailureLog) -> Result<(), StoreError> {
-		let key = self.file_key(path);
+		let key = self.file_key(path)?;
 		if let Some(dropped) = attempt.checked_sub(ATTEMPT_LOGS_KEPT).filter(|dropped| *dropped > 0) {
 			self.remove(Table::Logs(dropped), key.clone());
 		}
@@ -534,7 +561,7 @@ impl Store {
 	}
 
 	pub fn set_unknown(&mut self, path: &RelPath, record: &UnknownRecord) -> Result<(), StoreError> {
-		let key = self.file_key(path);
+		let key = self.file_key(path)?;
 		self.put(Table::Unknown, key, record)
 	}
 
@@ -731,9 +758,9 @@ impl Store {
 			.transpose()
 	}
 
-	fn file_key(&mut self, path: &RelPath) -> Vec<u8> {
+	fn file_key(&mut self, path: &RelPath) -> Result<Vec<u8>, StoreError> {
 		let folder = path.parent().unwrap_or_default();
-		let (id, new) = self.folders.assign(&folder);
+		let (id, new) = self.folders.assign(&folder)?;
 		if new {
 			self.push(Change {
 				table: Table::FolderIds,
@@ -741,7 +768,7 @@ impl Store {
 				value: Some(folder.as_bytes().to_vec()),
 			});
 		}
-		file_key(id, path.name_bytes())
+		Ok(file_key(id, path.name_bytes()))
 	}
 
 	fn known_file_key(&self, path: &RelPath) -> Option<Vec<u8>> {
@@ -785,7 +812,7 @@ impl Store {
 fn trimmed(log: &FailureLog) -> FailureLog {
 	let skip = log.log_tail.len().saturating_sub(LOG_TAIL_LINES);
 	FailureLog {
-		error: log.error.clone(),
+		error: log.error.chars().take(LOG_LINE_CHARS).collect(),
 		log_tail: log.log_tail[skip..]
 			.iter()
 			.map(|line| line.chars().take(LOG_LINE_CHARS).collect())
@@ -924,22 +951,108 @@ fn upgrade_path(path: &Path) -> PathBuf {
 	path.with_file_name(name)
 }
 
+/// The file a linked project file leads to: the upgrade writes its copy beside that file and renames it over that
+/// file, never over the link.
+fn real_file(path: &Path) -> Result<PathBuf, StoreError> {
+	if fs::symlink_metadata(path)?.file_type().is_symlink() {
+		return Ok(fs::canonicalize(path)?);
+	}
+	Ok(path.to_path_buf())
+}
+
+/// Every error of an upgrade says that the project file was left as it was, except a refusal the caller acts on.
+fn upgrade_failed(err: StoreError) -> StoreError {
+	let full = match &err {
+		StoreError::Io(io) | StoreError::Database(redb::Error::Io(io)) => io.kind() == io::ErrorKind::StorageFull,
+		_ => false,
+	};
+
+	match err {
+		StoreError::UpgradeFailed(_) | StoreError::AlreadyOpen | StoreError::TooNew(_) => err,
+		_ if full => StoreError::UpgradeFailed(
+			"there isn't enough free space for the upgraded copy, which takes about as much as the project file".into(),
+		),
+		other => StoreError::UpgradeFailed(other.to_string()),
+	}
+}
+
+/// An upgrade holds this lock on its copy from the moment the copy is checked until it is in place, so another open
+/// never removes a copy that is about to replace the project file.
+fn lock_upgrade(temp: &Path) -> Result<fs::File, StoreError> {
+	let file = fs::File::open(temp)?;
+	match file.try_lock() {
+		Ok(()) => Ok(file),
+		Err(fs::TryLockError::WouldBlock) => Err(StoreError::AlreadyOpen),
+		Err(fs::TryLockError::Error(err)) => Err(err.into()),
+	}
+}
+
 /// Runs only once this open holds the project file for writing.
 fn remove_stale_upgrade(path: &Path) -> Result<(), StoreError> {
 	let temp = upgrade_path(path);
 	match fs::symlink_metadata(&temp) {
-		Ok(meta) if meta.is_file() => Ok(fs::remove_file(&temp)?),
-		Ok(_) => Err(StoreError::Damaged(format!(
-			"{} is in the way of the project file's upgrade",
-			cryarchiver_engine::text::display_path(&temp)
-		))),
-		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-		Err(err) => Err(err.into()),
+		Ok(meta) if meta.is_file() => {}
+		Ok(_) => {
+			return Err(StoreError::UpgradeFailed(format!(
+				"{} is in the way of the upgraded copy",
+				cryarchiver_engine::text::display_path(&temp)
+			)));
+		}
+		Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+		Err(err) => return Err(err.into()),
 	}
+
+	let _held = lock_upgrade(&temp)?;
+	fs::remove_file(&temp)?;
+	Ok(())
+}
+
+/// Removes the upgrade copy only while it is still the file this upgrade created.
+fn remove_if_ours(temp: &Path, ours: FileIdentity) {
+	if file_id(temp).is_ok_and(|found| found == ours) {
+		let _ = fs::remove_file(temp);
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameWindow {
+	HoldingTheFile,
+	AfterReleasingIt,
+}
+
+#[cfg(test)]
+type RenameHook = Box<dyn FnMut(RenameWindow) -> bool>;
+
+#[cfg(test)]
+thread_local! {
+	/// Runs right before each rename attempt of an upgrade on this thread; returning true fails that attempt.
+	static BEFORE_UPGRADE_RENAME: std::cell::RefCell<Option<RenameHook>> = const { std::cell::RefCell::new(None) };
+}
+
+fn rename_into_place(
+	temp: &Path,
+	path: &Path,
+	#[cfg_attr(not(test), expect(unused_variables))] window: RenameWindow,
+) -> io::Result<()> {
+	#[cfg(test)]
+	if let Some(mut hook) = BEFORE_UPGRADE_RENAME.take() {
+		let fail = hook(window);
+		BEFORE_UPGRADE_RENAME.set(Some(hook));
+		if fail {
+			return Err(io::ErrorKind::PermissionDenied.into());
+		}
+	}
+
+	retry_transient(|| fs::rename(temp, path))
 }
 
 /// Writes the upgraded project next to the old file and replaces it with one rename, once the copy is synced and read
 /// back. A crash before the rename leaves the old file untouched; the next open removes the copy and starts again.
+///
+/// The old file stays open read-only until the copy is in place, which keeps every writer out of it. Where the file
+/// system can't rename over an open file (FAT and exFAT on Windows), the rename is tried again after closing it;
+/// the copy's lock still keeps other upgrades away, and a writer that opens the old file in that moment makes the
+/// rename fail rather than lose its writes.
 fn migrate(path: &Path) -> Result<(), StoreError> {
 	let temp = upgrade_path(path);
 	let old = ReadOnlyDatabase::open(path)?;
@@ -950,26 +1063,49 @@ fn migrate(path: &Path) -> Result<(), StoreError> {
 	}
 
 	let file = create_new_file(&temp)?;
-	let written = Database::builder()
+	let ours = match file_id(&temp) {
+		Ok(identity) => identity,
+		Err(err) => {
+			drop(file);
+			let _ = fs::remove_file(&temp);
+			return Err(err.into());
+		}
+	};
+
+	let checked = Database::builder()
 		.create_file(file)
 		.map_err(StoreError::from)
 		.and_then(|new| write_migrated(&old, &new))
+		.and_then(|()| Ok(fs::set_permissions(&temp, fs::metadata(path)?.permissions())?))
 		.and_then(|()| Ok(fs::OpenOptions::new().write(true).open(&temp)?.sync_all()?))
-		.and_then(|()| verify_migrated(&old, &temp));
-	drop(old);
-	if let Err(err) = written {
-		let _ = fs::remove_file(&temp);
-		return Err(err);
-	}
+		.and_then(|()| verify_migrated(&old, &temp))
+		.and_then(|()| lock_upgrade(&temp));
+	let held = match checked {
+		Ok(held) => held,
+		Err(err) => {
+			remove_if_ours(&temp, ours);
+			return Err(err);
+		}
+	};
 
-	if let Err(err) = fs::rename(&temp, path) {
-		let _ = fs::remove_file(&temp);
+	let renamed = match rename_into_place(&temp, path, RenameWindow::HoldingTheFile) {
+		Err(_) if cfg!(any(windows, test)) => {
+			drop(old);
+			rename_into_place(&temp, path, RenameWindow::AfterReleasingIt)
+		}
+		renamed => renamed,
+	};
+	if let Err(err) = renamed {
+		remove_if_ours(&temp, ours);
+		drop(held);
 		return Err(err.into());
 	}
 
-	// On Unix the rename itself is durable only once the folder that holds it is synced.
+	// On Unix the rename is durable only once the folder that holds it is synced. It has happened either way, so a
+	// share that can't sync a folder doesn't fail the open.
 	#[cfg(unix)]
-	fs::File::open(parent_folder(path))?.sync_all()?;
+	let _ = fs::File::open(parent_folder(path)).and_then(|folder| folder.sync_all());
+	drop(held);
 	Ok(())
 }
 
@@ -998,7 +1134,7 @@ fn write_migrated(old: &ReadOnlyDatabase, new: &Database) -> Result<(), StoreErr
 		let mut files = txn.open_table(FILES)?;
 		for entry in read.open_table(FILES)?.iter()? {
 			let (key, value) = entry?;
-			let key = folders.key_for(&RelPath::from_bytes(key.value().to_vec()));
+			let key = folders.key_for(&RelPath::from_bytes(key.value().to_vec()))?;
 			files.insert(key.as_slice(), codec.pack(value.value()).as_slice())?;
 		}
 
@@ -1006,14 +1142,14 @@ fn write_migrated(old: &ReadOnlyDatabase, new: &Database) -> Result<(), StoreErr
 		for entry in read.open_table(LOGS)?.iter()? {
 			let (key, value) = entry?;
 			let (path, attempt) = key.value();
-			let key = folders.key_for(&RelPath::from_bytes(path.to_vec()));
+			let key = folders.key_for(&RelPath::from_bytes(path.to_vec()))?;
 			logs.insert((key.as_slice(), attempt), codec.pack(value.value()).as_slice())?;
 		}
 
 		let mut unknown = txn.open_table(UNKNOWN)?;
 		for entry in read.open_table(UNKNOWN)?.iter()? {
 			let (key, value) = entry?;
-			let key = folders.key_for(&RelPath::from_bytes(key.value().to_vec()));
+			let key = folders.key_for(&RelPath::from_bytes(key.value().to_vec()))?;
 			unknown.insert(key.as_slice(), codec.pack(value.value()).as_slice())?;
 		}
 
@@ -1029,7 +1165,7 @@ fn write_migrated(old: &ReadOnlyDatabase, new: &Database) -> Result<(), StoreErr
 /// Reads the upgraded copy back from its file: it must hold every entry of the old file, byte for byte once
 /// unpacked, under the same paths, and nothing else.
 fn verify_migrated(old: &ReadOnlyDatabase, upgraded: &Path) -> Result<(), StoreError> {
-	let differs = || damaged("its upgraded copy didn't read back the same, so the old file was kept as it was");
+	let differs = || StoreError::UpgradeFailed("the upgraded copy didn't read back the same".into());
 	let new = ReadOnlyDatabase::open(upgraded)?;
 	if read_meta(&new)?.format != FORMAT_VERSION {
 		return Err(differs());
@@ -1419,7 +1555,7 @@ pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use std::ffi::OsStr;
 
 	use cryarchiver_engine::quality::memory::Offset;
@@ -1638,6 +1774,30 @@ mod tests {
 		fn write(&self, offset: u64, data: &[u8]) -> Result<(), io::Error> {
 			self.0.write(offset, data)
 		}
+	}
+
+	/// Rewrites a closed project file as a crash leaves it: a transaction committed, the file never closed.
+	pub(crate) fn leave_unclean(file: &Path) {
+		use redb::StorageBackend;
+
+		let bytes = std::fs::read(file).unwrap();
+		let memory = SharedMemory(std::sync::Arc::default());
+		memory.set_len(u64::try_from(bytes.len()).unwrap()).unwrap();
+		memory.write(0, &bytes).unwrap();
+
+		let db = redb::Builder::new().create_with_backend(memory.clone()).unwrap();
+		let txn = db.begin_write().unwrap();
+		{
+			let mut meta = txn.open_table(META).unwrap();
+			let settings = meta.get(SETTINGS_KEY).unwrap().unwrap().value().to_vec();
+			meta.insert(SETTINGS_KEY, settings.as_slice()).unwrap();
+		}
+		txn.commit().unwrap();
+
+		let mut unclean = vec![0; usize::try_from(memory.len().unwrap()).unwrap()];
+		memory.read(0, &mut unclean).unwrap();
+		std::mem::forget(db);
+		std::fs::write(file, &unclean).unwrap();
 	}
 
 	#[test]
@@ -1925,7 +2085,7 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
 		let long = FailureLog {
-			error: "encode failed: x".into(),
+			error: format!("encode failed: {}", "x".repeat(1000)),
 			log_tail: (0..500).map(|line| format!("{line} {}", "y".repeat(1000))).collect(),
 		};
 
@@ -1939,6 +2099,7 @@ mod tests {
 		assert_eq!(kept.log_tail.len(), LOG_TAIL_LINES);
 		assert!(kept.log_tail[0].starts_with("400 "), "{}", &kept.log_tail[0][..10]);
 		assert!(kept.log_tail.iter().all(|line| line.chars().count() <= LOG_LINE_CHARS));
+		assert_eq!(kept.error.chars().count(), LOG_LINE_CHARS);
 	}
 
 	#[test]
@@ -1981,6 +2142,7 @@ mod tests {
 	}
 
 	const OFFSET_GROUP: &str = "video/h264/1080/fps31/sdr8/progressive/clean/opaque|svt-av1-4.2.0|p5|t93.0/89.0";
+	const OFFSET_ONLY_GROUP: &str = "video/hevc/1080/fps31/sdr8/progressive/clean/opaque|svt-av1-4.2.0|p5|t93.0/89.0";
 
 	fn offset_stats() -> GroupStats {
 		GroupStats {
@@ -1991,6 +2153,12 @@ mod tests {
 			observations: 3,
 			without_grain: false,
 		}
+	}
+
+	fn offset_only_stats() -> GroupStats {
+		let stats = offset_stats().forgotten().unwrap();
+		assert_eq!(stats.observations, 0);
+		stats
 	}
 
 	fn write_format_1(path: &Path, files: &[(RelPath, FileRecord)], log: &(RelPath, u32, FailureLog)) {
@@ -2012,6 +2180,11 @@ mod tests {
 			meta.insert(
 				format!("{QUALITY_PREFIX}{OFFSET_GROUP}").as_str(),
 				rmp_serde::to_vec_named(&offset_stats()).unwrap().as_slice(),
+			)
+			.unwrap();
+			meta.insert(
+				format!("{QUALITY_PREFIX}{OFFSET_ONLY_GROUP}").as_str(),
+				rmp_serde::to_vec_named(&offset_only_stats()).unwrap().as_slice(),
 			)
 			.unwrap();
 
@@ -2068,7 +2241,14 @@ mod tests {
 		files.sort_by(|a, b| a.0.cmp(&b.0));
 		assert_eq!(read, files);
 		assert_eq!(loaded.last_attempts.get(&path("a.jpg")), Some(&2));
-		assert_eq!(loaded.quality, vec![(OFFSET_GROUP.to_owned(), offset_stats())]);
+		assert_eq!(
+			loaded.quality,
+			vec![
+				(OFFSET_GROUP.to_owned(), offset_stats()),
+				(OFFSET_ONLY_GROUP.to_owned(), offset_only_stats())
+			]
+		);
+		assert!(loaded.ignored_quality.is_empty(), "{:?}", loaded.ignored_quality);
 		assert_eq!(store.read_log(&path("a.jpg"), 2).unwrap(), Some(log.2));
 		assert!(!upgrade_path(&project(dir.path())).exists());
 	}
@@ -2082,11 +2262,12 @@ mod tests {
 
 		let opened = Store::open(&project(dir.path()));
 
-		assert!(
-			matches!(opened, Err(StoreError::Damaged(ref reason)) if reason.contains("in the way")),
-			"{:?}",
-			opened.err()
-		);
+		let Err(refused @ StoreError::UpgradeFailed(_)) = opened else {
+			panic!("{:?}", opened.err());
+		};
+		assert!(refused.to_string().contains("in the way"), "{refused}");
+		assert!(refused.to_string().contains("left as it was"), "{refused}");
+		assert!(!refused.to_string().contains("damaged"), "{refused}");
 		assert_eq!(read_closed(&project(dir.path())).unwrap().format, 1);
 		std::fs::remove_dir(upgrade_path(&project(dir.path()))).unwrap();
 		let (_, meta, loaded) = Store::open(&project(dir.path())).unwrap();
@@ -2106,6 +2287,216 @@ mod tests {
 
 		assert_eq!(std::fs::read(project(dir.path())).unwrap(), before);
 		assert!(!upgrade_path(&project(dir.path())).exists());
+	}
+
+	fn format_1_project(dir: &Path) -> Vec<(RelPath, FileRecord)> {
+		let mut files = vec![
+			(path("a.jpg"), committing()),
+			(nested("Trip/b.flac"), FileRecord::discovered(9, 9)),
+		];
+		write_format_1(&project(dir), &files, &(path("a.jpg"), 1, FailureLog::default()));
+		files.sort_by(|a, b| a.0.cmp(&b.0));
+		files
+	}
+
+	fn sorted_files(loaded: Loaded) -> Vec<(RelPath, FileRecord)> {
+		let mut files = loaded.files;
+		files.sort_by(|a, b| a.0.cmp(&b.0));
+		files
+	}
+
+	/// What a second open of the project, made right before a rename attempt of the upgrade, found.
+	#[derive(Debug, PartialEq, Eq)]
+	struct Intruder {
+		window: RenameWindow,
+		refused_as_open: bool,
+		copy_still_there: bool,
+	}
+
+	type Opened = Result<(Store, Meta, Loaded), StoreError>;
+
+	/// Opens the project with a second open made before each rename attempt; `fail` decides which attempts fail.
+	fn open_with_an_intruder(file: &Path, fail: fn(RenameWindow) -> bool) -> (Opened, Vec<Intruder>) {
+		let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+		let (hook_seen, hook_file) = (std::rc::Rc::clone(&seen), file.to_path_buf());
+		BEFORE_UPGRADE_RENAME.set(Some(Box::new(move |window| {
+			let second = Store::open(&hook_file);
+			hook_seen.borrow_mut().push(Intruder {
+				window,
+				refused_as_open: matches!(second, Err(StoreError::AlreadyOpen)),
+				copy_still_there: upgrade_path(&hook_file).is_file(),
+			});
+			fail(window)
+		})));
+
+		let opened = Store::open(file);
+		BEFORE_UPGRADE_RENAME.set(None);
+		let seen = seen.take();
+		(opened, seen)
+	}
+
+	#[test]
+	fn a_second_open_while_the_upgraded_copy_moves_in_is_refused_and_changes_nothing() {
+		let dir = tempfile::tempdir().unwrap();
+		let files = format_1_project(dir.path());
+
+		let (opened, seen) = open_with_an_intruder(&project(dir.path()), |_| false);
+
+		let (store, meta, loaded) = opened.unwrap();
+		assert_eq!(
+			seen,
+			vec![Intruder {
+				window: RenameWindow::HoldingTheFile,
+				refused_as_open: true,
+				copy_still_there: true,
+			}]
+		);
+		assert_eq!(meta.format, FORMAT_VERSION);
+		assert_eq!(sorted_files(loaded), files);
+		assert!(!upgrade_path(&project(dir.path())).exists());
+		drop(store);
+		assert_eq!(sorted_files(Store::open(&project(dir.path())).unwrap().2), files);
+	}
+
+	#[test]
+	fn a_second_open_after_the_old_file_is_released_leaves_the_checked_copy_alone() {
+		let dir = tempfile::tempdir().unwrap();
+		let files = format_1_project(dir.path());
+
+		let (opened, seen) =
+			open_with_an_intruder(&project(dir.path()), |window| window == RenameWindow::HoldingTheFile);
+
+		let (store, meta, loaded) = opened.unwrap();
+		assert_eq!(
+			seen,
+			vec![
+				Intruder {
+					window: RenameWindow::HoldingTheFile,
+					refused_as_open: true,
+					copy_still_there: true,
+				},
+				Intruder {
+					window: RenameWindow::AfterReleasingIt,
+					refused_as_open: true,
+					copy_still_there: true,
+				},
+			]
+		);
+		assert_eq!(meta.format, FORMAT_VERSION);
+		assert_eq!(sorted_files(loaded), files);
+		drop(store);
+		assert_eq!(sorted_files(Store::open(&project(dir.path())).unwrap().2), files);
+	}
+
+	#[test]
+	fn an_upgrade_whose_rename_fails_removes_its_own_copy_and_keeps_the_old_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let files = format_1_project(dir.path());
+
+		let (opened, seen) = open_with_an_intruder(&project(dir.path()), |_| true);
+
+		assert!(
+			matches!(opened, Err(StoreError::UpgradeFailed(_))),
+			"{:?}",
+			opened.err()
+		);
+		assert_eq!(seen.len(), 2);
+		assert!(
+			seen.iter()
+				.all(|intruder| intruder.refused_as_open && intruder.copy_still_there)
+		);
+		assert!(!upgrade_path(&project(dir.path())).exists());
+		assert_eq!(read_closed(&project(dir.path())).unwrap().format, 1);
+		assert_eq!(sorted_files(Store::open(&project(dir.path())).unwrap().2), files);
+	}
+
+	#[test]
+	fn a_copy_that_does_not_match_the_old_file_is_refused() {
+		let dir = tempfile::tempdir().unwrap();
+		format_1_project(dir.path());
+		let old = ReadOnlyDatabase::open(project(dir.path())).unwrap();
+		let copy = dir.path().join("copy.cryarchive");
+		let new = Database::builder()
+			.create_file(create_new_file(&copy).unwrap())
+			.unwrap();
+		write_migrated(&old, &new).unwrap();
+		drop(new);
+		verify_migrated(&old, &copy).unwrap();
+
+		let new = Database::open(&copy).unwrap();
+		let txn = new.begin_write().unwrap();
+		{
+			let mut files = txn.open_table(FILES).unwrap();
+			let key = file_key(ROOT_FOLDER, b"a.jpg");
+			let changed = rmp_serde::to_vec_named(&FileRecord::discovered(1, 1)).unwrap();
+			files
+				.insert(key.as_slice(), Codec::built_in().pack(&changed).as_slice())
+				.unwrap();
+		}
+		txn.commit().unwrap();
+		drop(new);
+
+		let checked = verify_migrated(&old, &copy);
+
+		assert!(matches!(checked, Err(StoreError::UpgradeFailed(_))), "{checked:?}");
+	}
+
+	#[test]
+	fn the_upgrade_copy_beside_a_newer_project_is_left_alone() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		store
+			.put(Table::Meta, FORMAT_KEY.as_bytes().to_vec(), &(FORMAT_VERSION + 1))
+			.unwrap();
+		store.flush().unwrap();
+		drop(store);
+		std::fs::write(upgrade_path(&project(dir.path())), b"a newer build's copy").unwrap();
+
+		assert!(matches!(Store::open(&project(dir.path())), Err(StoreError::TooNew(_))));
+		assert_eq!(
+			std::fs::read(upgrade_path(&project(dir.path()))).unwrap(),
+			b"a newer build's copy"
+		);
+	}
+
+	#[test]
+	fn packed_values_that_cannot_be_read_back_are_refused() {
+		let codec = Codec::built_in();
+		let bytes = rmp_serde::to_vec_named(&committing()).unwrap();
+		let packed = codec.pack(&bytes);
+		assert_eq!(packed[0], LZ4);
+		assert_eq!(codec.unpack(&packed).unwrap(), bytes);
+
+		let claimed = u32::try_from(bytes.len() + 10).unwrap().to_le_bytes();
+		let mut longer = packed.clone();
+		longer[1..5].copy_from_slice(&claimed);
+		let mut oversized = vec![LZ4];
+		oversized.extend(u32::try_from(MAX_RECORD_BYTES + 1).unwrap().to_le_bytes());
+		let unreadable = [
+			vec![9, 1, 2],
+			vec![LZ4, 1, 0],
+			oversized,
+			vec![LZ4, 10, 0, 0, 0, 0xFF, 0xFF],
+			longer,
+		];
+
+		for stored in unreadable {
+			assert!(
+				matches!(codec.unpack(&stored), Err(StoreError::Damaged(_))),
+				"{stored:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn values_over_the_record_limit_are_stored_raw() {
+		let codec = Codec::built_in();
+		let big = vec![0; MAX_RECORD_BYTES + 1];
+
+		let stored = codec.pack(&big);
+
+		assert_eq!(stored[0], RAW);
+		assert_eq!(codec.unpack(&stored).unwrap(), big);
 	}
 
 	#[test]
