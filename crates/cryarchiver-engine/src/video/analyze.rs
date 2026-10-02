@@ -24,6 +24,9 @@ const INTERLACED_FIELD_ORDERS: &[&str] = &["tt", "bb", "tb", "bt"];
 const LOW_DETAIL_SI: f64 = 15.0;
 const MIN_COMBED_BLOCKS: u64 = 40;
 const COMBED_SHARE: f64 = 0.8;
+/// The comb measure is overruled when idet calls most frames progressive: rows that differ by design (scanlines, line
+/// art) under uneven motion are the one progressive picture its symmetric sums can mistake for fields.
+const COMBED_MAX_PROGRESSIVE_SHARE: f64 = 0.5;
 const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:d=1,\
 	scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,\
 	format=yuv420p,siti=print_summary=1[out]";
@@ -256,7 +259,8 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 		}
 		// Faint interlacing that nothing flags: idet weighs whole frames, where a small moving area drowns in the still
 		// rest, while the comb measure counts only the moving blocks.
-		_ if combed.top_first + combed.bottom_first >= MIN_COMBED_BLOCKS
+		_ if progressive / frames < COMBED_MAX_PROGRESSIVE_SHARE
+			&& combed.top_first + combed.bottom_first >= MIN_COMBED_BLOCKS
 			&& (combed.top_first + combed.bottom_first) as f64
 				>= COMBED_SHARE * (combed.top_first + combed.bottom_first + combed.progressive) as f64 =>
 		{
@@ -617,6 +621,14 @@ mod tests {
 		let fast = [combed(37, 13, 6), combed(300, 0, 5)];
 		let mut black = combed(300, 0, 0);
 		black.black_s = 2.9;
+		let called_progressive = [SegmentStats {
+			progressive: 40,
+			..combed(95, 0, 3)
+		}];
+		assert_eq!(
+			classify(&called_progressive, Some(25.0), None).scan,
+			ScanType::Progressive
+		);
 
 		for stats in [
 			&telecine_like[..],

@@ -13,7 +13,7 @@ use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, Resize, Subtit
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{self, Stream, probe};
-use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
+use cryarchiver_engine::quality::memory::{GroupStats, Offset, SharedMemory};
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
 use cryarchiver_engine::toolchain::LIBAOM;
 use cryarchiver_engine::video::plan::synthesized_grain;
@@ -1854,6 +1854,227 @@ async fn a_missed_check_encodes_the_video_once_more_at_most() {
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
 }
 
+/// A zoom into the Mandelbrot set: fine detail that a high CRF visibly blurs, unlike the test pattern.
+fn mandelbrot(dir: &Path, name: &str, seconds: u32, codec: &[&str]) -> std::path::PathBuf {
+	let path = dir.join(name);
+	let source = format!("mandelbrot=s=320x240:r=25,trim=duration={seconds},format=yuv420p");
+	let mut args = vec!["-f", "lavfi", "-i", source.as_str()];
+	args.extend_from_slice(codec);
+	args.push(path.to_str().unwrap());
+	support::ffmpeg(&args);
+	path
+}
+
+const LOSSLESS: &[&str] = &["-c:v", "ffv1"];
+
+fn strict(source: &Path, mean: f64, floor: f64) -> Job {
+	Job {
+		overrides: Overrides {
+			video: Some(VmafOverride { mean, floor }),
+			..Overrides::default()
+		},
+		min_savings: 0.0,
+		..job(source)
+	}
+}
+
+/// The group `source` teaches at `job`'s settings, learned from a committed run.
+async fn taught(tools: &cryarchiver_engine::toolchain::Toolchain, job: &Job, dir: &Path) -> (String, GroupStats) {
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(tools.clone()).with_quality_memory(memory.clone());
+	let (outcome, _) = run_recording(&engine, job, &out_dir(dir, "taught")).await;
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	memory.entries().remove(0)
+}
+
+fn out_dir(dir: &Path, name: &str) -> std::path::PathBuf {
+	let out = dir.join(name);
+	fs::create_dir_all(&out).unwrap();
+	out
+}
+
+fn output_bytes(outcome: &JobOutcome) -> u64 {
+	match outcome {
+		JobOutcome::Encoded { output, .. } => fs::metadata(output).unwrap().len(),
+		other => panic!("{other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn a_learned_shortfall_makes_the_next_search_aim_higher() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = mandelbrot(dir.path(), "zoom.mkv", 6, LOSSLESS);
+	let tools = support::toolchain().await;
+	let (nominal_dir, raised_dir) = (dir.path().join("nominal"), dir.path().join("raised"));
+	fs::create_dir_all(&nominal_dir).unwrap();
+	fs::create_dir_all(&raised_dir).unwrap();
+	let (key, stats) = taught(&tools, &job(&clip), dir.path()).await;
+	let shortfall = GroupStats {
+		offset: Some(Offset { mean: -3.0, p5: -3.0 }),
+		..stats
+	}
+	.forgotten()
+	.unwrap();
+
+	let fresh = Engine::new(tools.clone()).with_quality_memory(Arc::new(SharedMemory::default()));
+	let (nominal, _) = run_recording(&fresh, &job(&clip), &nominal_dir).await;
+	let remembering = Engine::new(tools).with_quality_memory(Arc::new(SharedMemory::with_entries([(key, shortfall)])));
+	let (raised, events) = run_recording(&remembering, &job(&clip), &raised_dir).await;
+
+	assert_eq!(
+		stages(&events, Stage::Sample),
+		1,
+		"an offset alone is no setting: {events:?}"
+	);
+	assert!(
+		10 * output_bytes(&raised) > 11 * output_bytes(&nominal),
+		"{raised:?} {nominal:?}"
+	);
+}
+
+#[tokio::test]
+async fn a_probe_that_meets_only_the_nominal_target_still_goes_through_the_size_gate() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let mpeg4 = &["-c:v", "mpeg4", "-q:v", "2"];
+	let short = mandelbrot(dir.path(), "short.mp4", 6, mpeg4);
+	let long = mandelbrot(dir.path(), "long.mp4", 125, mpeg4);
+	let (key, stats) = taught(&tools, &strict(&short, 97.0, 95.0), dir.path()).await;
+	let shortfall = GroupStats {
+		offset: Some(Offset { mean: -3.0, p5: -3.0 }),
+		..stats
+	}
+	.forgotten()
+	.unwrap();
+	let every_noise_key = [
+		key.replace("/clean/", "/unmeasured/"),
+		key.replace("/unmeasured/", "/clean/"),
+	];
+	let demanding = Job {
+		min_savings: 1.0,
+		..strict(&long, 97.0, 95.0)
+	};
+	let predicted = async |memory: SharedMemory| {
+		let engine = Engine::new(tools.clone()).with_quality_memory(Arc::new(memory));
+		let (outcome, events) = run_recording(&engine, &demanding, dir.path()).await;
+		assert_eq!(stages(&events, Stage::Encode), 0, "{outcome:?}");
+		match outcome {
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::PredictedNotSmaller { predicted_bytes, .. },
+			} => predicted_bytes,
+			other => panic!("{other:?}"),
+		}
+	};
+
+	let at_nominal = predicted(SharedMemory::default()).await;
+	let raised = predicted(SharedMemory::with_entries(every_noise_key.map(|key| (key, shortfall)))).await;
+
+	assert!(
+		raised > at_nominal,
+		"the raised search ends at a lower CRF: {raised} {at_nominal}"
+	);
+}
+
+/// The VMAF scores in a "VMAF 97.9 / 97.0 at CRF 10" text.
+fn scores_in(text: &str) -> (f64, f64) {
+	let after = text.split("VMAF ").nth(1).unwrap();
+	let mut numbers = after.split(['/', ' ']).filter_map(|part| part.parse::<f64>().ok());
+	(numbers.next().unwrap(), numbers.next().unwrap())
+}
+
+#[tokio::test]
+async fn a_last_check_that_misses_by_half_a_point_at_most_is_written_with_a_warning() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
+	let careless = |mean: f64, floor: f64| {
+		let key = key.replace("|t93.0/89.0", &format!("|t{mean:.1}/{floor:.1}"));
+		Engine::new(tools.clone()).with_quality_memory(Arc::new(SharedMemory::with_entries([(
+			key,
+			GroupStats { setting: 55.0, ..stats },
+		)])))
+	};
+
+	let (unreachable, _) = run_recording(
+		&careless(99.0, 99.0),
+		&strict(&clip, 99.0, 99.0),
+		&out_dir(dir.path(), "unreachable"),
+	)
+	.await;
+	let JobOutcome::KeptOriginal {
+		reason: KeepReason::QualityUnreachable(reason),
+	} = &unreachable
+	else {
+		panic!("{unreachable:?}")
+	};
+	let (mean, p5) = scores_in(reason);
+	let (near, far) = ((mean + 0.3, p5 + 0.3), (mean + 0.3, p5 + 0.9));
+
+	let (written, events) = run_recording(
+		&careless(near.0, near.1),
+		&strict(&clip, near.0, near.1),
+		&out_dir(dir.path(), "near"),
+	)
+	.await;
+	assert!(
+		warned(&written, "written slightly below the quality target: VMAF "),
+		"{written:?}"
+	);
+	assert_eq!(
+		stages(&events, Stage::Encode),
+		2,
+		"encoded, then encoded again: {events:?}"
+	);
+
+	let (kept, _) = run_recording(
+		&careless(far.0, far.1),
+		&strict(&clip, far.0, far.1),
+		&out_dir(dir.path(), "far"),
+	)
+	.await;
+	assert!(
+		matches!(
+			kept,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::QualityUnreachable(_)
+			}
+		),
+		"{kept:?}"
+	);
+}
+
+#[tokio::test]
+async fn a_retry_never_lands_next_to_the_crf_that_missed() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let memory = Arc::new(learned_group(dir.path(), 55.0).await);
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory);
+
+	let (outcome, events) = run_recording(&engine, &job(&clip), dir.path()).await;
+
+	assert_eq!(stages(&events, Stage::Encode), 2, "{outcome:?}");
+	let last_text = match &outcome {
+		JobOutcome::Encoded { warnings, .. } => warnings
+			.iter()
+			.find_map(|warning| warning.split("encoded again at ").nth(1))
+			.unwrap_or_else(|| panic!("{warnings:?}"))
+			.to_owned(),
+		JobOutcome::KeptOriginal {
+			reason: KeepReason::QualityUnreachable(reason),
+		} => reason.split(" at ").nth(1).unwrap().to_owned(),
+		other => panic!("{other:?}"),
+	};
+	let again: f64 = last_text
+		.trim_start_matches("CRF ")
+		.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+		.next()
+		.unwrap()
+		.parse()
+		.unwrap();
+	assert!(55.0 - again >= 2.0, "{outcome:?}");
+}
+
 #[tokio::test]
 async fn interlaced_moderate_video_is_verified_at_double_rate() {
 	let dir = tempfile::tempdir().unwrap();
@@ -1987,12 +2208,26 @@ async fn a_learned_crf_whose_output_is_not_smaller_is_forgotten() {
 		0,
 		"the learned CRF was used: {events:?}"
 	);
-	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+	assert!(settings(&memory).is_empty(), "{:?}", memory.entries());
+	assert!(
+		memory.entries().iter().all(|(_, stats)| stats.offset.is_some()),
+		"the sample offset outlives the setting: {:?}",
+		memory.entries()
+	);
 
 	let (_, events) = run_recording(&engine, &demanding(&next), dir.path()).await;
 
 	assert_eq!(stages(&events, Stage::Sample), 1, "the next clip searches: {events:?}");
-	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+	assert!(settings(&memory).is_empty(), "{:?}", memory.entries());
+}
+
+/// The groups that still have a setting to use.
+fn settings(memory: &SharedMemory) -> Vec<(String, GroupStats)> {
+	memory
+		.entries()
+		.into_iter()
+		.filter(|(_, stats)| stats.learned())
+		.collect()
 }
 
 #[tokio::test]
@@ -2037,7 +2272,7 @@ async fn a_learned_crf_that_misses_its_check_and_its_retry_is_forgotten() {
 		2,
 		"encoded, then encoded again: {events:?}"
 	);
-	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+	assert!(settings(&memory).is_empty(), "{:?}", memory.entries());
 
 	let (_, events) = run_recording(&engine, &strict(&next), dir.path()).await;
 
@@ -2485,7 +2720,7 @@ async fn a_learned_crf_whose_requested_output_misses_its_check_and_its_retry_is_
 		2,
 		"encoded, then encoded again: {events:?}"
 	);
-	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+	assert!(settings(&memory).is_empty(), "{:?}", memory.entries());
 }
 
 fn position(bytes: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2909,7 +3144,7 @@ async fn a_capped_video_that_misses_its_check_is_written_without_a_retry() {
 		"the capped key's CRF was used: {events:?}"
 	);
 	assert_eq!(stages(&events, Stage::Encode), 1, "no retry under a cap: {events:?}");
-	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+	assert!(settings(&memory).is_empty(), "{:?}", memory.entries());
 }
 
 #[tokio::test]

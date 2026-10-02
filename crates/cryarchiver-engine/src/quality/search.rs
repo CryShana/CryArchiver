@@ -8,6 +8,9 @@ const CLOSE_ENOUGH: f64 = 0.5;
 const DOWN_MARGIN: f64 = 0.5;
 const MIN_SLOPE: f64 = 0.05;
 const MAX_SLOPE: f64 = 5.0;
+const RETRY_MARGIN: f64 = 1.0;
+const RETRY_SLOPE_TRUST: f64 = 0.75;
+const MIN_RETRY_DROP: f64 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target {
@@ -99,6 +102,9 @@ pub fn next(probes: &[Probe], target: Target, bounds: Bounds, prior_slope: f64) 
 	Next::Probe(candidate)
 }
 
+/// The CRF a missed full check is encoded again at. The retry is the last full encode, so it aims `RETRY_MARGIN` above
+/// the target on a slope it trusts only so far, and drops at least `MIN_RETRY_DROP`: the full check already landed
+/// away from the samples once, and a CRF next to the one that missed would miss again.
 pub fn retry_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bounds) -> Option<f64> {
 	let crf = bounds.quantize(crf);
 	let deficit = -target.margin(score);
@@ -106,7 +112,8 @@ pub fn retry_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bou
 		return None;
 	}
 
-	let drop = (deficit / slope.clamp(MIN_SLOPE, MAX_SLOPE) + DOWN_MARGIN).min(MAX_STEP);
+	let trusted = slope.clamp(MIN_SLOPE, MAX_SLOPE) * RETRY_SLOPE_TRUST;
+	let drop = ((deficit + RETRY_MARGIN) / trusted).clamp(MIN_RETRY_DROP, MAX_STEP);
 	let lowered = bounds.quantize(crf - drop);
 	(lowered < crf).then_some(lowered)
 }
@@ -323,10 +330,24 @@ mod tests {
 			frames: 300,
 		};
 
-		assert_eq!(retry_crf(30.0, missed, TARGET, 0.5, SVT), Some(26.5));
-		assert_eq!(retry_crf(30.0, missed, TARGET, 0.25, SVT), Some(23.5));
+		assert_eq!(retry_crf(30.0, missed, TARGET, 0.5, SVT), Some(23.25));
+		assert_eq!(retry_crf(30.0, missed, TARGET, 0.25, SVT), Some(22.0));
 		assert_eq!(retry_crf(30.0, linear(10.0), TARGET, 0.5, SVT), None);
 		assert_eq!(retry_crf(10.0, missed, TARGET, 0.5, SVT), None);
+	}
+
+	#[test]
+	fn a_retry_aims_above_the_target_and_never_lands_next_to_the_crf_that_missed() {
+		let missed_by = |deficit: f64| Score {
+			mean: TARGET.mean + 2.0,
+			p5: TARGET.floor - deficit,
+			frames: 300,
+		};
+
+		assert_eq!(retry_crf(30.0, missed_by(0.3), TARGET, 0.5, SVT), Some(26.5));
+		assert_eq!(retry_crf(30.0, missed_by(0.1), TARGET, 3.0, SVT), Some(28.0));
+		assert_eq!(retry_crf(30.0, missed_by(0.1), TARGET, 5.0, SVT), Some(28.0));
+		assert_eq!(retry_crf(11.0, missed_by(0.3), TARGET, 0.5, SVT), Some(10.0));
 	}
 
 	#[test]

@@ -1187,6 +1187,33 @@ mod tests {
 	}
 
 	#[test]
+	fn a_forgotten_group_keeps_its_sample_offset_across_a_reopen() {
+		let dir = tempfile::tempdir().unwrap();
+		let key = "video/h264/1080/fps31/sdr8/progressive/clean/opaque|svt-av1-4.2.0|p5|t93.0/89.0";
+		let forgotten = GroupStats {
+			setting: 29.5,
+			slope: Some(0.4),
+			bpp: Some(0.03),
+			offset: Some(Offset { mean: -0.6, p5: -2.1 }),
+			observations: 3,
+			without_grain: false,
+		}
+		.forgotten()
+		.unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		store.set_quality(key, &forgotten).unwrap();
+		store.flush().unwrap();
+		drop(store);
+
+		let (store, _, loaded) = Store::open(&project(dir.path())).unwrap();
+		drop(store);
+
+		assert_eq!(loaded.quality, vec![(key.to_owned(), forgotten)]);
+		assert!(!loaded.quality[0].1.learned());
+		assert!(loaded.ignored_quality.is_empty(), "{:?}", loaded.ignored_quality);
+	}
+
+	#[test]
 	fn a_quality_entry_stored_before_sample_offsets_reads_without_one() {
 		#[derive(Serialize)]
 		struct Earlier {

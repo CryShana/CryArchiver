@@ -28,6 +28,8 @@ pub struct GroupStats {
 	pub bpp: Option<f64>,
 	#[serde(default)]
 	pub offset: Option<Offset>,
+	/// 0 once the group's setting was forgotten: the entry then keeps only its offset, which says how its samples
+	/// predict its full checks whatever CRF they are encoded at.
 	pub observations: u32,
 	/// A noisy group whose files came out smaller without film grain than with it; the setting is for no grain.
 	#[serde(default)]
@@ -55,11 +57,40 @@ impl GroupStats {
 		}
 	}
 
-	/// Settings for and without grain don't mix: an observation of the other kind starts the group afresh.
+	/// Whether the group has a setting to use.
+	pub fn learned(&self) -> bool {
+		self.observations > 0
+	}
+
+	/// What is kept once the setting is forgotten: the offset alone, if there is one.
+	#[must_use]
+	pub fn forgotten(self) -> Option<Self> {
+		self.offset.map(|offset| Self {
+			slope: None,
+			bpp: None,
+			offset: Some(offset),
+			observations: 0,
+			without_grain: false,
+			..self
+		})
+	}
+
+	/// Settings for and without grain don't mix: an observation of the other kind starts the group afresh. The offset
+	/// carries over either way.
 	#[must_use]
 	pub fn updated(self, observation: Observation) -> Self {
-		if observation.without_grain != self.without_grain {
-			return Self::first(observation);
+		if observation.without_grain != self.without_grain || !self.learned() {
+			let offset = match (self.offset, observation.offset) {
+				(Some(old), Some(new)) => Some(Offset {
+					mean: f64::midpoint(old.mean, new.mean),
+					p5: f64::midpoint(old.p5, new.p5),
+				}),
+				(old, new) => new.or(old),
+			};
+			return Self {
+				offset,
+				..Self::first(observation)
+			};
 		}
 
 		let weight = f64::from(self.observations.min(HISTORY - 1));
@@ -146,11 +177,15 @@ fn setting_range(encoder: &str) -> Option<RangeInclusive<f64>> {
 }
 
 pub trait QualityMemory: Send + Sync {
+	/// The group's stats, when it has a setting to use.
 	fn lookup(&self, key: &CacheKey) -> Option<GroupStats>;
+
+	/// How far the group's full checks land from its search samples, kept even once its setting is forgotten.
+	fn offset(&self, key: &CacheKey) -> Option<Offset>;
 
 	fn record(&self, key: &CacheKey, observation: Observation);
 
-	/// Drops what the group learned, so that its next file starts afresh.
+	/// Drops the group's setting, so that its next file starts afresh. Its offset stays.
 	fn forget(&self, key: &CacheKey);
 }
 
@@ -204,7 +239,15 @@ impl SharedMemory {
 
 impl QualityMemory for SharedMemory {
 	fn lookup(&self, key: &CacheKey) -> Option<GroupStats> {
-		self.lock().stats.get(&key.to_string()).copied()
+		self.lock()
+			.stats
+			.get(&key.to_string())
+			.copied()
+			.filter(GroupStats::learned)
+	}
+
+	fn offset(&self, key: &CacheKey) -> Option<Offset> {
+		self.lock().stats.get(&key.to_string()).and_then(|stats| stats.offset)
 	}
 
 	fn record(&self, key: &CacheKey, observation: Observation) {
@@ -222,10 +265,14 @@ impl QualityMemory for SharedMemory {
 	fn forget(&self, key: &CacheKey) {
 		let key = key.to_string();
 		let mut entries = self.lock();
+		let Some(stats) = entries.stats.remove(&key) else {
+			return;
+		};
 
-		if entries.stats.remove(&key).is_some() {
-			entries.changed.insert(key);
+		if let Some(kept) = stats.forgotten() {
+			entries.stats.insert(key.clone(), kept);
 		}
+		entries.changed.insert(key);
 	}
 }
 
@@ -342,6 +389,36 @@ mod tests {
 
 		assert_eq!(memory.lookup(&key(ImageFormat::Jpeg)), None);
 		assert_eq!(memory.take_changed(), vec![(key(ImageFormat::Jpeg).to_string(), None)]);
+	}
+
+	#[test]
+	fn a_forgotten_group_keeps_its_offset_and_learns_its_setting_afresh() {
+		let memory = SharedMemory::default();
+		let measured = |setting: f64, mean: f64| Observation {
+			offset: Some(Offset { mean, p5: mean - 1.0 }),
+			..observation(setting)
+		};
+		memory.record(&key(ImageFormat::Jpeg), measured(30.0, -2.0));
+		memory.take_changed();
+
+		memory.forget(&key(ImageFormat::Jpeg));
+
+		assert_eq!(memory.lookup(&key(ImageFormat::Jpeg)), None);
+		assert_eq!(
+			memory.offset(&key(ImageFormat::Jpeg)),
+			Some(Offset { mean: -2.0, p5: -3.0 })
+		);
+		let changed = memory.take_changed();
+		assert!(
+			matches!(changed.as_slice(), [(_, Some(stats))] if !stats.learned() && stats.offset.is_some()),
+			"{changed:?}"
+		);
+
+		memory.record(&key(ImageFormat::Jpeg), measured(40.0, -1.0));
+
+		let relearned = memory.lookup(&key(ImageFormat::Jpeg)).unwrap();
+		assert_eq!((relearned.setting, relearned.observations), (40.0, 1));
+		assert_eq!(relearned.offset, Some(Offset { mean: -1.5, p5: -2.5 }));
 	}
 
 	#[test]

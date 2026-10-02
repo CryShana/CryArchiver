@@ -226,8 +226,13 @@ struct VideoQuality {
 	slope: f64,
 	/// The plan's film grain was left out, for its group's learned setting or after a search without it won.
 	without_grain: bool,
+	/// How far the group's full checks land from its samples; it outlives a forgotten setting.
+	offset: Option<Offset>,
 	/// What the search samples scored at the CRF the video is encoded at.
 	predicted: Option<Score>,
+	/// Where the hardest scenes the search aims at start, on the source's clock: the full check scores them too.
+	hardest_s: Vec<f64>,
+	retiming: Retiming,
 }
 
 impl VideoQuality {
@@ -238,12 +243,14 @@ impl VideoQuality {
 		}
 	}
 
-	/// A search toward `nominal` for a full encode of `length_s`, moved by what the group learned about its samples.
-	fn aim(&self, nominal: Target, length_s: Option<f64>) -> Aim {
+	/// A search toward `nominal` for a full encode of `length_s`, moved by what the group learned about its samples,
+	/// at an encoding rate measured earlier, if any.
+	fn aim(&self, nominal: Target, length_s: Option<f64>, rate: Option<f64>) -> Aim {
 		Aim {
 			nominal,
-			search: video_quality::search_target(nominal, self.stats.and_then(|stats| stats.offset)),
+			search: video_quality::search_target(nominal, self.offset),
 			length_s,
+			rate,
 		}
 	}
 }
@@ -256,7 +263,7 @@ enum Tuning {
 enum Checked {
 	Passed(Observation),
 	Missed(KeepReason),
-	/// Written as requested; learns nothing.
+	/// Written below the target, as requested or after a near miss; learns nothing.
 	Short,
 }
 
@@ -851,7 +858,7 @@ impl Engine {
 			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, chosen)).await?;
 		}
 
-		let mut quality = self.video_quality(cx.job, main, &analysis, &video);
+		let mut quality = self.video_quality(cx.job, main, &analysis, &video, span_s);
 		Self::apply_learned_grain(cx.job, &mut video, &mut quality);
 		if let Some(crf) = cx.job.options.advanced.crf {
 			video.warnings.push(format!(
@@ -1166,7 +1173,14 @@ impl Engine {
 		}
 	}
 
-	fn video_quality(&self, job: &Job, main: &Stream, analysis: &Analysis, video: &VideoPlan) -> VideoQuality {
+	fn video_quality(
+		&self,
+		job: &Job,
+		main: &Stream,
+		analysis: &Analysis,
+		video: &VideoPlan,
+		length_s: Option<f64>,
+	) -> VideoQuality {
 		let target = video_quality::target(job.speed, video.encoder.film_grain(), &job.overrides);
 		let key = CacheKey {
 			group: Group::Video(VideoGroup::of(main, analysis, video)),
@@ -1182,19 +1196,33 @@ impl Engine {
 			(None, Strategy::Fixed { crf, verify: false })
 		} else {
 			let stats = self.quality.lookup(&key);
-			let strategy =
-				video_quality::strategy(job.speed, stats.as_ref(), video.encoder.crf(), self.tools.has_vmaf());
+			let strategy = video_quality::strategy(
+				job.speed,
+				stats.as_ref(),
+				video.encoder.crf(),
+				self.tools.has_vmaf(),
+				length_s,
+			);
 			(stats, strategy)
 		};
 
 		VideoQuality {
 			strategy,
 			slope: stats.and_then(|stats| stats.slope).unwrap_or(DEFAULT_SLOPE),
+			offset: self.quality.offset(&key),
 			key,
 			stats,
 			target,
 			without_grain: false,
 			predicted: None,
+			hardest_s: video_quality::hardest_segments(
+				&analysis.detail,
+				video_quality::sample_count(job.speed, length_s.unwrap_or(0.0)),
+			)
+			.iter()
+			.map(|detail| detail.start_s)
+			.collect(),
+			retiming: Retiming::of(analysis.scan),
 		}
 	}
 
@@ -1291,9 +1319,9 @@ impl Engine {
 				));
 			}
 		};
-		let mut searched = {
+		let first = {
 			let scorer = self.scorer(cx, workspace, video);
-			let aim = quality.aim(quality.target, inputs.declared_s);
+			let aim = quality.aim(quality.target, inputs.declared_s, None);
 			Box::pin(video_quality::search(
 				&scorer,
 				samples,
@@ -1304,6 +1332,7 @@ impl Engine {
 			))
 			.await?
 		};
+		let mut searched = first.searched;
 
 		if let Some(level) = level {
 			let plain_video = VideoPlan {
@@ -1321,12 +1350,13 @@ impl Engine {
 					&scorer,
 					samples,
 					start,
-					quality.aim(plain_target, inputs.declared_s),
+					quality.aim(plain_target, inputs.declared_s, Some(first.rate)),
 					quality.slope,
 					bytes,
 					progress(1),
 				))
 				.await?
+				.searched
 			};
 
 			if video_quality::grain_choice(searched, plain) == GrainChoice::Plain {
@@ -1348,12 +1378,16 @@ impl Engine {
 				quality.predicted = Some(found.score);
 				found
 			}
-			Searched::Unreachable { crf, score } if quality.target.met(score) => {
+			Searched::Unreachable {
+				crf,
+				score,
+				sample_bytes,
+			} if quality.target.met(score) => {
 				quality.predicted = Some(score);
 				video.encoder = video.encoder.with_crf(crf);
-				return Ok(Tuning::Encode { verify: true });
+				return Ok(Self::predicted_size(cx, inputs, samples, sample_bytes));
 			}
-			Searched::Unreachable { crf, score } if cx.job.options.forced_video(mergeable(inputs.info)) => {
+			Searched::Unreachable { crf, score, .. } if cx.job.options.forced_video(mergeable(inputs.info)) => {
 				video.encoder = video.encoder.with_crf(crf);
 				video.warnings.push(format!(
 					"{}; encoded at CRF {crf} without a full check because it was requested",
@@ -1364,7 +1398,7 @@ impl Engine {
 				));
 				return Ok(Tuning::Encode { verify: false });
 			}
-			Searched::Unreachable { crf, score } => {
+			Searched::Unreachable { crf, score, .. } => {
 				return Ok(Tuning::Keep(video_quality::unreachable_reason(
 					crf,
 					score,
@@ -1402,7 +1436,10 @@ impl Engine {
 		temps: &mut EncodedTemps,
 		quality: &VideoQuality,
 	) -> Result<Checked, JobError> {
-		let windows = video_quality::verify_windows(temps.encoded.frames, temps.encoded.decoded_s, cx.job.speed);
+		let span_start_s = inputs.span.map_or(0.0, |span| span.start_s);
+		let hardest_s: Vec<f64> = quality.hardest_s.iter().map(|start_s| start_s - span_start_s).collect();
+		let windows =
+			video_quality::verify_windows(temps.encoded.frames, temps.encoded.decoded_s, cx.job.speed, &hardest_s);
 		let bounds = video_quality::bounds(&video.encoder);
 		let mut attempt = 1;
 		let mut first_offset = None;
@@ -1412,7 +1449,14 @@ impl Engine {
 			let score = {
 				let scorer = self.scorer(cx, workspace, video);
 				let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
-				Box::pin(scorer.verify(&temps.video.path, &windows, temps.encoded.frames, on_fraction)).await?
+				Box::pin(scorer.verify(
+					&temps.video.path,
+					&windows,
+					temps.encoded.frames,
+					quality.retiming,
+					on_fraction,
+				))
+				.await?
 			};
 
 			if attempt == 1 {
@@ -1444,6 +1488,13 @@ impl Engine {
 						&video_quality::short_text(crf, score, quality.target),
 						video.max_bitrate_kbps,
 					));
+					return Ok(Checked::Short);
+				}
+
+				if video_quality::near_miss(score, quality.target) {
+					temps
+						.warnings
+						.push(video_quality::near_miss_text(crf, score, quality.target));
 					return Ok(Checked::Short);
 				}
 

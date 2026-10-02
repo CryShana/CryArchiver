@@ -166,6 +166,55 @@ pub fn window_command(
 	cmd
 }
 
+/// One window of a full check, found by seeking instead of decoding both files up to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SeekedWindow {
+	/// Where the distorted file is seeked, on its own timestamps.
+	pub distorted_s: f64,
+	/// Where the reference is seeked, as a search sample would be.
+	pub source_s: f64,
+	pub length_s: f64,
+	/// Frames read past before the window, kept out of the score.
+	pub skipped: u64,
+	pub frames: u64,
+}
+
+/// Scores one window of `distorted` against the source: the distorted file is seeked on its own timestamps
+/// (`-seek_timestamp`), the reference exactly like a search sample at the same source time, and each keeps `frames`
+/// frames from there.
+pub fn seeked_window_command(
+	ffmpeg: &Path,
+	distorted: &Path,
+	window: SeekedWindow,
+	reference: &Reference<'_>,
+	scoring: &Scoring<'_>,
+) -> ToolCommand {
+	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
+	cmd.in_dir(scoring.dir);
+	cmd.args(["-hide_banner", "-nostdin", "-seek_timestamp", "1"]);
+	cmd.seek(window.distorted_s, window.length_s);
+	cmd.arg("-i").arg(process::tool_path(distorted));
+
+	let cut = reference.start.seek(window.source_s, window.length_s);
+	cmd.seek(cut.input_s, cut.input_length_s);
+	push_reference(&mut cmd, reference, scoring, Some(cut));
+
+	let keep = format!(
+		"trim=start_frame={}:end_frame={}",
+		window.skipped,
+		window.skipped + window.frames
+	);
+	let distorted_chain = chain(&[&keep, SCORED_FORMAT, BY_POSITION]);
+	let reference_chain = chain(&[reference.filters, &keep, SCORED_FORMAT, BY_POSITION]);
+	cmd.arg("-filter_complex").arg(format!(
+		"[0:v:0]{distorted_chain}[d];{};[d][r]{}[scored]",
+		reference_branch(reference, &reference_chain, Some(cut)),
+		libvmaf(scoring)
+	));
+	cmd.args(["-map", "[scored]", "-f", "null", "-"]);
+	cmd
+}
+
 pub async fn frames(
 	cmd: &ToolCommand,
 	scoring: &Scoring<'_>,
@@ -378,6 +427,54 @@ mod tests {
 			args.ends_with("-map [pace] -f null - -map [scored] -f null -"),
 			"{args}"
 		);
+	}
+
+	#[test]
+	fn a_seeked_window_reads_only_its_own_stretch_of_both_files() {
+		let reference = Reference {
+			source: Path::new("in.mkv"),
+			stream: 3,
+			decoder: None,
+			shape: "bwdif=mode=send_field:parity=tff:deint=all",
+			filters: "format=yuv420p10le",
+			window: None,
+			start: InputStart::default(),
+			overlay: None,
+			subtitles: None,
+		};
+		let window = SeekedWindow {
+			distorted_s: 61.98,
+			source_s: 65.98,
+			length_s: 5.04,
+			skipped: 1,
+			frames: 250,
+		};
+
+		let args = joined(&seeked_window_command(
+			Path::new("ffmpeg"),
+			Path::new("video.a1.mkv"),
+			window,
+			&reference,
+			&scoring(),
+		));
+
+		let reference_at = args.find(" -ss 65.980 -t 5.040 -i ").expect(&args);
+		assert!(
+			args.starts_with("-hide_banner -nostdin -seek_timestamp 1 -ss 61.980 -t 5.040 -i ")
+				&& reference_at > args.find("video.a1.mkv").unwrap(),
+			"{args}"
+		);
+		assert!(
+			args.contains("[0:v:0]trim=start_frame=1:end_frame=251,format=yuv420p10le,settb=1/1000,setpts=N[d];"),
+			"{args}"
+		);
+		assert!(
+			args.contains(
+				"[1:3]bwdif=mode=send_field:parity=tff:deint=all,format=yuv420p10le,trim=start_frame=1:end_frame=251,"
+			),
+			"{args}"
+		);
+		assert!(!args.contains("select=") && !args.contains("[pace]"), "{args}");
 	}
 
 	#[test]

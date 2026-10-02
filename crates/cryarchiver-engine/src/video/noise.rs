@@ -398,6 +398,7 @@ fn mean_luma(frame: &Frame<'_>) -> Option<f64> {
 pub fn combing(a: &Frame<'_>, b: &Frame<'_>, c: &Frame<'_>) -> Combing {
 	let (width, height) = (b.width, b.height);
 	let mut combing = Combing::default();
+
 	if [a, c]
 		.iter()
 		.any(|frame| (frame.width, frame.height) != (width, height))
@@ -409,6 +410,7 @@ pub fn combing(a: &Frame<'_>, b: &Frame<'_>, c: &Frame<'_>) -> Combing {
 
 	let (across, down) = (width / FIELD_BLOCK, (height - 2) / FIELD_BLOCK);
 	let stride = stride(across * down);
+
 	for row in (0..down).step_by(stride) {
 		for column in (0..across).step_by(stride) {
 			match field_vote([a, b, c], column * FIELD_BLOCK, 1 + row * FIELD_BLOCK) {

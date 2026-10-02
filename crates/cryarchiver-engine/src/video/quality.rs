@@ -10,16 +10,19 @@ use crate::outcome::{ErrorKind, JobError, KeepReason};
 use crate::preset::{Overrides, Speed};
 use crate::quality::memory::{GroupStats, Offset};
 use crate::quality::search::{self as crf_search, Bounds, Choice, Next, Probe, Target};
-use crate::quality::vmaf::{self, FrameWindow, Reference, Score, Scoring};
+use crate::quality::vmaf::{self, FrameWindow, Reference, Score, Scoring, SeekedWindow};
 use crate::toolchain::Toolchain;
 use crate::video::analyze::{Analysis, DEFAULT_SEGMENTS, Detail};
 use crate::video::encode::{Sample, encode_sample};
 use crate::video::plan::{Encoder, VideoPlan};
+use crate::video::verify::{self, Retiming};
 use crate::workspace::Workspace;
 
 pub const MAX_RETRIES: u32 = 1;
 pub const MAX_SEARCH_RAISE: f64 = 3.0;
-pub const MAX_SEARCH_LOWER: f64 = 1.0;
+/// The samples lean on the hardest scenes, so the full check usually lands above them: a group's offset only ever
+/// raises the search target.
+pub const MAX_SEARCH_LOWER: f64 = 0.0;
 
 const MAX_SEARCH_MEAN: f64 = 99.0;
 const MOTION_SHARE: usize = 3;
@@ -29,6 +32,8 @@ const SHORT_COVERAGE: f64 = 0.25;
 /// Below this spatial detail a segment is a flat picture (black, a title card) that any CRF encodes perfectly.
 const FLAT_SI: f64 = 2.0;
 const MAX_ANALYSIS_SEGMENTS: usize = 48;
+const LONG_SPAN_S: f64 = 600.0;
+const NEAR_MISS: f64 = 0.5;
 /// The safety margin starts once the full encode is expected to take this long, and reaches `FULL_MARGIN` at
 /// `FULL_MARGIN_S`, growing with each doubling between.
 const MARGIN_FROM_S: f64 = 15.0 * 60.0;
@@ -96,7 +101,20 @@ pub struct Found {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Searched {
 	Found(Found),
-	Unreachable { crf: f64, score: Score },
+	/// No probe reached the search target; the one closest to it, with its samples' size.
+	Unreachable {
+		crf: f64,
+		score: Score,
+		sample_bytes: u64,
+	},
+}
+
+/// A search's result, with how fast its samples encoded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Search {
+	pub searched: Searched,
+	/// Encoding seconds per second of samples, from the first probe.
+	pub rate: f64,
 }
 
 /// What a search aims at.
@@ -108,6 +126,9 @@ pub struct Aim {
 	pub search: Target,
 	/// The source seconds the full encode covers. The margin grows with the time encoding them will take.
 	pub length_s: Option<f64>,
+	/// An encoding rate (seconds per second of samples) measured earlier, so that the margin comes from it rather
+	/// than from this search's first probe.
+	pub rate: Option<f64>,
 }
 
 /// A probe's measurement over all the samples.
@@ -117,6 +138,8 @@ pub struct Probed {
 	pub bytes: u64,
 	/// The time the sample encodes took.
 	pub encode_s: f64,
+	/// The median sample's encoding seconds per second of source, so that one slow start-up doesn't set it.
+	pub rate: f64,
 }
 
 struct Sampling {
@@ -195,25 +218,29 @@ impl Aim {
 			nominal: target,
 			search: target,
 			length_s: None,
+			rate: None,
 		}
 	}
 
-	/// The search target with the margin for the full encode, once encoding `sampled_s` seconds of samples took
-	/// `encode_s`. It stays within `MAX_SEARCH_RAISE` of the nominal target.
-	pub fn target(self, encode_s: f64, sampled_s: f64) -> Target {
-		let Some(length_s) = self.length_s.filter(|_| sampled_s > 0.0) else {
+	/// The search target with the margin for the full encode, at the rate given earlier or else `measured_rate`
+	/// (encoding seconds per second of samples). It stays within `MAX_SEARCH_RAISE` of the nominal target and never
+	/// falls below it.
+	pub fn target(self, measured_rate: f64) -> Target {
+		let Some(length_s) = self.length_s else {
 			return self.search;
 		};
 
-		let margin = encode_margin(encode_s / sampled_s * length_s);
+		let margin = encode_margin(self.rate.unwrap_or(measured_rate) * length_s);
 		let mean = (self.search.mean + margin.mean)
 			.min(self.nominal.mean + MAX_SEARCH_RAISE)
 			.min(MAX_SEARCH_MEAN)
-			.max(self.search.mean);
+			.max(self.search.mean)
+			.max(self.nominal.mean);
 		let floor = (self.search.floor + margin.floor)
 			.min(self.nominal.floor + MAX_SEARCH_RAISE)
 			.min(mean)
-			.max(self.search.floor);
+			.max(self.search.floor)
+			.max(self.nominal.floor);
 		Target { mean, floor }
 	}
 }
@@ -265,8 +292,17 @@ pub fn bounds(encoder: &Encoder) -> Bounds {
 	}
 }
 
-pub fn strategy(speed: Speed, stats: Option<&GroupStats>, table_crf: f64, vmaf: bool) -> Strategy {
+/// At MODERATE a learned CRF is used as it is, except on a span of `LONG_SPAN_S` or more: a second full encode of a
+/// long file costs far more than searching from the learned CRF.
+pub fn strategy(
+	speed: Speed,
+	stats: Option<&GroupStats>,
+	table_crf: f64,
+	vmaf: bool,
+	length_s: Option<f64>,
+) -> Strategy {
 	let learned = stats.map(|stats| stats.setting);
+	let long = length_s.is_some_and(|length_s| length_s >= LONG_SPAN_S);
 
 	match speed {
 		Speed::Fast => Strategy::Fixed {
@@ -278,6 +314,7 @@ pub fn strategy(speed: Speed, stats: Option<&GroupStats>, table_crf: f64, vmaf: 
 			verify: false,
 		},
 		Speed::Moderate => match learned {
+			Some(crf) if long => Strategy::Search { start: crf },
 			Some(crf) => Strategy::Fixed { crf, verify: true },
 			None => Strategy::Search { start: table_crf },
 		},
@@ -324,8 +361,20 @@ pub fn search_samples(analysis: &Analysis, span: Option<TrimWindow>, speed: Spee
 
 /// At least `wanted` segments, more when the hardest ones alone are more.
 fn hardest_first(details: &[Detail], wanted: usize) -> Vec<&Detail> {
+	let mut chosen = hardest_segments(details, wanted);
+	for detail in ranked(details) {
+		if chosen.len() >= wanted {
+			break;
+		}
+		add_once(&mut chosen, detail);
+	}
+	chosen
+}
+
+/// The usable segments by detail, then the low-detail ones that still move, by detail; every segment when there are
+/// neither.
+fn ranked(details: &[Detail]) -> Vec<&Detail> {
 	let by_detail = |list: &mut Vec<&Detail>| list.sort_by(|a, b| b.si.unwrap_or(0.0).total_cmp(&a.si.unwrap_or(0.0)));
-	let moving_picture = |detail: &Detail| !detail.still && detail.si.is_none_or(|si| si >= FLAT_SI);
 
 	let mut ranked: Vec<&Detail> = details.iter().filter(|detail| detail.usable).collect();
 	by_detail(&mut ranked);
@@ -339,7 +388,18 @@ fn hardest_first(details: &[Detail], wanted: usize) -> Vec<&Detail> {
 		ranked = details.iter().collect();
 		by_detail(&mut ranked);
 	}
+	ranked
+}
 
+fn moving_picture(detail: &Detail) -> bool {
+	!detail.still && detail.si.is_none_or(|si| si >= FLAT_SI)
+}
+
+/// The hardest segments of `wanted` samples: the most detailed, the `wanted / MOTION_SHARE` busiest, the darkest and
+/// the noisiest. The busiest, darkest and noisiest may be segments that are not usable for detail (low detail, or
+/// mostly black to blackdetect): near-black scenes with content are exactly what blackdetect calls black, and only
+/// flat and held segments are left out.
+pub fn hardest_segments(details: &[Detail], wanted: usize) -> Vec<&Detail> {
 	let candidates: Vec<&Detail> = details.iter().filter(|detail| moving_picture(detail)).collect();
 	let mut busiest: Vec<&Detail> = candidates
 		.iter()
@@ -359,7 +419,7 @@ fn hardest_first(details: &[Detail], wanted: usize) -> Vec<&Detail> {
 		.max_by(|a, b| a.noise.unwrap_or(0.0).total_cmp(&b.noise.unwrap_or(0.0)));
 
 	let mut chosen: Vec<&Detail> = Vec::new();
-	let hardest = ranked
+	let hardest = ranked(details)
 		.first()
 		.copied()
 		.into_iter()
@@ -367,13 +427,6 @@ fn hardest_first(details: &[Detail], wanted: usize) -> Vec<&Detail> {
 		.chain(darkest)
 		.chain(noisiest);
 	for detail in hardest {
-		add_once(&mut chosen, detail);
-	}
-
-	for detail in ranked {
-		if chosen.len() >= wanted {
-			break;
-		}
 		add_once(&mut chosen, detail);
 	}
 	chosen
@@ -390,13 +443,15 @@ fn add_once<'a>(chosen: &mut Vec<&'a Detail>, detail: &'a Detail) {
 	clippy::cast_possible_truncation,
 	clippy::cast_sign_loss
 )]
-pub fn verify_windows(frames: u64, decoded_s: f64, speed: Speed) -> Vec<FrameWindow> {
-	let count: u64 = match speed {
-		Speed::Slow => 5,
-		Speed::Moderate => 3,
-		Speed::Fast => 0,
+/// The frames of the output the full check scores: windows spread evenly over it, more of them the longer it is, and
+/// one at each of `hardest_s` (seconds into the output), so that the scenes the search aimed at are checked too.
+pub fn verify_windows(frames: u64, decoded_s: f64, speed: Speed, hardest_s: &[f64]) -> Vec<FrameWindow> {
+	let (base, per_window_s, most) = match speed {
+		Speed::Slow => (5, 300.0, 24),
+		Speed::Moderate => (3, 600.0, 12),
+		Speed::Fast => return Vec::new(),
 	};
-	if count == 0 || frames == 0 {
+	if frames == 0 {
 		return Vec::new();
 	}
 
@@ -405,6 +460,7 @@ pub fn verify_windows(frames: u64, decoded_s: f64, speed: Speed) -> Vec<FrameWin
 	} else {
 		FALLBACK_FPS
 	};
+	let count = (base + (decoded_s.max(0.0) / per_window_s) as u64).min(most);
 	let length = ((VERIFY_WINDOW_S * fps).round() as u64).max(1);
 	let edge = (frames as f64 * EDGE_SKIP) as u64;
 	let span = frames - 2 * edge;
@@ -416,13 +472,64 @@ pub fn verify_windows(frames: u64, decoded_s: f64, speed: Speed) -> Vec<FrameWin
 	}
 
 	let stride = (span - length) / (count - 1);
-	(0..count)
-		.map(|index| {
-			let first = edge + index * stride;
-			FrameWindow {
-				first,
-				last: first + length - 1,
+	let spread = (0..count).map(|index| edge + index * stride);
+	let hardest = hardest_s
+		.iter()
+		.filter(|start_s| start_s.is_finite())
+		.map(|start_s| ((start_s.max(0.0) * fps).round() as u64).min(frames - length));
+	let mut firsts: Vec<u64> = spread.chain(hardest).collect();
+	firsts.sort_unstable();
+
+	let mut windows: Vec<FrameWindow> = Vec::new();
+	for first in firsts {
+		let last = first + length - 1;
+		match windows.last_mut() {
+			Some(previous) if first <= previous.last + 1 => previous.last = previous.last.max(last),
+			_ => windows.push(FrameWindow { first, last }),
+		}
+	}
+	windows
+}
+
+/// Where each window starts on the output's own frame `times` and on the source's clock (the trim's start plus the
+/// output time), half a frame back from its first frame, so that rounding can't move the seek onto the frame before.
+/// A deinterlaced output's windows start on the first of a source frame's two fields.
+#[allow(clippy::cast_possible_truncation)]
+pub fn seeked_windows(
+	windows: &[FrameWindow],
+	times: &[f64],
+	retiming: Retiming,
+	trim: Option<TrimWindow>,
+) -> Vec<SeekedWindow> {
+	let start_s = trim.map_or(0.0, |trim| trim.start_s);
+	let last_index = times.len().saturating_sub(1);
+
+	windows
+		.iter()
+		.filter_map(|window| {
+			let skipped = match retiming {
+				Retiming::Doubled => window.first % 2,
+				Retiming::Kept | Retiming::New => 0,
+			};
+			let first = (window.first - skipped) as usize;
+			let last = (window.last as usize).min(last_index);
+			if times.is_empty() || first + (skipped as usize) > last {
+				return None;
 			}
+
+			let gap = if first > 0 {
+				times[first] - times[first - 1]
+			} else {
+				times.get(1).map_or(0.0, |next| next - times[0])
+			};
+			let from = (times[first] - gap / 2.0).max(0.0);
+			Some(SeekedWindow {
+				distorted_s: from,
+				source_s: start_s + from,
+				length_s: times[last] - from + gap.max(0.0),
+				skipped,
+				frames: (last - first + 1) as u64 - skipped,
+			})
 		})
 		.collect()
 }
@@ -437,6 +544,19 @@ pub fn unreachable_text(crf: f64, score: Score, target: Target) -> String {
 /// The same measurement for an output written below its target because it was requested.
 pub fn short_text(crf: f64, score: Score, target: Target) -> String {
 	format!("quality target not reached ({})", measured(crf, score, target))
+}
+
+/// A last full check that missed by so little, on the mean and on the p5 alike, that the output is written anyway.
+pub fn near_miss(score: Score, target: Target) -> bool {
+	score.mean >= target.mean - NEAR_MISS && score.p5 >= target.floor - NEAR_MISS
+}
+
+pub fn near_miss_text(crf: f64, score: Score, target: Target) -> String {
+	format!(
+		"written slightly below the quality target: VMAF {:.1} / {:.1} at CRF {crf}, target {:.1} / {:.1} (within \
+		 {NEAR_MISS:.1})",
+		score.mean, score.p5, target.mean, target.floor
+	)
 }
 
 fn measured(crf: f64, score: Score, target: Target) -> String {
@@ -477,7 +597,7 @@ pub fn dropped_grain_text(level: u8, grain: Searched, plain: Searched, grain_tar
 			grain.crf,
 			grain.sample_bytes as f64 / plain.sample_bytes.max(1) as f64
 		),
-		Searched::Unreachable { crf, score } => format!("with it {}", short_text(crf, score, grain_target)),
+		Searched::Unreachable { crf, score, .. } => format!("with it {}", short_text(crf, score, grain_target)),
 	};
 	format!(
 		"film grain {level} was left out: {with}; without it CRF {} measured VMAF {:.1} / {:.1}",
@@ -494,12 +614,17 @@ impl Scorer<'_> {
 		let mut scores = Vec::new();
 		let mut bytes = 0;
 		let mut encode_s = 0.0;
+		let mut rates = Vec::new();
 
 		for (index, sample) in samples.iter().enumerate() {
 			let output = self.workspace.file(&format!("probe{round}-{index}.mkv"));
 			let started = Instant::now();
 			bytes += encode_sample(&self.tools.ffmpeg, self.source, &output, &plan, sample, self.cancel).await?;
-			encode_s += started.elapsed().as_secs_f64();
+			let elapsed_s = started.elapsed().as_secs_f64();
+			encode_s += elapsed_s;
+			if sample.length_s > 0.0 {
+				rates.push(elapsed_s / sample.length_s);
+			}
 
 			let log = format!("vmaf-probe{round}-{index}.json");
 			let scoring = self.scoring(&log);
@@ -515,25 +640,118 @@ impl Scorer<'_> {
 			let _ = fs::remove_file(&output);
 		}
 
+		rates.sort_by(f64::total_cmp);
 		Ok(Probed {
 			score: pooled(&scores)?,
 			bytes,
 			encode_s,
+			rate: rates.get(rates.len() / 2).copied().unwrap_or(f64::NAN),
 		})
 	}
 
-	#[allow(clippy::cast_precision_loss)]
+	/// The full check of `temp`, `total_frames` long, on `windows`. Each window is read by seeking both files, except
+	/// where frame positions can't be found by time: inverse telecine renumbers the frames from wherever it starts, and
+	/// a TS or PS source closes its timestamps up where they jump. Those, and an output whose frame times don't list
+	/// every frame, are decoded through to their windows.
 	pub async fn verify(
 		&self,
 		temp: &Path,
 		windows: &[FrameWindow],
 		total_frames: u64,
+		retiming: Retiming,
 		mut on_fraction: impl FnMut(f64),
 	) -> Result<Score, JobError> {
+		let scores = match self
+			.seeking_scores(temp, windows, total_frames, retiming, &mut on_fraction)
+			.await?
+		{
+			Some(scores) => scores,
+			None => {
+				self.verify_through(temp, windows, total_frames, &mut on_fraction)
+					.await?
+			}
+		};
+		pooled(&scores)
+	}
+
+	/// The full check by seeking alone: `None` when the output can't be checked that way.
+	pub async fn verify_by_seeking(
+		&self,
+		temp: &Path,
+		windows: &[FrameWindow],
+		total_frames: u64,
+		retiming: Retiming,
+	) -> Result<Option<Score>, JobError> {
+		match self
+			.seeking_scores(temp, windows, total_frames, retiming, &mut |_| {})
+			.await?
+		{
+			Some(scores) => pooled(&scores).map(Some),
+			None => Ok(None),
+		}
+	}
+
+	/// The windows' scores, or `None` when they can't be found by seeking or a window didn't give exactly its frames.
+	#[allow(clippy::cast_precision_loss)]
+	async fn seeking_scores(
+		&self,
+		temp: &Path,
+		windows: &[FrameWindow],
+		total_frames: u64,
+		retiming: Retiming,
+		on_fraction: &mut impl FnMut(f64),
+	) -> Result<Option<Vec<f64>>, JobError> {
+		if retiming == Retiming::New || self.plan.starts.main.streams_s.is_some() {
+			return Ok(None);
+		}
+		let Some(times) = verify::output_frame_times(self.tools, temp, self.cancel)
+			.await?
+			.filter(|times| u64::try_from(times.len()) == Ok(total_frames))
+		else {
+			return Ok(None);
+		};
+
+		let seeks = seeked_windows(windows, &times, retiming, self.plan.window);
+		let total: u64 = seeks.iter().map(|seek| seek.frames).sum();
+		let mut scores = Vec::new();
+
+		for (index, seek) in seeks.iter().enumerate() {
+			let log = format!("vmaf-verify-{index}.json");
+			let scoring = self.scoring(&log);
+			let cmd = vmaf::seeked_window_command(&self.tools.ffmpeg, temp, *seek, &self.reference(), &scoring);
+			let done = scores.len() as f64;
+			let window = vmaf::frames(
+				&cmd,
+				&scoring,
+				|progress| {
+					if let Some(frame) = progress.frame.filter(|_| total > 0) {
+						on_fraction(((done + frame as f64) / total as f64).clamp(0.0, 1.0));
+					}
+				},
+				self.cancel,
+			)
+			.await?;
+
+			if u64::try_from(window.len()) != Ok(seek.frames) {
+				return Ok(None);
+			}
+			scores.extend(window);
+		}
+		Ok(Some(scores))
+	}
+
+	#[allow(clippy::cast_precision_loss)]
+	async fn verify_through(
+		&self,
+		temp: &Path,
+		windows: &[FrameWindow],
+		total_frames: u64,
+		on_fraction: &mut impl FnMut(f64),
+	) -> Result<Vec<f64>, JobError> {
 		let scoring = self.scoring(VERIFY_LOG);
 		let cmd = vmaf::window_command(&self.tools.ffmpeg, temp, &self.reference(), windows, &scoring);
 
-		let scores = vmaf::frames(
+		vmaf::frames(
 			&cmd,
 			&scoring,
 			|progress| {
@@ -543,9 +761,7 @@ impl Scorer<'_> {
 			},
 			self.cancel,
 		)
-		.await?;
-
-		pooled(&scores)
+		.await
 	}
 
 	fn reference(&self) -> Reference<'_> {
@@ -579,13 +795,13 @@ pub async fn search(
 	aim: Aim,
 	prior_slope: f64,
 	on_round: impl FnMut(usize),
-) -> Result<Searched, JobError> {
+) -> Result<Search, JobError> {
 	search_below(scorer, samples, start, aim, prior_slope, None, on_round).await
 }
 
 /// `search`, given up as unreachable once a probe misses the target at `bytes` or more: every CRF that would pass is
 /// lower and larger still, so nothing smaller than `bytes` can be found. The target takes its margin from how long the
-/// first probe's encodes took.
+/// first probe's encodes took, unless the aim brings a rate.
 pub async fn search_below(
 	scorer: &Scorer<'_>,
 	samples: &[Sample],
@@ -594,49 +810,55 @@ pub async fn search_below(
 	prior_slope: f64,
 	bytes: Option<u64>,
 	mut on_round: impl FnMut(usize),
-) -> Result<Searched, JobError> {
+) -> Result<Search, JobError> {
 	let bounds = bounds(&scorer.plan.encoder);
-	let sampled_s: f64 = samples.iter().map(|sample| sample.length_s).sum();
 	let mut target = aim.search;
+	let mut rate = f64::NAN;
 	let mut probes: Vec<Probe> = Vec::new();
 	let mut sample_bytes: Vec<u64> = Vec::new();
 	let mut crf = bounds.quantize(start);
 
-	loop {
+	let searched = loop {
 		on_round(probes.len());
-		let Probed {
-			score,
-			bytes: size,
-			encode_s,
-		} = scorer.probe(crf, samples, probes.len()).await?;
+		let measured = scorer.probe(crf, samples, probes.len()).await?;
 		if probes.is_empty() {
-			target = aim.target(encode_s, sampled_s);
+			rate = aim.rate.unwrap_or(measured.rate);
+			target = aim.target(rate);
 		}
 
-		probes.push(Probe { crf, score });
-		sample_bytes.push(size);
-		if !target.met(score) && bytes.is_some_and(|bytes| size >= bytes) {
-			return Ok(Searched::Unreachable { crf, score });
+		probes.push(Probe {
+			crf,
+			score: measured.score,
+		});
+		sample_bytes.push(measured.bytes);
+		if !target.met(measured.score) && bytes.is_some_and(|bytes| measured.bytes >= bytes) {
+			break Searched::Unreachable {
+				crf,
+				score: measured.score,
+				sample_bytes: measured.bytes,
+			};
 		}
 
 		match crf_search::next(&probes, target, bounds, prior_slope) {
 			Next::Probe(next) => crf = next,
 			Next::Done(Choice::Chosen { index, slope }) => {
-				return Ok(Searched::Found(Found {
+				break Searched::Found(Found {
 					crf: probes[index].crf,
 					score: probes[index].score,
 					sample_bytes: sample_bytes[index],
 					slope,
-				}));
-			}
-			Next::Done(Choice::Unreachable { index }) => {
-				return Ok(Searched::Unreachable {
-					crf: probes[index].crf,
-					score: probes[index].score,
 				});
 			}
+			Next::Done(Choice::Unreachable { index }) => {
+				break Searched::Unreachable {
+					crf: probes[index].crf,
+					score: probes[index].score,
+					sample_bytes: sample_bytes[index],
+				};
+			}
 		}
-	}
+	};
+	Ok(Search { searched, rate })
 }
 
 fn pooled(scores: &[f64]) -> Result<Score, JobError> {
@@ -814,32 +1036,67 @@ mod tests {
 			without_grain: false,
 		};
 
+		let short = Some(599.0);
+
 		assert_eq!(
-			strategy(Speed::Fast, Some(&learned), 35.0, true),
+			strategy(Speed::Fast, Some(&learned), 35.0, true, short),
 			Strategy::Fixed {
 				crf: 35.0,
 				verify: false
 			}
 		);
 		assert_eq!(
-			strategy(Speed::Moderate, None, 29.0, true),
+			strategy(Speed::Moderate, None, 29.0, true, short),
 			Strategy::Search { start: 29.0 }
 		);
+		for length_s in [short, None] {
+			assert_eq!(
+				strategy(Speed::Moderate, Some(&learned), 29.0, true, length_s),
+				Strategy::Fixed {
+					crf: 31.5,
+					verify: true
+				}
+			);
+		}
 		assert_eq!(
-			strategy(Speed::Moderate, Some(&learned), 29.0, true),
-			Strategy::Fixed {
-				crf: 31.5,
-				verify: true
-			}
-		);
-		assert_eq!(
-			strategy(Speed::Slow, Some(&learned), 25.0, true),
+			strategy(Speed::Slow, Some(&learned), 25.0, true, short),
 			Strategy::Search { start: 31.5 }
 		);
 		assert_eq!(
-			strategy(Speed::Slow, None, 25.0, false),
+			strategy(Speed::Slow, None, 25.0, false, short),
 			Strategy::Fixed {
 				crf: 25.0,
+				verify: false
+			}
+		);
+	}
+
+	#[test]
+	fn a_long_file_at_moderate_searches_from_its_learned_crf() {
+		let learned = GroupStats {
+			setting: 31.5,
+			slope: Some(0.4),
+			bpp: None,
+			offset: None,
+			observations: 3,
+			without_grain: false,
+		};
+
+		assert_eq!(
+			strategy(Speed::Moderate, Some(&learned), 29.0, true, Some(600.0)),
+			Strategy::Search { start: 31.5 }
+		);
+		assert_eq!(
+			strategy(Speed::Moderate, Some(&learned), 29.0, false, Some(7200.0)),
+			Strategy::Fixed {
+				crf: 31.5,
+				verify: false
+			}
+		);
+		assert_eq!(
+			strategy(Speed::Fast, Some(&learned), 35.0, true, Some(7200.0)),
+			Strategy::Fixed {
+				crf: 35.0,
 				verify: false
 			}
 		);
@@ -1142,11 +1399,12 @@ mod tests {
 				floor: 92.0
 			}
 		));
+		assert_eq!(aimed(2.0, 0.5), target);
 		assert!(near(
-			aimed(2.0, 0.5),
+			aimed(1.0, -2.0),
 			Target {
-				mean: 92.0,
-				floor: 88.5
+				mean: 93.0,
+				floor: 91.0
 			}
 		));
 		assert_eq!(
@@ -1174,16 +1432,38 @@ mod tests {
 			nominal,
 			search,
 			length_s: Some(length_s),
+			rate: None,
 		};
 		let near = |a: Target, mean: f64, floor: f64| (a.mean - mean).abs() < 1e-9 && (a.floor - floor).abs() < 1e-9;
-		let at_realtime = |aim: Aim| aim.target(8.0, 8.0);
+		let at_realtime = |aim: Aim| aim.target(1.0);
 
 		assert_eq!(at_realtime(aim(nominal, 600.0)), nominal);
-		assert_eq!(aim(nominal, 1800.0).target(1.0, 2.0), nominal);
+		assert_eq!(aim(nominal, 1800.0).target(0.5), nominal);
 		assert!(near(at_realtime(aim(nominal, 1800.0)), 93.25, 89.375));
 		assert!(near(at_realtime(aim(nominal, 3600.0)), 93.5, 89.75));
-		assert!(near(aim(nominal, 3600.0).target(8.0, 2.0), 94.0, 90.5));
-		assert!(near(aim(nominal, 3600.0).target(80.0, 2.0), 94.0, 90.5));
+		assert!(near(aim(nominal, 3600.0).target(4.0), 94.0, 90.5));
+		assert!(near(aim(nominal, 3600.0).target(40.0), 94.0, 90.5));
+		assert!(near(
+			Aim {
+				rate: Some(4.0),
+				..aim(nominal, 3600.0)
+			}
+			.target(0.1),
+			94.0,
+			90.5
+		));
+		assert_eq!(
+			Aim {
+				search: Target {
+					mean: 92.0,
+					floor: 88.0
+				},
+				..aim(nominal, 600.0)
+			}
+			.target(1.0),
+			nominal,
+			"never below the nominal target"
+		);
 		assert!(near(
 			aim(
 				Target {
@@ -1192,19 +1472,18 @@ mod tests {
 				},
 				14_400.0
 			)
-			.target(1.0, 1.0),
+			.target(1.0),
 			96.0,
 			92.0
 		));
-		assert_eq!(Aim::exact(nominal).target(1000.0, 1.0), nominal);
-		assert_eq!(aim(nominal, 3600.0).target(f64::NAN, 2.0), nominal);
-		assert_eq!(aim(nominal, 3600.0).target(8.0, 0.0), nominal);
+		assert_eq!(Aim::exact(nominal).target(1000.0), nominal);
+		assert_eq!(aim(nominal, 3600.0).target(f64::NAN), nominal);
 	}
 
 	#[test]
 	fn windows_skip_the_edges_and_short_outputs_are_scored_whole() {
 		assert_eq!(
-			verify_windows(1500, 60.0, Speed::Moderate),
+			verify_windows(1500, 60.0, Speed::Moderate, &[]),
 			vec![
 				FrameWindow { first: 75, last: 199 },
 				FrameWindow { first: 687, last: 811 },
@@ -1214,12 +1493,103 @@ mod tests {
 				},
 			]
 		);
-		assert_eq!(verify_windows(1500, 60.0, Speed::Slow).len(), 5);
+		assert_eq!(verify_windows(1500, 60.0, Speed::Slow, &[]).len(), 5);
 		assert_eq!(
-			verify_windows(250, 10.0, Speed::Moderate),
+			verify_windows(250, 10.0, Speed::Moderate, &[30.0]),
 			vec![FrameWindow { first: 0, last: 249 }]
 		);
-		assert!(verify_windows(1500, 60.0, Speed::Fast).is_empty());
+		assert!(verify_windows(1500, 60.0, Speed::Fast, &[]).is_empty());
+	}
+
+	#[test]
+	fn the_check_scores_the_hardest_scenes_and_more_windows_on_longer_outputs() {
+		let windows = verify_windows(1500, 60.0, Speed::Moderate, &[20.0, 27.0, 56.0, f64::NAN]);
+
+		assert_eq!(
+			windows,
+			vec![
+				FrameWindow { first: 75, last: 199 },
+				FrameWindow { first: 500, last: 624 },
+				FrameWindow { first: 675, last: 811 },
+				FrameWindow {
+					first: 1299,
+					last: 1499
+				},
+			]
+		);
+
+		let count = |speed: Speed, seconds: f64| {
+			#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+			let frames = (seconds * 25.0) as u64;
+			verify_windows(frames, seconds, speed, &[]).len()
+		};
+		assert_eq!(
+			[600.0, 3600.0, 10_800.0].map(|seconds| count(Speed::Moderate, seconds)),
+			[4, 9, 12]
+		);
+		assert_eq!(
+			[600.0, 3600.0, 10_800.0].map(|seconds| count(Speed::Slow, seconds)),
+			[7, 17, 24]
+		);
+	}
+
+	#[test]
+	fn seeked_windows_start_half_a_frame_back_on_both_clocks() {
+		let times: Vec<f64> = (0..100_u32).map(|frame| 0.5 + 0.04 * f64::from(frame)).collect();
+		let window = FrameWindow { first: 11, last: 30 };
+		let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+		let [kept] = seeked_windows(&[window], &times, Retiming::Kept, None)[..] else {
+			panic!()
+		};
+		let [trimmed] = seeked_windows(
+			&[window],
+			&times,
+			Retiming::Kept,
+			Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 4.0,
+			}),
+		)[..] else {
+			panic!()
+		};
+		let [fields] = seeked_windows(&[window], &times, Retiming::Doubled, None)[..] else {
+			panic!()
+		};
+
+		assert!(near(kept.distorted_s, 0.92) && near(kept.source_s, 0.92), "{kept:?}");
+		assert!(
+			near(kept.length_s, 0.82) && (kept.skipped, kept.frames) == (0, 20),
+			"{kept:?}"
+		);
+		assert!(near(trimmed.source_s, 4.92), "{trimmed:?}");
+		assert!(
+			near(fields.distorted_s, 0.88) && (fields.skipped, fields.frames) == (1, 20),
+			"{fields:?}"
+		);
+		assert!(
+			seeked_windows(&[FrameWindow { first: 0, last: 9 }], &times, Retiming::Kept, None)[0].distorted_s >= 0.48
+		);
+		assert!(seeked_windows(&[window], &[], Retiming::Kept, None).is_empty());
+	}
+
+	#[test]
+	fn a_miss_of_at_most_half_a_point_on_both_scores_is_near() {
+		let target = Target {
+			mean: 91.0,
+			floor: 86.5,
+		};
+		let scored = |mean: f64, p5: f64| Score { mean, p5, frames: 300 };
+
+		assert!(near_miss(scored(92.0, 86.2), target));
+		assert!(near_miss(scored(90.5, 86.0), target));
+		assert!(!near_miss(scored(92.0, 85.9), target));
+		assert!(!near_miss(scored(90.4, 87.0), target));
+		assert!(!near_miss(scored(f64::NAN, 87.0), target));
+		assert_eq!(
+			near_miss_text(28.5, scored(92.04, 86.21), target),
+			"written slightly below the quality target: VMAF 92.0 / 86.2 at CRF 28.5, target 91.0 / 86.5 (within 0.5)"
+		);
 	}
 
 	#[test]
@@ -1257,6 +1627,7 @@ mod tests {
 			p5: 84.0,
 			frames: 300,
 		},
+		sample_bytes: 900_000,
 	};
 
 	#[test]
