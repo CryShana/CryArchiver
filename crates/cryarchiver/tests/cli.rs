@@ -604,6 +604,13 @@ fn compresses_a_video_next_to_the_source() {
 
 	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
 	assert!(stdout(&out).contains("✓ clip.mp4 → clip.cry.mkv"), "{}", stdout(&out));
+	let line = stdout(&out)
+		.lines()
+		.find(|line| line.starts_with("✓ clip.mp4"))
+		.unwrap()
+		.to_owned();
+	assert!(line.contains(" %), CRF "), "the chosen CRF ends the line: {line}");
+	assert!(!line.contains("VMAF"), "FAST measures no VMAF: {line}");
 	assert_eq!(fs::read(&source).unwrap(), before);
 	assert!(!dir.path().join(".cry-work").exists());
 }

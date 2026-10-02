@@ -16,10 +16,10 @@ use cryarchiver_project::{Command, Project, Target as ProjectTarget};
 
 use crate::source::{Action, ArchiveSource, SettingsChange, Target};
 use crate::view::{
-	ArchiveView, ClockTime, Duplicates, FileDetails, FileId, FileRow, FileState, FileStatus, FilterEntry, FilterResult,
-	FilterRow, FolderStats, Header, Issue, IssueId, IssueKind, IssueSummary, IssueVerbs, JobActivity, Library,
-	LiveProgress, Log, LogLine, LogMarker, NodeId, NoticeLevel, Notification, Overall, Parity, PathLink, PlanLine,
-	RunState, Settings, Speed, StageMark, SystemStats, Verb, WorkKind, WorkerJob, Workers,
+	ArchiveView, ClockTime, DecisionLine, Duplicates, FileDetails, FileId, FileRow, FileState, FileStatus, FilterEntry,
+	FilterResult, FilterRow, FolderStats, Header, Issue, IssueId, IssueKind, IssueSummary, IssueVerbs, JobActivity,
+	Library, LiveProgress, Log, LogLine, LogMarker, NodeId, NoticeLevel, Notification, Overall, Parity, PathLink,
+	PlanLine, RunState, Settings, Speed, StageMark, SystemStats, Verb, WorkKind, WorkerJob, Workers,
 };
 
 const LOG_CAPACITY: usize = 500;
@@ -448,6 +448,15 @@ impl ProjectSource {
 				.map(|(label, value)| PlanLine {
 					label: label.clone(),
 					value: value.clone(),
+				})
+				.collect(),
+			decision: details
+				.decision
+				.iter()
+				.map(|line| DecisionLine {
+					label: line.label.clone(),
+					value: line.value.clone(),
+					marked: line.marked,
 				})
 				.collect(),
 			quality: None,

@@ -94,6 +94,15 @@ fn render_facts(buf: &mut Buffer, area: Rect, details: &FileDetails, theme: &The
 		let color = if plan.label == "Note" { state_color } else { theme.text };
 		lines.push(labelled(&plan.label, &fit(&plan.value, value_width), fg(color), theme));
 	}
+	for decision in &details.decision {
+		let color = if decision.marked { theme.warn } else { theme.text };
+		lines.push(labelled(
+			&decision.label,
+			&fit(&decision.value, value_width),
+			fg(color),
+			theme,
+		));
+	}
 
 	if let Some(quality) = &details.quality {
 		let color = if quality.starts_with("target") {
@@ -252,5 +261,141 @@ fn render_issue(buf: &mut Buffer, area: Rect, issue: &IssueSummary, theme: &Them
 fn draw_lines(buf: &mut Buffer, area: Rect, lines: &[Line]) {
 	for (row, line) in (area.y..area.bottom()).zip(lines) {
 		put_line(buf, area.x, row, line, area.right());
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use cryarchiver_engine::decision::{CrfChoice, Decision, Measured, Reencode, Scan, StageTime, VideoDecision, Vmaf};
+	use cryarchiver_project::view::decision_lines;
+
+	use super::*;
+	use crate::theme::ColorDepth;
+	use crate::view::{DecisionLine, FileState, PlanLine};
+
+	fn reencoded() -> Decision {
+		Decision {
+			video: Some(VideoDecision {
+				encoder: "SVT-AV1 preset 5".into(),
+				crf: Some(36.75),
+				chosen: Some(CrfChoice::Searched),
+				target: Some(Vmaf { mean: 91.0, p5: 86.5 }),
+				grain_allowance: Some(Vmaf { mean: 2.0, p5: 2.5 }),
+				probes: vec![Measured::default(); 5],
+				checks: vec![
+					Measured {
+						crf: 38.0,
+						mean: 90.4,
+						p5: 85.9,
+					},
+					Measured {
+						crf: 36.75,
+						mean: 93.1,
+						p5: 87.2,
+					},
+				],
+				reencode: Some(Reencode {
+					reason: "the full check measured VMAF 90.4 / 85.9, below the target 91 / 86.5".into(),
+					from_crf: 38.0,
+					to_crf: 36.75,
+				}),
+				grain: Some(6),
+				scan: Some(Scan::Interlaced),
+				deinterlaced: true,
+				..VideoDecision::default()
+			}),
+			source_bytes: Some(1_750_000_000),
+			output_bytes: Some(152_000_000),
+			stages: vec![
+				StageTime {
+					stage: "analyse".into(),
+					seconds: 41.0,
+				},
+				StageTime {
+					stage: "sample".into(),
+					seconds: 312.0,
+				},
+				StageTime {
+					stage: "encode".into(),
+					seconds: 2410.0,
+				},
+				StageTime {
+					stage: "verify".into(),
+					seconds: 380.0,
+				},
+			],
+			attempts: 2,
+			..Decision::default()
+		}
+	}
+
+	fn text(buffer: &Buffer) -> String {
+		let area = buffer.area;
+		(area.top()..area.bottom())
+			.map(|y| {
+				let row: String = (area.left()..area.right()).map(|x| buffer[(x, y)].symbol()).collect();
+				row.trim_end().to_owned()
+			})
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	#[test]
+	fn a_finished_video_shows_its_decision_record() {
+		let decision = decision_lines(&reencoded())
+			.into_iter()
+			.map(|line| DecisionLine {
+				label: line.label,
+				value: line.value,
+				marked: line.marked,
+			})
+			.collect();
+		let details = FileDetails {
+			source_path: r"D:\Videos\concert.mkv".into(),
+			destination_path: r"E:\Archive\concert.mkv".into(),
+			source_info: "1.75 GB".into(),
+			state: FileState::Done,
+			stages: Vec::new(),
+			live: None,
+			bytes_in: 1_750_000_000,
+			bytes_out: Some(152_000_000),
+			estimated_out: None,
+			plan: vec![PlanLine {
+				label: "Kind".into(),
+				value: "media".into(),
+			}],
+			decision,
+			quality: None,
+			log_tail: Vec::new(),
+			notes: Vec::new(),
+			duplicates: Duplicates::None,
+			issue: None,
+		};
+		let area = Rect::new(0, 0, 120, 16);
+		let mut buffer = Buffer::empty(area);
+
+		render(
+			&mut buffer,
+			area,
+			"concert.mkv",
+			Some(&details),
+			&Theme::dark(ColorDepth::TrueColor),
+			&mut HitMap::default(),
+		);
+
+		let again = (0..area.height)
+			.find(|&y| {
+				text(&buffer)
+					.lines()
+					.nth(usize::from(y))
+					.is_some_and(|row| row.contains("Again"))
+			})
+			.unwrap();
+		assert_eq!(
+			buffer[(11, again)].fg,
+			Theme::dark(ColorDepth::TrueColor).warn,
+			"the encode again stands out"
+		);
+		insta::assert_snapshot!(text(&buffer));
 	}
 }

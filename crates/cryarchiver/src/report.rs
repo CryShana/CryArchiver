@@ -201,7 +201,7 @@ impl Status {
 				self.again = Some(*again);
 				return Some(again_text(again));
 			}
-			JobEvent::Warning(_) => {}
+			JobEvent::Warning(_) | JobEvent::Decision(_) => {}
 		}
 		None
 	}
@@ -464,6 +464,7 @@ pub fn outcome_line_with(source: &Path, outcome: &JobOutcome, tail_lines: usize,
 			src_bytes,
 			out_bytes,
 			warnings,
+			decision,
 		} => {
 			let saved = 100.0 - percent(*out_bytes, *src_bytes);
 			let change = if saved < 0.0 {
@@ -477,6 +478,9 @@ pub fn outcome_line_with(source: &Path, outcome: &JobOutcome, tail_lines: usize,
 				DecimalBytes(*src_bytes),
 				DecimalBytes(*out_bytes)
 			);
+			if let Some(chosen) = decision.crf_and_score() {
+				let _ = write!(line, ", {chosen}");
+			}
 			for warning in warnings.iter().filter(|warning| !shown.contains(warning)) {
 				let _ = write!(line, "\n    ⚠ {}", display_name(OsStr::new(warning)));
 			}
@@ -570,6 +574,7 @@ mod tests {
 	use std::path::PathBuf;
 	use std::sync::Arc;
 
+	use cryarchiver_engine::decision::{Decision, Measured, VideoDecision};
 	use cryarchiver_engine::outcome::{ErrorKind, JobError};
 	use cryarchiver_engine::quality::search::Target;
 	use indicatif::TermLike;
@@ -584,6 +589,7 @@ mod tests {
 			src_bytes: 20_000_000,
 			out_bytes: 2_000_000,
 			warnings: Vec::new(),
+			decision: Box::default(),
 		};
 		let kept = JobOutcome::KeptOriginal {
 			reason: KeepReason::AlreadyEfficient("already Opus".into()),
@@ -610,6 +616,7 @@ mod tests {
 					src_bytes: 6_430_000,
 					out_bytes: 32_090_000,
 					warnings: Vec::new(),
+					decision: Box::default(),
 				}
 			),
 			"✓ 02. 夜明け.flac → 02. 夜明け.cry.opus  6.43 MB → 32.09 MB (+399 %)"
@@ -620,6 +627,34 @@ mod tests {
 			"= 02. 夜明け.flac  kept: encoding would save too little (5.80 MB → predicted 7.10 MB)"
 		);
 		assert!(outcome_line(source, &failed).starts_with("✗ 02. 夜明け.flac  failed: source damaged"));
+	}
+
+	#[test]
+	fn a_video_line_ends_with_the_chosen_crf_and_the_full_check() {
+		let decision = Decision {
+			video: Some(VideoDecision {
+				crf: Some(36.75),
+				checks: vec![Measured {
+					crf: 36.75,
+					mean: 93.12,
+					p5: 87.21,
+				}],
+				..VideoDecision::default()
+			}),
+			..Decision::default()
+		};
+		let encoded = JobOutcome::Encoded {
+			output: PathBuf::from("clip.cry.mkv"),
+			src_bytes: 1_750_000_000,
+			out_bytes: 152_000_000,
+			warnings: vec!["a note".into()],
+			decision: Box::new(decision),
+		};
+
+		assert_eq!(
+			outcome_line(Path::new("clip.mp4"), &encoded),
+			"✓ clip.mp4 → clip.cry.mkv  1.75 GB → 152.00 MB (−91 %), CRF 36.75, VMAF 93.1 / 87.2\n    ⚠ a note"
+		);
 	}
 
 	#[test]
@@ -669,6 +704,7 @@ mod tests {
 			src_bytes: 3_000,
 			out_bytes: 1_000,
 			warnings: Vec::new(),
+			decision: Box::default(),
 		});
 		totals.add(&JobOutcome::Skipped {
 			reason: "not media".into(),
@@ -997,6 +1033,7 @@ mod tests {
 			src_bytes: 2_000,
 			out_bytes: 1_000,
 			warnings: vec!["first".into(), "second".into()],
+			decision: Box::default(),
 		};
 
 		let all = outcome_line_with(Path::new("a.mkv"), &encoded, SHORT_TAIL, &[]);

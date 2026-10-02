@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use cryarchiver_engine::decision::{CrfChoice, Decision, Scan, Vmaf};
 use cryarchiver_engine::engine::{Encode, EncodeAgain, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::plan::worst_case_memory;
@@ -62,6 +63,7 @@ async fn flac_is_encoded_verified_and_committed() {
 		output,
 		src_bytes,
 		out_bytes,
+		decision,
 		..
 	} = outcome
 	else {
@@ -70,6 +72,16 @@ async fn flac_is_encoded_verified_and_committed() {
 	assert_eq!(output, dir.path().join("a.cry.opus"));
 	assert!(out_bytes < src_bytes);
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+
+	let tracks = &decision.audio.as_ref().unwrap().tracks;
+	assert_eq!(tracks.len(), 1, "{decision:?}");
+	assert_eq!(tracks[0].codec, "opus");
+	assert!(tracks[0].bitrate_kbps.is_some_and(|kbps| kbps > 0), "{decision:?}");
+	assert_eq!(
+		(decision.source_bytes, decision.output_bytes),
+		(Some(src_bytes), Some(out_bytes))
+	);
+	assert_eq!(decision.video, None);
 }
 
 #[tokio::test]
@@ -1738,7 +1750,9 @@ async fn moderate_video_is_searched_checked_and_learned() {
 
 	let (outcome, events) = run_recording(&engine, &job(&clip), dir.path()).await;
 
-	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	let JobOutcome::Encoded { decision, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
 	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
 	assert_eq!(
 		stages(&events, Stage::Verify),
@@ -1746,6 +1760,16 @@ async fn moderate_video_is_searched_checked_and_learned() {
 		"the VMAF check and the final checks: {events:?}"
 	);
 	assert_eq!(stages(&events, Stage::Encode), 1, "{events:?}");
+
+	let video = decision.video.as_ref().unwrap();
+	assert_eq!(video.chosen, Some(CrfChoice::Searched), "{decision:?}");
+	assert!(!video.probes.is_empty(), "{decision:?}");
+	assert_eq!(video.checks.len(), 1, "{decision:?}");
+	assert_eq!(Some(video.checks[0].crf), video.crf);
+	assert_eq!((video.reencode.as_ref(), video.near_miss), (None, false));
+	assert_eq!(decision.attempts, 1);
+	assert!(decision.crf_and_score().unwrap().contains(", VMAF "), "{decision:?}");
+
 	let entries = memory.entries();
 	assert_eq!(entries.len(), 1, "{entries:?}");
 	assert!(
@@ -2110,6 +2134,73 @@ async fn a_repeated_encode_is_announced_with_what_the_check_measured_and_the_new
 	assert!(again.crf < 55.0, "{again:?}");
 	assert_eq!(events[index + 1], JobEvent::Stage(Stage::Encode), "{events:?}");
 	assert_eq!(stages(&events[..index], Stage::Encode), 1, "{events:?}");
+}
+
+#[tokio::test]
+async fn the_outcome_records_the_encode_again_with_both_checks_and_both_crfs() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
+	let strict_key = key.replace("|t93.0/89.0", "|t95.0/91.0");
+	let memory = SharedMemory::with_entries([(strict_key, GroupStats { setting: 55.0, ..stats })]);
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(Arc::new(memory));
+
+	let (outcome, events) = run_recording(&engine, &strict(&clip, 95.0, 91.0), dir.path()).await;
+
+	let JobOutcome::Encoded {
+		decision,
+		src_bytes,
+		out_bytes,
+		warnings,
+		..
+	} = &outcome
+	else {
+		panic!("{outcome:?}")
+	};
+	let announced: Vec<&Decision> = events
+		.iter()
+		.filter_map(|event| match event {
+			JobEvent::Decision(decision) => Some(&**decision),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(announced, [&**decision], "the record is announced once, as decided");
+
+	let video = decision.video.as_ref().unwrap();
+	assert_eq!(video.chosen, Some(CrfChoice::Learned), "{decision:?}");
+	assert!(video.custom_target, "{decision:?}");
+	assert_eq!(video.target, Some(Vmaf { mean: 95.0, p5: 91.0 }));
+	assert!(video.probes.is_empty(), "a learned CRF is not searched: {decision:?}");
+	assert_eq!(video.checks.len(), 2, "{decision:?}");
+
+	let again = video.reencode.as_ref().unwrap();
+	assert!(again.to_crf < 55.0, "{again:?}");
+	assert!(again.reason.contains("VMAF"), "{again:?}");
+	assert_eq!(
+		(again.from_crf, video.checks[0].crf, video.checks[1].crf, video.crf),
+		(55.0, 55.0, again.to_crf, Some(again.to_crf))
+	);
+	assert!(video.checks[0].mean < 95.0 || video.checks[0].p5 < 91.0, "{decision:?}");
+	assert_eq!(decision.attempts, 2);
+
+	assert_eq!(video.scan, Some(Scan::Progressive));
+	assert!(!video.deinterlaced);
+	assert!(video.encoder.starts_with("SVT-AV1 preset "), "{decision:?}");
+	assert_eq!((video.resized, video.trim, video.burned_subtitles), (None, None, false));
+	assert_eq!(
+		(decision.source_bytes, decision.output_bytes),
+		(Some(*src_bytes), Some(*out_bytes))
+	);
+	assert_eq!(&decision.warnings, warnings);
+	for stage in ["analyse", "encode", "verify", "mux"] {
+		assert!(
+			decision
+				.stages
+				.iter()
+				.any(|time| time.stage == stage && time.seconds > 0.0),
+			"{stage}: {decision:?}"
+		);
+	}
 }
 
 #[tokio::test]

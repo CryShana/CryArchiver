@@ -1,7 +1,7 @@
 //! The project file: one redb database (project layer spec §3). Write-ahead intents are durable before their action
 //! runs; every other change waits in a batch that commits every 1000 changes or 250 ms, whichever comes first.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cryarchiver_engine::commit::{FileIdentity, file_id, retry_transient};
+use cryarchiver_engine::decision::{CrfChoice, Decision, Measured, Scan, StageTime, VideoDecision, Vmaf};
 use cryarchiver_engine::quality::memory::GroupStats;
 use redb::{
 	Database, ReadOnlyDatabase, ReadOnlyTable, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -31,11 +32,16 @@ pub const LOG_TAIL_LINES: usize = 100;
 pub const LOG_LINE_CHARS: usize = 400;
 pub const ATTEMPT_LOGS_KEPT: u32 = 5;
 pub const LOG_BUDGET_BYTES: u64 = 32 << 20;
+pub const DECISION_BUDGET_BYTES: u64 = 32 << 20;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const FILES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("files");
 const FOLDERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("folders");
-const LOGS: TableDefinition<(&[u8], u32), &[u8]> = TableDefinition::new("logs");
+type AttemptTable = TableDefinition<'static, (&'static [u8], u32), &'static [u8]>;
+
+const LOGS: AttemptTable = TableDefinition::new("logs");
+/// What the engine decided for a file, by attempt as `logs`. Files made before it existed gain it when opened.
+const DECISIONS: AttemptTable = TableDefinition::new("decisions");
 const UNKNOWN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("unknown");
 const FOLDER_IDS: TableDefinition<u32, &[u8]> = TableDefinition::new("folder_ids");
 const ROOT_FOLDER: u32 = 0;
@@ -176,12 +182,13 @@ fn size_of(table: &impl ReadableTableMetadata) -> Result<TableSize, StoreError> 
 	})
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Table {
 	Meta,
 	Files,
 	Folders,
 	Logs(u32),
+	Decisions(u32),
 	Unknown,
 	FolderIds,
 }
@@ -314,6 +321,33 @@ fn built_in_dictionary() -> Vec<u8> {
 		error: "encode failed: ".into(),
 		log_tail: DICTIONARY_LOG_LINES.iter().map(|line| (*line).to_owned()).collect(),
 	};
+	let measured = Measured {
+		crf: 30.0,
+		mean: 93.0,
+		p5: 89.0,
+	};
+	let decision = Decision {
+		video: Some(VideoDecision {
+			encoder: "SVT-AV1 preset 5".into(),
+			crf: Some(30.0),
+			chosen: Some(CrfChoice::Searched),
+			target: Some(Vmaf { mean: 93.0, p5: 89.0 }),
+			probes: vec![measured],
+			checks: vec![measured],
+			scan: Some(Scan::Progressive),
+			..VideoDecision::default()
+		}),
+		source_bytes: Some(1_000_000),
+		output_bytes: Some(100_000),
+		stages: ["analyse", "sample", "encode", "verify", "mux"]
+			.map(|stage| StageTime {
+				stage: stage.into(),
+				seconds: 1.0,
+			})
+			.into(),
+		attempts: 1,
+		..Decision::default()
+	};
 
 	let mut dictionary = Vec::new();
 	for file in &files {
@@ -321,6 +355,7 @@ fn built_in_dictionary() -> Vec<u8> {
 	}
 	dictionary.extend(rmp_serde::to_vec_named(&folder).unwrap_or_default());
 	dictionary.extend(rmp_serde::to_vec_named(&log).unwrap_or_default());
+	dictionary.extend(rmp_serde::to_vec_named(&decision).unwrap_or_default());
 	dictionary
 }
 
@@ -463,6 +498,7 @@ impl Store {
 		} else {
 			db
 		};
+		add_decisions_table(&db)?;
 
 		let (codec, folders) = read_layout(&db)?;
 		let meta = read_meta(&db)?;
@@ -541,10 +577,34 @@ impl Store {
 		self.put(Table::Files, key, record)
 	}
 
-	pub fn remove_file(&mut self, path: &RelPath) {
-		if let Some(key) = self.known_file_key(path) {
-			self.remove(Table::Files, key);
+	/// Removes the file's record together with its failure logs and its decision records.
+	pub fn remove_file(&mut self, path: &RelPath) -> Result<(), StoreError> {
+		let Some(key) = self.known_file_key(path) else {
+			return Ok(());
+		};
+
+		let mut rows: HashSet<Table> = HashSet::new();
+		{
+			let txn = self.db.begin_read()?;
+			for entry in txn.open_table(LOGS)?.range(attempts_of(&key))? {
+				rows.insert(Table::Logs(entry?.0.value().1));
+			}
+			for entry in txn.open_table(DECISIONS)?.range(attempts_of(&key))? {
+				rows.insert(Table::Decisions(entry?.0.value().1));
+			}
 		}
+		rows.extend(
+			self.pending
+				.iter()
+				.filter(|change| change.key == key && matches!(change.table, Table::Logs(_) | Table::Decisions(_)))
+				.map(|change| change.table),
+		);
+
+		self.remove(Table::Files, key.clone());
+		for table in rows {
+			self.remove(table, key.clone());
+		}
+		Ok(())
 	}
 
 	pub fn set_folder(&mut self, path: &RelPath, record: &FolderRecord) -> Result<(), StoreError> {
@@ -557,6 +617,41 @@ impl Store {
 			self.remove(Table::Logs(dropped), key.clone());
 		}
 		self.put(Table::Logs(attempt), key, &trimmed(log))
+	}
+
+	pub fn set_decision(&mut self, path: &RelPath, attempt: u32, decision: &Decision) -> Result<(), StoreError> {
+		let key = self.file_key(path)?;
+		if let Some(dropped) = attempt.checked_sub(ATTEMPT_LOGS_KEPT).filter(|dropped| *dropped > 0) {
+			self.remove(Table::Decisions(dropped), key.clone());
+		}
+		self.put(Table::Decisions(attempt), key, &trimmed_decision(decision))
+	}
+
+	/// The file's newest decision record. One this build can't read, damaged or from a later build, reads as none:
+	/// the record only explains, so it never keeps the project from running.
+	pub fn latest_decision(&self, path: &RelPath) -> Result<Option<Decision>, StoreError> {
+		let Some(key) = self.known_file_key(path) else {
+			return Ok(None);
+		};
+
+		let mut rows: BTreeMap<u32, Option<Vec<u8>>> = BTreeMap::new();
+		{
+			let txn = self.db.begin_read()?;
+			for entry in txn.open_table(DECISIONS)?.range(attempts_of(&key))? {
+				let (row, value) = entry?;
+				rows.insert(row.value().1, Some(value.value().to_vec()));
+			}
+		}
+		for change in &self.pending {
+			if let Table::Decisions(attempt) = change.table
+				&& change.key == key
+			{
+				rows.insert(attempt, change.value.clone());
+			}
+		}
+
+		let newest = rows.into_values().rev().flatten().next();
+		Ok(newest.and_then(|stored| self.decode_value(&stored).ok()))
 	}
 
 	pub fn set_unknown(&mut self, path: &RelPath, record: &UnknownRecord) -> Result<(), StoreError> {
@@ -580,46 +675,75 @@ impl Store {
 	pub fn prune_logs(&mut self, failing: &HashSet<RelPath>, budget: u64) -> Result<usize, StoreError> {
 		self.flush()?;
 
-		let mut logs: Vec<(Vec<u8>, u32, u64)> = Vec::new();
-		{
-			let txn = self.db.begin_read()?;
-			for entry in txn.open_table(LOGS)?.iter()? {
-				let (key, value) = entry?;
-				let (path, attempt) = key.value();
-				logs.push((
-					path.to_vec(),
-					attempt,
-					u64::try_from(value.value().len()).unwrap_or(u64::MAX),
-				));
-			}
-		}
-		let mut total: u64 = logs.iter().map(|(_, _, bytes)| bytes).sum();
+		let logs = self.attempt_rows(LOGS)?;
+		let total: u64 = logs.iter().map(|(_, _, bytes)| bytes).sum();
 		if total <= budget {
 			return Ok(0);
 		}
 
 		let kept: HashSet<Vec<u8>> = failing.iter().filter_map(|path| self.known_file_key(path)).collect();
-		let mut newest: HashMap<&[u8], u32> = HashMap::new();
-		for (key, attempt, _) in &logs {
-			let last = newest.entry(key.as_slice()).or_default();
-			*last = (*last).max(*attempt);
-		}
+		let newest = newest_attempts(&logs);
 		let mut removable: Vec<&(Vec<u8>, u32, u64)> = logs
 			.iter()
 			.filter(|(key, attempt, _)| !kept.contains(key) || newest.get(key.as_slice()) != Some(attempt))
 			.collect();
 		removable.sort_by_key(|(key, attempt, _)| (kept.contains(key), *attempt));
 
+		self.remove_until(removable, total, budget, Table::Logs)
+	}
+
+	/// Removes decision records until their table fits `budget`: older attempts first, then the newest records, lowest
+	/// attempts first.
+	pub fn prune_decisions(&mut self, budget: u64) -> Result<usize, StoreError> {
+		self.flush()?;
+
+		let decisions = self.attempt_rows(DECISIONS)?;
+		let total: u64 = decisions.iter().map(|(_, _, bytes)| bytes).sum();
+		if total <= budget {
+			return Ok(0);
+		}
+
+		let newest = newest_attempts(&decisions);
+		let mut removable: Vec<&(Vec<u8>, u32, u64)> = decisions.iter().collect();
+		removable.sort_by_key(|(key, attempt, _)| (newest.get(key.as_slice()) == Some(attempt), *attempt));
+
+		self.remove_until(removable, total, budget, Table::Decisions)
+	}
+
+	/// Every row of a table keyed by file and attempt, with the bytes it stores.
+	fn attempt_rows(&self, definition: AttemptTable) -> Result<Vec<(Vec<u8>, u32, u64)>, StoreError> {
+		let txn = self.db.begin_read()?;
+		let mut rows = Vec::new();
+		for entry in txn.open_table(definition)?.iter()? {
+			let (key, value) = entry?;
+			let (path, attempt) = key.value();
+			rows.push((
+				path.to_vec(),
+				attempt,
+				u64::try_from(value.value().len()).unwrap_or(u64::MAX),
+			));
+		}
+		Ok(rows)
+	}
+
+	fn remove_until(
+		&mut self,
+		removable: Vec<&(Vec<u8>, u32, u64)>,
+		mut total: u64,
+		budget: u64,
+		table: fn(u32) -> Table,
+	) -> Result<usize, StoreError> {
 		let mut removed = 0;
 		for (key, attempt, bytes) in removable {
 			if total <= budget {
 				break;
 			}
 
-			self.remove(Table::Logs(*attempt), key.clone());
+			self.remove(table(*attempt), key.clone());
 			total = total.saturating_sub(*bytes);
 			removed += 1;
 		}
+
 		self.flush()?;
 		Ok(removed)
 	}
@@ -653,6 +777,7 @@ impl Store {
 			("files", size_of(&txn.open_table(FILES)?)?),
 			("folders", size_of(&txn.open_table(FOLDERS)?)?),
 			("logs", size_of(&txn.open_table(LOGS)?)?),
+			("decisions", size_of(&txn.open_table(DECISIONS)?)?),
 			("unknown", size_of(&txn.open_table(UNKNOWN)?)?),
 			("folder_ids", size_of(&txn.open_table(FOLDER_IDS)?)?),
 		])
@@ -680,6 +805,7 @@ impl Store {
 			let mut files = txn.open_table(FILES)?;
 			let mut folders = txn.open_table(FOLDERS)?;
 			let mut logs = txn.open_table(LOGS)?;
+			let mut decisions = txn.open_table(DECISIONS)?;
 			let mut unknown = txn.open_table(UNKNOWN)?;
 			let mut folder_ids = txn.open_table(FOLDER_IDS)?;
 
@@ -709,6 +835,12 @@ impl Store {
 					}
 					(Table::Logs(attempt), None) => {
 						logs.remove((key, attempt))?;
+					}
+					(Table::Decisions(attempt), Some(value)) => {
+						decisions.insert((key, attempt), value.as_slice())?;
+					}
+					(Table::Decisions(attempt), None) => {
+						decisions.remove((key, attempt))?;
 					}
 					(Table::Unknown, Some(value)) => {
 						unknown.insert(key, value.as_slice())?;
@@ -808,15 +940,71 @@ impl Store {
 	}
 }
 
-fn trimmed(log: &FailureLog) -> FailureLog {
-	let skip = log.log_tail.len().saturating_sub(LOG_TAIL_LINES);
-	FailureLog {
-		error: log.error.chars().take(LOG_LINE_CHARS).collect(),
-		log_tail: log.log_tail[skip..]
-			.iter()
-			.map(|line| line.chars().take(LOG_LINE_CHARS).collect())
-			.collect(),
+fn attempts_of(key: &[u8]) -> std::ops::RangeInclusive<(&[u8], u32)> {
+	(key, 0)..=(key, u32::MAX)
+}
+
+fn newest_attempts(rows: &[(Vec<u8>, u32, u64)]) -> HashMap<&[u8], u32> {
+	let mut newest: HashMap<&[u8], u32> = HashMap::new();
+	for (key, attempt, _) in rows {
+		let last = newest.entry(key.as_slice()).or_default();
+		*last = (*last).max(*attempt);
 	}
+	newest
+}
+
+fn capped(line: &str) -> String {
+	line.chars().take(LOG_LINE_CHARS).collect()
+}
+
+fn last_lines(lines: &[String]) -> Vec<String> {
+	let skip = lines.len().saturating_sub(LOG_TAIL_LINES);
+	lines[skip..].iter().map(|line| capped(line)).collect()
+}
+
+fn trimmed(log: &FailureLog) -> FailureLog {
+	FailureLog {
+		error: capped(&log.error),
+		log_tail: last_lines(&log.log_tail),
+	}
+}
+
+/// Held to the failure logs' limits: the last lines, each cut short.
+fn trimmed_decision(decision: &Decision) -> Decision {
+	let mut kept = decision.clone();
+	kept.warnings = last_lines(&decision.warnings);
+	kept.stages.truncate(LOG_TAIL_LINES);
+	if let Some(video) = &mut kept.video {
+		video.encoder = capped(&video.encoder);
+		video.probes.truncate(LOG_TAIL_LINES);
+		video.checks.truncate(LOG_TAIL_LINES);
+		if let Some(again) = &mut video.reencode {
+			again.reason = capped(&again.reason);
+		}
+	}
+	if let Some(image) = &mut kept.image {
+		image.route = capped(&image.route);
+		image.setting = image.setting.as_deref().map(capped);
+	}
+	if let Some(audio) = &mut kept.audio {
+		audio.tracks.truncate(LOG_TAIL_LINES);
+	}
+	kept
+}
+
+/// A project file made before decision records existed gets their table, in a commit of its own, the first time this
+/// build opens it; nothing else in it changes.
+fn add_decisions_table(db: &Database) -> Result<(), StoreError> {
+	match db.begin_read()?.open_table(DECISIONS) {
+		Ok(_) => return Ok(()),
+		Err(redb::TableError::TableDoesNotExist(_)) => {}
+		Err(err) => return Err(err.into()),
+	}
+
+	let txn = db.begin_write()?;
+	txn.open_table(DECISIONS)?;
+	txn.commit()?;
+	Ok(())
 }
 
 /// Creating through a dangling link would create its target, and on Windows `create_new` alone still does: the link is
@@ -928,6 +1116,7 @@ fn write_new(db: &Database, settings: &Settings, codec: &Codec) -> Result<(), St
 		txn.open_table(FILES)?;
 		txn.open_table(FOLDERS)?;
 		txn.open_table(LOGS)?;
+		txn.open_table(DECISIONS)?;
 		txn.open_table(UNKNOWN)?;
 		txn.open_table(FOLDER_IDS)?.insert(ROOT_FOLDER, b"".as_slice())?;
 	}
@@ -1251,7 +1440,12 @@ fn compare_copy(old: &impl ReadableDatabase, upgraded: &Path) -> Result<(), Stor
 	if !upgraded.is_empty() {
 		return Err(differs());
 	}
-	Ok(())
+
+	match new.open_table(DECISIONS) {
+		Ok(decisions) if decisions.len()? > 0 => Err(differs()),
+		Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => Ok(()),
+		Err(err) => Err(err.into()),
+	}
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
@@ -1554,6 +1748,23 @@ pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 		}
 	}
 
+	writeln!(out, "\n[decisions]")?;
+	match txn.open_table(DECISIONS) {
+		Ok(decisions) => {
+			for entry in decisions.iter()? {
+				let (key, value) = entry?;
+				let (path, attempt) = key.value();
+				let path = folders.path_of(path)?;
+				match codec.unpack(value.value()).and_then(|bytes| decode::<Decision>(&bytes)) {
+					Ok(decision) => writeln!(out, "{path:?} attempt {attempt} = {decision:?}")?,
+					Err(err) => writeln!(out, "{path:?} attempt {attempt} = unreadable ({err})")?,
+				}
+			}
+		}
+		Err(redb::TableError::TableDoesNotExist(_)) => {}
+		Err(err) => return Err(err.into()),
+	}
+
 	writeln!(out, "\n[unknown]")?;
 	for entry in txn.open_table(UNKNOWN)?.iter()? {
 		let (key, value) = entry?;
@@ -1578,6 +1789,7 @@ pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 pub(crate) mod tests {
 	use std::ffi::OsStr;
 
+	use cryarchiver_engine::decision::{Measured, VideoDecision};
 	use cryarchiver_engine::quality::memory::Offset;
 
 	use super::*;
@@ -2143,6 +2355,205 @@ pub(crate) mod tests {
 		assert_eq!(store.read_log(&path("failing.mkv"), 2).unwrap(), Some(log("new")));
 	}
 
+	fn decision(crf: f64) -> Decision {
+		Decision {
+			video: Some(VideoDecision {
+				crf: Some(crf),
+				checks: vec![Measured {
+					crf,
+					mean: 93.1,
+					p5: 87.2,
+				}],
+				..VideoDecision::default()
+			}),
+			warnings: vec!["a warning".into()],
+			attempts: 1,
+			..Decision::default()
+		}
+	}
+
+	fn entries(store: &Store, table: &str) -> u64 {
+		store
+			.table_sizes()
+			.unwrap()
+			.into_iter()
+			.find(|(name, _)| *name == table)
+			.unwrap()
+			.1
+			.entries
+	}
+
+	#[test]
+	fn decisions_round_trip_trimmed_and_keep_the_last_five_attempts() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		let long = Decision {
+			warnings: (0..500).map(|line| format!("{line} {}", "w".repeat(1000))).collect(),
+			..decision(30.0)
+		};
+
+		for attempt in 1..=7 {
+			let record = Decision {
+				attempts: attempt,
+				..long.clone()
+			};
+			store.set_decision(&path("a.mkv"), attempt, &record).unwrap();
+		}
+		store.set_decision(&path("b.mkv"), 1, &decision(36.75)).unwrap();
+		assert_eq!(
+			store.latest_decision(&path("b.mkv")).unwrap(),
+			Some(decision(36.75)),
+			"a batched record reads too"
+		);
+		store.flush().unwrap();
+		drop(store);
+
+		let (store, _, _) = Store::open(&project(dir.path())).unwrap();
+		let latest = store.latest_decision(&path("a.mkv")).unwrap().unwrap();
+		assert_eq!(latest.attempts, 7);
+		assert_eq!(latest.warnings.len(), LOG_TAIL_LINES);
+		assert!(latest.warnings[0].starts_with("400 "), "{}", &latest.warnings[0][..10]);
+		assert!(
+			latest
+				.warnings
+				.iter()
+				.all(|line| line.chars().count() <= LOG_LINE_CHARS)
+		);
+		assert_eq!(latest.video, long.video);
+		assert_eq!(store.latest_decision(&path("b.mkv")).unwrap(), Some(decision(36.75)));
+		assert_eq!(store.latest_decision(&path("c.mkv")).unwrap(), None);
+		assert_eq!(
+			entries(&store, "decisions"),
+			6,
+			"a.mkv's last five attempts and b.mkv's one"
+		);
+	}
+
+	#[test]
+	fn removing_a_file_removes_its_logs_and_its_decisions() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		let log = FailureLog {
+			error: "encode failed".into(),
+			log_tail: vec!["line".into()],
+		};
+		for name in ["gone.mkv", "kept.mkv"] {
+			store.set_file(&path(name), &committing()).unwrap();
+			store.set_log(&path(name), 1, &log).unwrap();
+			store.set_decision(&path(name), 2, &decision(30.0)).unwrap();
+		}
+		store.flush().unwrap();
+		store.set_log(&path("gone.mkv"), 3, &log).unwrap();
+		store.set_decision(&path("gone.mkv"), 3, &decision(31.0)).unwrap();
+
+		store.remove_file(&path("gone.mkv")).unwrap();
+		store.flush().unwrap();
+		drop(store);
+
+		let (store, _, loaded) = Store::open(&project(dir.path())).unwrap();
+		let names: Vec<String> = loaded.files.iter().map(|(key, _)| key.display()).collect();
+		assert_eq!(names, ["kept.mkv"]);
+		assert_eq!(loaded.last_attempts.get(&path("gone.mkv")), None);
+		assert_eq!(store.latest_decision(&path("gone.mkv")).unwrap(), None);
+		assert_eq!(store.read_log(&path("gone.mkv"), 1).unwrap(), None);
+		assert_eq!(store.latest_decision(&path("kept.mkv")).unwrap(), Some(decision(30.0)));
+		assert_eq!((entries(&store, "logs"), entries(&store, "decisions")), (1, 1));
+	}
+
+	#[test]
+	fn a_decision_this_build_cannot_read_is_passed_over() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		store.set_decision(&path("a.mkv"), 1, &decision(30.0)).unwrap();
+		let key = store.known_file_key(&path("a.mkv")).unwrap();
+		store.push(Change {
+			table: Table::Decisions(2),
+			key,
+			value: Some(vec![9, 1, 2, 3]),
+		});
+		store.flush().unwrap();
+
+		assert_eq!(store.latest_decision(&path("a.mkv")).unwrap(), None);
+	}
+
+	#[test]
+	fn a_project_from_before_decision_records_opens_unchanged_and_keeps_them_from_then_on() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		store.set_file(&path("a.txt"), &committing()).unwrap();
+		store
+			.set_log(
+				&path("a.txt"),
+				1,
+				&FailureLog {
+					error: "encode failed".into(),
+					log_tail: Vec::new(),
+				},
+			)
+			.unwrap();
+		store.flush().unwrap();
+		drop(store);
+		let db = Database::open(project(dir.path())).unwrap();
+		let txn = db.begin_write().unwrap();
+		assert!(txn.delete_table(DECISIONS).unwrap());
+		txn.commit().unwrap();
+		drop(db);
+
+		let mut out = Vec::new();
+		dump(&project(dir.path()), &mut out).unwrap();
+		let (mut store, meta, loaded) = Store::open(&project(dir.path())).unwrap();
+
+		assert!(String::from_utf8(out).unwrap().contains("\"a.txt\" = FileRecord"));
+		assert_eq!(meta.format, FORMAT_VERSION);
+		assert_eq!(loaded.files, [(path("a.txt"), committing())]);
+		assert_eq!(loaded.last_attempts.get(&path("a.txt")), Some(&1));
+		assert_eq!(store.latest_decision(&path("a.txt")).unwrap(), None);
+		assert_eq!(entries(&store, "decisions"), 0);
+
+		store.set_decision(&path("a.txt"), 2, &decision(30.0)).unwrap();
+		store.flush().unwrap();
+		drop(store);
+		let (store, _, _) = Store::open(&project(dir.path())).unwrap();
+		assert_eq!(store.latest_decision(&path("a.txt")).unwrap(), Some(decision(30.0)));
+		drop(store);
+
+		let mut out = Vec::new();
+		dump(&project(dir.path()), &mut out).unwrap();
+		let text = String::from_utf8(out).unwrap();
+		assert!(text.contains("[decisions]\n\"a.txt\" attempt 2 = Decision"), "{text}");
+	}
+
+	#[test]
+	fn pruning_decisions_drops_older_attempts_before_any_newest_record() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		let older = Decision {
+			warnings: (0..50).map(|line| format!("{line} {}", "w".repeat(300))).collect(),
+			..decision(30.0)
+		};
+		store.set_decision(&path("a.mkv"), 1, &older).unwrap();
+		store.set_decision(&path("a.mkv"), 2, &older).unwrap();
+		store.set_decision(&path("a.mkv"), 3, &decision(31.0)).unwrap();
+		store.set_decision(&path("b.mkv"), 1, &decision(32.0)).unwrap();
+		let newest_bytes = [decision(31.0), decision(32.0)]
+			.iter()
+			.map(|record| u64::try_from(store.codec.pack(&rmp_serde::to_vec_named(record).unwrap()).len()).unwrap())
+			.sum::<u64>();
+
+		assert_eq!(store.prune_decisions(DECISION_BUDGET_BYTES).unwrap(), 0);
+		let removed = store.prune_decisions(newest_bytes).unwrap();
+
+		assert_eq!(removed, 2);
+		assert_eq!(store.latest_decision(&path("a.mkv")).unwrap(), Some(decision(31.0)));
+		assert_eq!(store.latest_decision(&path("b.mkv")).unwrap(), Some(decision(32.0)));
+		assert_eq!(entries(&store, "decisions"), 2);
+		assert_eq!(
+			store.prune_decisions(1).unwrap(),
+			2,
+			"a budget too small for any record keeps none"
+		);
+	}
+
 	#[test]
 	fn compaction_gives_back_the_space_of_removed_records() {
 		let dir = tempfile::tempdir().unwrap();
@@ -2152,7 +2563,7 @@ pub(crate) mod tests {
 		}
 		store.flush().unwrap();
 		for index in 0..5_000 {
-			store.remove_file(&path(&format!("{index}.txt")));
+			store.remove_file(&path(&format!("{index}.txt"))).unwrap();
 		}
 		store.flush().unwrap();
 		let before = std::fs::metadata(project(dir.path())).unwrap().len();

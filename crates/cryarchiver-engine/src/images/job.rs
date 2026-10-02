@@ -6,6 +6,7 @@ use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use tokio_util::sync::CancellationToken;
 
+use crate::decision::ImageDecision;
 use crate::engine::{JobEvent, Stage};
 use crate::format::ANIMATED_JXL;
 use crate::images::animated::{self, Animation, ScanError};
@@ -72,6 +73,7 @@ pub enum ImageOutcome {
 		warnings: Vec<String>,
 		/// Settings the groups learn once the output is committed.
 		learned: Vec<(CacheKey, Observation)>,
+		chosen: ImageDecision,
 	},
 	Kept(KeepReason),
 }
@@ -406,6 +408,7 @@ async fn encode_and_choose(
 	};
 	let mut choice = Choice::default();
 	let mut learned = Vec::new();
+	let mut picked = None;
 
 	for (index, planned) in still.plan.candidates.iter().copied().enumerate() {
 		let key = candidate_key(cx.tools, input, &still, planned);
@@ -428,7 +431,12 @@ async fn encode_and_choose(
 				short,
 			} => {
 				choice.note(size);
+				let offered = path.clone();
 				choice.offer(path, size, short.then_some(score));
+				if choice.best.as_ref().is_some_and(|(best, _)| *best == offered) {
+					picked = Some(candidate_decision(candidate, score, still.plan.target));
+				}
+
 				if !short
 					&& cx.resize.is_none()
 					&& let Some(key) = key
@@ -470,7 +478,7 @@ async fn encode_and_choose(
 
 	let mut warnings = still.warnings;
 	warnings.extend(notes);
-	finish_choice(cx, workspace, choice, still.plan.target, warnings, learned)
+	finish_choice(cx, workspace, choice, still.plan.target, warnings, learned, picked)
 }
 
 async fn try_candidate(
@@ -699,6 +707,7 @@ fn finish_choice(
 	target: f64,
 	mut warnings: Vec<String>,
 	learned: Vec<(CacheKey, Observation)>,
+	picked: Option<ImageDecision>,
 ) -> Result<ImageOutcome, JobError> {
 	for (candidate, err) in &choice.failures {
 		let reason = match &err.kind {
@@ -724,6 +733,7 @@ fn finish_choice(
 				bytes,
 				warnings,
 				learned,
+				chosen: picked.unwrap_or_default(),
 			})
 		}
 		Verdict::Kept(reason) => Ok(ImageOutcome::Kept(reason)),
@@ -747,6 +757,20 @@ fn verdict(choice: Choice, target: f64, source_bytes: u64) -> Verdict {
 		src_bytes: source_bytes,
 		out_bytes: choice.smallest.unwrap_or(source_bytes),
 	})
+}
+
+fn candidate_decision(candidate: Candidate, score: f64, target: f64) -> ImageDecision {
+	let (route, setting) = match candidate {
+		Candidate::Ravif(settings) => ("AVIF", Some(format!("quality {}", settings.quality))),
+		Candidate::JxlLossy(settings) => ("JPEG XL", Some(format!("distance {:.2}", settings.distance))),
+		Candidate::JxlLossless(_) => ("lossless JPEG XL", None),
+	};
+	ImageDecision {
+		route: route.to_owned(),
+		setting,
+		score: Some(score),
+		target: Some(target),
+	}
 }
 
 fn candidate_name(candidate: Candidate) -> &'static str {
@@ -881,6 +905,12 @@ pub async fn encode_animation(
 		bytes,
 		warnings,
 		learned: Vec::new(),
+		chosen: ImageDecision {
+			route: "animated AVIF".to_owned(),
+			setting: Some(format!("CRF {}", settings.crf)),
+			score: Some(score),
+			target: Some(target),
+		},
 	})
 }
 

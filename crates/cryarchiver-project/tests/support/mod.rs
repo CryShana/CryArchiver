@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use cryarchiver_engine::commit::{Artifact, OutputSink, SourceTimes};
+use cryarchiver_engine::decision::Decision;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::naming::is_media_name;
 use cryarchiver_engine::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
@@ -56,6 +57,7 @@ pub enum Rule {
 #[derive(Default)]
 pub struct FakeEncoder {
 	rules: Mutex<Vec<(String, Rule)>>,
+	decisions: Mutex<Vec<(String, Decision)>>,
 	pub calls: Mutex<Vec<String>>,
 	running: AtomicUsize,
 	pub peak: AtomicUsize,
@@ -75,6 +77,22 @@ impl FakeEncoder {
 
 	pub fn calls(&self) -> Vec<String> {
 		self.calls.lock().unwrap().clone()
+	}
+
+	/// Files whose name ends with `suffix` report `decision`, as an event and on an encoded outcome, as the engine
+	/// does; the latest matching one wins.
+	pub fn decide(&self, suffix: &str, decision: Decision) {
+		self.decisions.lock().unwrap().push((suffix.to_owned(), decision));
+	}
+
+	fn decision_for(&self, name: &str) -> Option<Decision> {
+		self.decisions
+			.lock()
+			.unwrap()
+			.iter()
+			.rev()
+			.find(|(suffix, _)| name.ends_with(suffix.as_str()))
+			.map(|(_, decision)| decision.clone())
 	}
 
 	fn rule_for(&self, name: &str) -> Rule {
@@ -111,11 +129,16 @@ impl Encode for FakeEncoder {
 			let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
 			self.peak.fetch_max(running, Ordering::SeqCst);
 
+			let decision = self.decision_for(&name);
+			if let Some(decision) = &decision {
+				on_event(JobEvent::Decision(Box::new(decision.clone())));
+			}
+
 			let outcome = match self.rule_for(&name) {
 				Rule::Encode(extension) => {
 					on_event(JobEvent::Stage(Stage::Encode));
 					on_event(JobEvent::Progress(0.5));
-					stage(job, sink, extension, &name)
+					stage(job, sink, extension, &name, decision.unwrap_or_default())
 				}
 				Rule::Keep => JobOutcome::KeptOriginal {
 					reason: KeepReason::NotSmaller {
@@ -143,7 +166,7 @@ impl Encode for FakeEncoder {
 					replace_keeping_the_time(&path, &content, &sink.work_root(&job.source));
 					self.rule(&name, Rule::Encode("avif"));
 					on_event(JobEvent::Stage(Stage::Encode));
-					stage(job, sink, "avif", &name)
+					stage(job, sink, "avif", &name, Decision::default())
 				}
 				Rule::Rewrite {
 					path,
@@ -156,7 +179,7 @@ impl Encode for FakeEncoder {
 					drop(file);
 					self.rule(&name, Rule::Encode("avif"));
 					on_event(JobEvent::Stage(Stage::Encode));
-					stage(job, sink, "avif", &name)
+					stage(job, sink, "avif", &name, Decision::default())
 				}
 			};
 
@@ -181,7 +204,7 @@ fn replace_keeping_the_time(path: &Path, content: &[u8], scratch: &Path) {
 }
 
 /// Works in a job folder of the engine's own workspace, as the engine does.
-fn stage(job: &Job, sink: &dyn OutputSink, extension: &str, name: &str) -> JobOutcome {
+fn stage(job: &Job, sink: &dyn OutputSink, extension: &str, name: &str, decision: Decision) -> JobOutcome {
 	let workspace = match Workspace::for_sink(sink, &job.source) {
 		Ok(workspace) => workspace,
 		Err(err) => return JobOutcome::Failed(JobError::io(IoSide::Destination(&sink.work_root(&job.source)), &err)),
@@ -200,6 +223,7 @@ fn stage(job: &Job, sink: &dyn OutputSink, extension: &str, name: &str) -> JobOu
 			output: staged,
 			src_bytes: fs::metadata(&job.source).unwrap().len(),
 			warnings: Vec::new(),
+			decision: Box::new(decision),
 		},
 		Err(err) => JobOutcome::Failed(ErrorKind::DestinationIo(err.to_string()).into()),
 	}

@@ -2,7 +2,12 @@
 //! folds them into its own view in its refresh step and never waits on the project. Every `String` here is
 //! display-safe, escaped as `cryarchiver_engine::text::display_name` does.
 
+use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::time::Duration;
+
+use cryarchiver_engine::decision::{AudioTrack, CrfChoice, Decision, Scan, VideoDecision};
+use cryarchiver_engine::text::display_name;
 
 use crate::issues::{IssueId, Problem, Verbs};
 use crate::schedule::Work;
@@ -182,10 +187,21 @@ pub struct Details {
 	pub bytes_in: u64,
 	pub bytes_out: Option<u64>,
 	pub plan: Vec<(String, String)>,
+	/// What the engine decided for the file, as the project file keeps it.
+	pub decision: Vec<DecisionLine>,
 	/// What the project noted about the file this session, oldest first.
 	pub notes: Vec<String>,
 	pub duplicates: Duplicates,
 	pub issue: Option<IssueView>,
+}
+
+/// A line of a file's decision record. A marked line stands out: the video was encoded again, or written slightly
+/// below its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionLine {
+	pub label: String,
+	pub value: String,
+	pub marked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,9 +300,340 @@ pub fn size_text(bytes: u64) -> String {
 	}
 }
 
+/// A file's decision record in the words its details show it with.
+pub fn decision_lines(decision: &Decision) -> Vec<DecisionLine> {
+	let mut lines = Vec::new();
+	if let Some(video) = &decision.video {
+		video_lines(video, &mut lines);
+	}
+
+	if let Some(image) = &decision.image {
+		let mut encoder = image.route.clone();
+		if let Some(setting) = &image.setting {
+			let _ = write!(encoder, ", {setting}");
+		}
+		lines.push(plain("Encoder", encoder));
+		if let Some(score) = image.score {
+			let target = image.target.map_or_else(String::new, |target| format!(" vs {target}"));
+			lines.push(plain("Check", format!("SSIMULACRA2 {score:.1}{target}")));
+		}
+	}
+
+	if let Some(audio) = &decision.audio
+		&& !audio.tracks.is_empty()
+	{
+		let tracks: Vec<String> = audio.tracks.iter().map(track_text).collect();
+		lines.push(plain("Audio", tracks.join(" · ")));
+	}
+
+	let took: Vec<String> = decision
+		.stages
+		.iter()
+		.filter(|time| time.seconds >= 1.0)
+		.map(|time| format!("{} {}", time.stage, seconds_text(time.seconds)))
+		.collect();
+	if !took.is_empty() {
+		lines.push(plain("Took", took.join(", ")));
+	}
+
+	for warning in &decision.warnings {
+		lines.push(plain("Warning", display_name(OsStr::new(warning))));
+	}
+	lines
+}
+
+fn video_lines(video: &VideoDecision, lines: &mut Vec<DecisionLine>) {
+	if !video.encoder.is_empty() {
+		let grain = match video.grain {
+			Some(level) if video.grain_dropped => format!(" · film grain {level} left out"),
+			Some(level) => format!(" · film grain {level}"),
+			None => String::new(),
+		};
+		lines.push(plain("Encoder", format!("{}{grain}", video.encoder)));
+	}
+
+	if let Some(crf) = video.crf {
+		let probes = video.probes.len();
+		let mut how = match video.chosen {
+			Some(CrfChoice::Searched) => format!("searched, {probes} probes"),
+			Some(CrfChoice::LearnedSearchedAgain) => format!("learned, searched again, {probes} probes"),
+			Some(CrfChoice::Learned) => "learned".to_owned(),
+			Some(CrfChoice::Fixed) => "set with --crf, not measured".to_owned(),
+			Some(CrfChoice::Table) => "the speed's default, not measured".to_owned(),
+			Some(CrfChoice::Unsearched) => "nothing to sample, checked".to_owned(),
+			None => String::new(),
+		};
+		if video.custom_target {
+			how.push_str(if how.is_empty() {
+				"custom target"
+			} else {
+				", custom target"
+			});
+		}
+		let how = if how.is_empty() { how } else { format!(" ({how})") };
+		lines.push(plain("CRF", format!("{crf}{how}")));
+	}
+
+	if let Some(check) = video.checks.last() {
+		let mut text = format!("VMAF {:.1} / {:.1}", check.mean, check.p5);
+		if let Some(target) = video.target {
+			let _ = write!(text, " vs {} / {}", target.mean, target.p5);
+		}
+		if let Some(allowance) = video.grain_allowance {
+			let _ = write!(text, ", grain allowance {} / {}", allowance.mean, allowance.p5);
+		}
+		lines.push(plain("Check", text));
+	}
+
+	if let Some(again) = &video.reencode {
+		let missed = video
+			.checks
+			.iter()
+			.find(|check| (check.crf - again.from_crf).abs() < f64::EPSILON)
+			.map_or_else(
+				|| again.reason.clone(),
+				|check| format!("measured {:.1} / {:.1}", check.mean, check.p5),
+			);
+		lines.push(DecisionLine {
+			label: "Again".into(),
+			value: format!("CRF {} {missed}: encoded again at CRF {}", again.from_crf, again.to_crf),
+			marked: true,
+		});
+	}
+
+	if video.near_miss {
+		lines.push(DecisionLine {
+			label: "Target".into(),
+			value: "near miss: written slightly below the target".into(),
+			marked: true,
+		});
+	}
+
+	let mut picture = Vec::new();
+	match video.scan {
+		Some(Scan::Interlaced) => picture.push("interlaced, deinterlaced".to_owned()),
+		Some(Scan::Telecined) => picture.push("telecined, film frames restored".to_owned()),
+		Some(Scan::Progressive) | None => {}
+	}
+	if let Some((width, height)) = video.resized {
+		picture.push(format!("resized to {width}×{height}"));
+	}
+	if let Some(trim) = video.trim {
+		picture.push(format!(
+			"trimmed to {}–{}",
+			clock_text(trim.start_s),
+			clock_text(trim.start_s + trim.length_s)
+		));
+	}
+	if video.burned_subtitles {
+		picture.push("subtitles burned in".to_owned());
+	}
+	if !picture.is_empty() {
+		lines.push(plain("Picture", picture.join(" · ")));
+	}
+}
+
+fn track_text(track: &AudioTrack) -> String {
+	if track.codec == "copy" {
+		return "copied".to_owned();
+	}
+
+	let mut text = if track.codec == "opus" {
+		"Opus".to_owned()
+	} else {
+		track.codec.clone()
+	};
+	if let Some(kbps) = track.bitrate_kbps {
+		let _ = write!(text, " {kbps} kbps");
+	}
+	if let Some(channels) = track.channels {
+		let _ = write!(text, ", {channels} ch");
+	}
+	text
+}
+
+fn plain(label: &str, value: String) -> DecisionLine {
+	DecisionLine {
+		label: label.to_owned(),
+		value,
+		marked: false,
+	}
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn seconds_text(seconds: f64) -> String {
+	let whole = seconds.max(0.0).round() as u64;
+	match whole {
+		0..60 => format!("{whole}s"),
+		60..3600 => format!("{}m {}s", whole / 60, whole % 60),
+		_ => format!("{}h {}m", whole / 3600, whole / 60 % 60),
+	}
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn clock_text(seconds: f64) -> String {
+	let whole = seconds.max(0.0).floor() as u64;
+	if whole >= 3600 {
+		format!("{}:{:02}:{:02}", whole / 3600, whole / 60 % 60, whole % 60)
+	} else {
+		format!("{}:{:02}", whole / 60, whole % 60)
+	}
+}
+
 #[cfg(test)]
 mod tests {
+	use cryarchiver_engine::decision::{AudioDecision, ImageDecision, Measured, Reencode, StageTime, Trim, Vmaf};
+
 	use super::*;
+
+	fn labelled(lines: &[DecisionLine]) -> Vec<(String, String, bool)> {
+		lines
+			.iter()
+			.map(|line| (line.label.clone(), line.value.clone(), line.marked))
+			.collect()
+	}
+
+	fn line(label: &str, value: &str, marked: bool) -> (String, String, bool) {
+		(label.to_owned(), value.to_owned(), marked)
+	}
+
+	#[test]
+	fn a_video_record_reads_as_its_crf_its_check_and_what_happened_to_it() {
+		let decision = Decision {
+			video: Some(VideoDecision {
+				encoder: "SVT-AV1 preset 5".into(),
+				crf: Some(36.75),
+				chosen: Some(CrfChoice::Searched),
+				target: Some(Vmaf { mean: 91.0, p5: 86.5 }),
+				grain_allowance: Some(Vmaf { mean: 2.0, p5: 2.5 }),
+				probes: vec![Measured::default(); 5],
+				checks: vec![
+					Measured {
+						crf: 38.0,
+						mean: 90.04,
+						p5: 85.0,
+					},
+					Measured {
+						crf: 36.75,
+						mean: 93.06,
+						p5: 87.24,
+					},
+				],
+				reencode: Some(Reencode {
+					reason: "the full check measured VMAF 90.0 / 85.0, below the target 91 / 86.5".into(),
+					from_crf: 38.0,
+					to_crf: 36.75,
+				}),
+				near_miss: true,
+				grain: Some(6),
+				scan: Some(Scan::Interlaced),
+				deinterlaced: true,
+				resized: Some((1280, 720)),
+				trim: Some(Trim {
+					start_s: 70.0,
+					length_s: 30.5,
+				}),
+				..VideoDecision::default()
+			}),
+			stages: vec![
+				StageTime {
+					stage: "detect".into(),
+					seconds: 0.2,
+				},
+				StageTime {
+					stage: "encode".into(),
+					seconds: 603.0,
+				},
+			],
+			warnings: vec!["a \u{1b}[2J warning".into()],
+			..Decision::default()
+		};
+
+		assert_eq!(
+			labelled(&decision_lines(&decision)),
+			[
+				line("Encoder", "SVT-AV1 preset 5 · film grain 6", false),
+				line("CRF", "36.75 (searched, 5 probes)", false),
+				line("Check", "VMAF 93.1 / 87.2 vs 91 / 86.5, grain allowance 2 / 2.5", false),
+				line("Again", "CRF 38 measured 90.0 / 85.0: encoded again at CRF 36.75", true),
+				line("Target", "near miss: written slightly below the target", true),
+				line(
+					"Picture",
+					"interlaced, deinterlaced · resized to 1280×720 · trimmed to 1:10–1:40",
+					false
+				),
+				line("Took", "encode 10m 3s", false),
+				line("Warning", &display_name(OsStr::new("a \u{1b}[2J warning")), false),
+			]
+		);
+	}
+
+	#[test]
+	fn learned_fixed_and_dropped_grain_say_so() {
+		let video = |chosen, custom_target, grain_dropped| Decision {
+			video: Some(VideoDecision {
+				encoder: "SVT-AV1 preset 5".into(),
+				crf: Some(30.0),
+				chosen: Some(chosen),
+				custom_target,
+				grain: Some(4),
+				grain_dropped,
+				..VideoDecision::default()
+			}),
+			..Decision::default()
+		};
+
+		let learned = decision_lines(&video(CrfChoice::Learned, true, true));
+		assert_eq!(learned[0].value, "SVT-AV1 preset 5 · film grain 4 left out");
+		assert_eq!(learned[1].value, "30 (learned, custom target)");
+		assert_eq!(
+			decision_lines(&video(CrfChoice::Fixed, false, false))[1].value,
+			"30 (set with --crf, not measured)"
+		);
+		assert_eq!(decision_lines(&video(CrfChoice::Fixed, false, false)).len(), 2);
+	}
+
+	#[test]
+	fn image_and_audio_records_name_their_encoder_and_score() {
+		let image = Decision {
+			image: Some(ImageDecision {
+				route: "AVIF".into(),
+				setting: Some("quality 62".into()),
+				score: Some(86.44),
+				target: Some(85.0),
+			}),
+			..Decision::default()
+		};
+		let audio = Decision {
+			audio: Some(AudioDecision {
+				tracks: vec![
+					AudioTrack {
+						codec: "opus".into(),
+						bitrate_kbps: Some(128),
+						channels: Some(2),
+					},
+					AudioTrack {
+						codec: "copy".into(),
+						..AudioTrack::default()
+					},
+				],
+			}),
+			..Decision::default()
+		};
+
+		assert_eq!(
+			labelled(&decision_lines(&image)),
+			[
+				line("Encoder", "AVIF, quality 62", false),
+				line("Check", "SSIMULACRA2 86.4 vs 85", false)
+			]
+		);
+		assert_eq!(
+			labelled(&decision_lines(&audio)),
+			[line("Audio", "Opus 128 kbps, 2 ch · copied", false)]
+		);
+		assert!(decision_lines(&Decision::default()).is_empty());
+	}
 
 	#[test]
 	fn sizes_read_in_decimal_units() {

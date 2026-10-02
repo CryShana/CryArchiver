@@ -77,10 +77,24 @@ async fn a_photo_teaches_its_group_the_quality_it_needs() {
 		.run(&job(&photo), &sink(dir.path()), &|_| {}, &CancellationToken::new())
 		.await;
 
-	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	let JobOutcome::Encoded { decision, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
 	let entries = memory.entries();
 	assert_eq!(entries.len(), 1, "{entries:?}");
 	assert_eq!(entries[0].0, PHOTO_GROUP_AT_FAST);
+
+	let image = decision.image.as_ref().unwrap();
+	assert_eq!(image.route, "AVIF");
+	assert!(
+		image
+			.setting
+			.as_deref()
+			.is_some_and(|setting| setting.starts_with("quality ")),
+		"{image:?}"
+	);
+	assert_eq!(image.target, Some(80.0));
+	assert!(image.score.is_some_and(|score| score >= 80.0), "{image:?}");
 }
 
 #[tokio::test]

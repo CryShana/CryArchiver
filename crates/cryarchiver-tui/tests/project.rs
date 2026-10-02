@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::commit::OutputSink;
+use cryarchiver_engine::decision::{CrfChoice, Decision, VideoDecision};
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate};
-use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome};
+use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, VmafOverride};
 use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::text::display_path;
@@ -23,15 +24,29 @@ use tokio_util::sync::CancellationToken;
 
 const WAIT: Duration = Duration::from_secs(20);
 
-/// Copies everything, except files named `bad.jpg`, which fail as damaged.
+/// Copies everything, except files named `bad.jpg`, which fail as damaged, and `kept.mp4`, which the engine keeps
+/// after deciding on a learned CRF.
 struct CopyEverything;
+
+fn learned_decision() -> Decision {
+	Decision {
+		video: Some(VideoDecision {
+			encoder: "SVT-AV1 preset 5".into(),
+			crf: Some(30.0),
+			chosen: Some(CrfChoice::Learned),
+			near_miss: true,
+			..VideoDecision::default()
+		}),
+		..Decision::default()
+	}
+}
 
 impl Encode for CopyEverything {
 	fn encode<'a>(
 		&'a self,
 		job: &'a Job,
 		_sink: &'a dyn OutputSink,
-		_on_event: &'a (dyn Fn(JobEvent) + Sync),
+		on_event: &'a (dyn Fn(JobEvent) + Sync),
 		_cancel: &'a CancellationToken,
 	) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>> {
 		Box::pin(async move {
@@ -40,6 +55,14 @@ impl Encode for CopyEverything {
 					ErrorKind::SourceDamaged("truncated".into()),
 					vec!["[mjpeg] premature end of data".into()],
 				))
+			} else if job.source.file_name() == Some(OsStr::new("kept.mp4")) {
+				on_event(JobEvent::Decision(Box::new(learned_decision())));
+				JobOutcome::KeptOriginal {
+					reason: KeepReason::NotSmaller {
+						src_bytes: 10,
+						out_bytes: 10,
+					},
+				}
 			} else {
 				JobOutcome::Skipped {
 					reason: "not media".into(),
@@ -384,6 +407,37 @@ fn a_real_project_shows_only_what_it_knows() {
 	let screen = screen(&mut app);
 	assert!(!screen.contains("LATEST"), "{screen}");
 	assert!(!screen.contains("running ·"), "{screen}");
+}
+
+#[test]
+fn file_details_show_what_the_engine_decided() {
+	let setup = setup(&[("kept.mp4", b"\xFF\xD8\xFF\xE0 kept")]);
+	let mut source = open(&setup.project);
+	refresh_until(&mut source, "the finish", finished);
+	let root = source.view().library.root();
+	source.perform(Action::Expanded(root, true));
+	refresh_until(&mut source, "the rows", |s| s.files(root).is_some());
+	let file = source.files(root).unwrap()[0].id;
+
+	refresh_until(&mut source, "the decision", |s| {
+		s.details(file).is_some_and(|details| !details.decision.is_empty())
+	});
+	let details = source.details(file).unwrap();
+
+	assert_eq!(details.state, FileState::KeptOriginal);
+	let lines: Vec<(&str, &str, bool)> = details
+		.decision
+		.iter()
+		.map(|line| (line.label.as_str(), line.value.as_str(), line.marked))
+		.collect();
+	assert_eq!(
+		lines,
+		[
+			("Encoder", "SVT-AV1 preset 5", false),
+			("CRF", "30 (learned)", false),
+			("Target", "near miss: written slightly below the target", true),
+		]
+	);
 }
 
 #[test]

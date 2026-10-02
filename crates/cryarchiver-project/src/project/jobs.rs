@@ -4,9 +4,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use cryarchiver_engine::commit::{SourceTimes, check_space, file_id, free_space};
+use cryarchiver_engine::decision::Decision;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent};
 use cryarchiver_engine::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use cryarchiver_engine::sink::ArchivalSink;
@@ -51,6 +52,8 @@ pub(crate) struct Target {
 
 pub(crate) enum JobMessage {
 	Event(JobEvent),
+	/// What the engine decided for the file: the project keeps it with the job's attempt.
+	Decided(Box<Decision>),
 	/// The staged output is ready: the project writes `Committing` durably, then answers with the target.
 	Commit {
 		staged: Staged,
@@ -215,9 +218,16 @@ impl JobContext {
 	}
 
 	async fn encode(&self, job: &Job) -> Result<(), JobError> {
-		let on_event = |event: JobEvent| self.send(JobMessage::Event(event));
+		let announced = Mutex::new(None);
+		let on_event = |event: JobEvent| {
+			if let JobEvent::Decision(decision) = &event {
+				*announced.lock().unwrap_or_else(PoisonError::into_inner) = Some(decision.clone());
+			}
+			self.send(JobMessage::Event(event));
+		};
+
 		match self.encoder.encode(job, &self.sink, &on_event, &self.cancel).await {
-			JobOutcome::Encoded { output, .. } => {
+			JobOutcome::Encoded { output, decision, .. } => {
 				let extension = output
 					.extension()
 					.map(|extension| extension.to_string_lossy().into_owned())
@@ -233,9 +243,13 @@ impl JobContext {
 					return Err(self.source_changed().await);
 				}
 
+				self.send(JobMessage::Decided(decision));
 				self.commit(staged, Made::Encoded { extension }).await
 			}
 			JobOutcome::KeptOriginal { reason } => {
+				if let Some(decision) = announced.into_inner().unwrap_or_else(PoisonError::into_inner) {
+					self.send(JobMessage::Decided(decision));
+				}
 				self.send(JobMessage::Kept(keep_reason(&reason)));
 				self.copy(CopyReason::KeptOriginal).await
 			}
@@ -676,6 +690,7 @@ mod tests {
 					src_bytes: self.0.len() as u64,
 					output,
 					warnings: Vec::new(),
+					decision: Box::default(),
 				}
 			})
 		}

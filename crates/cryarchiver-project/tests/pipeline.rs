@@ -4,8 +4,10 @@ use std::fs;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use cryarchiver_engine::decision::{CrfChoice, Decision, Measured, VideoDecision, Vmaf};
 use cryarchiver_engine::outcome::ErrorKind;
 use cryarchiver_project::issues::{Problem, Verb};
+use cryarchiver_project::keys::RelPath;
 use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How, Output};
 use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
@@ -141,6 +143,109 @@ fn unrecoverable_failures_become_issues_with_their_log_until_retried() {
 	wait_for(&project, &mut snapshot, "the retry", complete);
 	assert!(snapshot.issues.is_empty());
 	assert_eq!(encoder.calls().len(), 2);
+}
+
+fn searched(crf: f64) -> Decision {
+	Decision {
+		video: Some(VideoDecision {
+			encoder: "SVT-AV1 preset 5".into(),
+			crf: Some(crf),
+			chosen: Some(CrfChoice::Searched),
+			target: Some(Vmaf { mean: 93.0, p5: 89.0 }),
+			probes: vec![Measured::default(); 3],
+			checks: vec![Measured {
+				crf,
+				mean: 93.4,
+				p5: 89.6,
+			}],
+			..VideoDecision::default()
+		}),
+		attempts: 1,
+		..Decision::default()
+	}
+}
+
+fn decision_shown(
+	project: &cryarchiver_project::Project,
+	snapshot: &mut Snapshot,
+	name: &str,
+) -> Vec<(String, String)> {
+	project.send(Command::Watch(FolderId::ROOT, true));
+	wait_for(project, snapshot, "the rows", |s| {
+		s.rows
+			.get(&FolderId::ROOT)
+			.is_some_and(|rows| rows.iter().any(|row| row.name == name))
+	});
+	let file = snapshot.row(FolderId::ROOT, name).id;
+	snapshot.details.clear();
+	project.send(Command::Details(file));
+	wait_for(project, snapshot, "the details", |s| s.details.contains_key(&file));
+
+	snapshot.details[&file]
+		.decision
+		.iter()
+		.map(|line| (line.label.clone(), line.value.clone()))
+		.collect()
+}
+
+#[test]
+fn what_the_engine_decided_is_kept_with_the_file_and_shown_after_a_reopen() {
+	let setup = setup(|_| {});
+	write(&setup.source, "clip.jpg", &jpeg(1, 100));
+	write(&setup.source, "kept.jpg", &jpeg(2, 100));
+	let encoder = FakeEncoder::new();
+	encoder.decide("clip.jpg", searched(36.75));
+	encoder.rule("kept.jpg", Rule::Keep);
+	encoder.decide("kept.jpg", searched(20.0));
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+	let shown = decision_shown(&project, &mut snapshot, "clip.jpg");
+	drop(project);
+
+	let expected = [
+		("Encoder".to_owned(), "SVT-AV1 preset 5".to_owned()),
+		("CRF".to_owned(), "36.75 (searched, 3 probes)".to_owned()),
+		("Check".to_owned(), "VMAF 93.4 / 89.6 vs 93 / 89".to_owned()),
+	];
+	assert_eq!(shown, expected);
+	let (store, _, _) = Store::open(&setup.project).unwrap();
+	let stored = |name: &str| store.latest_decision(&RelPath::from_bytes(name.into())).unwrap();
+	assert_eq!(stored("clip.jpg"), Some(searched(36.75)));
+	assert_eq!(
+		stored("kept.jpg"),
+		Some(searched(20.0)),
+		"a kept original keeps its record too"
+	);
+	drop(store);
+
+	let project = support::open(&setup, &FakeEncoder::new());
+	let mut snapshot = Snapshot::default();
+	assert_eq!(decision_shown(&project, &mut snapshot, "clip.jpg"), expected);
+}
+
+#[test]
+fn a_file_that_leaves_the_project_takes_its_failure_logs_with_it() {
+	let setup = setup(|_| {});
+	let broken = write(&setup.source, "broken.jpg", &jpeg(1, 100));
+	write(&setup.source, "other.jpg", &jpeg(2, 100));
+	let encoder = FakeEncoder::new();
+	encoder.rule("jpg", Rule::Fail(ErrorKind::SourceDamaged("no end marker".into())));
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "the issues", |s| s.issues.len() == 2);
+	fs::remove_file(&broken).unwrap();
+	project.send(Command::Rescan);
+	wait_for(&project, &mut snapshot, "the file to leave", |s| s.issues.len() == 1);
+	drop(project);
+
+	let (_, _, loaded) = Store::open(&setup.project).unwrap();
+	let attempts: Vec<String> = loaded.last_attempts.keys().map(RelPath::display).collect();
+	assert_eq!(attempts, ["other.jpg"]);
 }
 
 #[test]

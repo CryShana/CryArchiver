@@ -11,7 +11,7 @@ use crate::keys::RelPath;
 use crate::record::FileState;
 use crate::run::apply_folder_times;
 use crate::scan::{DestinationFile, walk_destination};
-use crate::store::LOG_BUDGET_BYTES;
+use crate::store::{DECISION_BUDGET_BYTES, LOG_BUDGET_BYTES};
 use crate::tree::FolderId;
 use crate::view::{LogKind, NoticeLevel};
 
@@ -204,8 +204,8 @@ impl Owner {
 		self.view.status_dirty = true;
 	}
 
-	/// Compacts the project file and caps its failure logs once it has grown by a megabyte or a tenth since the last
-	/// time. Called when a run finishes and when a project opens after a crash.
+	/// Compacts the project file and caps its failure logs and decision records once it has grown by a megabyte or a
+	/// tenth since the last time. Called when a run finishes and when a project opens after a crash.
 	pub(super) fn tidy_store(&mut self) {
 		self.save_quality();
 
@@ -220,13 +220,15 @@ impl Owner {
 		let tidied = self
 			.store
 			.prune_logs(&failing, LOG_BUDGET_BYTES)
+			.and_then(|_| self.store.prune_decisions(DECISION_BUDGET_BYTES))
 			.and_then(|_| self.store.compact());
 		match tidied {
 			Ok(_) => self.after_flush(),
 			Err(err) => self.log(
 				LogKind::Action,
 				format!(
-					"the project file could not be tidied (pruning old failure logs and giving free space back): {err}"
+					"the project file could not be tidied (pruning old failure logs and decision records and giving \
+					 free space back): {err}"
 				),
 			),
 		}

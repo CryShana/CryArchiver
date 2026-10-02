@@ -15,8 +15,9 @@ use crate::record::{CopyReason, FileState, How, IssueKind, MediaClass};
 use crate::schedule::Work;
 use crate::tree::{FileId, FolderId};
 use crate::view::{
-	Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, LogEntry, LogKind, Notice,
-	NoticeLevel, Overall, Parity, PathLink, RowState, RunState, Status, Update, Worker, size_text,
+	DecisionLine, Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, LogEntry, LogKind,
+	Notice, NoticeLevel, Overall, Parity, PathLink, RowState, RunState, Status, Update, Worker, decision_lines,
+	size_text,
 };
 
 const THROUGHPUT_WINDOW: Duration = Duration::from_mins(5);
@@ -442,6 +443,7 @@ impl Owner {
 	pub(super) fn details(&mut self, file: FileId) -> Details {
 		let issue = self.issue_files.contains(&file).then(|| self.file_issue_view(file));
 		let duplicates = self.duplicate_links(file);
+		let decision = self.decision_view(file);
 		let entry = self.tree.file(file);
 		let record = &entry.record;
 		let output = record.state.output();
@@ -478,9 +480,20 @@ impl Owner {
 			bytes_in: record.size,
 			bytes_out: status.bytes_out,
 			plan,
+			decision,
 			notes,
 			duplicates,
 			issue,
+		}
+	}
+
+	fn decision_view(&mut self, file: FileId) -> Vec<DecisionLine> {
+		match self.store.latest_decision(&self.tree.file(file).key) {
+			Ok(decision) => decision.as_ref().map(decision_lines).unwrap_or_default(),
+			Err(err) => {
+				self.fail(err);
+				Vec::new()
+			}
 		}
 	}
 

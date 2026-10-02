@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::commit::free_space;
+use cryarchiver_engine::decision::Decision;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::{collision_key, destination_name, placeholder_name};
 use cryarchiver_engine::options::JobOptions;
@@ -413,6 +414,7 @@ impl Owner {
 	pub(super) fn on_job(&mut self, file: FileId, message: JobMessage) {
 		match message {
 			JobMessage::Event(event) => self.on_job_event(file, event),
+			JobMessage::Decided(decision) => self.decided(file, &decision),
 			JobMessage::Commit {
 				staged,
 				made,
@@ -485,12 +487,31 @@ impl Owner {
 				self.touch_file(file);
 			}
 			JobEvent::Warning(warning) => self.note(file, warning),
-			JobEvent::Parts { .. } | JobEvent::Probe { .. } | JobEvent::Probed { .. } | JobEvent::EncodeAgain(_) => {
+			JobEvent::Parts { .. }
+			| JobEvent::Probe { .. }
+			| JobEvent::Probed { .. }
+			| JobEvent::EncodeAgain(_)
+			| JobEvent::Decision(_) => {
 				return;
 			}
 		}
 
 		self.pipeline.workers_dirty = true;
+	}
+
+	/// Kept with the attempt of the job that sent it, in the next batch.
+	fn decided(&mut self, file: FileId, decision: &Decision) {
+		let Some(attempt) = self.pipeline.jobs.get(&file).map(|job| job.attempt) else {
+			return;
+		};
+		if self.tree.file(file).removed || *decision == Decision::default() {
+			return;
+		}
+
+		let key = self.tree.file(file).key.clone();
+		if let Err(err) = self.store.set_decision(&key, attempt, decision) {
+			self.fail(err);
+		}
 	}
 
 	pub(super) fn note(&mut self, file: FileId, text: String) {

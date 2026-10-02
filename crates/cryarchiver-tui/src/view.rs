@@ -551,6 +551,8 @@ pub struct FileDetails {
 	pub bytes_out: Option<u64>,
 	pub estimated_out: Option<u64>,
 	pub plan: Vec<PlanLine>,
+	/// What the engine decided for the file, when the source keeps it.
+	pub decision: Vec<DecisionLine>,
 	pub quality: Option<String>,
 	/// The tool's live output; empty when the source doesn't have it.
 	pub log_tail: Vec<String>,
@@ -585,6 +587,14 @@ pub struct LiveProgress {
 pub struct PlanLine {
 	pub label: String,
 	pub value: String,
+}
+
+/// A marked line stands out: the video was encoded again, or written slightly below its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionLine {
+	pub label: String,
+	pub value: String,
+	pub marked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

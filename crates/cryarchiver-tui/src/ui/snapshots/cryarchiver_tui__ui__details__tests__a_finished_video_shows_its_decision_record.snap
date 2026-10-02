@@ -1,0 +1,20 @@
+---
+source: crates/cryarchiver-tui/src/ui/details.rs
+expression: text(&buffer)
+---
+╭─ concert.mkv ──────────────────────────────────────────────────────────────────────────────── ⏎ back · ↑↓ prev/next ─╮
+│ Source   D:\Videos\concert.mkv                                                                                       │
+│ Output   E:\Archive\concert.mkv                                                                                      │
+│          1.75 GB                                                                                                     │
+│ State    ✓ done                                                                                                      │
+│ Size     1.75 GB → 152 MB (−91 %)                                                                                    │
+│ Kind     media                                                                                                       │
+│ Encoder  SVT-AV1 preset 5 · film grain 6                                                                             │
+│ CRF      36.75 (searched, 5 probes)                                                                                  │
+│ Check    VMAF 93.1 / 87.2 vs 91 / 86.5, grain allowance 2 / 2.5                                                      │
+│ Again    CRF 38 measured 90.4 / 85.9: encoded again at CRF 36.75                                                     │
+│ Picture  interlaced, deinterlaced                                                                                    │
+│ Took     analyse 41s, sample 5m 12s, encode 40m 10s, verify 6m 20s                                                   │
+│                                                                                                                      │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

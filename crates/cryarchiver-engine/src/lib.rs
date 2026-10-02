@@ -2,6 +2,7 @@ pub mod audio;
 pub mod calibration;
 pub mod commit;
 pub mod container;
+pub mod decision;
 pub mod detect;
 pub mod engine;
 pub mod format;

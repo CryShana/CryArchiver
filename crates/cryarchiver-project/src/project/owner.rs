@@ -380,8 +380,7 @@ impl Owner {
 	pub(super) fn save_file(&mut self, file: FileId) {
 		let entry = self.tree.file(file);
 		let result = if entry.removed {
-			self.store.remove_file(&entry.key);
-			Ok(())
+			self.store.remove_file(&entry.key)
 		} else {
 			self.store.set_file(&entry.key, &entry.record)
 		};

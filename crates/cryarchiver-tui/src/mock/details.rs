@@ -36,6 +36,7 @@ pub fn build(source: &MockSource, file: FileId) -> Option<FileDetails> {
 			.is_active()
 			.then(|| round_to_u64(as_f64(status.bytes_in) * 0.33)),
 		plan: plan(source, file, kind),
+		decision: Vec::new(),
 		quality: quality(source, file, status, kind),
 		log_tail: source.log_tail(file, status),
 		notes: Vec::new(),

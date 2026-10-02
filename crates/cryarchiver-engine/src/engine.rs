@@ -16,6 +16,9 @@ use crate::audio::{cover, encode, tags, verify};
 use crate::calibration::tables;
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
+use crate::decision::{
+	AudioDecision, AudioTrack, CrfChoice, Decision, Measured, Recorder, Reencode, Scan, Trim, Vmaf, encoder_text,
+};
 use crate::detect::{self, Detection, MediaClass};
 use crate::format::{OutputFormat, check_bitrate_cap, check_kind};
 use crate::images::animated::{self, Animation};
@@ -114,6 +117,8 @@ pub enum JobEvent {
 		score: Score,
 	},
 	EncodeAgain(EncodeAgain),
+	/// What the engine decided for the file, once its output is ready to commit or it keeps the original.
+	Decision(Box<Decision>),
 }
 
 /// The full encode is repeated because its quality check missed the target.
@@ -173,6 +178,7 @@ struct Context<'a> {
 	source_bytes: u64,
 	on_event: &'a (dyn Fn(JobEvent) + Sync),
 	cancel: &'a CancellationToken,
+	record: &'a Recorder,
 }
 
 struct Staged {
@@ -397,6 +403,13 @@ impl Engine {
 			return Err(ErrorKind::Cancelled.into());
 		}
 
+		let recorder = Recorder::default();
+		let recording = |event: JobEvent| {
+			recorder.observe(&event);
+			on_event(event);
+		};
+		let on_event: &(dyn Fn(JobEvent) + Sync) = &recording;
+
 		on_event(JobEvent::Stage(Stage::Detect));
 		let Detection { meta, class, probe_log } = detect::detect(&self.tools, &job.source, cancel).await?;
 		if let (Some(format), Some(kind)) = (job.options.format, media_kind(&class)) {
@@ -543,6 +556,7 @@ impl Engine {
 			source_bytes: meta.len(),
 			on_event,
 			cancel,
+			record: &recorder,
 		};
 		let produced = match &planned {
 			Planned::Audio { info, plan, from_video } => {
@@ -554,12 +568,24 @@ impl Engine {
 		};
 		let mut staged = match produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes))? {
 			Produced::Output(staged) => staged,
-			Produced::Kept(reason) => return Ok(JobOutcome::KeptOriginal { reason }),
+			Produced::Kept(reason) => {
+				on_event(JobEvent::Decision(Box::new(recorder.snapshot())));
+				return Ok(JobOutcome::KeptOriginal { reason });
+			}
 		};
 		let learned = std::mem::take(&mut staged.learned);
 
+		recorder.update(|decision| {
+			decision.warnings.clone_from(&staged.warnings);
+			decision.source_bytes = Some(staged.source_share.unwrap_or(cx.source_bytes));
+			decision.output_bytes = Some(staged.bytes);
+			decision.attempts = decision.attempts.max(1);
+		});
+		let decision = Box::new(recorder.snapshot());
+		on_event(JobEvent::Decision(decision.clone()));
+
 		on_event(JobEvent::Stage(Stage::Commit));
-		let outcome = finish(job, sink, &work_root, &meta, before, staged)?;
+		let outcome = finish(job, sink, &work_root, &meta, before, staged, decision)?;
 
 		if matches!(outcome, JobOutcome::Encoded { .. }) {
 			for (key, observation) in &learned {
@@ -644,13 +670,17 @@ impl Engine {
 				bytes,
 				warnings,
 				learned,
-			} => Produced::Output(Staged {
-				path,
-				bytes,
-				source_share: None,
-				warnings,
-				learned,
-			}),
+				chosen,
+			} => {
+				cx.record.update(|decision| decision.image = Some(chosen));
+				Produced::Output(Staged {
+					path,
+					bytes,
+					source_share: None,
+					warnings,
+					learned,
+				})
+			}
 			ImageOutcome::Kept(reason) => Produced::Kept(reason),
 		})
 	}
@@ -746,6 +776,7 @@ impl Engine {
 		let mut plan = with_clipped_chapters(plan, info, workspace)?;
 		plan.options.titles = encoded_titles(info, &plan.tracks);
 		let plan = &plan;
+		cx.record.update(|decision| decision.audio = Some(audio_decision(plan)));
 
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let cmd = encode::command(&self.tools.ffmpeg, &cx.job.source, &output, plan);
@@ -906,6 +937,15 @@ impl Engine {
 			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, chosen)).await?;
 		}
 
+		cx.record.video(|record| {
+			record.grain = video.encoder.grain_level();
+			record.scan = Some(Scan::from(analysis.scan));
+			record.deinterlaced = analysis.scan != ScanType::Progressive;
+			record.resized = size;
+			record.trim = window.map(Trim::from);
+			record.burned_subtitles = rules.burn.is_some();
+		});
+
 		let mut quality = self.video_quality(cx.job, main, &analysis, &video, span_s);
 		Self::apply_learned_grain(cx.job, &mut video, &mut quality);
 		if let Some(crf) = cx.job.options.advanced.crf {
@@ -933,12 +973,14 @@ impl Engine {
 			span: window.or(declared_s.map(|length_s| TrimWindow { start_s: 0.0, length_s })),
 			compared_bytes: source_share(cx.source_bytes, window, declared_s).unwrap_or(cx.source_bytes),
 		};
-		let verify =
-			match Box::pin(self.choose_crf(cx, workspace, &inputs, &analysis, &mut video, &mut quality)).await? {
-				Tuning::Keep(reason) => return Ok(self.kept_video(&quality, reason)),
-				Tuning::Encode { verify } => verify,
-			};
+		let tuning = Box::pin(self.choose_crf(cx, workspace, &inputs, &analysis, &mut video, &mut quality)).await?;
+		record_choice(cx, &video, &quality);
+		let verify = match tuning {
+			Tuning::Keep(reason) => return Ok(self.kept_video(&quality, reason)),
+			Tuning::Encode { verify } => verify,
+		};
 
+		cx.record.update(|decision| decision.attempts = 1);
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &inputs)).await?;
 		let learned = if verify {
@@ -1194,14 +1236,21 @@ impl Engine {
 		let encoded = image_job::encode_animation(&image, &frames.path, &animation, workspace, fold_repeats(warnings));
 		Ok(match Box::pin(encoded).await? {
 			ImageOutcome::Output {
-				path, bytes, warnings, ..
-			} => Produced::Output(Staged {
 				path,
 				bytes,
-				source_share: job.share,
 				warnings,
-				learned: Vec::new(),
-			}),
+				chosen,
+				..
+			} => {
+				cx.record.update(|decision| decision.image = Some(chosen));
+				Produced::Output(Staged {
+					path,
+					bytes,
+					source_share: job.share,
+					warnings,
+					learned: Vec::new(),
+				})
+			}
 			ImageOutcome::Kept(reason) => Produced::Kept(reason),
 		})
 	}
@@ -1516,6 +1565,7 @@ impl Engine {
 			}
 
 			let crf = video.encoder.crf();
+			cx.record.video(|record| record.checks.push(Measured::new(crf, score)));
 			if quality.target.met(score) {
 				return Ok(Checked::Passed(Observation {
 					setting: search::implied_crf(crf, score, quality.target, quality.slope, bounds),
@@ -1544,6 +1594,7 @@ impl Engine {
 					temps
 						.warnings
 						.push(video_quality::near_miss_text(crf, score, quality.target));
+					cx.record.video(|record| record.near_miss = true);
 					return Ok(Checked::Short);
 				}
 
@@ -1560,6 +1611,19 @@ impl Engine {
 			));
 			video.encoder = video.encoder.with_crf(lower);
 			attempt += 1;
+			let (target, again) = (quality.target, video.encoder.crf());
+			cx.record.video(|record| {
+				record.reencode = Some(Reencode {
+					reason: format!(
+						"the full check measured VMAF {:.1} / {:.1}, below the target {} / {}",
+						score.mean, score.p5, target.mean, target.floor
+					),
+					from_crf: crf,
+					to_crf: again,
+				});
+				record.crf = Some(again);
+			});
+			cx.record.update(|decision| decision.attempts = attempt);
 
 			(cx.on_event)(JobEvent::EncodeAgain(EncodeAgain {
 				attempt,
@@ -2328,6 +2392,7 @@ fn finish(
 	meta: &Metadata,
 	before: SourceTimes,
 	staged: Staged,
+	decision: Box<Decision>,
 ) -> Result<JobOutcome, JobError> {
 	if source_changed(&job.source, meta.len(), &before) {
 		return Err(ErrorKind::SourceChanged.into());
@@ -2344,6 +2409,7 @@ fn finish(
 			src_bytes: staged.source_share.unwrap_or(meta.len()),
 			out_bytes: staged.bytes,
 			warnings: staged.warnings,
+			decision,
 		}),
 		Err(CommitError::Exists(path)) => Ok(skipped(&format!("output already exists: {}", display_path(&path)))),
 		Err(CommitError::IsSource(path)) => Ok(skipped(&format!("{} is the source file", display_path(&path)))),
@@ -2352,6 +2418,56 @@ fn finish(
 			&err,
 		)),
 	}
+}
+
+/// How the CRF the video is encoded at was chosen, and the target its check holds it to.
+fn record_choice(cx: &Context<'_>, video: &VideoPlan, quality: &VideoQuality) {
+	let learned = |crf: f64| {
+		quality
+			.stats
+			.is_some_and(|stats| (stats.setting - crf).abs() < f64::EPSILON)
+	};
+	let chosen = match quality.strategy {
+		_ if cx.job.options.advanced.crf.is_some() => CrfChoice::Fixed,
+		Strategy::Search { .. } if quality.stats.is_some() => CrfChoice::LearnedSearchedAgain,
+		Strategy::Search { .. } => CrfChoice::Searched,
+		Strategy::Fixed { crf, .. } if learned(crf) => CrfChoice::Learned,
+		Strategy::Fixed { verify: true, .. } => CrfChoice::Unsearched,
+		Strategy::Fixed { verify: false, .. } => CrfChoice::Table,
+	};
+	let tables = &tables().video;
+
+	cx.record.video(|record| {
+		record.encoder = encoder_text(&video.encoder);
+		record.crf = Some(video.encoder.crf());
+		record.chosen = Some(chosen);
+		record.target = Some(Vmaf::from(quality.target));
+		record.grain_allowance = video.encoder.film_grain().then_some(Vmaf {
+			mean: tables.grain_allowance_mean,
+			p5: tables.grain_allowance_floor,
+		});
+		record.custom_target = cx.job.speed != Speed::Fast && cx.job.overrides.normalized().video.is_some();
+		record.grain_dropped = quality.without_grain;
+	});
+}
+
+fn audio_decision(plan: &FilePlan) -> AudioDecision {
+	let tracks = plan
+		.tracks
+		.iter()
+		.map(|track| match &track.plan {
+			TrackPlan::Encode(encode) => AudioTrack {
+				codec: "opus".into(),
+				bitrate_kbps: Some(encode.bitrate_kbps),
+				channels: Some(encode.channels),
+			},
+			TrackPlan::Copy => AudioTrack {
+				codec: "copy".into(),
+				..AudioTrack::default()
+			},
+		})
+		.collect();
+	AudioDecision { tracks }
 }
 
 fn unsearched_warning(declared_s: Option<f64>, crf: f64) -> String {

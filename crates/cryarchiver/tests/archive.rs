@@ -162,4 +162,12 @@ fn a_fast_project_run_writes_no_quality_entries() {
 	let dumped = String::from_utf8(dumped).unwrap();
 	let quality = dumped.split("[quality]").nth(1).unwrap();
 	assert!(quality.trim().is_empty(), "{dumped}");
+
+	let decisions = dumped.split("[decisions]").nth(1).unwrap();
+	let decisions = decisions.split("[unknown]").next().unwrap();
+	assert!(decisions.contains("\"clip.mp4\" attempt 1 = Decision"), "{dumped}");
+	assert!(
+		decisions.contains("chosen: Some(Table)"),
+		"the real engine's choice is kept: {dumped}"
+	);
 }

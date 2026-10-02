@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::decision::Decision;
 use crate::text::display_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +153,7 @@ pub enum JobOutcome {
 		src_bytes: u64,
 		out_bytes: u64,
 		warnings: Vec<String>,
+		decision: Box<Decision>,
 	},
 	KeptOriginal {
 		reason: KeepReason,
