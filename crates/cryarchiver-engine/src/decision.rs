@@ -57,8 +57,10 @@ pub struct Measured {
 pub enum CrfChoice {
 	/// Searched on samples of the video.
 	Searched,
-	/// The CRF the video's group learned, used as it is.
+	/// The CRF the video's group learned, used as it is and checked.
 	Learned,
+	/// The CRF the video's group learned, used without a quality measurement (no libvmaf).
+	LearnedUnmeasured,
 	/// Searched again, starting from the CRF the video's group learned.
 	LearnedSearchedAgain,
 	/// Set with `--crf`; the quality was not measured.
@@ -264,6 +266,7 @@ impl Recorder {
 		match event {
 			JobEvent::Stage(stage) => self.lock().enter(Some(*stage), Instant::now()),
 			JobEvent::Probed { crf, score } => self.video(|video| video.probes.push(Measured::new(*crf, *score))),
+			JobEvent::Warning(warning) => self.update(|decision| decision.warnings.push(warning.clone())),
 			_ => {}
 		}
 	}
@@ -316,7 +319,7 @@ mod tests {
 	}
 
 	#[test]
-	fn stages_add_up_their_time_and_probes_are_recorded() {
+	fn stages_add_up_their_time_and_probes_and_warnings_are_recorded() {
 		let recorder = Recorder::default();
 
 		recorder.observe(&JobEvent::Stage(Stage::Encode));
@@ -330,10 +333,12 @@ mod tests {
 			},
 		});
 		recorder.observe(&JobEvent::Stage(Stage::Encode));
+		recorder.observe(&JobEvent::Warning("a note".into()));
 		let decision = recorder.snapshot();
 
 		let names: Vec<&str> = decision.stages.iter().map(|time| time.stage.as_str()).collect();
 		assert_eq!(names, ["encode", "verify"]);
+		assert_eq!(decision.warnings, ["a note"]);
 		assert_eq!(
 			decision.video.unwrap().probes,
 			[Measured {

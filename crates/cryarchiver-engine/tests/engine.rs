@@ -2438,6 +2438,20 @@ async fn a_learned_crf_whose_output_is_not_smaller_is_forgotten() {
 		0,
 		"the learned CRF was used: {events:?}"
 	);
+	let kept = events
+		.iter()
+		.find_map(|event| match event {
+			JobEvent::Decision(decision) => Some(decision),
+			_ => None,
+		})
+		.unwrap();
+	assert_eq!(kept.source_bytes, Some(fs::metadata(&short).unwrap().len()));
+	assert_eq!(kept.output_bytes, None);
+	assert_eq!(
+		kept.video.as_ref().and_then(|video| video.chosen),
+		Some(CrfChoice::Learned),
+		"{kept:?}"
+	);
 	assert!(settings(&memory).is_empty(), "{:?}", memory.entries());
 	assert!(
 		memory.entries().iter().all(|(_, stats)| stats.offset.is_some()),

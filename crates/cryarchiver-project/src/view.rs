@@ -300,9 +300,13 @@ pub fn size_text(bytes: u64) -> String {
 	}
 }
 
+/// The label of a decision line that holds one of the engine's warnings, as `display_name` shows it.
+pub const WARNING_LABEL: &str = "Warning";
+
 /// A file's decision record in the words its details show it with.
 pub fn decision_lines(decision: &Decision) -> Vec<DecisionLine> {
 	let mut lines = Vec::new();
+
 	if let Some(video) = &decision.video {
 		video_lines(video, &mut lines);
 	}
@@ -337,8 +341,9 @@ pub fn decision_lines(decision: &Decision) -> Vec<DecisionLine> {
 	}
 
 	for warning in &decision.warnings {
-		lines.push(plain("Warning", display_name(OsStr::new(warning))));
+		lines.push(plain(WARNING_LABEL, display_name(OsStr::new(warning))));
 	}
+
 	lines
 }
 
@@ -353,11 +358,15 @@ fn video_lines(video: &VideoDecision, lines: &mut Vec<DecisionLine>) {
 	}
 
 	if let Some(crf) = video.crf {
-		let probes = video.probes.len();
+		let probes = match video.probes.len() {
+			1 => "1 probe".to_owned(),
+			count => format!("{count} probes"),
+		};
 		let mut how = match video.chosen {
-			Some(CrfChoice::Searched) => format!("searched, {probes} probes"),
-			Some(CrfChoice::LearnedSearchedAgain) => format!("learned, searched again, {probes} probes"),
+			Some(CrfChoice::Searched) => format!("searched, {probes}"),
+			Some(CrfChoice::LearnedSearchedAgain) => format!("learned, searched again, {probes}"),
 			Some(CrfChoice::Learned) => "learned".to_owned(),
+			Some(CrfChoice::LearnedUnmeasured) => "learned, not measured".to_owned(),
 			Some(CrfChoice::Fixed) => "set with --crf, not measured".to_owned(),
 			Some(CrfChoice::Table) => "the speed's default, not measured".to_owned(),
 			Some(CrfChoice::Unsearched) => "nothing to sample, checked".to_owned(),
@@ -370,6 +379,7 @@ fn video_lines(video: &VideoDecision, lines: &mut Vec<DecisionLine>) {
 				", custom target"
 			});
 		}
+
 		let how = if how.is_empty() { how } else { format!(" ({how})") };
 		lines.push(plain("CRF", format!("{crf}{how}")));
 	}
@@ -591,6 +601,14 @@ mod tests {
 			"30 (set with --crf, not measured)"
 		);
 		assert_eq!(decision_lines(&video(CrfChoice::Fixed, false, false)).len(), 2);
+		assert_eq!(
+			decision_lines(&video(CrfChoice::LearnedUnmeasured, false, false))[1].value,
+			"30 (learned, not measured)"
+		);
+
+		let mut one_probe = video(CrfChoice::Searched, false, false);
+		one_probe.video.as_mut().unwrap().probes.push(Measured::default());
+		assert_eq!(decision_lines(&one_probe)[1].value, "30 (searched, 1 probe)");
 	}
 
 	#[test]

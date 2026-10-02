@@ -182,7 +182,7 @@ fn size_of(table: &impl ReadableTableMetadata) -> Result<TableSize, StoreError> 
 	})
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Table {
 	Meta,
 	Files,
@@ -583,26 +583,45 @@ impl Store {
 			return Ok(());
 		};
 
-		let mut rows: HashSet<Table> = HashSet::new();
+		let mut logs: HashSet<u32> = HashSet::new();
 		{
 			let txn = self.db.begin_read()?;
 			for entry in txn.open_table(LOGS)?.range(attempts_of(&key))? {
-				rows.insert(Table::Logs(entry?.0.value().1));
-			}
-			for entry in txn.open_table(DECISIONS)?.range(attempts_of(&key))? {
-				rows.insert(Table::Decisions(entry?.0.value().1));
+				logs.insert(entry?.0.value().1);
 			}
 		}
-		rows.extend(
-			self.pending
-				.iter()
-				.filter(|change| change.key == key && matches!(change.table, Table::Logs(_) | Table::Decisions(_)))
-				.map(|change| change.table),
-		);
+		logs.extend(self.pending.iter().filter_map(|change| match change.table {
+			Table::Logs(attempt) if change.key == key => Some(attempt),
+			_ => None,
+		}));
 
 		self.remove(Table::Files, key.clone());
-		for table in rows {
-			self.remove(table, key.clone());
+		for attempt in logs {
+			self.remove(Table::Logs(attempt), key.clone());
+		}
+		self.remove_decisions(path)
+	}
+
+	/// Removes every decision record of the file, written or still batched.
+	pub fn remove_decisions(&mut self, path: &RelPath) -> Result<(), StoreError> {
+		let Some(key) = self.known_file_key(path) else {
+			return Ok(());
+		};
+
+		let mut attempts: HashSet<u32> = HashSet::new();
+		{
+			let txn = self.db.begin_read()?;
+			for entry in txn.open_table(DECISIONS)?.range(attempts_of(&key))? {
+				attempts.insert(entry?.0.value().1);
+			}
+		}
+		attempts.extend(self.pending.iter().filter_map(|change| match change.table {
+			Table::Decisions(attempt) if change.key == key => Some(attempt),
+			_ => None,
+		}));
+
+		for attempt in attempts {
+			self.remove(Table::Decisions(attempt), key.clone());
 		}
 		Ok(())
 	}

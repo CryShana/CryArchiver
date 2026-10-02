@@ -1,3 +1,7 @@
+use std::ffi::OsStr;
+
+use cryarchiver_engine::text::display_name;
+use cryarchiver_project::view::WARNING_LABEL;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -10,6 +14,7 @@ use crate::theme::{Theme, glyph, issue_glyph, label};
 use crate::view::{Duplicates, FileDetails, IssueSummary, PathLink, StageProgress};
 
 const LABEL: usize = 9;
+const WARNINGS_SHOWN: usize = 3;
 
 pub fn render(
 	buf: &mut Buffer,
@@ -94,15 +99,8 @@ fn render_facts(buf: &mut Buffer, area: Rect, details: &FileDetails, theme: &The
 		let color = if plan.label == "Note" { state_color } else { theme.text };
 		lines.push(labelled(&plan.label, &fit(&plan.value, value_width), fg(color), theme));
 	}
-	for decision in &details.decision {
-		let color = if decision.marked { theme.warn } else { theme.text };
-		lines.push(labelled(
-			&decision.label,
-			&fit(&decision.value, value_width),
-			fg(color),
-			theme,
-		));
-	}
+
+	lines.extend(record_lines(details, value_width, theme));
 
 	if let Some(quality) = &details.quality {
 		let color = if quality.starts_with("target") {
@@ -114,6 +112,41 @@ fn render_facts(buf: &mut Buffer, area: Rect, details: &FileDetails, theme: &The
 	}
 
 	draw_lines(buf, area, &lines);
+}
+
+/// The decision record, leaving out the warnings the notes already show and all but the first few of the rest.
+fn record_lines<'a>(details: &FileDetails, value_width: usize, theme: &Theme) -> Vec<Line<'a>> {
+	let noted = |value: &str| details.notes.iter().any(|note| display_name(OsStr::new(note)) == value);
+	let mut lines = Vec::new();
+	let mut warnings = 0;
+
+	for decision in &details.decision {
+		if decision.label == WARNING_LABEL {
+			if noted(&decision.value) {
+				continue;
+			}
+
+			warnings += 1;
+			if warnings > WARNINGS_SHOWN {
+				continue;
+			}
+		}
+
+		let color = if decision.marked { theme.warn } else { theme.text };
+		lines.push(labelled(
+			&decision.label,
+			&fit(&decision.value, value_width),
+			fg(color),
+			theme,
+		));
+	}
+
+	if warnings > WARNINGS_SHOWN {
+		let more = format!("… {} more", warnings - WARNINGS_SHOWN);
+		lines.push(labelled("", &more, fg(theme.dim), theme));
+	}
+
+	lines
 }
 
 fn labelled<'a>(label: &str, value: &str, style: Style, theme: &Theme) -> Line<'a> {
@@ -340,17 +373,57 @@ mod tests {
 			.join("\n")
 	}
 
-	#[test]
-	fn a_finished_video_shows_its_decision_record() {
-		let decision = decision_lines(&reencoded())
+	fn shown(decision: &Decision) -> Vec<DecisionLine> {
+		decision_lines(decision)
 			.into_iter()
 			.map(|line| DecisionLine {
 				label: line.label,
 				value: line.value,
 				marked: line.marked,
 			})
-			.collect();
+			.collect()
+	}
+
+	fn drawn(details: &FileDetails) -> Buffer {
+		let area = Rect::new(0, 0, 120, 16);
+		let mut buffer = Buffer::empty(area);
+		render(
+			&mut buffer,
+			area,
+			"concert.mkv",
+			Some(details),
+			&Theme::dark(ColorDepth::TrueColor),
+			&mut HitMap::default(),
+		);
+		buffer
+	}
+
+	#[test]
+	fn warnings_the_notes_show_are_left_out_and_only_the_first_few_of_the_rest_shown() {
+		let decision = Decision {
+			warnings: ["seen live", "first", "second", "third", "fourth", "fifth"]
+				.map(str::to_owned)
+				.into(),
+			..Decision::default()
+		};
 		let details = FileDetails {
+			decision: shown(&decision),
+			notes: vec!["seen live".into()],
+			..finished(Vec::new())
+		};
+
+		let text = text(&drawn(&details));
+
+		assert!(!text.contains("Warning  seen live"), "{text}");
+		for warning in ["first", "second", "third"] {
+			assert!(text.contains(&format!("Warning  {warning}")), "{text}");
+		}
+		assert!(!text.contains("fourth"), "{text}");
+		assert!(text.contains("         … 2 more"), "{text}");
+	}
+
+	fn finished(decision: Vec<DecisionLine>) -> FileDetails {
+		FileDetails {
 			source_path: r"D:\Videos\concert.mkv".into(),
 			destination_path: r"E:\Archive\concert.mkv".into(),
 			source_info: "1.75 GB".into(),
@@ -370,20 +443,14 @@ mod tests {
 			notes: Vec::new(),
 			duplicates: Duplicates::None,
 			issue: None,
-		};
-		let area = Rect::new(0, 0, 120, 16);
-		let mut buffer = Buffer::empty(area);
+		}
+	}
 
-		render(
-			&mut buffer,
-			area,
-			"concert.mkv",
-			Some(&details),
-			&Theme::dark(ColorDepth::TrueColor),
-			&mut HitMap::default(),
-		);
+	#[test]
+	fn a_finished_video_shows_its_decision_record() {
+		let buffer = drawn(&finished(shown(&reencoded())));
 
-		let again = (0..area.height)
+		let again = (0..buffer.area.height)
 			.find(|&y| {
 				text(&buffer)
 					.lines()

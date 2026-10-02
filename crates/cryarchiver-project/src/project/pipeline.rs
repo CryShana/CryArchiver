@@ -387,6 +387,11 @@ impl Owner {
 		self.pipeline.workers_dirty = true;
 		if work != Work::Delete {
 			self.set_state(file, FileState::InProgress { attempt });
+
+			let key = self.tree.file(file).key.clone();
+			if let Err(err) = self.store.remove_decisions(&key) {
+				self.fail(err);
+			}
 		}
 		tokio::spawn(context.run(task));
 	}

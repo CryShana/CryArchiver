@@ -227,6 +227,42 @@ fn what_the_engine_decided_is_kept_with_the_file_and_shown_after_a_reopen() {
 }
 
 #[test]
+fn a_new_job_clears_the_records_of_earlier_jobs_even_at_a_higher_attempt() {
+	let setup = setup(|_| {});
+	write(&setup.source, "page.html", b"<html><body>saved page</body></html>");
+	write(&setup.source, "encoded.jpg", &jpeg(1, 100));
+	let (mut store, _, _) = Store::open(&setup.project).unwrap();
+	for name in ["page.html", "encoded.jpg"] {
+		store
+			.set_decision(&RelPath::from_bytes(name.into()), 3, &searched(20.0))
+			.unwrap();
+	}
+	store.flush().unwrap();
+	drop(store);
+	let encoder = FakeEncoder::new();
+	encoder.decide("encoded.jpg", searched(30.0));
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+	drop(project);
+
+	let (store, _, _) = Store::open(&setup.project).unwrap();
+	let stored = |name: &str| store.latest_decision(&RelPath::from_bytes(name.into())).unwrap();
+	assert_eq!(
+		stored("page.html"),
+		None,
+		"a copy leaves no record of an earlier encode"
+	);
+	assert_eq!(
+		stored("encoded.jpg"),
+		Some(searched(30.0)),
+		"the attempt 1 record shows, not the old attempt 3"
+	);
+}
+
+#[test]
 fn a_file_that_leaves_the_project_takes_its_failure_logs_with_it() {
 	let setup = setup(|_| {});
 	let broken = write(&setup.source, "broken.jpg", &jpeg(1, 100));

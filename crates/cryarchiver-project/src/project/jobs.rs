@@ -250,6 +250,7 @@ impl JobContext {
 				if let Some(decision) = announced.into_inner().unwrap_or_else(PoisonError::into_inner) {
 					self.send(JobMessage::Decided(decision));
 				}
+
 				self.send(JobMessage::Kept(keep_reason(&reason)));
 				self.copy(CopyReason::KeptOriginal).await
 			}

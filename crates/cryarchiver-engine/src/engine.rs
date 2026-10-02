@@ -569,6 +569,7 @@ impl Engine {
 		let mut staged = match produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes))? {
 			Produced::Output(staged) => staged,
 			Produced::Kept(reason) => {
+				recorder.update(|decision| decision.source_bytes = Some(cx.source_bytes));
 				on_event(JobEvent::Decision(Box::new(recorder.snapshot())));
 				return Ok(JobOutcome::KeptOriginal { reason });
 			}
@@ -2431,7 +2432,8 @@ fn record_choice(cx: &Context<'_>, video: &VideoPlan, quality: &VideoQuality) {
 		_ if cx.job.options.advanced.crf.is_some() => CrfChoice::Fixed,
 		Strategy::Search { .. } if quality.stats.is_some() => CrfChoice::LearnedSearchedAgain,
 		Strategy::Search { .. } => CrfChoice::Searched,
-		Strategy::Fixed { crf, .. } if learned(crf) => CrfChoice::Learned,
+		Strategy::Fixed { crf, verify: true } if learned(crf) => CrfChoice::Learned,
+		Strategy::Fixed { crf, verify: false } if learned(crf) => CrfChoice::LearnedUnmeasured,
 		Strategy::Fixed { verify: true, .. } => CrfChoice::Unsearched,
 		Strategy::Fixed { verify: false, .. } => CrfChoice::Table,
 	};
