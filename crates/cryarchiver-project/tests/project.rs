@@ -1293,6 +1293,7 @@ fn quality_learned_in_one_run_is_there_the_next_time() {
 				setting: 90.5,
 				slope: None,
 				bpp: None,
+				offset: None,
 				without_grain: false,
 			},
 		);
@@ -1325,6 +1326,7 @@ fn a_forgotten_group_is_gone_the_next_time() {
 		setting: 90.5,
 		slope: None,
 		bpp: None,
+		offset: None,
 		without_grain: false,
 	};
 	for forget in [false, true] {

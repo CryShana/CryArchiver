@@ -851,6 +851,8 @@ pub fn dump(path: &Path, out: &mut dyn Write) -> Result<(), StoreError> {
 mod tests {
 	use std::ffi::OsStr;
 
+	use cryarchiver_engine::quality::memory::Offset;
+
 	use super::*;
 	use crate::record::{CopyReason, FileState, Hash, How, Output};
 
@@ -1160,6 +1162,7 @@ mod tests {
 			setting: 29.5,
 			slope: Some(0.4),
 			bpp: Some(0.03),
+			offset: Some(Offset { mean: -0.4, p5: -2.7 }),
 			observations: 2,
 			without_grain: false,
 		};
@@ -1184,12 +1187,62 @@ mod tests {
 	}
 
 	#[test]
+	fn a_quality_entry_stored_before_sample_offsets_reads_without_one() {
+		#[derive(Serialize)]
+		struct Earlier {
+			setting: f64,
+			slope: Option<f64>,
+			bpp: Option<f64>,
+			observations: u32,
+			without_grain: bool,
+		}
+
+		let dir = tempfile::tempdir().unwrap();
+		let key = "video/h264/1080/fps31/sdr8/progressive/clean/opaque|svt-av1-4.2.0|p5|t93.0/89.0";
+		let earlier = Earlier {
+			setting: 29.5,
+			slope: Some(0.4),
+			bpp: None,
+			observations: 2,
+			without_grain: false,
+		};
+		let mut store = Store::create(&project(dir.path()), &Settings::default()).unwrap();
+		store.push(Change {
+			table: Table::Meta,
+			key: format!("{QUALITY_PREFIX}{key}").into_bytes(),
+			value: Some(rmp_serde::to_vec_named(&earlier).unwrap()),
+		});
+		store.flush().unwrap();
+		drop(store);
+
+		let (store, _, loaded) = Store::open(&project(dir.path())).unwrap();
+		drop(store);
+
+		assert_eq!(
+			loaded.quality,
+			vec![(
+				key.to_owned(),
+				GroupStats {
+					setting: 29.5,
+					slope: Some(0.4),
+					bpp: None,
+					offset: None,
+					observations: 2,
+					without_grain: false,
+				}
+			)]
+		);
+		assert!(loaded.ignored_quality.is_empty(), "{:?}", loaded.ignored_quality);
+	}
+
+	#[test]
 	fn an_unreadable_quality_entry_is_skipped_and_the_project_still_opens() {
 		let dir = tempfile::tempdir().unwrap();
 		let stats = GroupStats {
 			setting: 88.0,
 			slope: None,
 			bpp: None,
+			offset: None,
 			observations: 1,
 			without_grain: false,
 		};
@@ -1228,6 +1281,7 @@ mod tests {
 			setting: 29.5,
 			slope: Some(0.4),
 			bpp: Some(0.03),
+			offset: None,
 			observations: 3,
 			without_grain: false,
 		};

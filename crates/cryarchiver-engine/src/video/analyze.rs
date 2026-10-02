@@ -7,7 +7,7 @@ use crate::outcome::JobError;
 use crate::probe::Stream;
 use crate::process::{self, RunError, STALL_TIMEOUT, ToolCommand};
 use crate::toolchain::Toolchain;
-use crate::video::noise::{self, Triplet};
+use crate::video::noise::{self, Combing, Measured, Triplet};
 
 const SEGMENT_S: f64 = 3.0;
 const WHOLE_FILE_BELOW_S: f64 = 12.0;
@@ -79,7 +79,11 @@ pub struct SegmentStats {
 	pub black_s: f64,
 	pub frozen_s: f64,
 	pub si: Option<f64>,
+	pub ti: Option<f64>,
 	pub noise: Vec<Triplet>,
+	/// The mean luma of the frames measured for noise, on the 8-bit scale.
+	pub luma: Option<f64>,
+	pub combing: Combing,
 }
 
 pub fn segments(duration_s: Option<f64>, count: usize) -> Vec<Segment> {
@@ -287,15 +291,21 @@ pub async fn analyze(
 		};
 
 		let cmd = segment_command(&tools.ffmpeg, source, main.index, forced_decoder(main), &segment);
-		let (out, noise) = tokio::join!(
+		let (out, pixels) = tokio::join!(
 			super::run_ffmpeg(&cmd, |_| {}, cancel),
-			segment_noise(tools, source, main, &segment, cancel)
+			segment_pixels(tools, source, main, &segment, cancel)
 		);
-		let (out, noise) = (out?, noise?);
+		let (out, pixels) = (out?, pixels?);
 
 		Ok::<_, JobError>(
-			parse_segment(&out.stderr_tail, segment.start_s, segment_length(&segment, end_s))
-				.map(|stats| SegmentStats { noise, ..stats }),
+			parse_segment(&out.stderr_tail, segment.start_s, segment_length(&segment, end_s)).map(|stats| {
+				SegmentStats {
+					noise: pixels.triplets,
+					luma: pixels.luma,
+					combing: pixels.combing,
+					..stats
+				}
+			}),
 		)
 	};
 
@@ -314,25 +324,25 @@ pub async fn analyze(
 }
 
 /// A source whose luma can't be decoded to raw frames (an RGB stream, say) is left unmeasured rather than failed.
-async fn segment_noise(
+async fn segment_pixels(
 	tools: &Toolchain,
 	source: &Path,
 	main: &Stream,
 	segment: &Segment,
 	cancel: &CancellationToken,
-) -> Result<Vec<Triplet>, JobError> {
+) -> Result<Measured, JobError> {
 	let cmd = noise::command(&tools.ffmpeg, source, main, segment);
 	let mut reader = noise::Reader::default();
 
 	let out = match process::run_streamed(&cmd, |chunk| reader.push(chunk), cancel).await {
 		Ok(out) => out,
-		Err(RunError::CaptureLimit(_) | RunError::Crashed { .. }) => return Ok(Vec::new()),
+		Err(RunError::CaptureLimit(_) | RunError::Crashed { .. }) => return Ok(Measured::default()),
 		Err(err) => return Err(err.into()),
 	};
 	Ok(if out.status.success() {
 		reader.finish()
 	} else {
-		Vec::new()
+		Measured::default()
 	})
 }
 
@@ -389,7 +399,10 @@ mod tests {
 			black_s: 0.0,
 			frozen_s: 0.0,
 			si: Some(60.0),
+			ti: None,
 			noise: Vec::new(),
+			luma: None,
+			combing: Combing::default(),
 		}
 	}
 

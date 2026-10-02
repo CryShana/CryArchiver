@@ -4,6 +4,11 @@
 //! three, so that a smoother B-frame or one re-quantised frame can't set it. Only flat blocks count, so line art and
 //! texture can't pass for noise, and moving ones are skipped. Grain depends on brightness, so blocks are pooled per
 //! luma band.
+//!
+//! The same frames give the segment's brightness and a direct look at its fields: in a moving block of the middle
+//! frame, each field of interlaced video matches the other field of one neighbouring frame (half a frame away) much
+//! better than that of the other (one and a half frames away), while the two fields of a progressive frame are one
+//! instant and match both neighbours alike.
 
 use std::path::Path;
 
@@ -42,6 +47,10 @@ const LOW_FREQUENCY_SLACK: f64 = 0.02;
 /// How far a block's mean change may stray from the triplet's median one. Fades and flicker change every block alike;
 /// motion over a gradient changes each by its own gradient.
 const DC_SLACK: f64 = 0.25;
+/// A normal deviation over the median absolute deviation.
+const MAD_TO_DEVIATION: f64 = 1.4826;
+/// How much a second difference of independent values widens their deviation: √6.
+const SECOND_DIFFERENCE_GAIN: f64 = 2.449_489_742_783_178;
 /// A triplet whose flat blocks mostly move is left out: compression flicker rides on motion, so the blocks of a
 /// moving picture that happen to look still can't be trusted.
 const MOVING_SHARE: f64 = 0.5;
@@ -52,11 +61,48 @@ const DEFAULT_PERIOD: u32 = 25;
 const MAX_WIDTH: u32 = 3840;
 const MAX_HEIGHT: u32 = 2160;
 const PGM_HEADER_BYTES: usize = 32;
+const LUMA_STEP: usize = 4;
+const FIELD_BLOCK: usize = 16;
+/// A block moves when its fields' best match with a neighbouring frame is this much worse than with their own frame.
+const MOVING_OVER_STILL: f64 = 1.5;
+const MIN_MOTION: f64 = 1.0;
+/// Interlaced fields match one neighbour about three times better than the other; progressive ones match both alike.
+const FIELD_ASYMMETRY: f64 = 1.5;
+const PROGRESSIVE_SYMMETRY: f64 = 1.2;
+/// The fields of an interlaced frame are half a frame apart, like its better neighbour; progressive fields are one
+/// instant, much closer than either neighbour.
+const OWN_FIELDS_SHARE: f64 = 0.6;
+const MIN_FIELD_GAP: f64 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Triplet {
 	/// The median noise deviation of each luma band's usable blocks, in 8-bit code values.
 	pub bands: [Option<f64>; BAND_COUNT],
+}
+
+/// The moving blocks of the frames between two others, by what their fields show.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Combing {
+	pub top_first: u64,
+	pub bottom_first: u64,
+	pub progressive: u64,
+}
+
+impl Combing {
+	fn add(&mut self, other: Self) {
+		self.top_first += other.top_first;
+		self.bottom_first += other.bottom_first;
+		self.progressive += other.progressive;
+	}
+}
+
+/// What a segment's raw frames showed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Measured {
+	pub triplets: Vec<Triplet>,
+	/// The mean luma of the frames, on the 8-bit scale.
+	pub luma: Option<f64>,
+	pub combing: Combing,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,6 +171,8 @@ pub struct Reader {
 	pending: Vec<u8>,
 	held: Vec<Held>,
 	triplets: Vec<Triplet>,
+	luma: Vec<f64>,
+	combing: Combing,
 	peak_bytes: usize,
 	/// The stream stopped being PGM; nothing after it is read.
 	broken: bool,
@@ -158,8 +206,19 @@ impl Reader {
 			}
 
 			if let [a, b, c] = self.held.as_slice() {
-				self.triplets.extend(triplet(&a.frame(), &b.frame(), &c.frame()));
+				let (triplet, luma, combing) = off_the_worker(|| {
+					let [a, b, c] = [a.frame(), b.frame(), c.frame()];
+					(
+						triplet(&a, &b, &c),
+						[a, b, c].map(|frame| mean_luma(&frame)),
+						combing(&a, &b, &c),
+					)
+				});
 				self.held.clear();
+
+				self.triplets.extend(triplet);
+				self.luma.extend(luma.into_iter().flatten());
+				self.combing.add(combing);
 			}
 		}
 	}
@@ -169,8 +228,13 @@ impl Reader {
 		self.peak_bytes
 	}
 
-	pub fn finish(self) -> Vec<Triplet> {
-		self.triplets
+	#[allow(clippy::cast_precision_loss)]
+	pub fn finish(self) -> Measured {
+		Measured {
+			luma: (!self.luma.is_empty()).then(|| self.luma.iter().sum::<f64>() / self.luma.len() as f64),
+			triplets: self.triplets,
+			combing: self.combing,
+		}
 	}
 
 	fn note_peak(&mut self) {
@@ -275,15 +339,14 @@ pub fn triplet(a: &Frame<'_>, b: &Frame<'_>, c: &Frame<'_>) -> Option<Triplet> {
 		return None;
 	}
 
-	let candidates: Vec<&Block> = blocks
-		.iter()
-		.filter(|block| block.flat && (BANDS[0]..BANDS[BAND_COUNT]).contains(&block.mean))
-		.collect();
+	let candidate = |block: &Block| block.flat && (BANDS[0]..BANDS[BAND_COUNT]).contains(&block.mean);
+	let candidates: Vec<&Block> = blocks.iter().filter(|block| candidate(block)).collect();
 	let typical_dc = median(&mut candidates.iter().map(|block| block.dc).collect::<Vec<_>>());
+	let grain_tolerance = DC_SLACK + 3.0 * unshared_dc_spread(&blocks, across.div_ceil(stride), candidate);
 	let usable: Vec<&Block> = candidates
 		.iter()
 		.copied()
-		.filter(|block| block.still && (block.dc - typical_dc).abs() <= block.dc_tolerance)
+		.filter(|block| block.still && (block.dc - typical_dc).abs() <= block.dc_tolerance.max(grain_tolerance))
 		.collect();
 	if (candidates.len() - usable.len()) as f64 > MOVING_SHARE * candidates.len() as f64 {
 		return None;
@@ -301,10 +364,117 @@ pub fn triplet(a: &Frame<'_>, b: &Frame<'_>, c: &Frame<'_>) -> Option<Triplet> {
 }
 
 /// Every PGM triplet in `bytes`, measured.
-pub fn measure(bytes: &[u8]) -> Vec<Triplet> {
+pub fn measure(bytes: &[u8]) -> Measured {
 	let mut reader = Reader::default();
 	reader.push(bytes);
 	reader.finish()
+}
+
+/// Pixel work done inside an async task: on a multi-threaded runtime, its worker hands its other tasks on first.
+fn off_the_worker<T>(work: impl FnOnce() -> T) -> T {
+	match tokio::runtime::Handle::try_current() {
+		Ok(runtime) if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+			tokio::task::block_in_place(work)
+		}
+		_ => work(),
+	}
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn mean_luma(frame: &Frame<'_>) -> Option<f64> {
+	let mut sum = 0.0;
+	let mut count = 0_usize;
+	for y in (0..frame.height).step_by(LUMA_STEP) {
+		for x in (0..frame.width).step_by(LUMA_STEP) {
+			sum += f64::from(frame.sample(x, y));
+			count += 1;
+		}
+	}
+
+	(count > 0).then(|| sum / count as f64)
+}
+
+/// The field votes of the moving blocks of `b`, the frame between `a` and `c`.
+pub fn combing(a: &Frame<'_>, b: &Frame<'_>, c: &Frame<'_>) -> Combing {
+	let (width, height) = (b.width, b.height);
+	let mut combing = Combing::default();
+	if [a, c]
+		.iter()
+		.any(|frame| (frame.width, frame.height) != (width, height))
+		|| width < FIELD_BLOCK
+		|| height < FIELD_BLOCK + 2
+	{
+		return combing;
+	}
+
+	let (across, down) = (width / FIELD_BLOCK, (height - 2) / FIELD_BLOCK);
+	let stride = stride(across * down);
+	for row in (0..down).step_by(stride) {
+		for column in (0..across).step_by(stride) {
+			match field_vote([a, b, c], column * FIELD_BLOCK, 1 + row * FIELD_BLOCK) {
+				Some(FieldVote::TopFirst) => combing.top_first += 1,
+				Some(FieldVote::BottomFirst) => combing.bottom_first += 1,
+				Some(FieldVote::Progressive) => combing.progressive += 1,
+				None => {}
+			}
+		}
+	}
+	combing
+}
+
+enum FieldVote {
+	TopFirst,
+	BottomFirst,
+	Progressive,
+}
+
+/// How each row of the block at `(x0, y0)` in the middle frame matches the rows of the other field around it, in its own
+/// frame and in each neighbour. Row 0 belongs to the top field. Top first, a top row is half a frame after the bottom
+/// rows of the frame before it and a bottom row half a frame before the top rows of the frame after it; bottom first,
+/// the other way round.
+#[allow(clippy::cast_precision_loss)]
+fn field_vote(frames: [&Frame<'_>; 3], x0: usize, y0: usize) -> Option<FieldVote> {
+	let [a, b, c] = frames;
+	let (mut own, mut top_first, mut bottom_first) = (0.0, 0.0, 0.0);
+
+	for y in y0..y0 + FIELD_BLOCK {
+		for x in x0..x0 + FIELD_BLOCK {
+			let here = f64::from(b.sample(x, y));
+			let across =
+				|frame: &Frame<'_>| (here - f64::from(frame.sample(x, y - 1) + frame.sample(x, y + 1)) / 2.0).abs();
+			let (before, after) = (across(a), across(c));
+
+			own += across(b);
+			if y % 2 == 0 {
+				top_first += before;
+				bottom_first += after;
+			} else {
+				top_first += after;
+				bottom_first += before;
+			}
+		}
+	}
+
+	let pixels = (FIELD_BLOCK * FIELD_BLOCK) as f64;
+	let (closer, farther) = (top_first.min(bottom_first), top_first.max(bottom_first));
+	if farther < MOVING_OVER_STILL * own + MIN_MOTION * pixels {
+		return None;
+	}
+
+	if farther >= FIELD_ASYMMETRY * closer
+		&& own >= OWN_FIELDS_SHARE * closer
+		&& farther - closer >= MIN_FIELD_GAP * pixels
+	{
+		Some(if top_first < bottom_first {
+			FieldVote::TopFirst
+		} else {
+			FieldVote::BottomFirst
+		})
+	} else if farther < PROGRESSIVE_SYMMETRY * closer {
+		Some(FieldVote::Progressive)
+	} else {
+		None
+	}
 }
 
 /// The noisiest luma band's median over the triplets, among the bands measured in at least a third of them (two at
@@ -331,6 +501,20 @@ struct Block {
 	sigma: f64,
 	flat: bool,
 	still: bool,
+}
+
+/// The deviation of the still blocks' mean changes that their neighbours in the row don't share, from the median
+/// second difference along the row. Grain moves each block's mean on its own, the more the coarser it is, while motion
+/// over a smooth gradient moves neighbouring blocks by amounts that change smoothly along it.
+fn unshared_dc_spread(blocks: &[Block], columns: usize, candidate: impl Fn(&Block) -> bool) -> f64 {
+	let mut curvatures: Vec<f64> = blocks
+		.chunks(columns.max(1))
+		.flat_map(|row| row.windows(3))
+		.filter(|run| run.iter().all(|block| block.still && candidate(block)))
+		.map(|run| (run[0].dc - 2.0 * run[1].dc + run[2].dc).abs())
+		.collect();
+
+	MAD_TO_DEVIATION * median(&mut curvatures) / SECOND_DIFFERENCE_GAIN
 }
 
 fn stride(blocks: usize) -> usize {
@@ -620,6 +804,113 @@ mod tests {
 		);
 	}
 
+	fn coarse(sigma: f64, grain_px: usize, seed: u64) -> impl FnMut(usize, usize) -> f64 {
+		let (across, down) = (W / grain_px + 1, H / grain_px + 1);
+		let mut random = Random(seed);
+		let cells: Vec<f64> = (0..across * down).map(|_| random.gaussian()).collect();
+
+		move |x, y| 120.0 + sigma * cells[(y / grain_px) * across + x / grain_px]
+	}
+
+	#[test]
+	fn coarse_grain_on_a_still_picture_is_measured() {
+		for grain_px in [2, 4, 6, 8] {
+			let frames = three(|index| encode(W, H, coarse(4.0, grain_px, 41 + index as u64)));
+
+			let level = strongest(measured(&frames));
+
+			assert!(level.is_some_and(|level| level > 1.0), "{grain_px} px: {level:?}");
+		}
+	}
+
+	fn pattern(x: f64, y: f64) -> f64 {
+		120.0 + 40.0 * (x / 6.0).sin() * (y / 9.0).cos() + 15.0 * (x / 2.7 + y / 3.3).sin()
+	}
+
+	/// Three frames of a picture moving by `motion` pixels (x, y) a frame, each frame's rows taken at the times its
+	/// fields show: `Some(true)` for top field first, `Some(false)` for bottom first, `None` for progressive.
+	#[allow(clippy::cast_precision_loss)]
+	fn filmed(fields: Option<bool>, motion: (f64, f64), noise: f64, seed: u64) -> [Vec<u8>; 3] {
+		three(|index| {
+			let mut random = Random(seed + index as u64);
+			encode(W, H, |x, y| {
+				let late = match fields {
+					Some(top_first) => (y % 2 == 0) != top_first,
+					None => false,
+				};
+				let time = index as f64 + if late { 0.5 } else { 0.0 };
+				pattern(x as f64 - motion.0 * time, y as f64 - motion.1 * time) + noise * random.gaussian()
+			})
+		})
+	}
+
+	fn fields_of(frames: &[Vec<u8>; 3]) -> Combing {
+		let [a, b, c] = frames.each_ref().map(|bytes| Frame::gray16(W, H, bytes).unwrap());
+		combing(&a, &b, &c)
+	}
+
+	#[test]
+	fn woven_fields_of_a_moving_picture_vote_for_their_field_order() {
+		for motion in [(2.0, 0.0), (6.0, 0.0), (0.0, 2.0), (3.0, 3.0)] {
+			let top = fields_of(&filmed(Some(true), motion, 1.0, 3));
+			let bottom = fields_of(&filmed(Some(false), motion, 1.0, 3));
+
+			assert!(
+				top.top_first > 100 && top.top_first > 20 * (top.bottom_first + top.progressive),
+				"{motion:?}: {top:?}"
+			);
+			assert!(
+				bottom.bottom_first > 100 && bottom.bottom_first > 20 * (bottom.top_first + bottom.progressive),
+				"{motion:?}: {bottom:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn progressive_motion_does_not_vote_for_fields() {
+		for motion in [(2.0, 0.0), (6.0, 0.0), (0.0, 1.0), (0.0, 3.0), (3.0, 3.0), (0.5, 0.0)] {
+			let votes = fields_of(&filmed(None, motion, 1.0, 5));
+
+			assert!(
+				votes.progressive > 20 && votes.top_first + votes.bottom_first <= votes.progressive / 50,
+				"{motion:?}: {votes:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn still_noise_and_scene_cuts_cast_no_field_votes() {
+		let noisy = fields_of(&noisy_gray([4.0; 3], 9));
+		let [a, b, _] = filmed(None, (0.0, 0.0), 1.0, 7);
+		let [_, _, c] = filmed(Some(true), (40.0, 0.0), 1.0, 8);
+		let cut = fields_of(&[a, b, c]);
+
+		assert_eq!(noisy.top_first + noisy.bottom_first, 0, "{noisy:?}");
+		assert!(noisy.progressive < 5, "{noisy:?}");
+		assert!(cut.top_first + cut.bottom_first <= cut.progressive / 50, "{cut:?}");
+	}
+
+	#[test]
+	fn the_reader_keeps_the_brightness_and_the_field_votes_of_what_it_measured() {
+		let flat = |level: f64| encode(W, H, |_, _| level);
+		let frames: Vec<Vec<u8>> = [flat(40.0), flat(40.0), flat(40.0)]
+			.into_iter()
+			.chain(filmed(Some(true), (4.0, 0.0), 1.0, 11))
+			.map(|pixels| pgm16(W, H, &pixels))
+			.collect();
+
+		let measured = measure(&frames.concat());
+
+		assert!(
+			measured
+				.luma
+				.is_some_and(|luma| (luma - f64::midpoint(40.0, 120.0)).abs() < 2.0),
+			"{measured:?}"
+		);
+		assert!(measured.combing.top_first > 100, "{measured:?}");
+		assert_eq!(Reader::default().finish().luma, None);
+	}
+
 	#[test]
 	fn a_scene_cut_is_not_measured() {
 		let cut = three(|index| encode(W, H, |_, _| if index < 2 { 60.0 } else { 160.0 }));
@@ -694,9 +985,30 @@ mod tests {
 				reader.push(piece);
 			}
 
-			assert_eq!(reader.finish(), expected, "chunks of {chunk}");
+			assert_eq!(reader.finish().triplets, expected, "chunks of {chunk}");
 		}
-		assert_eq!(measure(&stream), expected);
+		assert_eq!(measure(&stream).triplets, expected);
+	}
+
+	#[test]
+	fn frames_are_measured_on_either_kind_of_runtime() {
+		let stream: Vec<u8> = noisy_gray([1.0; 3], 21)
+			.iter()
+			.flat_map(|pixels| pgm16(W, H, pixels))
+			.collect();
+		let runtimes = [
+			tokio::runtime::Builder::new_current_thread().build(),
+			tokio::runtime::Builder::new_multi_thread().worker_threads(2).build(),
+		];
+
+		for runtime in runtimes {
+			let stream = stream.clone();
+			let measured = runtime
+				.unwrap()
+				.block_on(async { tokio::spawn(async move { measure(&stream) }).await.unwrap() });
+
+			assert_eq!(measured.triplets.len(), 1, "{measured:?}");
+		}
 	}
 
 	#[test]
@@ -707,7 +1019,7 @@ mod tests {
 		reader.push(&pgm16(W, H, &noisy_gray([1.0; 3], 1)[0]));
 
 		assert!(reader.peak_bytes() <= 64, "{}", reader.peak_bytes());
-		assert!(reader.finish().is_empty());
+		assert!(reader.finish().triplets.is_empty());
 	}
 
 	#[test]
@@ -758,7 +1070,7 @@ mod tests {
 
 		let peak = reader.peak_bytes();
 		assert!(peak <= 3 * frame.len() + (1 << 17), "{peak} bytes held");
-		assert_eq!(reader.finish().len(), 2);
+		assert_eq!(reader.finish().triplets.len(), 2);
 	}
 
 	#[test]

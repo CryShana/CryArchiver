@@ -440,6 +440,7 @@ async fn encode_and_choose(
 							setting,
 							slope: None,
 							bpp: None,
+							offset: None,
 							without_grain: false,
 						},
 					));

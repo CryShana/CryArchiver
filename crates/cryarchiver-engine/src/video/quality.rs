@@ -587,6 +587,7 @@ mod tests {
 			setting: 31.5,
 			slope: Some(0.4),
 			bpp: None,
+			offset: None,
 			observations: 3,
 			without_grain: false,
 		};

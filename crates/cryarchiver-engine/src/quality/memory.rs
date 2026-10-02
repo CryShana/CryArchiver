@@ -10,6 +10,14 @@ use crate::toolchain::{LIBAOM, LIBJXL, LIBVPX_VP9, SVT_AV1};
 use crate::video::quality::CRF_RANGE;
 
 const HISTORY: u32 = 8;
+const MAX_STORED_OFFSET: f64 = 20.0;
+
+/// How far a full check landed from the search samples' prediction: the full score minus the predicted one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Offset {
+	pub mean: f64,
+	pub p5: f64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GroupStats {
@@ -18,6 +26,8 @@ pub struct GroupStats {
 	pub slope: Option<f64>,
 	#[serde(default)]
 	pub bpp: Option<f64>,
+	#[serde(default)]
+	pub offset: Option<Offset>,
 	pub observations: u32,
 	/// A noisy group whose files came out smaller without film grain than with it; the setting is for no grain.
 	#[serde(default)]
@@ -29,6 +39,7 @@ pub struct Observation {
 	pub setting: f64,
 	pub slope: Option<f64>,
 	pub bpp: Option<f64>,
+	pub offset: Option<Offset>,
 	pub without_grain: bool,
 }
 
@@ -38,6 +49,7 @@ impl GroupStats {
 			setting: observation.setting,
 			slope: observation.slope,
 			bpp: observation.bpp,
+			offset: observation.offset,
 			observations: 1,
 			without_grain: observation.without_grain,
 		}
@@ -56,11 +68,19 @@ impl GroupStats {
 			(Some(old), Some(new)) => Some(blend(old, new)),
 			(old, new) => new.or(old),
 		};
+		let offset = match (self.offset, observation.offset) {
+			(Some(old), Some(new)) => Some(Offset {
+				mean: blend(old.mean, new.mean),
+				p5: blend(old.p5, new.p5),
+			}),
+			(old, new) => new.or(old),
+		};
 
 		Self {
 			setting: blend(self.setting, observation.setting),
 			slope: merge(self.slope, observation.slope),
 			bpp: merge(self.bpp, observation.bpp),
+			offset,
 			observations: self.observations.saturating_add(1),
 			without_grain: self.without_grain,
 		}
@@ -95,6 +115,15 @@ impl GroupStats {
 			return Some(format!(
 				"the bits per pixel {:?} are not a positive number",
 				self.bpp.unwrap_or_default()
+			));
+		}
+
+		let plausible = |gap: f64| (-MAX_STORED_OFFSET..=MAX_STORED_OFFSET).contains(&gap);
+		if let Some(offset) = self.offset
+			&& !(plausible(offset.mean) && plausible(offset.p5))
+		{
+			return Some(format!(
+				"the sample offset {offset:?} is not a plausible VMAF difference"
 			));
 		}
 		None
@@ -222,8 +251,31 @@ mod tests {
 			setting,
 			slope: Some(0.4),
 			bpp: None,
+			offset: None,
 			without_grain: false,
 		}
+	}
+
+	#[test]
+	fn offsets_blend_like_the_other_values_and_survive_observations_without_one() {
+		let observed = |mean: f64| Observation {
+			setting: 30.0,
+			slope: None,
+			bpp: None,
+			offset: Some(Offset { mean, p5: mean * 2.0 }),
+			without_grain: false,
+		};
+
+		let first = GroupStats::first(observed(-1.0));
+		let second = first.updated(observed(-3.0));
+		let third = second.updated(Observation {
+			offset: None,
+			..observed(0.0)
+		});
+
+		assert_eq!(first.offset, Some(Offset { mean: -1.0, p5: -2.0 }));
+		assert_eq!(second.offset, Some(Offset { mean: -2.0, p5: -4.0 }));
+		assert_eq!(third.offset, second.offset);
 	}
 
 	#[test]
@@ -298,6 +350,7 @@ mod tests {
 			setting,
 			slope,
 			bpp,
+			offset: None,
 			observations: 1,
 			without_grain: false,
 		};
@@ -321,5 +374,29 @@ mod tests {
 		assert!(stats(120.0, None, None).problem(photo).is_some());
 		assert!(stats(40.0, None, None).problem(tall).is_some());
 		assert!(stats(29.5, None, None).problem("video/x|x264|p5|t93.0").is_some());
+	}
+
+	#[test]
+	fn implausible_sample_offsets_are_refused() {
+		let video = "video/h264/1080/fps31/sdr8/progressive/clean/opaque|svt-av1-4.2.0|p5|t93.0/89.0";
+		let offset = |mean: f64, p5: f64| GroupStats {
+			setting: 29.5,
+			slope: Some(0.4),
+			bpp: None,
+			offset: Some(Offset { mean, p5 }),
+			observations: 1,
+			without_grain: false,
+		};
+
+		assert_eq!(offset(-0.4, -2.7).problem(video), None);
+		assert_eq!(offset(20.0, -20.0).problem(video), None);
+		for bad in [
+			offset(-20.5, 0.0),
+			offset(0.0, 35.0),
+			offset(f64::NAN, 0.0),
+			offset(0.0, f64::NEG_INFINITY),
+		] {
+			assert!(bad.problem(video).is_some(), "{bad:?}");
+		}
 	}
 }

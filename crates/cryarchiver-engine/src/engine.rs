@@ -1395,6 +1395,7 @@ impl Engine {
 					setting: search::implied_crf(crf, score, quality.target, quality.slope, bounds),
 					slope: Some(quality.slope),
 					bpp: output_bpp(&temps.video.path, video, temps.encoded.frames),
+					offset: None,
 					without_grain: quality.without_grain,
 				}));
 			}
