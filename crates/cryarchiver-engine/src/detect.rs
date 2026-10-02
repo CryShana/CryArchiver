@@ -170,8 +170,9 @@ pub fn classify(header: &[u8], info: Option<MediaInfo>) -> MediaClass {
 		return MediaClass::Other(format!("not media: detected only as {format}"));
 	}
 
-	let image_magic = magic.is_some_and(|kind| kind.matcher_type() == MatcherType::Image);
 	let image_demuxer = format == "image2" || format.ends_with("_pipe");
+	let image_magic = magic.is_some_and(|kind| kind.matcher_type() == MatcherType::Image)
+		|| (image_demuxer && unlisted_image_signature(header, &info));
 	if image_demuxer && !image_magic {
 		return MediaClass::Other("the extension says image, but the content does not match".into());
 	}
@@ -202,6 +203,29 @@ pub fn classify(header: &[u8], info: Option<MediaInfo>) -> MediaClass {
 		return MediaClass::Audio(info);
 	}
 	MediaClass::Other("no audio or video streams".into())
+}
+
+/// QOI, PNM and TGA images, which `infer` doesn't know. TGA has no signature, so its fixed header must describe a
+/// plausible image that ffprobe also read as TGA.
+fn unlisted_image_signature(header: &[u8], info: &MediaInfo) -> bool {
+	match header {
+		[b'q', b'o', b'i', b'f', ..] => return true,
+		[b'P', b'1'..=b'7', next, ..] if next.is_ascii_whitespace() => return true,
+		_ => {}
+	}
+
+	let targa = info.streams.first().is_some_and(|stream| stream.codec_name == "targa");
+	let Some(&[_, colour_map, kind, _, _, _, _, _, _, _, _, _, w0, w1, h0, h1, depth, _]) = header.get(..18) else {
+		return false;
+	};
+	let mapped = matches!(kind, 1 | 9);
+
+	targa
+		&& matches!(kind, 1 | 2 | 3 | 9 | 10 | 11)
+		&& (colour_map == 1 || (colour_map == 0 && !mapped))
+		&& u16::from_le_bytes([w0, w1]) > 0
+		&& u16::from_le_bytes([h0, h1]) > 0
+		&& matches!(depth, 8 | 15 | 16 | 24 | 32)
 }
 
 #[cfg(test)]
@@ -290,6 +314,40 @@ mod tests {
 		assert!(matches!(classify(PNG, png), MediaClass::StillImage(_)));
 		assert!(matches!(classify(b"GIF89a\x40\x01", gif), MediaClass::AnimatedImage(_)));
 		assert!(matches!(classify(HEIC, heic), MediaClass::StillImage(_)));
+	}
+
+	#[test]
+	fn qoi_pnm_and_tga_are_trusted_by_their_own_headers() {
+		let probed = |format: &str, codec: &str| {
+			info(&format!(
+				r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"{codec}"}}],"format":{{"format_name":"{format}"}}}}"#
+			))
+		};
+		let tga = [&[0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 192, 0, 32, 8][..], &[0; 16]].concat();
+
+		assert!(matches!(
+			classify(b"qoif\0\0\x01\0\0\0\0\xc0\x04\0", probed("qoi_pipe", "qoi")),
+			MediaClass::StillImage(_)
+		));
+		assert!(matches!(
+			classify(b"P6\n256 192\n255\n", probed("ppm_pipe", "ppm")),
+			MediaClass::StillImage(_)
+		));
+		assert!(matches!(
+			classify(&tga, probed("image2", "targa")),
+			MediaClass::StillImage(_)
+		));
+		assert!(matches!(
+			classify(
+				b"<!DOCTYPE html><html><body>503</body></html>",
+				probed("image2", "targa")
+			),
+			MediaClass::Other(_)
+		));
+		assert!(matches!(
+			classify(&tga, probed("image2", "mjpeg")),
+			MediaClass::Other(_)
+		));
 	}
 
 	#[test]

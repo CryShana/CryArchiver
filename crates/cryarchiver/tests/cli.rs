@@ -1096,3 +1096,54 @@ fn a_verbose_run_with_a_failure_writes_nothing_but_the_outputs() {
 		.collect();
 	assert_eq!(produced, ["good.cry.opus"]);
 }
+
+fn snapshot(dir: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+	let mut files: Vec<_> = fs::read_dir(dir)
+		.unwrap()
+		.map(|entry| {
+			let entry = entry.unwrap();
+			(entry.file_name(), fs::read(entry.path()).unwrap())
+		})
+		.collect();
+	files.sort();
+	files
+}
+
+#[test]
+fn a_folder_with_damaged_and_misnamed_files_fails_only_those() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("in");
+	fs::create_dir(&source).unwrap();
+	flac(&source, "good.flac", 2);
+	let cut = flac(&source, "cut.flac", 10);
+	let bytes = fs::read(&cut).unwrap();
+	fs::write(&cut, &bytes[..bytes.len() * 2 / 5]).unwrap();
+	fs::write(source.join("notes.mp4"), b"not a video\n").unwrap();
+	fs::write(source.join("empty.jpg"), b"").unwrap();
+	fs::write(
+		source.join("error.gif"),
+		b"<!DOCTYPE html><html><body>503</body></html>",
+	)
+	.unwrap();
+	let before = snapshot(&source);
+
+	let out = cryarchiver(
+		dir.path(),
+		&["in", "-o", "out", "--speed", "fast", "--min-savings", "0"],
+	);
+
+	let text = stdout(&out);
+	assert_eq!(out.status.code(), Some(1), "{text}");
+	assert!(text.contains("✓ good.flac"), "{text}");
+	assert!(text.contains("✗ cut.flac  failed: source damaged"), "{text}");
+	for skipped in ["notes.mp4", "empty.jpg", "error.gif"] {
+		assert!(text.contains(&format!("· {skipped}  skipped")), "{text}");
+	}
+
+	assert_eq!(snapshot(&source), before);
+	let produced: Vec<String> = fs::read_dir(dir.path().join("out"))
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+	assert_eq!(produced, ["good.cry.opus"]);
+}
