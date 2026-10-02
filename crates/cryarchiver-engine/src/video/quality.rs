@@ -171,6 +171,7 @@ pub enum GrainChoice {
 	Plain,
 }
 
+#[derive(Clone, Copy)]
 pub struct Scorer<'a> {
 	pub tools: &'a Toolchain,
 	pub source: &'a Path,

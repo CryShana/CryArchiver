@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+cryarchiver-engine = { path = "../crates/cryarchiver-engine" }
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true

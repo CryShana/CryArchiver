@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cryarchiver-engine", "crates/cryarchiver-project", "crates/cryarchiver-tui", "crates/cryarchiver"]
+members = ["crates/cryarchiver-engine", "crates/cryarchiver-project", "crates/cryarchiver-tui", "crates/cryarchiver", "xtask"]
 exclude = ["vendor/avif-serialize"]
 
 [workspace.package]

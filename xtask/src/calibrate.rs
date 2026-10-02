@@ -1,0 +1,372 @@
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use cryarchiver_engine::calibration::{Tables, parse, tables};
+use cryarchiver_engine::detect::{self, Detection, MediaClass};
+use cryarchiver_engine::options::TrimWindow;
+use cryarchiver_engine::preset::{Overrides, Speed};
+use cryarchiver_engine::probe;
+use cryarchiver_engine::quality::search::Target;
+use cryarchiver_engine::toolchain::{ToolConfig, Toolchain};
+use cryarchiver_engine::video::VideoStarts;
+use cryarchiver_engine::video::analyze::{Analysis, analyze};
+use cryarchiver_engine::video::encode::Sample;
+use cryarchiver_engine::video::plan::{Encoder, Resolution, VideoCaps, VideoPlan, plan_video, usable_main};
+use cryarchiver_engine::video::quality::{
+	Aim, Found, Scorer, Searched, analysis_segments, search, search_samples, target,
+};
+use cryarchiver_engine::workspace::Workspace;
+use tokio_util::sync::CancellationToken;
+
+const SLOW: u8 = 0;
+const MODERATE: u8 = 1;
+const FAST: u8 = 2;
+const SPEEDS: [(u8, Speed); 3] = [(FAST, Speed::Fast), (MODERATE, Speed::Moderate), (SLOW, Speed::Slow)];
+const PRESET_4: u8 = 4;
+const REPORT_KEYS: [&str; 2] = ["videos-measured", "moderate-preset4-bytes-ratio"];
+
+#[derive(Debug, Default)]
+pub struct Measurements {
+	pub crf: BTreeMap<(u8, usize), Vec<f64>>,
+	pub bpp: [Vec<f64>; 6],
+	pub grain_mean: Vec<f64>,
+	pub grain_floor: Vec<f64>,
+	pub preset4_ratio: Vec<f64>,
+	pub slope: Vec<f64>,
+	pub videos: usize,
+}
+
+pub fn median(values: &[f64]) -> Option<f64> {
+	if values.is_empty() {
+		return None;
+	}
+
+	let mut sorted = values.to_vec();
+	sorted.sort_by(f64::total_cmp);
+	let middle = sorted.len() / 2;
+	Some(if sorted.len().is_multiple_of(2) {
+		f64::midpoint(sorted[middle - 1], sorted[middle])
+	} else {
+		sorted[middle]
+	})
+}
+
+#[allow(clippy::cast_precision_loss)]
+pub fn updated(mut tables: Tables, measured: &Measurements) -> Tables {
+	let rows = [
+		(SLOW, &mut tables.video.svt_crf_slow),
+		(MODERATE, &mut tables.video.svt_crf_moderate),
+		(FAST, &mut tables.video.svt_crf_fast),
+	];
+	for (speed, row) in rows {
+		for (index, cell) in row.iter_mut().enumerate() {
+			if let Some(crf) = measured.crf.get(&(speed, index)).and_then(|values| median(values)) {
+				*cell = (crf * 4.0).floor() / 4.0;
+			}
+		}
+	}
+
+	for (cell, values) in tables.video.expected_bpp.iter_mut().zip(&measured.bpp) {
+		if let Some(bpp) = median(values) {
+			*cell = (bpp * 1000.0).round() / 1000.0;
+		}
+	}
+
+	if let Some(mean) = median(&measured.grain_mean) {
+		tables.video.grain_allowance_mean = mean.max(0.0);
+	}
+
+	if let Some(floor) = median(&measured.grain_floor) {
+		tables.video.grain_allowance_floor = floor.max(0.0);
+	}
+
+	if let Some(slope) = median(&measured.slope) {
+		tables.video.default_slope = (slope * 1000.0).round() / 1000.0;
+	}
+
+	tables.report.insert(REPORT_KEYS[0].into(), measured.videos as f64);
+	if let Some(ratio) = median(&measured.preset4_ratio) {
+		tables.report.insert(REPORT_KEYS[1].into(), ratio);
+	}
+	tables
+}
+
+pub async fn run(corpus: &Path, out: &Path) -> Result<(), String> {
+	let cancel = CancellationToken::new();
+	let tools = Toolchain::detect(&ToolConfig::default(), &cancel)
+		.await
+		.map_err(|err| err.to_string())?;
+	if !tools.has_vmaf() {
+		return Err("calibration needs ffmpeg with libvmaf".into());
+	}
+
+	let scratch = tempfile::tempdir().map_err(|err| err.to_string())?;
+	let mut measured = Measurements::default();
+	for file in corpus_files(corpus)? {
+		match Box::pin(measure_video(&tools, &file, scratch.path(), &mut measured, &cancel)).await {
+			Ok(true) => println!("✓ {}", file.display()),
+			Ok(false) => {}
+			Err(reason) => println!("· {}: {reason}", file.display()),
+		}
+	}
+
+	let text = toml::to_string_pretty(&updated(tables().clone(), &measured)).map_err(|err| err.to_string())?;
+	parse(&text)?;
+	fs::write(out, text).map_err(|err| format!("{}: {err}", out.display()))
+}
+
+fn corpus_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+	let mut files = Vec::new();
+	let mut folders = vec![root.to_path_buf()];
+	while let Some(folder) = folders.pop() {
+		let entries = fs::read_dir(&folder).map_err(|err| format!("{}: {err}", folder.display()))?;
+		for entry in entries.flatten() {
+			match entry.file_type() {
+				Ok(kind) if kind.is_dir() => folders.push(entry.path()),
+				Ok(kind) if kind.is_file() => files.push(entry.path()),
+				_ => {}
+			}
+		}
+	}
+	files.sort();
+	Ok(files)
+}
+
+async fn measure_video(
+	tools: &Toolchain,
+	source: &Path,
+	scratch: &Path,
+	measured: &mut Measurements,
+	cancel: &CancellationToken,
+) -> Result<bool, String> {
+	let Detection { class, .. } = detect::detect(tools, source, cancel)
+		.await
+		.map_err(|err| err.to_string())?;
+	let MediaClass::Video(_) = class else {
+		return Ok(false);
+	};
+
+	let bytes = fs::metadata(source).map_err(|err| err.to_string())?.len();
+	let (info, _) = probe::probe_video(tools, source, bytes, cancel)
+		.await
+		.map_err(|err| format!("{err:?}"))?;
+	let caps = VideoCaps {
+		vp9_alpha: tools.vp9_alpha,
+		libaom: tools.has_libaom(),
+	};
+	let main = usable_main(&info, &caps, None).map_err(|reason| format!("{reason:?}"))?;
+	let declared = main.declared_duration().or(info.format.duration);
+	let span = declared.map(|length_s| TrimWindow { start_s: 0.0, length_s });
+	let workspace = Workspace::create(scratch, source).map_err(|err| err.to_string())?;
+	let threads = std::thread::available_parallelism().map_or(1, usize::from);
+	let mut by_segments: BTreeMap<usize, Analysis> = BTreeMap::new();
+
+	let mut any = false;
+	for (row, speed) in SPEEDS {
+		let sampling_speed = if speed == Speed::Fast { Speed::Moderate } else { speed };
+		let segments = analysis_segments(sampling_speed, declared);
+		let analysis = match by_segments.entry(segments) {
+			Entry::Occupied(known) => known.into_mut(),
+			Entry::Vacant(slot) => slot.insert(
+				Box::pin(analyze(tools, source, main, declared, segments, None, cancel))
+					.await
+					.map_err(|err| err.to_string())?,
+			),
+		};
+
+		let mut plan = plan_video(&info, main, &[], analysis, speed, None);
+		let Encoder::SvtAv1 { .. } = plan.encoder else {
+			return Ok(false);
+		};
+		plan.starts = VideoStarts::of(&info, &plan.streams);
+		let samples = search_samples(analysis, span, sampling_speed);
+		if samples.is_empty() {
+			continue;
+		}
+
+		let goal = target(speed, plan.encoder.film_grain(), &Overrides::default());
+		let scorer = Scorer {
+			tools,
+			source,
+			workspace: &workspace,
+			plan: &plan,
+			threads,
+			cancel,
+		};
+		let start = plan.encoder.crf();
+		let default_slope = tables().video.default_slope;
+		let Searched::Found(found) = search(&scorer, &samples, start, Aim::exact(goal), default_slope, |_| {})
+			.await
+			.map_err(|err| err.to_string())?
+			.searched
+		else {
+			continue;
+		};
+		any = true;
+		let bucket = Resolution::of(plan.width, plan.height).index();
+		measured.crf.entry((row, bucket)).or_default().push(found.crf);
+		if row == MODERATE {
+			let fps = main.fps().unwrap_or(25.0);
+			Box::pin(measure_at_moderate(scorer, &samples, found, (goal, fps), measured)).await?;
+		}
+	}
+
+	if any {
+		measured.videos += 1;
+	}
+	Ok(any)
+}
+
+#[allow(clippy::cast_precision_loss)]
+async fn measure_at_moderate(
+	scorer: Scorer<'_>,
+	samples: &[Sample],
+	found: Found,
+	(goal, fps): (Target, f64),
+	measured: &mut Measurements,
+) -> Result<(), String> {
+	let plan = scorer.plan;
+	let bucket = Resolution::of(plan.width, plan.height).index();
+
+	measured.slope.push(found.slope);
+	let seconds: f64 = samples.iter().map(|sample| sample.length_s).sum();
+	let pixels = f64::from(plan.width) * f64::from(plan.height) * seconds * fps;
+	if pixels > 0.0 {
+		measured.bpp[bucket].push(found.sample_bytes as f64 * 8.0 / pixels);
+	}
+
+	if plan.encoder.film_grain() {
+		let grain_free = VideoPlan {
+			encoder: Encoder::SvtAv1 {
+				preset: plan.encoder.preset(),
+				crf: found.crf,
+				film_grain: None,
+			},
+			..plan.clone()
+		};
+		let without = Scorer {
+			plan: &grain_free,
+			..scorer
+		}
+		.probe(found.crf, samples, 90, |_| {})
+		.await
+		.map_err(|err| err.to_string())?;
+		measured.grain_mean.push(without.score.mean - found.score.mean);
+		measured.grain_floor.push(without.score.p5 - found.score.p5);
+	}
+
+	let slower = VideoPlan {
+		encoder: Encoder::SvtAv1 {
+			preset: PRESET_4,
+			crf: found.crf,
+			film_grain: plan.encoder.grain_level(),
+		},
+		..plan.clone()
+	};
+	let slower_scorer = Scorer {
+		plan: &slower,
+		..scorer
+	};
+	if let Searched::Found(at_preset_4) = search(
+		&slower_scorer,
+		samples,
+		found.crf,
+		Aim::exact(goal),
+		found.slope,
+		|_| {},
+	)
+	.await
+	.map_err(|err| err.to_string())?
+	.searched
+		&& found.sample_bytes > 0
+	{
+		measured
+			.preset4_ratio
+			.push(at_preset_4.sample_bytes as f64 / found.sample_bytes as f64);
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn medians_of_odd_and_even_counts() {
+		assert_eq!(median(&[]), None);
+		assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
+		assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), Some(2.5));
+	}
+
+	#[test]
+	fn only_measured_cells_change_and_crfs_round_to_quarter_steps() {
+		let mut measured = Measurements::default();
+		measured
+			.crf
+			.entry((MODERATE, 2))
+			.or_default()
+			.extend([31.1, 31.6, 30.2]);
+		measured.bpp[2].extend([0.051, 0.049]);
+		measured.grain_mean.push(1.4);
+		measured.grain_floor.push(2.1);
+		measured.preset4_ratio.push(0.96);
+		measured.videos = 3;
+		let before = tables().clone();
+
+		let after = updated(before.clone(), &measured);
+
+		assert_eq!(after.video.svt_crf_moderate[2], 31.0);
+		assert_eq!(after.video.svt_crf_moderate[0], before.video.svt_crf_moderate[0]);
+		assert_eq!(after.video.svt_crf_slow, before.video.svt_crf_slow);
+		assert_eq!(after.video.expected_bpp[2], 0.05);
+		assert_eq!(after.video.grain_allowance_mean, 1.4);
+		assert_eq!(after.report.get("videos-measured"), Some(&3.0));
+		assert_eq!(after.report.get("moderate-preset4-bytes-ratio"), Some(&0.96));
+		assert_eq!(parse(&toml::to_string_pretty(&after).unwrap()).as_ref(), Ok(&after));
+	}
+
+	#[test]
+	fn the_report_holds_numbers_under_fixed_keys_only() {
+		let mut measured = Measurements::default();
+		measured.preset4_ratio.push(0.9);
+		measured.slope.extend([0.4, 0.6]);
+		measured.videos = 2;
+
+		let after = updated(tables().clone(), &measured);
+
+		assert!(
+			after.report.keys().all(|key| REPORT_KEYS.contains(&key.as_str())),
+			"{:?}",
+			after.report
+		);
+		assert_eq!(after.video.default_slope, 0.5);
+	}
+
+	#[test]
+	fn every_file_of_every_folder_is_listed() {
+		let corpus = tempfile::tempdir().unwrap();
+		let deeper = corpus.path().join("nested").join("deeper");
+		fs::create_dir_all(&deeper).unwrap();
+		for file in [
+			corpus.path().join("notes.mp4"),
+			corpus.path().join("_draft.mkv"),
+			deeper.join("late-start.mkv"),
+		] {
+			fs::write(file, b"x").unwrap();
+		}
+
+		let files = corpus_files(corpus.path()).unwrap();
+
+		assert_eq!(
+			files,
+			[
+				corpus.path().join("_draft.mkv"),
+				deeper.join("late-start.mkv"),
+				corpus.path().join("notes.mp4"),
+			]
+		);
+	}
+}

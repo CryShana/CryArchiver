@@ -75,7 +75,7 @@ impl Resolution {
 		}
 	}
 
-	fn index(self) -> usize {
+	pub fn index(self) -> usize {
 		self as usize
 	}
 }
