@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +47,21 @@ pub struct EncodedVideo {
 pub struct Sample {
 	pub start_s: f64,
 	pub length_s: f64,
+}
+
+/// What encoding a set of samples gave.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sampled {
+	pub bytes: u64,
+	/// The median sample's encoding seconds per second of source (`NaN` for none).
+	pub rate: f64,
+}
+
+/// The middle of `rates`, so that one slow start-up doesn't set it; `NaN` for none.
+pub fn median_rate(mut rates: Vec<f64>) -> f64 {
+	rates.retain(|rate| rate.is_finite());
+	rates.sort_by(f64::total_cmp);
+	rates.get(rates.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
 #[derive(Clone, Copy)]
@@ -253,16 +269,25 @@ pub async fn encode_samples(
 	samples: &[Sample],
 	mut on_samples: impl FnMut(usize),
 	cancel: &CancellationToken,
-) -> Result<u64, JobError> {
-	let mut total = 0;
+) -> Result<Sampled, JobError> {
+	let mut bytes = 0;
+	let mut rates = Vec::new();
 	on_samples(0);
 
 	for (index, sample) in samples.iter().enumerate() {
 		let output = workspace.file(&format!("sample-{index}.mkv"));
-		total += encode_sample(ffmpeg, source, &output, plan, sample, cancel).await?;
+		let started = Instant::now();
+		bytes += encode_sample(ffmpeg, source, &output, plan, sample, cancel).await?;
+		if sample.length_s > 0.0 {
+			rates.push(started.elapsed().as_secs_f64() / sample.length_s);
+		}
 		on_samples(index + 1);
 	}
-	Ok(total)
+
+	Ok(Sampled {
+		bytes,
+		rate: median_rate(rates),
+	})
 }
 
 pub(crate) fn failed_encode(out: process::ToolOutput) -> JobError {
@@ -1018,6 +1043,13 @@ mod tests {
 		assert_eq!(samples(Some(MIN_PREDICTED_DURATION_S)).len(), 4);
 		assert!(samples(Some(119.9)).is_empty());
 		assert!(samples(None).is_empty());
+	}
+
+	#[test]
+	fn the_encoding_rate_is_the_median_samples() {
+		assert!((median_rate(vec![9.0, 1.0, 1.2, f64::NAN, 1.1]) - 1.2).abs() < 1e-9);
+		assert!((median_rate(vec![2.0]) - 2.0).abs() < 1e-9);
+		assert!(median_rate(Vec::new()).is_nan());
 	}
 
 	#[test]

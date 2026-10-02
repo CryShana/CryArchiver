@@ -13,7 +13,7 @@ use crate::quality::search::{self as crf_search, Bounds, Choice, Next, Probe, Ta
 use crate::quality::vmaf::{self, FrameWindow, Reference, Score, Scoring, SeekedWindow};
 use crate::toolchain::Toolchain;
 use crate::video::analyze::{Analysis, DEFAULT_SEGMENTS, Detail};
-use crate::video::encode::{Sample, encode_sample};
+use crate::video::encode::{Sample, encode_sample, median_rate};
 use crate::video::plan::{Encoder, VideoPlan};
 use crate::video::verify::{self, Retiming};
 use crate::workspace::Workspace;
@@ -37,6 +37,8 @@ const NEAR_MISS: f64 = 0.5;
 /// The safety margin starts once the full encode is expected to take this long, and reaches `FULL_MARGIN` at
 /// `FULL_MARGIN_S`, growing with each doubling between.
 const MARGIN_FROM_S: f64 = 15.0 * 60.0;
+/// The expected full encode time from which a learned CRF is searched again: where the margin starts.
+pub const LONG_ENCODE_S: f64 = MARGIN_FROM_S;
 const FULL_MARGIN_S: f64 = 4.0 * 3600.0;
 const FULL_MARGIN: Target = Target { mean: 1.0, floor: 1.5 };
 const NO_MARGIN: Target = Target { mean: 0.0, floor: 0.0 };
@@ -216,6 +218,13 @@ pub fn search_target(target: Target, offset: Option<Offset>) -> Target {
 		mean,
 		floor: (target.floor + shift(offset.p5)).min(mean),
 	}
+}
+
+/// Whether a full encode of `length_s` at `rate` (encoding seconds per second of source) is expected to take at least
+/// `from_s` (by default `LONG_ENCODE_S`): long enough that a learned CRF is searched again, so that a second full encode
+/// of it is less likely.
+pub fn long_encode(rate: f64, length_s: f64, from_s: f64) -> bool {
+	rate * length_s >= from_s
 }
 
 /// The margin for a full encode expected to take `expected_s`.
@@ -668,12 +677,11 @@ impl Scorer<'_> {
 			on_samples(index + 1);
 		}
 
-		rates.sort_by(f64::total_cmp);
 		Ok(Probed {
 			score: pooled(&scores)?,
 			bytes,
 			encode_s,
-			rate: rates.get(rates.len() / 2).copied().unwrap_or(f64::NAN),
+			rate: median_rate(rates),
 		})
 	}
 
@@ -1111,6 +1119,16 @@ mod tests {
 				verify: false
 			}
 		);
+	}
+
+	#[test]
+	fn a_learned_crf_is_searched_again_once_the_full_encode_is_expected_to_take_a_quarter_hour() {
+		assert!(!long_encode(1.0, 300.0, LONG_ENCODE_S));
+		assert!(!long_encode(2.9, 300.0, LONG_ENCODE_S));
+		assert!(long_encode(3.0, 300.0, LONG_ENCODE_S));
+		assert!(long_encode(12.0, 120.0, LONG_ENCODE_S));
+		assert!(!long_encode(f64::NAN, 300.0, LONG_ENCODE_S));
+		assert!(long_encode(0.01, 120.0, 1.0));
 	}
 
 	#[test]

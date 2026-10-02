@@ -163,6 +163,8 @@ pub struct Engine {
 	video_threads: Option<usize>,
 	memory_gate: Option<Arc<dyn MemoryGate>>,
 	quality: Arc<dyn QualityMemory>,
+	/// The expected full encode time from which a learned CRF is searched again.
+	long_encode_s: f64,
 }
 
 struct Context<'a> {
@@ -285,6 +287,13 @@ impl VideoQuality {
 	}
 }
 
+/// What the size gate's samples showed.
+struct Gate {
+	keep: Option<KeepReason>,
+	/// The full encode is expected to take `Engine::long_encode_s` or more at the samples' rate.
+	long: bool,
+}
+
 enum Tuning {
 	Keep(KeepReason),
 	Encode { verify: bool },
@@ -308,12 +317,19 @@ impl Engine {
 			video_threads: None,
 			memory_gate: None,
 			quality: Arc::new(SharedMemory::default()),
+			long_encode_s: video_quality::LONG_ENCODE_S,
 		}
 	}
 
 	#[must_use]
 	pub fn with_quality_memory(self, quality: Arc<dyn QualityMemory>) -> Self {
 		Self { quality, ..self }
+	}
+
+	/// Moves the expected full encode time from which a learned CRF is searched again (`LONG_ENCODE_S` by default).
+	#[must_use]
+	pub fn with_long_encode_s(self, long_encode_s: f64) -> Self {
+		Self { long_encode_s, ..self }
 	}
 
 	#[must_use]
@@ -1317,10 +1333,15 @@ impl Engine {
 			return Ok(Tuning::Encode { verify });
 		}
 
-		let gate = Box::pin(self.sample_gate(cx, workspace, inputs, video));
-		match gate.await? {
+		let gate = Box::pin(self.sample_gate(cx, workspace, inputs, video)).await?;
+		let searchable = learned && !samples.is_empty();
+		match gate.keep {
+			None if searchable && gate.long => {
+				quality.strategy = Strategy::Search { start: quality.start() };
+				Box::pin(self.search_crf(cx, workspace, inputs, &samples, video, quality)).await
+			}
 			None => Ok(Tuning::Encode { verify }),
-			Some(_) if learned && !samples.is_empty() => {
+			Some(_) if searchable => {
 				quality.strategy = Strategy::Search {
 					start: quality.start().max(table_crf),
 				};
@@ -1603,10 +1624,13 @@ impl Engine {
 		workspace: &Workspace,
 		inputs: &VideoInputs<'_>,
 		video: &VideoPlan,
-	) -> Result<Option<KeepReason>, JobError> {
+	) -> Result<Gate, JobError> {
 		let samples = video_encode::samples(inputs.declared_s);
 		let Some(duration_s) = inputs.declared_s.filter(|_| !samples.is_empty()) else {
-			return Ok(None);
+			return Ok(Gate {
+				keep: None,
+				long: false,
+			});
 		};
 
 		(cx.on_event)(JobEvent::Stage(Stage::Sample));
@@ -1616,7 +1640,7 @@ impl Engine {
 				total: samples.len(),
 			});
 		};
-		let sample_bytes = Box::pin(video_encode::encode_samples(
+		let encoded = Box::pin(video_encode::encode_samples(
 			&self.tools.ffmpeg,
 			&cx.job.source,
 			workspace,
@@ -1628,12 +1652,11 @@ impl Engine {
 		.await?;
 
 		let other_bits_per_s = video_encode::other_bitrate(inputs.info, inputs.streams);
-		let predicted = video_encode::predicted_bytes(sample_bytes, &samples, duration_s, other_bits_per_s);
-		Ok(video_encode::predicted_keep(
-			inputs.compared_bytes,
-			predicted,
-			cx.job.min_savings,
-		))
+		let predicted = video_encode::predicted_bytes(encoded.bytes, &samples, duration_s, other_bits_per_s);
+		Ok(Gate {
+			keep: video_encode::predicted_keep(inputs.compared_bytes, predicted, cx.job.min_savings),
+			long: video_quality::long_encode(encoded.rate, duration_s, self.long_encode_s),
+		})
 	}
 
 	async fn cut_cues(

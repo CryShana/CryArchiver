@@ -2271,6 +2271,44 @@ async fn a_learned_crf_too_low_for_the_size_gate_is_searched_again() {
 	assert!(group.setting > 10.0, "{group:?}");
 }
 
+#[tokio::test]
+async fn a_learned_crf_whose_full_encode_is_expected_to_take_long_is_searched_again() {
+	let dir = tempfile::tempdir().unwrap();
+	let short = support::mpeg4(dir.path(), "short.mp4", 3);
+	let long = support::mpeg4(dir.path(), "long.mp4", 125);
+	let tools = support::toolchain().await;
+	let learned = Arc::new(SharedMemory::default());
+	run_recording(
+		&Engine::new(tools.clone()).with_quality_memory(learned.clone()),
+		&job(&short),
+		dir.path(),
+	)
+	.await;
+	let entries = learned.entries();
+	let run = async |long_encode_s: f64, out: &str| {
+		let engine = Engine::new(tools.clone())
+			.with_quality_memory(Arc::new(SharedMemory::with_entries(entries.clone())))
+			.with_long_encode_s(long_encode_s);
+		run_recording(&engine, &job(&long), &out_dir(dir.path(), out)).await
+	};
+
+	let (quick, quick_events) = run(f64::INFINITY, "quick").await;
+	let (slow, slow_events) = run(1.0, "slow").await;
+
+	assert!(matches!(quick, JobOutcome::Encoded { .. }), "{quick:?}");
+	assert!(matches!(slow, JobOutcome::Encoded { .. }), "{slow:?}");
+	assert_eq!(
+		stages(&quick_events, Stage::Sample),
+		1,
+		"the size gate's samples alone: {quick_events:?}"
+	);
+	assert_eq!(
+		stages(&slow_events, Stage::Sample),
+		2,
+		"the size gate, then the search: {slow_events:?}"
+	);
+}
+
 async fn learned_group(dir: &Path, setting: f64) -> SharedMemory {
 	let first = support::mpeg4(dir, "first.mp4", 3);
 	let learned = Arc::new(SharedMemory::default());
