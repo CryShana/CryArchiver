@@ -25,6 +25,11 @@ enum Task {
 
 fn main() -> ExitCode {
 	let Task::Calibrate { corpus, out } = Cli::parse().task;
+	if let Err(message) = calibrate::check_out(&out) {
+		eprintln!("error: {message}");
+		return ExitCode::from(2);
+	}
+
 	let runtime = tokio::runtime::Runtime::new().expect("tokio runtime starts");
 
 	match runtime.block_on(calibrate::run(&corpus, &out)) {

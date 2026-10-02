@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::calibration::{Tables, parse, tables};
@@ -25,6 +26,8 @@ const MODERATE: u8 = 1;
 const FAST: u8 = 2;
 const SPEEDS: [(u8, Speed); 3] = [(FAST, Speed::Fast), (MODERATE, Speed::Moderate), (SLOW, Speed::Slow)];
 const PRESET_4: u8 = 4;
+/// Clear of the searches' probe rounds, so its sample files never collide with theirs.
+const GRAIN_FREE_ROUND: usize = 90;
 const REPORT_KEYS: [&str; 2] = ["videos-measured", "moderate-preset4-bytes-ratio"];
 
 #[derive(Debug, Default)]
@@ -70,7 +73,7 @@ pub fn updated(mut tables: Tables, measured: &Measurements) -> Tables {
 
 	for (cell, values) in tables.video.expected_bpp.iter_mut().zip(&measured.bpp) {
 		if let Some(bpp) = median(values) {
-			*cell = (bpp * 1000.0).round() / 1000.0;
+			*cell = thousandths(bpp);
 		}
 	}
 
@@ -83,18 +86,53 @@ pub fn updated(mut tables: Tables, measured: &Measurements) -> Tables {
 	}
 
 	if let Some(slope) = median(&measured.slope) {
-		tables.video.default_slope = (slope * 1000.0).round() / 1000.0;
+		tables.video.default_slope = thousandths(slope);
 	}
 
 	tables.report.insert(REPORT_KEYS[0].into(), measured.videos as f64);
 	if let Some(ratio) = median(&measured.preset4_ratio) {
 		tables.report.insert(REPORT_KEYS[1].into(), ratio);
 	}
+
 	tables
+}
+
+/// Rounded to a thousandth, and never below one: the tables refuse a zero.
+fn thousandths(value: f64) -> f64 {
+	((value * 1000.0).round() / 1000.0).max(0.001)
+}
+
+/// Refuses an `--out` that exists or whose folder can't be written, before any measuring.
+pub fn check_out(out: &Path) -> Result<(), String> {
+	if fs::symlink_metadata(out).is_ok() {
+		return Err(format!(
+			"{} already exists; calibration never replaces a file",
+			out.display()
+		));
+	}
+
+	let folder = match out.parent() {
+		Some(parent) if !parent.as_os_str().is_empty() => parent,
+		_ => Path::new("."),
+	};
+	if !folder.is_dir() {
+		return Err(format!("{} is not a folder", folder.display()));
+	}
+
+	tempfile::tempfile_in(folder)
+		.map(drop)
+		.map_err(|err| format!("{} can't be written: {err}", folder.display()))
 }
 
 pub async fn run(corpus: &Path, out: &Path) -> Result<(), String> {
 	let cancel = CancellationToken::new();
+	let stop = cancel.clone();
+	tokio::spawn(async move {
+		if tokio::signal::ctrl_c().await.is_ok() {
+			stop.cancel();
+		}
+	});
+
 	let tools = Toolchain::detect(&ToolConfig::default(), &cancel)
 		.await
 		.map_err(|err| err.to_string())?;
@@ -110,11 +148,38 @@ pub async fn run(corpus: &Path, out: &Path) -> Result<(), String> {
 			Ok(false) => {}
 			Err(reason) => println!("· {}: {reason}", file.display()),
 		}
+
+		if cancel.is_cancelled() {
+			return Err("stopped; nothing was written".into());
+		}
 	}
 
-	let text = toml::to_string_pretty(&updated(tables().clone(), &measured)).map_err(|err| err.to_string())?;
-	parse(&text)?;
-	fs::write(out, text).map_err(|err| format!("{}: {err}", out.display()))
+	println!("videos measured: {}", measured.videos);
+	if measured.videos == 0 {
+		return Err("no video in the corpus could be measured; nothing was written".into());
+	}
+
+	write_tables(out, &updated(tables().clone(), &measured))
+}
+
+/// Writes `tables` to the new file `out`. When that fails, the tables go to stdout, so a finished run is not lost.
+fn write_tables(out: &Path, tables: &Tables) -> Result<(), String> {
+	let text = toml::to_string_pretty(tables).map_err(|err| err.to_string())?;
+
+	let written = parse(&text).and_then(|_| {
+		fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(out)
+			.and_then(|mut file| file.write_all(text.as_bytes()))
+			.map_err(|err| format!("{}: {err}", out.display()))
+	});
+	if let Err(err) = written {
+		println!("{text}");
+		return Err(format!("{err}; the measured tables are printed above"));
+	}
+
+	Ok(())
 }
 
 fn corpus_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -151,7 +216,7 @@ async fn measure_video(
 	let bytes = fs::metadata(source).map_err(|err| err.to_string())?.len();
 	let (info, _) = probe::probe_video(tools, source, bytes, cancel)
 		.await
-		.map_err(|err| format!("{err:?}"))?;
+		.map_err(|err| err.to_string())?;
 	let caps = VideoCaps {
 		vp9_alpha: tools.vp9_alpha,
 		libaom: tools.has_libaom(),
@@ -164,6 +229,7 @@ async fn measure_video(
 	let mut by_segments: BTreeMap<usize, Analysis> = BTreeMap::new();
 
 	let mut any = false;
+	let mut unmeasured = "no search samples: the duration is unknown";
 	for (row, speed) in SPEEDS {
 		let sampling_speed = if speed == Speed::Fast { Speed::Moderate } else { speed };
 		let segments = analysis_segments(sampling_speed, declared);
@@ -178,7 +244,7 @@ async fn measure_video(
 
 		let mut plan = plan_video(&info, main, &[], analysis, speed, None);
 		let Encoder::SvtAv1 { .. } = plan.encoder else {
-			return Ok(false);
+			return Err("the planned encoder is not SVT-AV1".into());
 		};
 		plan.starts = VideoStarts::of(&info, &plan.streams);
 		let samples = search_samples(analysis, span, sampling_speed);
@@ -202,6 +268,7 @@ async fn measure_video(
 			.map_err(|err| err.to_string())?
 			.searched
 		else {
+			unmeasured = "the quality target was reached at no speed";
 			continue;
 		};
 		any = true;
@@ -213,10 +280,12 @@ async fn measure_video(
 		}
 	}
 
-	if any {
-		measured.videos += 1;
+	if !any {
+		return Err(unmeasured.into());
 	}
-	Ok(any)
+
+	measured.videos += 1;
+	Ok(true)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -250,7 +319,7 @@ async fn measure_at_moderate(
 			plan: &grain_free,
 			..scorer
 		}
-		.probe(found.crf, samples, 90, |_| {})
+		.probe(found.crf, samples, GRAIN_FREE_ROUND, |_| {})
 		.await
 		.map_err(|err| err.to_string())?;
 		measured.grain_mean.push(without.score.mean - found.score.mean);
@@ -286,6 +355,7 @@ async fn measure_at_moderate(
 			.preset4_ratio
 			.push(at_preset_4.sample_bytes as f64 / found.sample_bytes as f64);
 	}
+
 	Ok(())
 }
 
@@ -323,6 +393,7 @@ mod tests {
 		assert_eq!(after.video.svt_crf_slow, before.video.svt_crf_slow);
 		assert_eq!(after.video.expected_bpp[2], 0.05);
 		assert_eq!(after.video.grain_allowance_mean, 1.4);
+		assert_eq!(after.video.grain_allowance_floor, 2.1);
 		assert_eq!(after.report.get("videos-measured"), Some(&3.0));
 		assert_eq!(after.report.get("moderate-preset4-bytes-ratio"), Some(&0.96));
 		assert_eq!(parse(&toml::to_string_pretty(&after).unwrap()).as_ref(), Ok(&after));
@@ -343,6 +414,50 @@ mod tests {
 			after.report
 		);
 		assert_eq!(after.video.default_slope, 0.5);
+	}
+
+	#[test]
+	fn tiny_medians_never_round_to_a_value_the_tables_refuse() {
+		let mut measured = Measurements::default();
+		measured.bpp[5].push(0.0004);
+		measured.slope.push(0.0002);
+
+		let after = updated(tables().clone(), &measured);
+
+		assert_eq!(after.video.expected_bpp[5], 0.001);
+		assert_eq!(after.video.default_slope, 0.001);
+		assert!(parse(&toml::to_string_pretty(&after).unwrap()).is_ok());
+	}
+
+	#[test]
+	fn an_output_that_exists_or_has_no_folder_is_refused_up_front() {
+		let folder = tempfile::tempdir().unwrap();
+		let existing = folder.path().join("tables.toml");
+		fs::write(&existing, "kept").unwrap();
+
+		assert!(check_out(&folder.path().join("new.toml")).is_ok());
+		assert!(check_out(&existing).unwrap_err().contains("already exists"));
+		assert!(check_out(folder.path()).unwrap_err().contains("already exists"));
+		assert!(
+			check_out(&folder.path().join("missing").join("tables.toml"))
+				.unwrap_err()
+				.contains("is not a folder")
+		);
+		assert_eq!(fs::read_dir(folder.path()).unwrap().count(), 1);
+	}
+
+	#[test]
+	fn tables_are_written_to_a_new_file_and_never_over_an_existing_one() {
+		let folder = tempfile::tempdir().unwrap();
+		let out = folder.path().join("tables.toml");
+		let existing = folder.path().join("taken.toml");
+		fs::write(&existing, "kept").unwrap();
+
+		write_tables(&out, tables()).unwrap();
+
+		assert_eq!(parse(&fs::read_to_string(&out).unwrap()).as_ref(), Ok(tables()));
+		assert!(write_tables(&existing, tables()).unwrap_err().contains("printed above"));
+		assert_eq!(fs::read_to_string(&existing).unwrap(), "kept");
 	}
 
 	#[test]
