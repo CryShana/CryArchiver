@@ -1,6 +1,5 @@
 //! The recent projects of the start menu, kept in `recent.bin`.
 
-use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -42,19 +41,13 @@ enum ReadError {
 impl RecentStore {
 	pub fn locate() -> Self {
 		let exe = std::env::current_exe().ok();
-		let exe_dir = exe.as_deref().and_then(Path::parent);
-		Self::locate_in(exe_dir, |name| std::env::var_os(name))
+		Self::locate_in(exe.as_deref().and_then(Path::parent))
 	}
 
-	/// Next to the executable when a probe file can be created there, otherwise in the user's config folder. With
-	/// neither, the list is off for the session rather than kept in the current folder.
-	pub fn locate_in(exe_dir: Option<&Path>, env: impl Fn(&str) -> Option<OsString>) -> Self {
-		if let Some(dir) = exe_dir.filter(|dir| writable(dir)) {
-			return Self::at(dir.join(FILE_NAME));
-		}
-
+	/// Next to the executable when a probe file can be created there; otherwise the list is off for the session.
+	pub fn locate_in(exe_dir: Option<&Path>) -> Self {
 		Self {
-			file: config_dir(&env).map(|folder| folder.join(FILE_NAME)),
+			file: exe_dir.filter(|dir| writable(dir)).map(|dir| dir.join(FILE_NAME)),
 		}
 	}
 
@@ -253,23 +246,6 @@ fn unique_name(stem: &str, extension: &str) -> String {
 	static NEXT: AtomicU64 = AtomicU64::new(0);
 	let serial = NEXT.fetch_add(1, Ordering::Relaxed);
 	format!("{stem}.{}-{serial}.{extension}", std::process::id())
-}
-
-#[cfg(windows)]
-fn config_dir(env: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-	env("APPDATA")
-		.map(PathBuf::from)
-		.filter(|dir| dir.is_absolute())
-		.map(|dir| dir.join("CryArchiver"))
-}
-
-#[cfg(not(windows))]
-fn config_dir(env: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-	let absolute = |name: &str| env(name).map(PathBuf::from).filter(|dir| dir.is_absolute());
-
-	absolute("XDG_CONFIG_HOME")
-		.or_else(|| absolute("HOME").map(|home| home.join(".config")))
-		.map(|dir| dir.join("cryarchiver"))
 }
 
 #[cfg(test)]
@@ -476,6 +452,7 @@ mod tests {
 	#[cfg(windows)]
 	#[test]
 	fn unpaired_surrogates_survive_the_round_trip() {
+		use std::ffi::OsString;
 		use std::os::windows::ffi::OsStringExt;
 
 		let dir = tempfile::tempdir().unwrap();
@@ -549,32 +526,22 @@ mod tests {
 	fn a_writable_exe_folder_holds_the_list() {
 		let dir = tempfile::tempdir().unwrap();
 
-		let store = RecentStore::locate_in(Some(dir.path()), |_| None);
+		let store = RecentStore::locate_in(Some(dir.path()));
 
 		assert_eq!(store.file(), Some(dir.path().join(FILE_NAME).as_path()));
 		assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 	}
 
 	#[test]
-	fn an_unwritable_exe_folder_falls_back_to_the_config_folder() {
+	fn an_unwritable_exe_folder_never_falls_back_to_a_config_folder() {
 		let dir = tempfile::tempdir().unwrap();
 		let blocked = dir.path().join("file");
 		fs::write(&blocked, b"").unwrap();
-		let exe_dir = blocked.join("bin");
-		let config = dir.path().join("config");
-		let home = dir.path().join("home");
-		let env = |name: &str| match name {
-			"APPDATA" | "XDG_CONFIG_HOME" => Some(config.clone().into_os_string()),
-			"HOME" => Some(home.clone().into_os_string()),
-			_ => None,
-		};
 
-		let store = RecentStore::locate_in(Some(&exe_dir), env);
+		let store = RecentStore::locate_in(Some(&blocked.join("bin")));
 
-		let folder = if cfg!(windows) { "CryArchiver" } else { "cryarchiver" };
-		assert_eq!(store.file(), Some(config.join(folder).join(FILE_NAME).as_path()));
-		store.record(&dir.path().join("a.cryarchive"), 1).unwrap();
-		assert_eq!(store.load().entries.len(), 1);
+		assert_eq!(store.file(), None);
+		assert!(store.load().notice.unwrap().contains("off for this session"));
 	}
 
 	#[test]
@@ -583,7 +550,7 @@ mod tests {
 		let blocked = dir.path().join("file");
 		fs::write(&blocked, b"").unwrap();
 
-		let store = RecentStore::locate_in(Some(&blocked.join("bin")), |_| None);
+		let store = RecentStore::locate_in(Some(&blocked.join("bin")));
 
 		assert_eq!(store.file(), None);
 		let loaded = store.load();
@@ -592,20 +559,5 @@ mod tests {
 		assert!(store.record(&dir.path().join("a.cryarchive"), 1).is_err());
 		assert!(!Path::new(FILE_NAME).exists());
 		assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-	}
-
-	#[cfg(unix)]
-	#[test]
-	fn without_xdg_config_home_the_list_goes_under_dot_config() {
-		let dir = tempfile::tempdir().unwrap();
-		let home = dir.path().join("home");
-		let env = |name: &str| (name == "HOME").then(|| home.clone().into_os_string());
-
-		let store = RecentStore::locate_in(Some(&dir.path().join("missing")), env);
-
-		assert_eq!(
-			store.file(),
-			Some(home.join(".config").join("cryarchiver").join(FILE_NAME).as_path())
-		);
 	}
 }
