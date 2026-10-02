@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::calibration::tables;
 use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError, KeepReason};
 use crate::preset::{Overrides, Speed};
@@ -34,13 +35,9 @@ const FLAT_SI: f64 = 2.0;
 const MAX_ANALYSIS_SEGMENTS: usize = 48;
 const LONG_SPAN_S: f64 = 600.0;
 const NEAR_MISS: f64 = 0.5;
-/// The safety margin starts once the full encode is expected to take this long, and reaches `FULL_MARGIN` at
-/// `FULL_MARGIN_S`, growing with each doubling between.
-const MARGIN_FROM_S: f64 = 15.0 * 60.0;
-/// The expected full encode time from which a learned CRF is searched again: where the margin starts.
-pub const LONG_ENCODE_S: f64 = MARGIN_FROM_S;
-const FULL_MARGIN_S: f64 = 4.0 * 3600.0;
-const FULL_MARGIN: Target = Target { mean: 1.0, floor: 1.5 };
+/// The expected full encode time from which a learned CRF is searched again: where the shipped tables start the
+/// margin (`margin-from-s`).
+pub const LONG_ENCODE_S: f64 = 15.0 * 60.0;
 const NO_MARGIN: Target = Target { mean: 0.0, floor: 0.0 };
 
 const TARGETS: [Target; 3] = [
@@ -57,7 +54,6 @@ const TARGETS: [Target; 3] = [
 		floor: 88.0,
 	},
 ];
-const GRAIN_ALLOWANCE: Target = Target { mean: 2.0, floor: 2.5 };
 const SLOW_ANALYSIS_SEGMENTS: usize = 8;
 const MODERATE_SAMPLING: Sampling = Sampling {
 	base: 3,
@@ -199,9 +195,10 @@ pub fn target(speed: Speed, film_grain: bool, overrides: &Overrides) -> Target {
 		return base;
 	}
 
+	let video = &tables().video;
 	Target {
-		mean: base.mean - GRAIN_ALLOWANCE.mean,
-		floor: base.floor - GRAIN_ALLOWANCE.floor,
+		mean: base.mean - video.grain_allowance_mean,
+		floor: base.floor - video.grain_allowance_floor,
 	}
 }
 
@@ -227,16 +224,20 @@ pub fn long_encode(rate: f64, length_s: f64, from_s: f64) -> bool {
 	rate * length_s >= from_s
 }
 
-/// The margin for a full encode expected to take `expected_s`.
+/// The margin for a full encode expected to take `expected_s`: none up to `margin-from-s`, then growing with each
+/// doubling to the full margin at `full-margin-s`.
 pub fn encode_margin(expected_s: f64) -> Target {
-	if expected_s.is_nan() || expected_s <= MARGIN_FROM_S {
+	let video = &tables().video;
+
+	if expected_s.is_nan() || expected_s <= video.margin_from_s {
 		return NO_MARGIN;
 	}
 
-	let share = ((expected_s / MARGIN_FROM_S).log2() / (FULL_MARGIN_S / MARGIN_FROM_S).log2()).min(1.0);
+	let share =
+		((expected_s / video.margin_from_s).log2() / (video.full_margin_s / video.margin_from_s).log2()).min(1.0);
 	Target {
-		mean: FULL_MARGIN.mean * share,
-		floor: FULL_MARGIN.floor * share,
+		mean: video.full_margin_mean * share,
+		floor: video.full_margin_floor * share,
 	}
 }
 

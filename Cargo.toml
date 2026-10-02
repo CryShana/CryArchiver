@@ -57,6 +57,7 @@ thiserror = "2.0.21"
 throbber-widgets-tui = "0.11.1"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "signal", "sync"] }
 tokio-util = "0.7.19"
+toml = "1.1.6"
 tui-input = "0.15.5"
 ulid = "3.0.0"
 unicode-normalization = "0.1.25"

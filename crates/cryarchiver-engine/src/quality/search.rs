@@ -1,7 +1,6 @@
 use crate::quality::vmaf::Score;
 
 pub const MAX_PROBES: usize = 4;
-pub const DEFAULT_SLOPE: f64 = 0.5;
 
 const MAX_STEP: f64 = 8.0;
 const CLOSE_ENOUGH: f64 = 0.5;
@@ -168,6 +167,7 @@ fn slope(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::calibration::tables;
 
 	const TARGET: Target = Target {
 		mean: 95.0,
@@ -202,7 +202,7 @@ mod tests {
 		let mut crf = SVT.quantize(start);
 		loop {
 			probes.push(Probe { crf, score: curve(crf) });
-			match next(&probes, TARGET, SVT, DEFAULT_SLOPE) {
+			match next(&probes, TARGET, SVT, tables().video.default_slope) {
 				Next::Probe(next) => crf = next,
 				Next::Done(choice) => return (choice, probes.iter().map(|probe| probe.crf).collect()),
 			}
@@ -249,7 +249,7 @@ mod tests {
 			},
 		];
 
-		let next = next(&probes, TARGET, SVT, DEFAULT_SLOPE);
+		let next = next(&probes, TARGET, SVT, tables().video.default_slope);
 
 		assert!(
 			matches!(next, Next::Probe(crf) if (crf - 16.5).abs() < 1e-9),
@@ -276,12 +276,14 @@ mod tests {
 			score: flat(55.0),
 		}];
 
-		assert!(matches!(next(&first, TARGET, SVT, DEFAULT_SLOPE), Next::Probe(crf) if (crf - 37.0).abs() < 1e-9));
+		assert!(
+			matches!(next(&first, TARGET, SVT, tables().video.default_slope), Next::Probe(crf) if (crf - 37.0).abs() < 1e-9)
+		);
 		assert_eq!(
-			next(&at_the_top, TARGET, SVT, DEFAULT_SLOPE),
+			next(&at_the_top, TARGET, SVT, tables().video.default_slope),
 			Next::Done(Choice::Chosen {
 				index: 0,
-				slope: DEFAULT_SLOPE
+				slope: tables().video.default_slope
 			})
 		);
 	}
@@ -307,7 +309,7 @@ mod tests {
 			},
 		];
 
-		let next = next(&noisy, TARGET, SVT, DEFAULT_SLOPE);
+		let next = next(&noisy, TARGET, SVT, tables().video.default_slope);
 
 		assert!(matches!(next, Next::Probe(crf) if crf > 22.0), "{next:?}");
 	}
@@ -404,7 +406,7 @@ mod tests {
 			},
 		];
 
-		match next(&probes, TARGET, SVT, DEFAULT_SLOPE) {
+		match next(&probes, TARGET, SVT, tables().video.default_slope) {
 			Next::Probe(crf) => assert!(is_on_grid(crf, SVT), "{crf} is off the grid"),
 			Next::Done(_) => {}
 		}
@@ -431,7 +433,7 @@ mod tests {
 			},
 		];
 
-		let next = next(&probes, TARGET, SVT, DEFAULT_SLOPE);
+		let next = next(&probes, TARGET, SVT, tables().video.default_slope);
 
 		assert!(
 			matches!(next, Next::Probe(crf) if (crf - 17.0).abs() < 1e-9),
@@ -451,7 +453,7 @@ mod tests {
 			score: passing_by_2_1,
 		}];
 
-		let next = next(&probes, TARGET, SVT, DEFAULT_SLOPE);
+		let next = next(&probes, TARGET, SVT, tables().video.default_slope);
 
 		assert!(
 			matches!(next, Next::Probe(crf) if (crf - 33.0).abs() < 1e-9 && is_on_grid(crf, SVT)),

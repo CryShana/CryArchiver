@@ -1,9 +1,10 @@
+use crate::calibration::tables;
 use crate::options::{Resize, TrimWindow, VideoEncoderChoice};
 use crate::outcome::KeepReason;
 use crate::preset::Speed;
 use crate::probe::{Frame, MediaInfo, Stream};
 use crate::video::VideoStarts;
-use crate::video::analyze::{Analysis, NOISY_SIGMA, NoiseClass, ScanType, forced_decoder};
+use crate::video::analyze::{Analysis, NoiseClass, ScanType, forced_decoder};
 use crate::video::burn::Overlay;
 use crate::video::colour::{self, ColourTags, conversion, output_tags, setparams};
 
@@ -14,13 +15,6 @@ const ALPHA_PIX_FMT: &str = "yuva420p";
 const ALPHA_PIX_FMT_PREFIXES: &[&str] = &["yuva", "gbrap", "rgba", "bgra", "argb", "abgr", "ya"];
 const EFFICIENT_CODECS: &[&str] = &["av1", "vp9"];
 const EFFICIENCY_HEADROOM: f64 = 1.2;
-const EXPECTED_BPP: [f64; 6] = [0.08, 0.06, 0.045, 0.035, 0.025, 0.02];
-const SVT_CRF: [[f64; 6]; 3] = [
-	[24.0, 25.0, 25.0, 26.0, 28.0, 30.0],
-	[28.0, 29.0, 29.0, 30.0, 32.0, 34.0],
-	[35.0, 35.0, 35.0, 37.0, 36.0, 38.0],
-];
-const VP9_CRF: [u8; 6] = [33, 32, 31, 30, 28, 28];
 const MASTERING_DISPLAY: &str = "Mastering display metadata";
 const HDR10_PLUS: &str = "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)";
 const FILM_GRAIN_PARAMETERS: &str = "Film grain parameters";
@@ -31,8 +25,6 @@ const MIN_PACKET_SLACK: f64 = 2.0;
 const SOURCE_FRAME_TOLERANCE: u64 = 2;
 const VIDEO_BASE_BYTES: u64 = 512 << 20;
 const VIDEO_BYTES_PER_PIXEL: u64 = 540;
-/// (noise deviation from which the level applies, film-grain level), noisiest first.
-const GRAIN_LEVELS: [(f64, u8); 3] = [(1.8, 10), (1.0, 8), (NOISY_SIGMA, 6)];
 const SVT_MAX_LP: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +258,7 @@ pub fn plan_video(
 	let encoder = if alpha {
 		Encoder::Vp9Alpha {
 			cpu_used: pick(speed, [1, 2, 4]),
-			crf: VP9_CRF[resolution.index()],
+			crf: tables().video.vp9_crf[resolution.index()],
 		}
 	} else if too_large_for_svt(width, height) {
 		aom_encoder(speed, resolution)
@@ -419,18 +411,23 @@ pub fn svt_params(crf: f64, grain: Option<u8>, lp: Option<u8>, max_kbps: Option<
 }
 
 pub fn source_grain(analysis: &Analysis) -> Option<u8> {
-	let lightest = GRAIN_LEVELS[GRAIN_LEVELS.len() - 1].1;
+	let lightest = tables().video.grain_levels.last().copied();
 
-	(analysis.noise == NoiseClass::Light).then(|| grain_level(analysis.noise_sigma).unwrap_or(lightest))
+	(analysis.noise == NoiseClass::Light)
+		.then(|| grain_level(analysis.noise_sigma).or(lightest))
+		.flatten()
 }
 
 pub fn grain_level(noise_sigma: Option<f64>) -> Option<u8> {
 	let noise_sigma = noise_sigma?;
+	let video = &tables().video;
 
-	GRAIN_LEVELS
+	video
+		.grain_from_sigma
 		.iter()
-		.find(|(from, _)| noise_sigma >= *from)
-		.map(|(_, level)| *level)
+		.zip(video.grain_levels)
+		.find(|(from, _)| noise_sigma >= **from)
+		.map(|(_, level)| level)
 }
 
 /// Frames whose decoder made up their grain from film grain parameters (AV1, or H.264/HEVC film grain SEI).
@@ -439,7 +436,7 @@ pub fn synthesized_grain(frames: &[Frame]) -> bool {
 }
 
 fn svt_crf(speed: Speed, resolution: Resolution) -> f64 {
-	SVT_CRF[pick(speed, [0, 1, 2])][resolution.index()]
+	tables().video.svt_crf(speed)[resolution.index()]
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -530,7 +527,7 @@ pub fn efficient_at(info: &MediaInfo, main: &Stream, expected_bpp: f64) -> Optio
 }
 
 fn already_efficient(info: &MediaInfo, main: &Stream) -> Option<String> {
-	let expected = EXPECTED_BPP[Resolution::of(main.width?, main.height?).index()];
+	let expected = tables().video.expected_bpp[Resolution::of(main.width?, main.height?).index()];
 	efficient_at(info, main, expected)
 }
 

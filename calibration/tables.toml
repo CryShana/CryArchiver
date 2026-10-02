@@ -1,0 +1,25 @@
+version = 1
+
+[video]
+svt-crf-slow = [24.0, 25.0, 25.0, 26.0, 28.0, 30.0]
+svt-crf-moderate = [28.0, 29.0, 29.0, 30.0, 32.0, 34.0]
+svt-crf-fast = [35.0, 35.0, 35.0, 37.0, 36.0, 38.0]
+vp9-crf = [33, 32, 31, 30, 28, 28]
+expected-bpp = [0.08, 0.06, 0.045, 0.035, 0.025, 0.02]
+noisy-sigma = 0.29
+low-detail-si = 15.0
+grain-allowance-mean = 2.0
+grain-allowance-floor = 2.5
+grain-from-sigma = [1.8, 1.0, 0.29]
+grain-levels = [10, 8, 6]
+default-slope = 0.5
+margin-from-s = 900.0
+full-margin-s = 14400.0
+full-margin-mean = 1.0
+full-margin-floor = 1.5
+
+[images]
+ravif-points-per-quality = 1.25
+jxl-points-per-distance = 8.0
+
+[report]

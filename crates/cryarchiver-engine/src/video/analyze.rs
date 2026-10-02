@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::calibration::tables;
 use crate::options::TrimWindow;
 use crate::outcome::JobError;
 use crate::probe::Stream;
@@ -22,7 +23,6 @@ const FLAGGED_INTERLACED_VOTES: f64 = 10.0;
 const FIELD_ORDER_SHARE: f64 = 0.8;
 const REJECT_SHARE: f64 = 0.5;
 const INTERLACED_FIELD_ORDERS: &[&str] = &["tt", "bb", "tb", "bt"];
-const LOW_DETAIL_SI: f64 = 15.0;
 const MIN_COMBED_BLOCKS: u64 = 40;
 const COMBED_SHARE: f64 = 0.8;
 /// The comb measure is overruled when idet calls most frames progressive: rows that differ by design (scanlines, line
@@ -33,8 +33,6 @@ const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:
 	format=yuv420p,siti=print_summary=1[out]";
 
 pub const DEFAULT_SEGMENTS: usize = 4;
-/// The noise deviation, in 8-bit code values, from which a source counts as noisy.
-pub const NOISY_SIGMA: f64 = 0.29;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanType {
@@ -288,7 +286,7 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 		})
 		.collect();
 	let noise_sigma = noise::level(&triplets);
-	let noise = if noise_sigma.is_some_and(|sigma| sigma >= NOISY_SIGMA) {
+	let noise = if noise_sigma.is_some_and(|sigma| sigma >= tables().video.noisy_sigma) {
 		NoiseClass::Light
 	} else {
 		NoiseClass::Clean
@@ -303,7 +301,7 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 			ti: segment.ti,
 			luma: segment.luma,
 			noise: noise::level(&segment.noise),
-			usable: !blank(segment) && segment.si.is_none_or(|si| si >= LOW_DETAIL_SI),
+			usable: !blank(segment) && segment.si.is_none_or(|si| si >= tables().video.low_detail_si),
 			still: segment.frozen_s >= REJECT_SHARE * segment.length_s,
 		})
 		.collect();
@@ -922,12 +920,14 @@ mod tests {
 
 	#[test]
 	fn noise_just_under_the_threshold_is_clean() {
+		let noisy_sigma = tables().video.noisy_sigma;
+
 		let faint = classify(
-			&[measured([None, Some(NOISY_SIGMA - 0.01), None, None])],
+			&[measured([None, Some(noisy_sigma - 0.01), None, None])],
 			Some(25.0),
 			None,
 		);
-		let noisy = classify(&[measured([None, Some(NOISY_SIGMA), None, None])], Some(25.0), None);
+		let noisy = classify(&[measured([None, Some(noisy_sigma), None, None])], Some(25.0), None);
 
 		assert_eq!(faint.noise, NoiseClass::Clean);
 		assert_eq!(noisy.noise, NoiseClass::Light);

@@ -1,5 +1,6 @@
 use std::ops::RangeInclusive;
 
+use crate::calibration::tables;
 use crate::images::props::Effective;
 use crate::images::ssim::padded_size;
 use crate::images::structure::Structure;
@@ -16,8 +17,6 @@ pub const BOMB_PIXELS: u64 = 500_000_000;
 pub const MAX_VERIFY_PIXELS: u64 = fast_ssim2::MAX_IMAGE_PIXELS as u64;
 pub const MAX_RETRIES: u32 = 2;
 
-const RAVIF_POINTS_PER_QUALITY: f64 = 1.25;
-const JXL_POINTS_PER_DISTANCE: f64 = 8.0;
 const LEARNED_HEADROOM: f64 = 2.0;
 const RAISE_QUALITY_MARGIN: f64 = 1.0;
 const RAISE_DISTANCE_MARGIN: f64 = 0.1;
@@ -137,7 +136,8 @@ impl Candidate {
 		match self {
 			Self::Ravif(settings) => {
 				let quality = f64::from(settings.quality);
-				let raised = (quality + deficit / RAVIF_POINTS_PER_QUALITY + RAISE_QUALITY_MARGIN).min(MAX_QUALITY);
+				let raised = (quality + deficit / tables().images.ravif_points_per_quality + RAISE_QUALITY_MARGIN)
+					.min(MAX_QUALITY);
 				(raised > quality).then_some(Self::Ravif(RavifSettings {
 					quality: raised as f32,
 					..settings
@@ -145,7 +145,8 @@ impl Candidate {
 			}
 			Self::JxlLossy(settings) => {
 				let distance = f64::from(settings.distance);
-				let lowered = (distance - deficit / JXL_POINTS_PER_DISTANCE - RAISE_DISTANCE_MARGIN).max(MIN_DISTANCE);
+				let lowered = (distance - deficit / tables().images.jxl_points_per_distance - RAISE_DISTANCE_MARGIN)
+					.max(MIN_DISTANCE);
 				(lowered < distance).then_some(Self::JxlLossy(JxlSettings {
 					distance: lowered as f32,
 					..settings
@@ -158,8 +159,8 @@ impl Candidate {
 	pub fn needed_setting(self, score: f64, target: f64, speed: Speed) -> Option<f64> {
 		let spare = score - target - LEARNED_HEADROOM;
 		let needed = match self {
-			Self::Ravif(settings) => f64::from(settings.quality) - spare / RAVIF_POINTS_PER_QUALITY,
-			Self::JxlLossy(settings) => f64::from(settings.distance) + spare / JXL_POINTS_PER_DISTANCE,
+			Self::Ravif(settings) => f64::from(settings.quality) - spare / tables().images.ravif_points_per_quality,
+			Self::JxlLossy(settings) => f64::from(settings.distance) + spare / tables().images.jxl_points_per_distance,
 			Self::JxlLossless(_) => return None,
 		};
 

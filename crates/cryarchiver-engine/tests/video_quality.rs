@@ -4,10 +4,11 @@ use std::fs;
 
 use std::path::Path;
 
+use cryarchiver_engine::calibration::tables;
 use cryarchiver_engine::options::{SubtitlePick, TrimWindow};
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe::probe;
-use cryarchiver_engine::quality::search::{DEFAULT_SLOPE, Target};
+use cryarchiver_engine::quality::search::Target;
 use cryarchiver_engine::quality::vmaf::{Reference, Score, Scoring, frames, model_for, pool, window_command};
 use cryarchiver_engine::toolchain::Toolchain;
 use cryarchiver_engine::video::analyze::{Analysis, DEFAULT_SEGMENTS, NoiseClass, ScanType, analyze};
@@ -68,7 +69,7 @@ async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
 			&samples,
 			plan.encoder.crf(),
 			Aim::exact(goal),
-			DEFAULT_SLOPE,
+			tables().video.default_slope,
 			|_| {},
 		)
 		.await
@@ -144,7 +145,16 @@ async fn a_long_encode_aims_the_search_above_the_target_from_its_first_probe() {
 		threads: 4,
 		cancel: &cancel,
 	};
-	let searched = |aim: Aim| search(&scorer, &samples, plan.encoder.crf(), aim, DEFAULT_SLOPE, |_| {});
+	let searched = |aim: Aim| {
+		search(
+			&scorer,
+			&samples,
+			plan.encoder.crf(),
+			aim,
+			tables().video.default_slope,
+			|_| {},
+		)
+	};
 
 	let exact = searched(Aim::exact(goal)).await.unwrap();
 	let days = searched(Aim {
@@ -351,7 +361,7 @@ async fn a_search_below_a_size_gives_up_once_a_miss_is_already_that_large() {
 		&samples,
 		40.0,
 		Aim::exact(unreachable),
-		DEFAULT_SLOPE,
+		tables().video.default_slope,
 		Some(1),
 		|step| {
 			if matches!(step, SearchStep::Probe { .. }) {

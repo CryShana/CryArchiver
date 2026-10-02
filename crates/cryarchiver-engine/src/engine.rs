@@ -13,6 +13,7 @@ use crate::audio::plan::{
 	plan_file_with, retarget,
 };
 use crate::audio::{cover, encode, tags, verify};
+use crate::calibration::tables;
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
 use crate::detect::{self, Detection, MediaClass};
@@ -30,7 +31,7 @@ use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::quality::keys::{CacheKey, Group, VideoGroup};
 use crate::quality::memory::{GroupStats, Observation, Offset, QualityMemory, SharedMemory};
-use crate::quality::search::{self, DEFAULT_SLOPE, MAX_PROBES, Target};
+use crate::quality::search::{self, MAX_PROBES, Target};
 use crate::quality::vmaf::Score;
 use crate::text::{display_path, fold_repeats};
 use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
@@ -1255,7 +1256,9 @@ impl Engine {
 
 		VideoQuality {
 			strategy,
-			slope: stats.and_then(|stats| stats.slope).unwrap_or(DEFAULT_SLOPE),
+			slope: stats
+				.and_then(|stats| stats.slope)
+				.unwrap_or(tables().video.default_slope),
 			offset: self.quality.offset(&key),
 			key,
 			stats,
