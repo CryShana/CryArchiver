@@ -5695,7 +5695,7 @@ async fn an_aom_override_still_encodes_the_video() {
 }
 
 #[tokio::test]
-async fn an_aom_override_without_libaom_fails_the_file() {
+async fn an_aom_override_without_libaom_is_a_toolchain_problem_found_before_any_analysis() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 2);
 	let mut tools = support::toolchain().await;
@@ -5708,16 +5708,73 @@ async fn an_aom_override_without_libaom_fails_the_file() {
 		},
 	);
 
-	let outcome = Engine::new(tools)
-		.run(&aom, &sink(dir.path()), &|_| {}, &CancellationToken::new())
-		.await;
+	let (outcome, events) = run_recording(&Engine::new(tools), &aom, dir.path()).await;
 
 	assert!(
 		matches!(&outcome, JobOutcome::Failed(err)
-			if err.to_string().contains("--video-encoder aom needs ffmpeg with libaom-av1")),
+			if err.kind == ErrorKind::Toolchain("--video-encoder aom needs ffmpeg with libaom-av1".into())),
 		"{outcome:?}"
 	);
+	assert_eq!(
+		stages(&events, Stage::Probe) + stages(&events, Stage::Analyze),
+		0,
+		"{events:?}"
+	);
 	assert!(!dir.path().join("clip.cry.mkv").exists());
+}
+
+#[tokio::test]
+async fn a_video_too_wide_for_svt_without_libaom_is_a_toolchain_problem_found_before_any_analysis() {
+	let dir = tempfile::tempdir().unwrap();
+	let wide = dir.path().join("wide.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc=size=17000x16:rate=5:duration=1",
+		"-c:v",
+		"ffv1",
+		wide.to_str().unwrap(),
+	]);
+	let mut tools = support::toolchain().await;
+	tools.encoders.remove(LIBAOM);
+
+	let (outcome, events) = run_recording(&Engine::new(tools), &fast(&wide), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err)
+			if matches!(&err.kind, ErrorKind::Toolchain(problem) if problem.starts_with("17000×16 is larger than SVT-AV1"))),
+		"{outcome:?}"
+	);
+	assert_eq!(
+		stages(&events, Stage::Probe) + stages(&events, Stage::Analyze),
+		0,
+		"{events:?}"
+	);
+}
+
+#[tokio::test]
+async fn an_animated_image_without_libaom_is_a_toolchain_problem_found_before_it_is_encoded() {
+	let dir = tempfile::tempdir().unwrap();
+	let gif = dir.path().join("spin.gif");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc=size=64x64:rate=10:duration=1",
+		gif.to_str().unwrap(),
+	]);
+	let mut tools = support::toolchain().await;
+	tools.encoders.remove(LIBAOM);
+
+	let (outcome, events) = run_recording(&Engine::new(tools), &fast(&gif), dir.path()).await;
+
+	assert!(
+		matches!(&outcome, JobOutcome::Failed(err)
+			if err.kind == ErrorKind::Toolchain("an animated AVIF needs ffmpeg with libaom-av1".into())),
+		"{outcome:?}"
+	);
+	assert_eq!(stages(&events, Stage::Encode), 0, "{events:?}");
 }
 
 fn resized(job: Job, width: Option<u32>, height: Option<u32>) -> Job {
@@ -6093,6 +6150,41 @@ async fn id3_musicbrainz_tags_arrive_with_vorbis_names() {
 			.items()
 			.any(|(key, value)| key == "MUSICBRAINZ_ALBUMID" && value == "abc")
 	);
+}
+
+#[tokio::test]
+async fn a_vorbis_ogg_output_keeps_the_source_cover() {
+	let dir = tempfile::tempdir().unwrap();
+	let ogg = support::tone(
+		dir.path(),
+		"covered.ogg",
+		"mono",
+		1,
+		3,
+		&["-c:a", "libvorbis", "-b:a", "32k"],
+	);
+	let cover =
+		cryarchiver_engine::audio::cover::source_pictures(&support::mp3_with_cover(dir.path(), "a.mp3", "Song"));
+	let mut tagged = VorbisFile::read_from(&mut File::open(&ogg).unwrap(), ParseOptions::new()).unwrap();
+	tagged
+		.vorbis_comments_mut()
+		.insert_picture(cover[0].clone(), None)
+		.unwrap();
+	tagged
+		.save_to_path(&ogg, lofty::config::WriteOptions::default())
+		.unwrap();
+
+	let outcome = run(&requested(&ogg, OutputFormat::Ogg), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		!warnings.iter().any(|warning| warning.contains("cover")),
+		"{warnings:?}"
+	);
+	let vorbis = VorbisFile::read_from(&mut File::open(output).unwrap(), ParseOptions::new()).unwrap();
+	assert_eq!(vorbis.vorbis_comments().pictures().len(), 1);
 }
 
 #[tokio::test]

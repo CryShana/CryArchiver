@@ -488,6 +488,7 @@ impl Owner {
 		self.pipeline.waits.forget(file);
 		self.pipeline.deferred.remove(&file);
 		self.pipeline.retries.remove(&file);
+		self.pipeline.retry_threads.remove(&file);
 		self.pipeline.retry_at.retain(|(_, waiting)| *waiting != file);
 		self.pipeline.requeued.retain(|(waiting, _)| *waiting != file);
 		self.pipeline.chosen_copies.remove(&file);

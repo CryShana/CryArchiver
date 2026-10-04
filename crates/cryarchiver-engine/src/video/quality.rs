@@ -600,6 +600,13 @@ pub fn unreachable_reason(crf: f64, score: Score, target: Target) -> KeepReason 
 	KeepReason::QualityUnreachable(unreachable_text(crf, score, target))
 }
 
+pub fn with_cap_note(reason: &str, cap_kbps: Option<u32>) -> String {
+	match cap_kbps {
+		Some(kbps) => format!("{reason} under the {} Mbit/s cap", f64::from(kbps) / 1000.0),
+		None => reason.to_owned(),
+	}
+}
+
 /// The smaller of the two results that reach their targets (grain on a tie). When neither does, the one without grain
 /// is kept: grain's denoiser only moves the picture further from the source.
 pub fn grain_choice(grain: Searched, plain: Searched) -> GrainChoice {
@@ -612,12 +619,22 @@ pub fn grain_choice(grain: Searched, plain: Searched) -> GrainChoice {
 	}
 }
 
-/// Why film grain was left out.
+/// Why film grain was left out; a target missed under a bitrate cap names the cap.
 #[allow(clippy::cast_precision_loss)]
-pub fn dropped_grain_text(level: u8, grain: Searched, plain: Searched, grain_target: Target) -> String {
+pub fn dropped_grain_text(
+	level: u8,
+	grain: Searched,
+	plain: Searched,
+	grain_target: Target,
+	cap_kbps: Option<u32>,
+) -> String {
 	let Searched::Found(plain) = plain else {
 		return format!(
-			"film grain {level} was left out: the quality target was reached neither with it nor without it"
+			"film grain {level} was left out: {}",
+			with_cap_note(
+				"the quality target was reached neither with it nor without it",
+				cap_kbps
+			)
 		);
 	};
 
@@ -627,7 +644,10 @@ pub fn dropped_grain_text(level: u8, grain: Searched, plain: Searched, grain_tar
 			grain.crf,
 			grain.sample_bytes as f64 / plain.sample_bytes.max(1) as f64
 		),
-		Searched::Unreachable { crf, score, .. } => format!("with it {}", short_text(crf, score, grain_target)),
+		Searched::Unreachable { crf, score, .. } => format!(
+			"with it {}",
+			with_cap_note(&short_text(crf, score, grain_target), cap_kbps)
+		),
 	};
 	format!(
 		"film grain {level} was left out: {with}; without it CRF {} measured VMAF {:.1} / {:.1}",
@@ -820,6 +840,7 @@ impl Scorer<'_> {
 		Scoring {
 			model: vmaf::model_for(self.plan.width, self.plan.height),
 			threads: self.threads,
+			budget: self.plan.threads.map(|threads| threads.tool),
 			dir: self.workspace.dir(),
 			log,
 		}
@@ -1729,18 +1750,40 @@ mod tests {
 		let grain_target = target(Speed::Moderate, true, &Overrides::default());
 
 		assert_eq!(
-			dropped_grain_text(14, found(12.0, 600_000), found(29.0, 100_000), grain_target),
+			dropped_grain_text(14, found(12.0, 600_000), found(29.0, 100_000), grain_target, None),
 			"film grain 14 was left out: with it the samples needed CRF 12 and came out 6.0× the size; \
 			 without it CRF 29 measured VMAF 93.4 / 89.2"
 		);
 		assert_eq!(
-			dropped_grain_text(20, MISSED, found(29.0, 100_000), grain_target),
+			dropped_grain_text(20, MISSED, found(29.0, 100_000), grain_target, None),
 			"film grain 20 was left out: with it quality target not reached (VMAF 90.1 / 84.0 at CRF 10, target \
 			 91.0 / 86.5); without it CRF 29 measured VMAF 93.4 / 89.2"
 		);
 		assert_eq!(
-			dropped_grain_text(8, MISSED, MISSED, grain_target),
+			dropped_grain_text(8, MISSED, MISSED, grain_target, None),
 			"film grain 8 was left out: the quality target was reached neither with it nor without it"
+		);
+	}
+
+	#[test]
+	fn grain_dropped_under_a_bitrate_cap_names_the_cap() {
+		let grain_target = target(Speed::Moderate, true, &Overrides::default());
+		let cap = Some(12_500);
+
+		assert_eq!(
+			dropped_grain_text(20, MISSED, found(29.0, 100_000), grain_target, cap),
+			"film grain 20 was left out: with it quality target not reached (VMAF 90.1 / 84.0 at CRF 10, target \
+			 91.0 / 86.5) under the 12.5 Mbit/s cap; without it CRF 29 measured VMAF 93.4 / 89.2"
+		);
+		assert_eq!(
+			dropped_grain_text(8, MISSED, MISSED, grain_target, cap),
+			"film grain 8 was left out: the quality target was reached neither with it nor without it under the \
+			 12.5 Mbit/s cap"
+		);
+		assert_eq!(
+			dropped_grain_text(14, found(12.0, 600_000), found(29.0, 100_000), grain_target, cap),
+			"film grain 14 was left out: with it the samples needed CRF 12 and came out 6.0× the size; \
+			 without it CRF 29 measured VMAF 93.4 / 89.2"
 		);
 	}
 

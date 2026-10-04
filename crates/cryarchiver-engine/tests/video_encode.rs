@@ -101,10 +101,7 @@ async fn a_noisy_clip_is_encoded_with_the_grain_level_its_noise_measures() {
 	let tools = support::toolchain().await;
 	let cancel = CancellationToken::new();
 	let info = probe(&tools, &noisy, &cancel).await.unwrap();
-	let caps = VideoCaps {
-		vp9_alpha: false,
-		libaom: false,
-	};
+	let caps = VideoCaps { vp9_alpha: false };
 	let main = precheck(&info, &caps).unwrap();
 	let analysis = Box::pin(analyze(
 		&tools,
@@ -162,11 +159,8 @@ async fn an_av1_source_with_film_grain_gets_no_more_grain() {
 	let tools = support::toolchain().await;
 	let cancel = CancellationToken::new();
 	let info = probe(&tools, &grained, &cancel).await.unwrap();
-	let caps = VideoCaps {
-		vp9_alpha: false,
-		libaom: false,
-	};
-	let main = usable_main(&info, &caps, None).unwrap();
+	let caps = VideoCaps { vp9_alpha: false };
+	let main = usable_main(&info, &caps).unwrap();
 	let frames = first_frames(&tools, &grained, main.index, 5, &cancel).await.unwrap();
 	let analysis = Box::pin(analyze(
 		&tools,

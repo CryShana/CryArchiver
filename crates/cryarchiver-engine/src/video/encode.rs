@@ -102,12 +102,7 @@ fn encode_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan,
 	cmd.count_lines_containing(DECODE_ERRORS);
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "repeat+info"]);
 
-	if let Some(threads) = plan.threads {
-		cmd.arg("-threads")
-			.arg(threads.tool.to_string())
-			.arg("-filter_threads")
-			.arg(threads.tool.to_string());
-	}
+	cmd.threads(plan.threads.map(|threads| threads.tool));
 
 	let start = if main_only { plan.starts.main } else { plan.starts.every };
 	let cut = sample
@@ -518,6 +513,7 @@ pub async fn extract(
 mod tests {
 	use super::*;
 	use crate::audio::plan::{EncodePlan, LayoutFix, TrackJob};
+	use crate::video::burn::Overlay;
 	use crate::video::plan::test_plan;
 	use crate::video::streams::SubtitleTrack;
 	use crate::video::{InputStart, VideoStarts, joined};
@@ -606,8 +602,45 @@ mod tests {
 			&budgeted,
 		));
 
-		assert!(args.contains("-threads 4 -filter_threads 4 -i "), "{args}");
+		assert!(
+			args.contains("-threads 4 -filter_threads 4 -filter_complex_threads 4 -i "),
+			"{args}"
+		);
 		assert!(args.contains("-svtav1-params tune=0:keyint=5s:crf=32:lp=2"), "{args}");
+	}
+
+	#[test]
+	fn a_burned_subtitle_graph_runs_on_the_thread_budget() {
+		let burned = VideoPlan {
+			threads: Some(Threads { tool: 3, svt_lp: 1 }),
+			overlay: Some(Overlay {
+				offset_s: 0.0,
+				canvas: None,
+				ten_bit: false,
+			}),
+			..plan(svt(), None)
+		};
+		let unbudgeted = VideoPlan {
+			threads: None,
+			..burned.clone()
+		};
+
+		let args = joined(&video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/v.mkv"),
+			&burned,
+		));
+		let free = joined(&video_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("work/v.mkv"),
+			&unbudgeted,
+		));
+
+		let complex = args.find("-filter_complex ").unwrap();
+		assert!(args[..complex].contains("-filter_complex_threads 3 "), "{args}");
+		assert!(!free.contains("threads"), "{free}");
 	}
 
 	#[test]

@@ -236,7 +236,6 @@ fn source_offset(info: &MediaInfo, window: Option<TrimWindow>) -> Option<String>
 /// seek can read back to a cue still on screen at the cut, which would move the file's start to that cue, so a packet
 /// that starts before the window (a negative `pts` here) is dropped, and one running past the end is cut short there.
 ///
-///
 /// A DVD packet (`own_stop`) also carries its stop time in its payload, which decoders honour over the container's
 /// duration, so one running past the end is dropped instead; its container duration stands for that stop time.
 ///

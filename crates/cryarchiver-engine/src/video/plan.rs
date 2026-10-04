@@ -49,7 +49,6 @@ pub fn svt_lp(threads: usize, cores: usize) -> u8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoCaps {
 	pub vp9_alpha: bool,
-	pub libaom: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,20 +199,15 @@ pub fn main_stream(info: &MediaInfo) -> Option<&Stream> {
 }
 
 pub fn precheck<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream, KeepReason> {
-	let main = usable_main(info, caps, None)?;
+	let main = usable_main(info, caps)?;
 	if let Some(reason) = already_efficient(info, main) {
 		return Err(KeepReason::AlreadyEfficient(reason));
 	}
 	Ok(main)
 }
 
-/// Under `resize`, the size limits apply to the output size; a resize the video can't take fails later, with its own
-/// reason.
-pub fn usable_main<'a>(
-	info: &'a MediaInfo,
-	caps: &VideoCaps,
-	resize: Option<Resize>,
-) -> Result<&'a Stream, KeepReason> {
+/// Whether libaom-av1 is there for a video larger than SVT-AV1 takes is the engine's to check (`beyond_svt`).
+pub fn usable_main<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream, KeepReason> {
 	let main = main_stream(info).ok_or_else(|| KeepReason::Unsupported("no video stream to encode".into()))?;
 
 	if let Some((profile, compatibility)) = dolby_vision(main)
@@ -229,16 +223,16 @@ pub fn usable_main<'a>(
 			"transparent video needs libvpx-vp9 with alpha support".into(),
 		));
 	}
+	Ok(main)
+}
 
+/// The output size, when it is larger than SVT-AV1 takes, so that the video is encoded with libaom-av1. Under
+/// `resize` the limits apply to the output size; a resize the video can't take fails later, with its own reason.
+pub fn beyond_svt(main: &Stream, resize: Option<Resize>) -> Option<(u32, u32)> {
 	let (width, height) = resize
 		.and_then(|resize| resize.size(shown_size(main), true).ok())
 		.unwrap_or_else(|| display_size(main));
-	if too_large_for_svt(width, height) && !has_alpha(main) && !caps.libaom {
-		return Err(KeepReason::Unsupported(format!(
-			"{width}×{height} is larger than SVT-AV1 supports and libaom-av1 is not available"
-		)));
-	}
-	Ok(main)
+	(too_large_for_svt(width, height) && !has_alpha(main)).then_some((width, height))
 }
 
 /// `resize` is the output size under `--resize`; the encoder and its CRF follow the output size.
@@ -572,10 +566,7 @@ pub(crate) fn test_plan() -> VideoPlan {
 mod tests {
 	use super::*;
 
-	const CAPS: VideoCaps = VideoCaps {
-		vp9_alpha: true,
-		libaom: true,
-	};
+	const CAPS: VideoCaps = VideoCaps { vp9_alpha: true };
 	const PROGRESSIVE_CLEAN: Analysis = Analysis {
 		scan: ScanType::Progressive,
 		noise: NoiseClass::Clean,
@@ -716,6 +707,7 @@ mod tests {
 		let scoring = Scoring {
 			model: "vmaf_v0.6.1",
 			threads: 1,
+			budget: None,
 			dir: std::path::Path::new("work"),
 			log: "vmaf.json",
 		};
@@ -1061,10 +1053,7 @@ mod tests {
 			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"prores","width":640,"height":360,
 			"pix_fmt":"yuva444p12le"}]}"#,
 		);
-		let without_libvpx = VideoCaps {
-			vp9_alpha: false,
-			libaom: true,
-		};
+		let without_libvpx = VideoCaps { vp9_alpha: false };
 
 		let vp9 = plan(&vp9_alpha, &[], PROGRESSIVE_CLEAN, Speed::Moderate);
 		assert_eq!(vp9.decoder, Some("libvpx-vp9"));
@@ -1106,18 +1095,12 @@ mod tests {
 			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"mjpeg","width":17000,"height":960,
 			"pix_fmt":"yuvj420p","avg_frame_rate":"5/1"}]}"#,
 		);
-		let without_libaom = VideoCaps {
-			vp9_alpha: true,
-			libaom: false,
-		};
 
 		let plan = plan(&wide, &[], PROGRESSIVE_CLEAN, Speed::Fast);
 
 		assert_eq!(plan.encoder, Encoder::Aom { cpu_used: 6, crf: 38 });
-		assert!(matches!(
-			precheck(&wide, &without_libaom),
-			Err(KeepReason::Unsupported(_))
-		));
+		assert_eq!(beyond_svt(main_stream(&wide).unwrap(), None), Some((17_000, 960)));
+		assert!(precheck(&wide, &CAPS).is_ok(), "the engine checks for libaom-av1");
 	}
 
 	#[test]
@@ -1126,27 +1109,19 @@ mod tests {
 			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"mjpeg","width":17000,"height":960,
 			"pix_fmt":"yuvj420p","avg_frame_rate":"5/1"}]}"#,
 		);
-		let without_libaom = VideoCaps {
-			vp9_alpha: true,
-			libaom: false,
-		};
 		let width = |width| {
 			Some(Resize {
 				width: Some(width),
 				height: None,
 			})
 		};
+		let h264 = h264("");
+		let (wide, h264) = (main_stream(&wide).unwrap(), main_stream(&h264).unwrap());
 
-		assert!(usable_main(&wide, &without_libaom, width(1920)).is_ok());
-		assert!(matches!(
-			usable_main(&wide, &without_libaom, None),
-			Err(KeepReason::Unsupported(reason)) if reason.starts_with("17000×960 ")
-		));
-		assert!(matches!(
-			usable_main(&h264(""), &without_libaom, width(20_000)),
-			Err(KeepReason::Unsupported(reason)) if reason.starts_with("20000×11250 is larger than SVT-AV1")
-		));
-		assert!(usable_main(&h264(""), &CAPS, width(20_000)).is_ok());
+		assert_eq!(beyond_svt(wide, width(1920)), None);
+		assert_eq!(beyond_svt(wide, None), Some((17_000, 960)));
+		assert_eq!(beyond_svt(h264, width(20_000)), Some((20_000, 11_250)));
+		assert_eq!(beyond_svt(h264, None), None);
 	}
 
 	#[test]

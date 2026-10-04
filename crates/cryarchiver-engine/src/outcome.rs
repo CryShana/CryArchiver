@@ -22,7 +22,8 @@ pub enum ErrorKind {
 	InsufficientSpace { need: u64, free: u64 },
 	#[error("no progress for {0:?}")]
 	Stalled(Duration),
-	#[error("encoder crashed: {0}")]
+	/// Names the tool: "ffprobe crashed: …".
+	#[error("{0}")]
 	ToolCrashed(String),
 	#[error("i/o error at the destination: {0}")]
 	DestinationIo(String),
@@ -61,6 +62,17 @@ impl ErrorKind {
 			| Self::Cancelled => ErrorClass::ManualRetry,
 			Self::SourceUnreadable(_) | Self::SourceDamaged(_) | Self::EncodeFailed(_) => ErrorClass::Unrecoverable,
 		}
+	}
+
+	/// The thread budget of the attempt after this error, from the budget of the one that failed: halved after a
+	/// crash, which fewer threads may avoid, and otherwise kept. No budget counts as the whole machine.
+	pub fn retry_threads(&self, threads: Option<usize>) -> Option<usize> {
+		if !matches!(self, Self::ToolCrashed(_)) {
+			return threads;
+		}
+
+		let current = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from));
+		Some((current / 2).max(1))
 	}
 }
 
@@ -172,16 +184,20 @@ impl From<crate::process::RunError> for JobError {
 			RunError::Cancelled => ErrorKind::Cancelled.into(),
 			RunError::Stalled(after) => ErrorKind::Stalled(after).into(),
 			RunError::Spawn(err) => ErrorKind::Toolchain(err.to_string()).into(),
-			RunError::Io(err) => ErrorKind::ToolCrashed(err.to_string()).into(),
+			err @ RunError::Io(_) => ErrorKind::ToolCrashed(err.to_string()).into(),
 			RunError::CaptureLimit(limit) => ErrorKind::SourceDamaged(format!(
 				"the decoded image is larger than its header declares ({limit} bytes)"
 			))
 			.into(),
 			RunError::Crashed {
+				tool,
 				description,
 				stderr_tail,
 				..
-			} => JobError::with_log(ErrorKind::ToolCrashed(description), stderr_tail),
+			} => JobError::with_log(
+				ErrorKind::ToolCrashed(format!("{tool} crashed: {description}")),
+				stderr_tail,
+			),
 		}
 	}
 }
@@ -215,6 +231,18 @@ mod tests {
 			ErrorKind::SourceDamaged("no EOI".into()).class(),
 			ErrorClass::Unrecoverable
 		);
+	}
+
+	#[test]
+	fn a_crash_halves_the_threads_down_to_one_and_other_errors_keep_them() {
+		let crash = ErrorKind::ToolCrashed("ffmpeg crashed: out of memory (exit code -12)".into());
+
+		assert_eq!(crash.retry_threads(Some(8)), Some(4));
+		assert_eq!(crash.retry_threads(Some(5)), Some(2));
+		assert_eq!(crash.retry_threads(Some(1)), Some(1));
+		assert!(crash.retry_threads(None).is_some_and(|threads| threads >= 1));
+		assert_eq!(ErrorKind::Locked.retry_threads(Some(8)), Some(8));
+		assert_eq!(ErrorKind::Locked.retry_threads(None), None);
 	}
 
 	#[test]

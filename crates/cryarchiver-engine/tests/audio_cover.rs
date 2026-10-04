@@ -5,7 +5,7 @@ use std::fs::File;
 use cryarchiver_engine::audio::cover::{add_pictures, source_pictures};
 use lofty::config::ParseOptions;
 use lofty::file::AudioFile;
-use lofty::ogg::{OggPictureStorage, OpusFile};
+use lofty::ogg::{OggPictureStorage, OpusFile, VorbisFile};
 
 #[test]
 fn cover_and_title_survive_mp3_to_opus() {
@@ -31,6 +31,30 @@ fn cover_and_title_survive_mp3_to_opus() {
 	let file = OpusFile::read_from(&mut File::open(&opus).unwrap(), ParseOptions::new()).unwrap();
 	assert_eq!(file.vorbis_comments().pictures().len(), 1);
 	assert_eq!(file.vorbis_comments().get("TITLE"), Some("曲名テスト"));
+}
+
+#[test]
+fn a_cover_reaches_a_vorbis_ogg_too() {
+	let dir = tempfile::tempdir().unwrap();
+	let mp3 = support::mp3_with_cover(dir.path(), "a.mp3", "Song");
+	let ogg = dir.path().join("a.ogg");
+	support::ffmpeg(&[
+		"-i",
+		mp3.to_str().unwrap(),
+		"-map",
+		"0:a",
+		"-map_metadata",
+		"0",
+		"-c:a",
+		"libvorbis",
+		ogg.to_str().unwrap(),
+	]);
+
+	add_pictures(&ogg, source_pictures(&mp3)).unwrap();
+
+	let file = VorbisFile::read_from(&mut File::open(&ogg).unwrap(), ParseOptions::new()).unwrap();
+	assert_eq!(file.vorbis_comments().pictures().len(), 1);
+	assert_eq!(file.vorbis_comments().get("TITLE"), Some("Song"));
 }
 
 #[test]

@@ -23,6 +23,7 @@ use crate::video::run_ffmpeg;
 
 pub const MAX_SAMPLED_FRAMES: u32 = 10;
 pub const MAX_FRAMES: u32 = 100_000;
+pub const NEEDS_LIBAOM: &str = "an animated AVIF needs ffmpeg with libaom-av1";
 const GIF_DEFAULT_DELAY_MS: u32 = 100;
 const DELAY_TOLERANCE_MS: u32 = 1;
 const HEAD_BYTES: u64 = 16;
@@ -259,10 +260,13 @@ pub fn encode_command(
 	output: &Path,
 	animation: &Animation,
 	settings: AnimatedSettings,
+	threads: usize,
 ) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	cmd.count_lines_containing(IMAGE_DECODE_ERRORS);
-	cmd.args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
+	cmd.args(["-hide_banner", "-nostdin", "-y", "-v", "error"])
+		.threads(Some(threads))
+		.arg("-i")
 		.arg(process::tool_path(source));
 
 	if animation.alpha {
@@ -276,7 +280,8 @@ pub fn encode_command(
 		.arg(settings.crf.to_string())
 		.arg("-cpu-used")
 		.arg(settings.cpu_used.to_string())
-		.args(["-row-mt", "1"]);
+		.args(["-row-mt", "1", "-threads"])
+		.arg(threads.max(1).to_string());
 
 	let timeline = &animation.timeline;
 	let last = timeline.frames.saturating_sub(1);

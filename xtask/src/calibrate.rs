@@ -219,9 +219,8 @@ async fn measure_video(
 		.map_err(|err| err.to_string())?;
 	let caps = VideoCaps {
 		vp9_alpha: tools.vp9_alpha,
-		libaom: tools.has_libaom(),
 	};
-	let main = usable_main(&info, &caps, None).map_err(|reason| format!("{reason:?}"))?;
+	let main = usable_main(&info, &caps).map_err(|reason| format!("{reason:?}"))?;
 	let declared = main.declared_duration().or(info.format.duration);
 	let span = declared.map(|length_s| TrimWindow { start_s: 0.0, length_s });
 	let workspace = Workspace::create(scratch, source).map_err(|err| err.to_string())?;

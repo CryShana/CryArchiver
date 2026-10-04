@@ -370,7 +370,13 @@ async fn a_tool_that_crashes_is_reported_as_crashed_with_its_stderr() {
 		let ErrorKind::ToolCrashed(description) = &job.kind else {
 			panic!("{script:?}: {job:?}");
 		};
+		let program = if cfg!(windows) { "cmd" } else { "sh" };
 		assert!(description.contains(named), "{script:?}: {description}");
+		assert!(
+			job.kind.to_string().starts_with(&format!("{program} crashed: ")),
+			"{script:?}: {}",
+			job.kind
+		);
 		assert!(
 			job.log_tail.iter().any(|line| line.contains("boom")),
 			"{script:?}: {job:?}"

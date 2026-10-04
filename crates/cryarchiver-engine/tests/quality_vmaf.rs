@@ -30,6 +30,7 @@ fn scoring<'a>(dir: &'a Path, log: &'a str) -> Scoring<'a> {
 	Scoring {
 		model: "vmaf_v0.6.1",
 		threads: 4,
+		budget: None,
 		dir,
 		log,
 	}

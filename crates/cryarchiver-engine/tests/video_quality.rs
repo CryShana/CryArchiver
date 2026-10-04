@@ -23,10 +23,7 @@ use cryarchiver_engine::video::verify::{Retiming, undecoded_lead};
 use cryarchiver_engine::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
 
-const CAPS: VideoCaps = VideoCaps {
-	vp9_alpha: false,
-	libaom: false,
-};
+const CAPS: VideoCaps = VideoCaps { vp9_alpha: false };
 /// Against a reference without the cues, the burned clip's p5 is about 79.
 const SUBTITLES_ALIGNED_P5: f64 = 90.0;
 /// testsrc2 scored against itself one frame later gives a VMAF mean of about 44.
@@ -225,6 +222,7 @@ async fn both_checks(
 	let scoring = Scoring {
 		model: model_for(plan.width, plan.height),
 		threads: 4,
+		budget: None,
 		dir: workspace.dir(),
 		log: "vmaf-through.json",
 	};

@@ -169,8 +169,15 @@ async fn encode_and_verify(dir: &Path, source: &Path) -> (Animation, f64) {
 		&output,
 		&animation,
 		plan_animation(Speed::Fast, true).unwrap(),
+		2,
 	);
+	let budgeted = cmd
+		.args
+		.windows(2)
+		.filter(|pair| pair[0] == "-threads" && pair[1] == "2")
+		.count();
 
+	assert_eq!(budgeted, 2, "the decoder and libaom: {:?}", cmd.args);
 	assert!(
 		run(&cmd, StdoutMode::Capture, |_| {}, &cancel)
 			.await

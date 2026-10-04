@@ -75,16 +75,9 @@ where
 			return outcome;
 		}
 
-		if matches!(err.kind, ErrorKind::ToolCrashed(_)) {
-			job.options.threads = Some(halved(job.options.threads));
-		}
+		job.options.threads = err.kind.retry_threads(job.options.threads);
 		attempt += 1;
 	}
-}
-
-pub fn halved(threads: Option<usize>) -> usize {
-	let current = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from));
-	(current / 2).max(1)
 }
 
 pub async fn wait(wait: Wait, source: &Path, work_root: &Path, cancel: &CancellationToken) -> bool {
@@ -349,14 +342,6 @@ mod tests {
 			matches!(&timed_out, JobOutcome::Failed(err) if err.kind == ErrorKind::SourceChanged),
 			"{timed_out:?}"
 		);
-	}
-
-	#[test]
-	fn halving_keeps_at_least_one_thread() {
-		assert_eq!(halved(Some(1)), 1);
-		assert_eq!(halved(Some(8)), 4);
-		assert_eq!(halved(Some(5)), 2);
-		assert!(halved(None) >= 1);
 	}
 
 	#[test]

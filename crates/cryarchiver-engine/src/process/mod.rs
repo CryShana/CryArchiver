@@ -72,6 +72,22 @@ impl ToolCommand {
 			.arg(format!("{length_s:.3}"))
 	}
 
+	/// ffmpeg's decoder threads for the next `-i`, and every filter graph's threads; nothing without a budget.
+	pub fn threads(&mut self, threads: Option<usize>) -> &mut Self {
+		if let Some(threads) = threads {
+			let threads = threads.max(1).to_string();
+			self.args([
+				"-threads",
+				&threads,
+				"-filter_threads",
+				&threads,
+				"-filter_complex_threads",
+				&threads,
+			]);
+		}
+		self
+	}
+
 	pub fn count_lines_containing(&mut self, patterns: &'static [&'static str]) -> &mut Self {
 		self.counted = patterns;
 		self
@@ -111,8 +127,10 @@ pub enum RunError {
 	Cancelled,
 	#[error("the tool wrote more than {0} bytes")]
 	CaptureLimit(usize),
-	#[error("the tool crashed: {description}")]
+	#[error("{tool} crashed: {description}")]
 	Crashed {
+		/// The program's name, such as `ffprobe`.
+		tool: String,
 		description: String,
 		status: ExitStatus,
 		stderr_tail: Vec<String>,
@@ -217,6 +235,10 @@ async fn drive(
 
 	if let Some(description) = crash_description(status) {
 		return Err(RunError::Crashed {
+			tool: cmd
+				.program
+				.file_stem()
+				.map_or_else(|| "the tool".to_owned(), |stem| stem.to_string_lossy().into_owned()),
 			description,
 			status,
 			stderr_tail,

@@ -245,7 +245,7 @@ impl Reader {
 
 /// Decodes `TRIPLETS` runs of three consecutive frames, about a second apart, as PGM luma on stdout: 8-bit for 8-bit
 /// sources, 16-bit for deeper ones.
-pub fn command(ffmpeg: &Path, source: &Path, main: &Stream, segment: &Segment) -> ToolCommand {
+pub fn command(ffmpeg: &Path, source: &Path, main: &Stream, segment: &Segment, threads: Option<usize>) -> ToolCommand {
 	#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 	let period = main
 		.fps()
@@ -269,7 +269,8 @@ pub fn command(ffmpeg: &Path, source: &Path, main: &Stream, segment: &Segment) -
 		cmd.arg("-c:v").arg(decoder);
 	}
 
-	cmd.arg("-i")
+	cmd.threads(threads)
+		.arg("-i")
 		.arg(process::tool_path(source))
 		.arg("-map")
 		.arg(format!("0:{}", main.index))
@@ -1095,12 +1096,14 @@ mod tests {
 			Path::new("in.mkv"),
 			&stream("yuva420p10le", 7680, 4320),
 			&segment,
+			None,
 		);
 		let eight_bit = command(
 			Path::new("ffmpeg"),
 			Path::new("in.mkv"),
 			&stream("yuva420p", 1920, 1080),
 			&segment,
+			None,
 		);
 		let args = crate::video::joined(&deep);
 

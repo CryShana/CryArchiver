@@ -9,6 +9,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use crate::options::VideoEncoderChoice;
 use crate::process::{self, RunError, StdoutMode, ToolCommand, ToolOutput};
 use crate::quality::vmaf;
 use crate::text::display_path;
@@ -322,6 +323,12 @@ impl Toolchain {
 
 	pub fn has_libaom(&self) -> bool {
 		self.encoders.contains(LIBAOM)
+	}
+
+	/// What this ffmpeg lacks for an encoder chosen with `--video-encoder`, known before any file is read.
+	pub fn video_encoder_problem(&self, choice: Option<VideoEncoderChoice>) -> Option<&'static str> {
+		(choice == Some(VideoEncoderChoice::Aom) && !self.has_libaom())
+			.then_some("--video-encoder aom needs ffmpeg with libaom-av1")
 	}
 
 	pub fn has_libjxl(&self) -> bool {
@@ -987,6 +994,24 @@ mod tests {
 		tools.encoders.remove("libaom-av1");
 
 		assert!(!tools.has_libaom());
+	}
+
+	#[test]
+	fn an_encoder_choice_this_ffmpeg_lacks_is_named() {
+		let complete = complete_toolchain();
+		let mut without_libaom = complete_toolchain();
+		without_libaom.encoders.remove("libaom-av1");
+
+		assert_eq!(
+			without_libaom.video_encoder_problem(Some(VideoEncoderChoice::Aom)),
+			Some("--video-encoder aom needs ffmpeg with libaom-av1")
+		);
+		assert_eq!(
+			without_libaom.video_encoder_problem(Some(VideoEncoderChoice::SvtAv1)),
+			None
+		);
+		assert_eq!(without_libaom.video_encoder_problem(None), None);
+		assert_eq!(complete.video_encoder_problem(Some(VideoEncoderChoice::Aom)), None);
 	}
 
 	#[test]

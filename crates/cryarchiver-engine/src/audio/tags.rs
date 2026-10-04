@@ -36,42 +36,63 @@ pub fn vorbis_name(key: &str) -> Option<&'static str> {
 }
 
 pub fn rename_keys(ogg: &Path) -> Result<usize, Box<dyn Error + Send + Sync>> {
+	edit_comments(ogg, |comments| Ok(rename_in(comments)))
+}
+
+/// Applies `edit` to the comments of an Ogg Opus or Vorbis file, and saves the file when `edit` counts a change.
+pub fn edit_comments(
+	ogg: &Path,
+	edit: impl FnOnce(&mut VorbisComments) -> Result<usize, Box<dyn Error + Send + Sync>>,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
 	let options = ParseOptions::new().read_properties(false);
 	let file_type = Probe::open(ogg)?.options(options).guess_file_type()?.file_type();
 
 	match file_type {
 		Some(FileType::Opus) => {
 			let mut file = OpusFile::read_from(&mut File::open(ogg)?, options)?;
-			let renamed = rename_in(file.vorbis_comments_mut());
-			if renamed > 0 {
+			let changed = edit(file.vorbis_comments_mut())?;
+			if changed > 0 {
 				file.save_to_path(ogg, WriteOptions::default())?;
 			}
-			Ok(renamed)
+			Ok(changed)
 		}
 		Some(FileType::Vorbis) => {
 			let mut file = VorbisFile::read_from(&mut File::open(ogg)?, options)?;
-			let renamed = rename_in(file.vorbis_comments_mut());
-			if renamed > 0 {
+			let changed = edit(file.vorbis_comments_mut())?;
+			if changed > 0 {
 				file.save_to_path(ogg, WriteOptions::default())?;
 			}
-			Ok(renamed)
+			Ok(changed)
 		}
 		other => Err(format!("not an Ogg Opus or Vorbis file ({other:?})").into()),
 	}
 }
 
+/// A renamed item that the comments already hold under its Vorbis name, with the same value, is kept once.
 fn rename_in(comments: &mut VorbisComments) -> usize {
 	let items: Vec<(String, String)> = comments.take_items().collect();
 
+	let mut kept: Vec<(String, String, bool)> = Vec::new();
 	let mut renamed = 0;
 	for (key, value) in items {
-		match vorbis_name(&key) {
+		let (key, is_renamed) = match vorbis_name(&key) {
 			Some(name) if name != key => {
 				renamed += 1;
-				comments.push(name.to_owned(), value);
+				(name.to_owned(), true)
 			}
-			_ => comments.push(key, value),
+			_ => (key, false),
+		};
+
+		let held = kept.iter().any(|(seen, seen_value, seen_renamed)| {
+			(is_renamed || *seen_renamed) && seen.eq_ignore_ascii_case(&key) && *seen_value == value
+		});
+		if !held {
+			kept.push((key, value, is_renamed));
 		}
+	}
+
+	for (key, value, _) in kept {
+		comments.push(key, value);
 	}
 	renamed
 }
@@ -99,5 +120,39 @@ mod tests {
 		);
 		assert_eq!(vorbis_name("REPLAYGAIN_TRACK_GAIN"), None);
 		assert_eq!(vorbis_name("title"), None);
+	}
+
+	#[test]
+	fn a_renamed_key_whose_value_is_already_under_its_vorbis_name_is_kept_once() {
+		let mut comments = VorbisComments::default();
+		for (key, value) in [
+			("MusicBrainz Album Id", "abc"),
+			("MUSICBRAINZ_ALBUMID", "abc"),
+			("MUSICBRAINZ_ARTISTID", "xyz"),
+			("MusicBrainz Artist Id", "other"),
+			("lyrics-eng", "la la"),
+			("lyrics-fra", "lo lo"),
+			("ARTIST", "Band"),
+			("ARTIST", "Band"),
+		] {
+			comments.push(key.to_owned(), value.to_owned());
+		}
+
+		let renamed = rename_in(&mut comments);
+
+		let items: Vec<(&str, &str)> = comments.items().collect();
+		assert_eq!(renamed, 4);
+		assert_eq!(
+			items,
+			[
+				("MUSICBRAINZ_ALBUMID", "abc"),
+				("MUSICBRAINZ_ARTISTID", "xyz"),
+				("MUSICBRAINZ_ARTISTID", "other"),
+				("LYRICS", "la la"),
+				("LYRICS", "lo lo"),
+				("ARTIST", "Band"),
+				("ARTIST", "Band"),
+			]
+		);
 	}
 }

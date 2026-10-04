@@ -34,6 +34,8 @@ const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:
 
 pub const DEFAULT_SEGMENTS: usize = 4;
 
+const PARALLEL_SEGMENTS: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanType {
 	Progressive,
@@ -129,12 +131,24 @@ pub fn window_segments(duration_s: Option<f64>, count: usize, window: Option<Tri
 		.collect()
 }
 
+/// How many segments are analysed at once, and the threads of each of their two tools: the whole budget between
+/// them, at least one thread each.
+pub fn segment_threads(threads: Option<usize>) -> (usize, Option<usize>) {
+	let Some(threads) = threads else {
+		return (PARALLEL_SEGMENTS, None);
+	};
+
+	let parallel = (threads / 2).clamp(1, PARALLEL_SEGMENTS);
+	(parallel, Some((threads / (2 * parallel)).max(1)))
+}
+
 pub fn segment_command(
 	ffmpeg: &Path,
 	source: &Path,
 	stream_index: u32,
 	decoder: Option<&str>,
 	segment: &Segment,
+	threads: Option<usize>,
 ) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	cmd.args(["-hide_banner", "-nostdin", "-noautorotate"]);
@@ -146,7 +160,8 @@ pub fn segment_command(
 		cmd.arg("-c:v").arg(decoder);
 	}
 
-	cmd.arg("-i")
+	cmd.threads(threads)
+		.arg("-i")
 		.arg(process::tool_path(source))
 		.arg("-filter_complex")
 		.arg(format!("[0:{stream_index}]{FILTERS}"))
@@ -331,26 +346,28 @@ pub async fn analyze(
 		source,
 		main,
 		(duration_s, window),
-		count,
+		(count, None),
 		&|_, _| {},
 		cancel,
 	))
 	.await
 }
 
-/// `analyze`, telling `on_segments` how many of the segments are done, from none to all.
+/// `analyze` of `count` segments within a thread budget, if any, telling `on_segments` how many of the segments are
+/// done, from none to all.
 pub async fn analyze_reporting(
 	tools: &Toolchain,
 	source: &Path,
 	main: &Stream,
 	(duration_s, window): (Option<f64>, Option<TrimWindow>),
-	count: usize,
+	(count, threads): (usize, Option<usize>),
 	on_segments: &(dyn Fn(usize, usize) + Sync),
 	cancel: &CancellationToken,
 ) -> Result<Analysis, JobError> {
 	let end_s = window.map_or(duration_s, |window| Some(window.start_s + window.length_s));
 	let segments = window_segments(duration_s, count, window);
 	let (done, total) = (&AtomicUsize::new(0), segments.len());
+	let (parallel, threads) = segment_threads(threads);
 	on_segments(0, total);
 
 	let run = |segment: Option<Segment>| async move {
@@ -358,10 +375,17 @@ pub async fn analyze_reporting(
 			return Ok(None);
 		};
 
-		let cmd = segment_command(&tools.ffmpeg, source, main.index, forced_decoder(main), &segment);
+		let cmd = segment_command(
+			&tools.ffmpeg,
+			source,
+			main.index,
+			forced_decoder(main),
+			&segment,
+			threads,
+		);
 		let (out, pixels) = tokio::join!(
 			super::run_ffmpeg(&cmd, |_| {}, cancel),
-			segment_pixels(tools, source, main, &segment, cancel)
+			segment_pixels(tools, source, main, &segment, threads, cancel)
 		);
 		let (out, pixels) = (out?, pixels?);
 		on_segments(done.fetch_add(1, Ordering::SeqCst) + 1, total);
@@ -379,7 +403,7 @@ pub async fn analyze_reporting(
 	};
 
 	let mut stats = Vec::new();
-	for chunk in segments.chunks(4) {
+	for chunk in segments.chunks(parallel) {
 		let (first, second, third, fourth) = tokio::join!(
 			run(chunk.first().copied()),
 			run(chunk.get(1).copied()),
@@ -398,9 +422,10 @@ async fn segment_pixels(
 	source: &Path,
 	main: &Stream,
 	segment: &Segment,
+	threads: Option<usize>,
 	cancel: &CancellationToken,
 ) -> Result<Measured, JobError> {
-	let cmd = noise::command(&tools.ffmpeg, source, main, segment);
+	let cmd = noise::command(&tools.ffmpeg, source, main, segment, threads);
 	let mut reader = noise::Reader::default();
 
 	let out = match process::run_streamed(&cmd, |chunk| reader.push(chunk), cancel).await {
@@ -522,7 +547,7 @@ mod tests {
 				length_s: 20.0,
 			}),
 		);
-		let whole = segment_command(Path::new("ffmpeg"), Path::new("in.mkv"), 0, None, &from_zero[0]);
+		let whole = segment_command(Path::new("ffmpeg"), Path::new("in.mkv"), 0, None, &from_zero[0], None);
 
 		assert_eq!(
 			from_zero,
@@ -542,6 +567,65 @@ mod tests {
 				length_s: None
 			}]
 		);
+	}
+
+	#[test]
+	fn the_segments_analysed_at_once_share_the_thread_budget() {
+		assert_eq!(segment_threads(None), (4, None));
+		assert_eq!(segment_threads(Some(2)), (1, Some(1)));
+		assert_eq!(segment_threads(Some(6)), (3, Some(1)));
+		assert_eq!(segment_threads(Some(8)), (4, Some(1)));
+		assert_eq!(segment_threads(Some(32)), (4, Some(4)));
+
+		for threads in 1..=64 {
+			let (parallel, each) = segment_threads(Some(threads));
+			let each = each.unwrap();
+			assert!((1..=4).contains(&parallel), "{threads}");
+			assert!(
+				2 * parallel * each <= threads.max(2),
+				"{threads}: {parallel} × 2 × {each}"
+			);
+		}
+	}
+
+	#[test]
+	fn both_segment_tools_run_on_their_share_of_the_budget() {
+		let segment = Segment {
+			start_s: 10.0,
+			length_s: Some(3.0),
+		};
+		let main: Stream = serde_json::from_str(r#"{"index":0,"codec_type":"video","codec_name":"h264"}"#).unwrap();
+
+		let measured = crate::video::joined(&segment_command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			0,
+			None,
+			&segment,
+			Some(2),
+		));
+		let pixels = crate::video::joined(&noise::command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			&main,
+			&segment,
+			Some(2),
+		));
+		let free = crate::video::joined(&noise::command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			&main,
+			&segment,
+			None,
+		));
+
+		for args in [&measured, &pixels] {
+			assert!(
+				args.contains("-threads 2 -filter_threads 2 -filter_complex_threads 2 -i "),
+				"{args}"
+			);
+		}
+		assert!(!free.contains("threads"), "{free}");
 	}
 
 	#[test]

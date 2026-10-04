@@ -65,6 +65,8 @@ pub(crate) struct Pipeline {
 	pub(super) waits: Waits,
 	pub(super) retry_at: BTreeSet<(Instant, FileId)>,
 	pub(super) retries: HashMap<FileId, u32>,
+	/// The thread budget of a file's next attempt, once a tool crashed in an earlier one.
+	pub(super) retry_threads: HashMap<FileId, usize>,
 	/// Work whose job ended cancelled, back at the front of its queue from the next tick on, so a job cancelled every
 	/// time it starts never restarts back to back.
 	pub(super) requeued: Vec<(FileId, Work)>,
@@ -129,6 +131,7 @@ impl Pipeline {
 			waits: Waits::default(),
 			retry_at: BTreeSet::new(),
 			retries: HashMap::new(),
+			retry_threads: HashMap::new(),
 			requeued: Vec::new(),
 			jobs: HashMap::new(),
 			deferred: HashSet::new(),
@@ -406,7 +409,10 @@ impl Owner {
 				drop_aux: !self.settings.keep_auxiliary_images,
 				min_savings: self.settings.min_savings_fraction(),
 				overrides: self.settings.overrides,
-				options: JobOptions::default(),
+				options: JobOptions {
+					threads: self.pipeline.retry_threads.get(&file).copied(),
+					..JobOptions::default()
+				},
 			})),
 			Work::Copy if self.pipeline.chosen_copies.contains(&file) => Some(Task::Copy(CopyReason::Chosen)),
 			Work::Copy => Some(self.reference_task(file).unwrap_or(Task::Copy(CopyReason::NotMedia))),
@@ -690,6 +696,7 @@ impl Owner {
 		record.replaces = None;
 		self.tree.set_record(file, record);
 		self.pipeline.retries.remove(&file);
+		self.pipeline.retry_threads.remove(&file);
 		self.set_state(file, FileState::Done(output));
 		self.output_placed_during_walk(file);
 		self.forget_reference_content(file);
@@ -815,6 +822,9 @@ impl Owner {
 			&& let Some(delay) = retry_delay(self.tuning.retry_base, retries)
 		{
 			self.pipeline.retries.insert(file, retries + 1);
+			if let Some(threads) = err.kind.retry_threads(self.pipeline.retry_threads.get(&file).copied()) {
+				self.pipeline.retry_threads.insert(file, threads);
+			}
 			self.note(file, format!("{}; retrying in {} s", err.kind, delay.as_secs()));
 			self.set_state(file, FileState::Queued);
 			self.pipeline.retry_at.insert((Instant::now() + delay, file));
@@ -894,6 +904,7 @@ impl Owner {
 		}
 		self.last_attempts.insert(key.clone(), attempt);
 		self.pipeline.retries.remove(&file);
+		self.pipeline.retry_threads.remove(&file);
 
 		self.give_up_output(file);
 		self.set_state(
@@ -1500,6 +1511,56 @@ pub(super) mod tests {
 		fixture.owner.tick(Instant::now());
 
 		assert!(fixture.owner.pipeline.jobs.contains_key(&fixture.file));
+	}
+
+	#[test]
+	fn each_retry_after_a_crash_runs_on_half_the_threads() {
+		let mut fixture = Fixture::named("song.flac", b"fLaC");
+		let threads_of = |owner: &mut Owner, file: FileId| match owner.task_for(file, Work::Encode) {
+			Some(Task::Encode(job)) => job.options.threads,
+			_ => panic!("an encode task was expected"),
+		};
+		let crash = || {
+			failed(ErrorKind::ToolCrashed(
+				"ffmpeg crashed: out of memory (exit code -12)".into(),
+			))
+		};
+		let cores = std::thread::available_parallelism().map_or(2, usize::from);
+		let half = (cores / 2).max(1);
+
+		let first = threads_of(&mut fixture.owner, fixture.file);
+		fixture.running();
+		fixture.job(crash());
+		let second = threads_of(&mut fixture.owner, fixture.file);
+		fixture.running();
+		fixture.job(crash());
+		let third = threads_of(&mut fixture.owner, fixture.file);
+		fixture.running();
+		fixture.job(crash());
+
+		assert_eq!(first, None);
+		assert_eq!(second, Some(half));
+		assert_eq!(third, Some((half / 2).max(1)));
+		assert!(matches!(fixture.record().state, FileState::Issue { .. }));
+		assert_eq!(
+			threads_of(&mut fixture.owner, fixture.file),
+			None,
+			"an issue starts afresh"
+		);
+	}
+
+	#[test]
+	fn other_retried_errors_keep_the_threads() {
+		let mut fixture = Fixture::named("song.flac", b"fLaC");
+
+		fixture.running();
+		fixture.job(failed(ErrorKind::DestinationIo("reset".into())));
+
+		assert_eq!(fixture.record().state, FileState::Queued);
+		assert!(matches!(
+			fixture.owner.task_for(fixture.file, Work::Encode),
+			Some(Task::Encode(job)) if job.options.threads.is_none()
+		));
 	}
 
 	#[test]

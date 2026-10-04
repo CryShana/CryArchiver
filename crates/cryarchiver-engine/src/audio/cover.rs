@@ -1,13 +1,14 @@
 use std::error::Error;
-use std::fs::File;
 use std::path::Path;
 
-use lofty::config::{ParseOptions, WriteOptions};
-use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
-use lofty::ogg::{OggPictureStorage, OpusFile};
+use lofty::config::ParseOptions;
+use lofty::file::{TaggedFile, TaggedFileExt};
+use lofty::ogg::OggPictureStorage;
 use lofty::picture::Picture;
 use lofty::probe::Probe;
 use lofty::tag::Tag;
+
+use crate::audio::tags;
 
 pub fn source_pictures(source: &Path) -> Vec<Picture> {
 	let Ok(tagged) = read_tags(source) else {
@@ -26,18 +27,20 @@ pub fn source_pictures(source: &Path) -> Vec<Picture> {
 	unique
 }
 
-pub fn add_pictures(opus: &Path, pictures: Vec<Picture>) -> Result<(), Box<dyn Error + Send + Sync>> {
+/// Writes `pictures` into an Ogg Opus or Vorbis file as `METADATA_BLOCK_PICTURE` comments.
+pub fn add_pictures(ogg: &Path, pictures: Vec<Picture>) -> Result<(), Box<dyn Error + Send + Sync>> {
 	if pictures.is_empty() {
 		return Ok(());
 	}
 
-	let mut file = OpusFile::read_from(&mut File::open(opus)?, ParseOptions::new().read_properties(false))?;
-	for picture in pictures {
-		file.vorbis_comments_mut().insert_picture(picture, None)?;
-	}
-
-	file.save_to_path(opus, WriteOptions::default())?;
-	Ok(())
+	tags::edit_comments(ogg, |comments| {
+		let added = pictures.len();
+		for picture in pictures {
+			comments.insert_picture(picture, None)?;
+		}
+		Ok(added)
+	})
+	.map(drop)
 }
 
 fn read_tags(source: &Path) -> Result<TaggedFile, Box<dyn Error + Send + Sync>> {

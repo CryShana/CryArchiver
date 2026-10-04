@@ -820,6 +820,10 @@ async fn produce_animation(
 		return Err(ErrorKind::EncodeFailed(ANIMATED_JXL.into()).into());
 	}
 
+	if !cx.caps.libaom {
+		return Err(ErrorKind::Toolchain(animated::NEEDS_LIBAOM.into()).into());
+	}
+
 	let shown = (f64::from(timeline.width), f64::from(timeline.height));
 	let size = cx
 		.resize
@@ -858,7 +862,7 @@ pub async fn encode_animation(
 
 	(cx.on_event)(JobEvent::Stage(Stage::Encode));
 	let output = workspace.file("out.avif");
-	let cmd = animated::encode_command(&cx.tools.ffmpeg, frames, &output, animation, settings);
+	let cmd = animated::encode_command(&cx.tools.ffmpeg, frames, &output, animation, settings, cx.threads);
 	let total = f64::from(animation.timeline.frames);
 	run_ffmpeg(
 		&cmd,

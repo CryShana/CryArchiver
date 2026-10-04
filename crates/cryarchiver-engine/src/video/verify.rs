@@ -604,24 +604,7 @@ pub async fn alpha_ssim(
 	video: &VideoPlan,
 	cancel: &CancellationToken,
 ) -> Result<f64, JobError> {
-	let mut cmd = ToolCommand::new(&tools.ffmpeg, STALL_TIMEOUT);
-	cmd.args(["-hide_banner", "-nostdin", "-c:v", "libvpx-vp9", "-i"])
-		.arg(process::tool_path(output));
-	if let Some(window) = video.window {
-		cmd.seek(window.start_s, window.length_s);
-	}
-	if let Some(decoder) = video.decoder {
-		cmd.arg("-c:v").arg(decoder);
-	}
-	cmd.arg("-i")
-		.arg(process::tool_path(source))
-		.arg("-filter_complex")
-		.arg(format!(
-			"[0:v:0]alphaextract,format=gray[o];[1:{}]{},alphaextract,format=gray[s];[o][s]ssim",
-			video.streams[0],
-			burn::chained(&[&video.shape, &video.filters])
-		));
-	cmd.args(["-f", "null", "-"]);
+	let cmd = alpha_ssim_command(&tools.ffmpeg, output, source, video);
 
 	let out = run_ffmpeg(&cmd, |_| {}, cancel).await?;
 	parse_ssim(&out.stderr_tail).ok_or_else(|| {
@@ -630,6 +613,33 @@ pub async fn alpha_ssim(
 			out.stderr_tail,
 		)
 	})
+}
+
+pub fn alpha_ssim_command(ffmpeg: &Path, output: &Path, source: &Path, video: &VideoPlan) -> ToolCommand {
+	let threads = video.threads.map(|threads| threads.tool);
+
+	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
+	cmd.args(["-hide_banner", "-nostdin", "-c:v", "libvpx-vp9"])
+		.threads(threads)
+		.arg("-i")
+		.arg(process::tool_path(output));
+	if let Some(window) = video.window {
+		cmd.seek(window.start_s, window.length_s);
+	}
+	if let Some(decoder) = video.decoder {
+		cmd.arg("-c:v").arg(decoder);
+	}
+	cmd.threads(threads)
+		.arg("-i")
+		.arg(process::tool_path(source))
+		.arg("-filter_complex")
+		.arg(format!(
+			"[0:v:0]alphaextract,format=gray[o];[1:{}]{},alphaextract,format=gray[s];[o][s]ssim",
+			video.streams[0],
+			burn::chained(&[&video.shape, &video.filters])
+		));
+	cmd.args(["-f", "null", "-"]);
+	cmd
 }
 
 pub fn check_alpha(ssim: f64) -> Result<(), JobError> {
@@ -760,6 +770,35 @@ mod tests {
 			hdr10,
 			..test_plan()
 		}
+	}
+
+	#[test]
+	fn the_alpha_check_decodes_both_files_on_the_thread_budget() {
+		let budgeted = VideoPlan {
+			threads: Some(crate::video::plan::Threads { tool: 2, svt_lp: 1 }),
+			..plan(true, false)
+		};
+
+		let args = crate::video::joined(&alpha_ssim_command(
+			Path::new("ffmpeg"),
+			Path::new("video.webm"),
+			Path::new("in.webm"),
+			&budgeted,
+		));
+		let free = crate::video::joined(&alpha_ssim_command(
+			Path::new("ffmpeg"),
+			Path::new("video.webm"),
+			Path::new("in.webm"),
+			&plan(true, false),
+		));
+
+		assert_eq!(
+			args.matches(" -threads 2 -filter_threads 2 -filter_complex_threads 2 -i ")
+				.count(),
+			2,
+			"{args}"
+		);
+		assert!(!free.contains("-threads"), "{free}");
 	}
 
 	fn output(video: &str, extra: &str) -> MediaInfo {

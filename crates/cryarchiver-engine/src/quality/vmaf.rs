@@ -54,7 +54,10 @@ pub struct Reference<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Scoring<'a> {
 	pub model: &'static str,
+	/// libvmaf's threads.
 	pub threads: usize,
+	/// The job's thread budget for the decoders and the filters, when it has one.
+	pub budget: Option<usize>,
 	pub dir: &'a Path,
 	pub log: &'a str,
 }
@@ -193,7 +196,7 @@ pub fn seeked_window_command(
 	cmd.in_dir(scoring.dir);
 	cmd.args(["-hide_banner", "-nostdin", "-seek_timestamp", "1"]);
 	cmd.seek(window.distorted_s, window.length_s);
-	cmd.arg("-i").arg(process::tool_path(distorted));
+	cmd.threads(scoring.budget).arg("-i").arg(process::tool_path(distorted));
 
 	let cut = reference.start.seek(window.source_s, window.length_s);
 	cmd.seek(cut.input_s, cut.input_length_s);
@@ -238,7 +241,9 @@ pub async fn frames(
 fn base(ffmpeg: &Path, distorted: &Path, scoring: &Scoring<'_>) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	cmd.in_dir(scoring.dir);
-	cmd.args(["-hide_banner", "-nostdin", "-i"])
+	cmd.args(["-hide_banner", "-nostdin"])
+		.threads(scoring.budget)
+		.arg("-i")
 		.arg(process::tool_path(distorted));
 	cmd
 }
@@ -250,7 +255,9 @@ fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Sc
 	if let Some(decoder) = reference.decoder {
 		cmd.arg("-c:v").arg(decoder);
 	}
-	cmd.arg("-i").arg(process::tool_path(reference.source));
+	cmd.threads(scoring.budget)
+		.arg("-i")
+		.arg(process::tool_path(reference.source));
 
 	if let Some(overlay) = reference.overlay {
 		cmd.args(overlay.input_args())
@@ -310,9 +317,66 @@ mod tests {
 		Scoring {
 			model: HD_MODEL,
 			threads: 8,
+			budget: None,
 			dir: Path::new("work"),
 			log: "vmaf-probe0-1.json",
 		}
+	}
+
+	#[test]
+	fn both_files_are_decoded_on_the_thread_budget() {
+		let reference = Reference {
+			source: Path::new("in.mkv"),
+			stream: 0,
+			decoder: Some("libvpx-vp9"),
+			shape: "",
+			filters: "format=yuv420p10le",
+			window: None,
+			start: InputStart::default(),
+			overlay: None,
+			subtitles: None,
+		};
+		let budgeted = Scoring {
+			budget: Some(3),
+			..scoring()
+		};
+		let window = SeekedWindow {
+			distorted_s: 10.0,
+			source_s: 10.0,
+			length_s: 4.0,
+			skipped: 0,
+			frames: 100,
+		};
+		let ffmpeg = Path::new("ffmpeg");
+		let distorted = Path::new("video.a1.mkv");
+
+		let commands = [
+			sample_command(ffmpeg, distorted, &reference, 12.5, 4.0, &budgeted),
+			window_command(
+				ffmpeg,
+				distorted,
+				&reference,
+				&[FrameWindow { first: 0, last: 9 }],
+				&budgeted,
+			),
+			seeked_window_command(ffmpeg, distorted, window, &reference, &budgeted),
+		];
+		let free = joined(&sample_command(ffmpeg, distorted, &reference, 12.5, 4.0, &scoring()));
+
+		for cmd in &commands {
+			let args = joined(cmd);
+			assert_eq!(
+				args.matches(" -threads 3 -filter_threads 3 -filter_complex_threads 3 -i ")
+					.count(),
+				2,
+				"{args}"
+			);
+			assert!(
+				args.contains("libvmaf=model=version=vmaf_v0.6.1:n_threads=8:"),
+				"{args}"
+			);
+		}
+		assert!(!free.contains("-threads"), "{free}");
 	}
 
 	#[test]

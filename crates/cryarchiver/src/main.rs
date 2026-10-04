@@ -787,6 +787,11 @@ async fn compress(args: CompressArgs) -> u8 {
 		return 2;
 	}
 
+	if let Some(problem) = tools.video_encoder_problem(args.video_encoder) {
+		eprintln!("error: {problem}");
+		return 2;
+	}
+
 	for line in tools.report().iter().filter(|line| line.status == Status::Missing) {
 		let kinds: Vec<String> = line.needed_for.iter().map(ToString::to_string).collect();
 		eprintln!(

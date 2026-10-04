@@ -99,10 +99,7 @@ async fn mux_combines_temps_source_streams_and_attachments() {
 		noise_sigma: None,
 		detail: Vec::new(),
 	};
-	let caps = VideoCaps {
-		vp9_alpha: false,
-		libaom: false,
-	};
+	let caps = VideoCaps { vp9_alpha: false };
 	let main = precheck(&info, &caps).unwrap();
 	let video = plan_video(&info, main, &[], &analysis, Speed::Fast, None);
 

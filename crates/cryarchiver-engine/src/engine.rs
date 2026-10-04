@@ -26,9 +26,7 @@ use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput,
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{
-	JobOptions, Resize, TrimWindow, VideoEncoderChoice, kept_as_requested, kept_as_requested_part, upscaled,
-};
+use crate::options::{JobOptions, Resize, TrimWindow, kept_as_requested, kept_as_requested_part, upscaled};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -47,7 +45,7 @@ use crate::video::plan::{
 	self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, threads_for, usable_main,
 };
 use crate::video::quality::{
-	self as video_quality, Aim, GrainChoice, MAX_RETRIES, Scorer, SearchStep, Searched, Strategy,
+	self as video_quality, Aim, GrainChoice, MAX_RETRIES, Scorer, SearchStep, Searched, Strategy, with_cap_note,
 };
 use crate::video::streams::{CueFormat, Extracted, StreamPlan, StreamRules, plan_streams};
 use crate::video::verify::{
@@ -510,9 +508,12 @@ impl Engine {
 				let planned = self
 					.video_main(&info, job)
 					.map_err(Refusal::from)
-					.and_then(|_| plan_streams(&info, &rules));
+					.and_then(|main| plan_streams(&info, &rules).map(|_| main));
 				match planned {
-					Ok(_) => Planned::Video(rules),
+					Ok(main) => {
+						self.check_libaom(job, main)?;
+						Planned::Video(rules)
+					}
 					Err(Refusal::Keep(reason)) => return Ok(JobOutcome::KeptOriginal { reason }),
 					Err(Refusal::Impossible(reason)) => return Err(ErrorKind::EncodeFailed(reason).into()),
 				}
@@ -699,15 +700,30 @@ impl Engine {
 	fn video_caps(&self) -> VideoCaps {
 		VideoCaps {
 			vp9_alpha: self.tools.vp9_alpha,
-			libaom: self.tools.has_libaom(),
 		}
 	}
 
 	fn video_main<'a>(&self, info: &'a MediaInfo, job: &Job) -> Result<&'a Stream, KeepReason> {
 		if job.options.forced_video(mergeable(info)) {
-			usable_main(info, &self.video_caps(), job.options.resize)
+			usable_main(info, &self.video_caps())
 		} else {
 			precheck(info, &self.video_caps())
+		}
+	}
+
+	/// Refuses a video that needs libaom-av1 when this ffmpeg lacks it, before anything is decoded.
+	fn check_libaom(&self, job: &Job, main: &Stream) -> Result<(), JobError> {
+		let choice = job.options.advanced.video_encoder;
+		if let Some(problem) = self.tools.video_encoder_problem(choice) {
+			return Err(ErrorKind::Toolchain(problem.into()).into());
+		}
+
+		match video_plan::beyond_svt(main, job.options.resize) {
+			Some((width, height)) if choice.is_none() && !self.tools.has_libaom() => Err(ErrorKind::Toolchain(
+				format!("{width}×{height} is larger than SVT-AV1 supports and needs ffmpeg with libaom-av1"),
+			)
+			.into()),
+			_ => Ok(()),
 		}
 	}
 
@@ -741,18 +757,22 @@ impl Engine {
 			&cx.job.source,
 			main,
 			(span.declared_s, span.window),
-			segments,
+			(segments, self.tool_threads(cx.job)),
 			&on_segments,
 			cx.cancel,
 		))
 		.await
 	}
 
+	/// The thread budget of the tools a video job starts, when the engine or the job sets one.
+	fn tool_threads(&self, job: &Job) -> Option<usize> {
+		let cores = std::thread::available_parallelism().map_or(1, usize::from);
+		(self.video_threads.is_some() || job.options.threads.is_some()).then(|| self.job_threads(job, cores))
+	}
+
 	fn budget_threads(&self, job: &Job, video: &mut VideoPlan) {
 		let cores = std::thread::available_parallelism().map_or(1, usize::from);
-		if self.video_threads.is_some() || job.options.threads.is_some() {
-			video.threads = Some(threads_for(self.job_threads(job, cores), cores));
-		}
+		video.threads = self.tool_threads(job).map(|threads| threads_for(threads, cores));
 	}
 
 	/// Sets the trim window and the frame count the encode must give: none under a trim, and otherwise the
@@ -926,9 +946,6 @@ impl Engine {
 		self.budget_threads(cx.job, &mut video);
 
 		if let Some(choice) = cx.job.options.advanced.video_encoder {
-			if choice == VideoEncoderChoice::Aom && !self.tools.has_libaom() {
-				return Err(ErrorKind::EncodeFailed("--video-encoder aom needs ffmpeg with libaom-av1".into()).into());
-			}
 			video_plan::force_encoder(&mut video, choice, cx.job.speed).map_err(ErrorKind::EncodeFailed)?;
 		}
 
@@ -1087,7 +1104,7 @@ impl Engine {
 
 		self.require(MediaKind::Image)?;
 		if !self.tools.has_libaom() {
-			return Err(ErrorKind::Toolchain("an animated AVIF needs ffmpeg with libaom-av1".into()).into());
+			return Err(ErrorKind::Toolchain(animated::NEEDS_LIBAOM.into()).into());
 		}
 
 		Ok(())
@@ -1548,6 +1565,7 @@ impl Engine {
 					searched,
 					plain,
 					quality.target,
+					video.max_bitrate_kbps,
 				));
 				video.encoder = plain_video.encoder;
 				quality.target = plain_target;
@@ -2609,13 +2627,6 @@ fn short_note(reason: &str, cap_kbps: Option<u32>) -> String {
 		"{}; it was written because it was requested",
 		with_cap_note(reason, cap_kbps)
 	)
-}
-
-fn with_cap_note(reason: &str, cap_kbps: Option<u32>) -> String {
-	match cap_kbps {
-		Some(kbps) => format!("{reason} under the {} Mbit/s cap", f64::from(kbps) / 1000.0),
-		None => reason.to_owned(),
-	}
 }
 
 #[allow(clippy::cast_precision_loss)]

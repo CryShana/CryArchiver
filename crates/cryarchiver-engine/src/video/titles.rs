@@ -8,7 +8,10 @@ use crate::probe::Stream;
 /// `DTS`. Parts may be joined by one separator or none (`E-AC-3`, `EAC3`). Atmos rides on E-AC-3 and `TrueHD`, and
 /// `DTS:X` on DTS: the Opus output carries neither, so they are codec words of those codecs.
 const FAMILIES: &[(&[&str], &[&[&str]])] = &[
-	(&["aac"], &[&["AAC"]]),
+	(
+		&["aac"],
+		&[&["HE", "AAC", "v2"], &["HE", "AAC"], &["AAC", "LC"], &["AAC"]],
+	),
 	(&["ac3"], &[&["Dolby", "Digital"], &["AC", "3"], &["DD"]]),
 	(
 		&["eac3"],
@@ -26,6 +29,7 @@ const FAMILIES: &[(&[&str], &[&[&str]])] = &[
 		&[
 			&["DTS", "HD", "Master", "Audio"],
 			&["DTS", "HD", "MA"],
+			&["DTS", "HD", "HRA"],
 			&["DTS", "HD"],
 			&["DTS:X"],
 			&["DTS", "ES"],
@@ -43,6 +47,7 @@ const FAMILIES: &[(&[&str], &[&[&str]])] = &[
 const PCM_WORDS: &[&[&str]] = &[&["LPCM"], &["PCM"]];
 const CHANNEL_WORDS: &[&str] = &["2.0", "5.1", "7.1"];
 const SEPARATORS: &[char] = &[' ', '.', '-', '_'];
+const JOINERS: &[char] = &[',', '/', '+', '&'];
 
 /// What the track was and what it becomes.
 #[derive(Debug, Clone, Copy)]
@@ -91,7 +96,7 @@ pub fn retitle(title: &str, encode: Encode<'_>) -> Option<String> {
 		let between = &title[last..word.start];
 		last = word.end;
 		if is_codec && named {
-			retitled.push_str(between.strip_suffix(SEPARATORS).unwrap_or(between));
+			retitled.push_str(without_joiner(between));
 			continue;
 		}
 
@@ -151,16 +156,28 @@ fn codec_words(codec: &str) -> &'static [&'static [&'static str]] {
 		.map_or(&[], |(_, words)| words)
 }
 
-fn continues_word(byte: u8) -> bool {
-	byte.is_ascii_alphanumeric() || byte == b'+'
+/// The text before a codec word that is removed, less what joined that word to the one before: a separator, or a
+/// comma, slash, plus or ampersand with the spaces around it.
+fn without_joiner(between: &str) -> &str {
+	let trimmed = between.trim_end_matches(' ');
+	match trimmed.strip_suffix(JOINERS) {
+		Some(rest) => rest.trim_end_matches(' '),
+		None => between.strip_suffix(SEPARATORS).unwrap_or(between),
+	}
 }
 
-/// Where a codec word from `forms` that starts at `at` ends. It must be a whole word, though channels may follow it
-/// directly (`DDP5.1`).
+fn continues_word(c: char) -> bool {
+	c.is_alphanumeric() || c == '+'
+}
+
+/// Where a codec word from `forms` that starts at `at` ends. It must be a whole word, not glued by a hyphen to a word
+/// before it (`xHE-AAC`), though channels may follow it directly (`DDP5.1`).
 fn codec_word_end(title: &str, at: usize, forms: &[&[&str]]) -> Option<usize> {
-	let bytes = title.as_bytes();
-	if at > 0 && continues_word(bytes[at - 1]) {
-		return None;
+	let mut before = title[..at].chars().rev();
+	match before.next() {
+		Some(c) if continues_word(c) => return None,
+		Some('-') if before.next().is_some_and(char::is_alphabetic) => return None,
+		_ => {}
 	}
 
 	forms.iter().find_map(|parts| {
@@ -175,7 +192,7 @@ fn codec_word_end(title: &str, at: usize, forms: &[&[&str]]) -> Option<usize> {
 			end += part.len();
 		}
 
-		let whole = bytes.get(end).is_none_or(|next| !continues_word(*next));
+		let whole = title[end..].chars().next().is_none_or(|next| !continues_word(next));
 		(whole || channel_word_end(title, end, true).is_some()).then_some(end)
 	})
 }
@@ -185,14 +202,15 @@ fn codec_word_end(title: &str, at: usize, forms: &[&[&str]]) -> Option<usize> {
 fn channel_word_end(title: &str, at: usize, after_codec: bool) -> Option<usize> {
 	let bytes = title.as_bytes();
 	let word = CHANNEL_WORDS.iter().find(|word| title[at..].starts_with(**word))?;
-	if at > 0 && !after_codec && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'.') {
+	let before = title[..at].chars().next_back();
+	if !after_codec && before.is_some_and(|c| c.is_alphanumeric() || c == '.') {
 		return None;
 	}
 
 	let end = at + word.len();
 	let digit = |index: usize| bytes.get(index).is_some_and(u8::is_ascii_digit);
-	let continues =
-		bytes.get(end).is_some_and(u8::is_ascii_alphanumeric) || (bytes.get(end) == Some(&b'.') && digit(end + 1));
+	let continues = title[end..].chars().next().is_some_and(char::is_alphanumeric)
+		|| (bytes.get(end) == Some(&b'.') && digit(end + 1));
 	(!continues).then_some(end)
 }
 
@@ -244,6 +262,59 @@ mod tests {
 		assert_eq!(
 			retitle("PCM 2.0", encode("pcm_s24le", "2.0", "2.0")).as_deref(),
 			Some("Opus 2.0")
+		);
+	}
+
+	#[test]
+	fn a_codec_word_with_its_profile_is_rewritten_whole() {
+		let aac = encode("aac", "2.0", "2.0");
+
+		assert_eq!(retitle("HE-AAC 2.0", aac).as_deref(), Some("Opus 2.0"));
+		assert_eq!(retitle("English HE-AACv2", aac).as_deref(), Some("English Opus"));
+		assert_eq!(retitle("AAC-LC", aac).as_deref(), Some("Opus"));
+		assert_eq!(
+			retitle("DTS-HD HRA 7.1", encode("dts", "7.1", "7.1")).as_deref(),
+			Some("Opus 7.1")
+		);
+	}
+
+	#[test]
+	fn a_codec_word_glued_to_another_word_by_a_hyphen_is_left_alone() {
+		assert_eq!(retitle("E-AC-3 5.1", encode("ac3", "5.1", "5.1")), None);
+		assert_eq!(retitle("XHE-AAC", encode("aac", "2.0", "2.0")), None);
+		assert_eq!(
+			retitle("x264-AAC", encode("aac", "2.0", "2.0")).as_deref(),
+			Some("x264-Opus")
+		);
+	}
+
+	#[test]
+	fn a_removed_codec_word_takes_what_joined_it_along() {
+		assert_eq!(
+			retitle("Commentary (E-AC-3, Atmos)", encode("eac3", "2.0", "2.0")).as_deref(),
+			Some("Commentary (Opus)")
+		);
+		assert_eq!(
+			retitle("English DTS-HD MA / DTS:X 7.1", encode("dts", "7.1", "7.1")).as_deref(),
+			Some("English Opus 7.1")
+		);
+		assert_eq!(
+			retitle("TrueHD + Atmos", encode("truehd", "7.1", "7.1")).as_deref(),
+			Some("Opus")
+		);
+	}
+
+	#[test]
+	fn letters_beyond_ascii_continue_a_word() {
+		let aac = encode("aac", "2.0", "2.0");
+
+		assert_eq!(retitle("AACé", aac), None);
+		assert_eq!(retitle("éAAC", aac), None);
+		assert_eq!(retitle("Ä5.1", encode("aac", "5.1", "2.0")), None);
+		assert_eq!(retitle("日本語 2.0 AAC", aac).as_deref(), Some("日本語 2.0 Opus"));
+		assert_eq!(
+			retitle("Русский 5.1 AAC", encode("aac", "5.1", "2.0")).as_deref(),
+			Some("Русский 2.0 Opus")
 		);
 	}
 
