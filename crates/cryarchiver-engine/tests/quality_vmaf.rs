@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::outcome::ErrorKind;
 use cryarchiver_engine::process::{STALL_TIMEOUT, ToolCommand};
-use cryarchiver_engine::quality::vmaf::{
-	FrameWindow, Reference, Scoring, frames, pool, sample_command, window_command,
-};
+use cryarchiver_engine::quality::vmaf::{Reference, Scoring, frames, pool, sample_command, whole_command};
 use cryarchiver_engine::video::InputStart;
 use tokio_util::sync::CancellationToken;
 
@@ -86,7 +84,7 @@ async fn a_sample_cut_like_the_reference_scores_near_the_top() {
 }
 
 #[tokio::test]
-async fn windows_pair_frames_by_position_and_pace_the_progress() {
+async fn the_whole_check_pairs_frames_by_position_scores_every_nth_and_reports_every_frame() {
 	let dir = tempfile::tempdir().unwrap();
 	let ffmpeg = support::toolchain().await.ffmpeg;
 	let source = support::mpeg4(dir.path(), "clip.mp4", 4);
@@ -97,12 +95,11 @@ async fn windows_pair_frames_by_position_and_pace_the_progress() {
 		&[],
 		"trim=start_frame=1,setpts=PTS-STARTPTS",
 	);
-	let windows = [FrameWindow { first: 5, last: 14 }, FrameWindow { first: 60, last: 69 }];
 	let cancel = CancellationToken::new();
 
 	let mut paced = 0;
 	let copy_scoring = scoring(dir.path(), "copy.json");
-	let copy_cmd = window_command(&ffmpeg, &copy, &reference(&source), &windows, &copy_scoring);
+	let copy_cmd = whole_command(&ffmpeg, &copy, &reference(&source), 3, &copy_scoring);
 	let copy_frames = frames(
 		&copy_cmd,
 		&copy_scoring,
@@ -113,11 +110,11 @@ async fn windows_pair_frames_by_position_and_pace_the_progress() {
 	.unwrap();
 	let same = pool(&copy_frames).unwrap();
 	let shifted_scoring = scoring(dir.path(), "shifted.json");
-	let shifted_cmd = window_command(&ffmpeg, &shifted, &reference(&source), &windows, &shifted_scoring);
+	let shifted_cmd = whole_command(&ffmpeg, &shifted, &reference(&source), 3, &shifted_scoring);
 	let off_by_one = pool(&frames(&shifted_cmd, &shifted_scoring, |_| {}, &cancel).await.unwrap()).unwrap();
 
 	assert!(same.mean > 99.0, "{same:?}");
-	assert_eq!(same.frames, 20);
+	assert_eq!(same.frames, 34, "frames 0, 3, 6 … 99");
 	assert_eq!(paced, 100);
 	assert!(off_by_one.mean < same.mean - 5.0, "{off_by_one:?} vs {same:?}");
 }

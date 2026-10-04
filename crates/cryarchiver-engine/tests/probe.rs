@@ -64,7 +64,10 @@ async fn video_probe_counts_packets_and_reads_rotation_and_chapters() {
 	let tools = support::toolchain().await;
 
 	let bytes = std::fs::metadata(&rotated).unwrap().len();
-	let (info, json) = probe_video(&tools, &rotated, bytes, &CancellationToken::new())
+	let (info, json) = probe_video(&tools, &rotated, bytes, true, &CancellationToken::new())
+		.await
+		.unwrap();
+	let (uncounted, uncounted_json) = probe_video(&tools, &rotated, bytes, false, &CancellationToken::new())
 		.await
 		.unwrap();
 
@@ -73,6 +76,11 @@ async fn video_probe_counts_packets_and_reads_rotation_and_chapters() {
 	assert_eq!(video.rotation(), 90);
 	assert!((video.fps().unwrap() - 25.0).abs() < 0.01);
 	assert!(String::from_utf8_lossy(&json).contains("\"nb_read_packets\""));
+
+	let video = uncounted.streams.iter().find(|stream| stream.is_real_video()).unwrap();
+	assert_eq!(video.nb_read_packets, None, "a trim reads only its window");
+	assert_eq!((video.rotation(), video.fps()), (90, info.streams[0].fps()));
+	assert!(!String::from_utf8_lossy(&uncounted_json).contains("\"nb_read_packets\""));
 }
 
 #[tokio::test]

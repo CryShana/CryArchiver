@@ -325,6 +325,7 @@ fn built_in_dictionary() -> Vec<u8> {
 		crf: 30.0,
 		mean: 93.0,
 		p5: 89.0,
+		without_grain: false,
 	};
 	let decision = Decision {
 		video: Some(VideoDecision {
@@ -2382,6 +2383,7 @@ pub(crate) mod tests {
 					crf,
 					mean: 93.1,
 					p5: 87.2,
+					..Measured::default()
 				}],
 				..VideoDecision::default()
 			}),

@@ -270,10 +270,13 @@ pub async fn probe(tools: &Toolchain, path: &Path, cancel: &CancellationToken) -
 	Ok(info)
 }
 
+/// The video's streams, and with `count_packets` how many packets each holds (`nb_read_packets`), which reads the whole
+/// file.
 pub async fn probe_video(
 	tools: &Toolchain,
 	path: &Path,
 	source_bytes: u64,
+	count_packets: bool,
 	cancel: &CancellationToken,
 ) -> Result<(MediaInfo, Vec<u8>), ProbeError> {
 	let mut cmd = ToolCommand::new(&tools.ffprobe, process::scaled_timeout(source_bytes));
@@ -287,10 +290,11 @@ pub async fn probe_video(
 		"-show_streams",
 		"-show_chapters",
 		"-show_programs",
-		"-count_packets",
-		"-i",
-	])
-	.arg(process::tool_path(path));
+	]);
+	if count_packets {
+		cmd.arg("-count_packets");
+	}
+	cmd.arg("-i").arg(process::tool_path(path));
 
 	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
 	if !out.status.success() {
@@ -342,7 +346,8 @@ pub async fn first_frames(
 
 /// Whether an AV1 stream's first frame header carries film grain parameters, read from the bitstream rather than from
 /// the decoder: libaom-av1 applies the grain without exporting it. The trace shows `apply_grain` only when the
-/// sequence header sets `film_grain_params_present`.
+/// sequence header sets `film_grain_params_present`. A crashed probe counts as grain, so that grain is never added on
+/// top of grain the source may already carry.
 pub async fn av1_film_grain(
 	tools: &Toolchain,
 	path: &Path,
@@ -369,8 +374,14 @@ pub async fn av1_film_grain(
 
 	match process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await {
 		Ok(out) => Ok(out.status.success() && out.counted_lines > 0),
-		Err(RunError::Crashed { .. }) => Ok(false),
-		Err(err) => Err(err.into()),
+		Err(err) => grain_after_failure(err),
+	}
+}
+
+fn grain_after_failure(err: RunError) -> Result<bool, ProbeError> {
+	match err {
+		RunError::Crashed { .. } => Ok(true),
+		err => Err(err.into()),
 	}
 }
 
@@ -389,6 +400,29 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(windows)]
+	fn crashed_status() -> std::process::ExitStatus {
+		std::os::windows::process::ExitStatusExt::from_raw(0xC000_0005)
+	}
+
+	#[cfg(unix)]
+	fn crashed_status() -> std::process::ExitStatus {
+		std::os::unix::process::ExitStatusExt::from_raw(11)
+	}
+
+	#[test]
+	fn a_grain_probe_that_crashed_counts_as_grain() {
+		let crashed = RunError::Crashed {
+			tool: "ffmpeg".into(),
+			description: "access violation".into(),
+			status: crashed_status(),
+			stderr_tail: Vec::new(),
+		};
+
+		assert!(matches!(grain_after_failure(crashed), Ok(true)));
+		assert!(grain_after_failure(RunError::Cancelled).is_err());
+	}
 
 	const MP3_WITH_COVER: &str = r#"{
 		"streams": [

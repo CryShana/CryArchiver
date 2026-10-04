@@ -51,6 +51,8 @@ pub struct Measured {
 	pub crf: f64,
 	pub mean: f64,
 	pub p5: f64,
+	/// A probe of the second search pass, the one without the planned film grain.
+	pub without_grain: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +113,8 @@ pub struct VideoDecision {
 	/// The full check of each encode, in order.
 	pub checks: Vec<Measured>,
 	pub reencode: Option<Reencode>,
-	/// The last check missed the target by at most half a point, and the encode was written anyway.
+	/// A full check missed the target by at most half a point, and the encode was written as it was, without
+	/// encoding it again.
 	pub near_miss: bool,
 	/// The film grain level planned for the video.
 	pub grain: Option<u8>,
@@ -179,7 +182,21 @@ impl Measured {
 			crf,
 			mean: score.mean,
 			p5: score.p5,
+			without_grain: false,
 		}
+	}
+}
+
+impl VideoDecision {
+	/// The probes of the search pass whose result was encoded, and how many the other pass ran.
+	pub fn chosen_probes(&self) -> (usize, usize) {
+		let plain_chosen = self.grain_dropped && self.probes.iter().any(|probe| probe.without_grain);
+		let chosen = self
+			.probes
+			.iter()
+			.filter(|probe| probe.without_grain == plain_chosen)
+			.count();
+		(chosen, self.probes.len() - chosen)
 	}
 }
 
@@ -279,6 +296,23 @@ impl Recorder {
 		self.update(|decision| change(decision.video.get_or_insert_default()));
 	}
 
+	pub(crate) fn probe_count(&self) -> usize {
+		self.lock()
+			.decision
+			.video
+			.as_ref()
+			.map_or(0, |video| video.probes.len())
+	}
+
+	/// Tags the probes recorded from `first` on as the search pass without film grain.
+	pub(crate) fn tag_without_grain(&self, first: usize) {
+		self.video(|video| {
+			for probe in video.probes.iter_mut().skip(first) {
+				probe.without_grain = true;
+			}
+		});
+	}
+
 	/// The record so far, the current stage timed up to now.
 	pub(crate) fn snapshot(&self) -> Decision {
 		let mut state = self.lock();
@@ -308,11 +342,13 @@ mod tests {
 			crf: 38.0,
 			mean: 90.04,
 			p5: 85.0,
+			..Measured::default()
 		});
 		video.checks.push(Measured {
 			crf: 36.75,
 			mean: 93.06,
 			p5: 87.24,
+			..Measured::default()
 		});
 		assert_eq!(decision.crf_and_score().as_deref(), Some("CRF 36.75, VMAF 93.1 / 87.2"));
 		assert_eq!(Decision::default().crf_and_score(), None);
@@ -344,9 +380,42 @@ mod tests {
 			[Measured {
 				crf: 30.0,
 				mean: 94.0,
-				p5: 90.0
+				p5: 90.0,
+				without_grain: false,
 			}]
 		);
+	}
+
+	#[test]
+	fn only_the_probes_of_the_pass_that_was_encoded_count_as_its_search() {
+		let probe = |without_grain: bool| Measured {
+			without_grain,
+			..Measured::default()
+		};
+		let searched = |grain_dropped: bool, probes: Vec<Measured>| VideoDecision {
+			probes,
+			grain_dropped,
+			..VideoDecision::default()
+		};
+		let both = vec![probe(false), probe(false), probe(false), probe(true), probe(true)];
+
+		assert_eq!(searched(false, both.clone()).chosen_probes(), (3, 2));
+		assert_eq!(searched(true, both).chosen_probes(), (2, 3));
+		assert_eq!(
+			searched(true, vec![probe(false); 4]).chosen_probes(),
+			(4, 0),
+			"grain learned away: one pass, without grain"
+		);
+		assert_eq!(searched(false, Vec::new()).chosen_probes(), (0, 0));
+	}
+
+	#[test]
+	fn a_record_without_pass_tags_reads_its_probes_as_the_first_pass() {
+		let bytes = br#"{"crf":30.0,"mean":94.0,"p5":90.0}"#;
+
+		let probe: Measured = serde_json::from_slice(bytes).unwrap();
+
+		assert!(!probe.without_grain);
 	}
 
 	#[test]

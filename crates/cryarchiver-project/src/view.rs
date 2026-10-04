@@ -358,10 +358,15 @@ fn video_lines(video: &VideoDecision, lines: &mut Vec<DecisionLine>) {
 	}
 
 	if let Some(crf) = video.crf {
-		let probes = match video.probes.len() {
+		let (chosen, other) = video.chosen_probes();
+		let mut probes = match chosen {
 			1 => "1 probe".to_owned(),
 			count => format!("{count} probes"),
 		};
+		if other > 0 {
+			let pass = if video.grain_dropped { "with" } else { "without" };
+			let _ = write!(probes, "; {other} more {pass} film grain");
+		}
 		let mut how = match video.chosen {
 			Some(CrfChoice::Searched) => format!("searched, {probes}"),
 			Some(CrfChoice::LearnedSearchedAgain) => format!("learned, searched again, {probes}"),
@@ -522,11 +527,13 @@ mod tests {
 						crf: 38.0,
 						mean: 90.04,
 						p5: 85.0,
+						..Measured::default()
 					},
 					Measured {
 						crf: 36.75,
 						mean: 93.06,
 						p5: 87.24,
+						..Measured::default()
 					},
 				],
 				reencode: Some(Reencode {
@@ -609,6 +616,34 @@ mod tests {
 		let mut one_probe = video(CrfChoice::Searched, false, false);
 		one_probe.video.as_mut().unwrap().probes.push(Measured::default());
 		assert_eq!(decision_lines(&one_probe)[1].value, "30 (searched, 1 probe)");
+	}
+
+	#[test]
+	fn a_search_in_two_passes_counts_the_probes_of_the_pass_it_kept() {
+		let plain = Measured {
+			without_grain: true,
+			..Measured::default()
+		};
+		let two_passes = |grain_dropped| Decision {
+			video: Some(VideoDecision {
+				crf: Some(30.0),
+				chosen: Some(CrfChoice::Searched),
+				grain: Some(8),
+				grain_dropped,
+				probes: [vec![Measured::default(); 3], vec![plain; 2]].concat(),
+				..VideoDecision::default()
+			}),
+			..Decision::default()
+		};
+
+		assert_eq!(
+			decision_lines(&two_passes(false))[0].value,
+			"30 (searched, 3 probes; 2 more without film grain)"
+		);
+		assert_eq!(
+			decision_lines(&two_passes(true))[0].value,
+			"30 (searched, 2 probes; 3 more with film grain)"
+		);
 	}
 
 	#[test]

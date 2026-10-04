@@ -240,6 +240,50 @@ async fn a_trim_keeps_only_its_frames() {
 }
 
 #[tokio::test]
+async fn the_record_tells_what_was_done_to_the_picture_as_for_a_video() {
+	let dir = tempfile::tempdir().unwrap();
+	let cues = dir.path().join("cues.srt");
+	fs::write(&cues, "1\n00:00:01,000 --> 00:00:02,000\nhello\n").unwrap();
+	let source = support::black_clip_of(dir.path(), "talk.mkv", 3, &cues, "srt");
+	let options = JobOptions {
+		trim: Some(Trim {
+			start_s: 0.5,
+			end_s: Some(2.5),
+		}),
+		resize: Some(Resize {
+			width: Some(160),
+			height: None,
+		}),
+		burn_subs: Some(BurnSubs {
+			pick: SubtitlePick::Default,
+			size_percent: 10,
+		}),
+		..JobOptions::default()
+	};
+
+	let (outcome, _) = run(&as_avif(&source, options), dir.path()).await;
+
+	let JobOutcome::Encoded { decision, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	let picture = decision.video.as_ref().expect("the picture facts are recorded");
+	assert_eq!(
+		picture.trim,
+		Some(cryarchiver_engine::decision::Trim {
+			start_s: 0.5,
+			length_s: 2.0
+		})
+	);
+	assert!(picture.resized.is_some_and(|(width, _)| width == 160), "{picture:?}");
+	assert!(picture.burned_subtitles, "{picture:?}");
+	assert_eq!(
+		(picture.scan, picture.deinterlaced),
+		(Some(cryarchiver_engine::decision::Scan::Progressive), false)
+	);
+	assert!(decision.image.is_some(), "{decision:?}");
+}
+
+#[tokio::test]
 async fn a_resize_scales_every_frame_keeping_the_aspect_ratio() {
 	let dir = tempfile::tempdir().unwrap();
 	let source = support::mpeg4(dir.path(), "wide.mp4", 1);

@@ -422,31 +422,6 @@ pub async fn check_frame_times(
 	}
 }
 
-/// The times of the frames of `path`'s first video stream, in order, or `None` when a packet has no time.
-pub async fn output_frame_times(
-	tools: &Toolchain,
-	path: &Path,
-	cancel: &CancellationToken,
-) -> Result<Option<Vec<f64>>, JobError> {
-	let listed = packet_times(
-		tools,
-		(path, "v:0"),
-		("packet=pts_time", None),
-		"the output's frame times can't be listed",
-		cancel,
-	)
-	.await?;
-
-	let mut times = parsed(&listed)
-		.iter()
-		.map(|packet| packet.pts)
-		.collect::<Option<Vec<f64>>>();
-	if let Some(times) = &mut times {
-		times.sort_by(f64::total_cmp);
-	}
-	Ok(times)
-}
-
 /// ffprobe's list of `entries` for `stream`'s packets in `path`, one packet per line.
 async fn packet_times(
 	tools: &Toolchain,

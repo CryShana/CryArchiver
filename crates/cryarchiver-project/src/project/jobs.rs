@@ -204,7 +204,7 @@ impl JobContext {
 
 		let result = match task {
 			Task::Encode(job) => self.encode(&job).await,
-			Task::Copy(reason) => self.copy(reason).await,
+			Task::Copy(reason) => self.copy(reason, None).await,
 			Task::Write {
 				content,
 				made,
@@ -243,23 +243,19 @@ impl JobContext {
 					return Err(self.source_changed().await);
 				}
 
-				self.send(JobMessage::Decided(decision));
-				self.commit(staged, Made::Encoded { extension }).await
+				self.commit(staged, Made::Encoded { extension }, Some(decision)).await
 			}
 			JobOutcome::KeptOriginal { reason } => {
-				if let Some(decision) = announced.into_inner().unwrap_or_else(PoisonError::into_inner) {
-					self.send(JobMessage::Decided(decision));
-				}
-
+				let decision = announced.into_inner().unwrap_or_else(PoisonError::into_inner);
 				self.send(JobMessage::Kept(keep_reason(&reason)));
-				self.copy(CopyReason::KeptOriginal).await
+				self.copy(CopyReason::KeptOriginal, decision).await
 			}
-			JobOutcome::Skipped { .. } => self.copy(CopyReason::NotMedia).await,
+			JobOutcome::Skipped { .. } => self.copy(CopyReason::NotMedia, None).await,
 			JobOutcome::Failed(err) => Err(err),
 		}
 	}
 
-	async fn copy(&self, reason: CopyReason) -> Result<(), JobError> {
+	async fn copy(&self, reason: CopyReason, decided: Option<Box<Decision>>) -> Result<(), JobError> {
 		let destination = self.sink.staged_dir();
 		check_space(&destination, self.size)?;
 		self.prepare_staging().await?;
@@ -278,7 +274,7 @@ impl JobContext {
 			return Err(self.source_changed().await);
 		}
 
-		self.commit(staged, Made::Copied(reason)).await
+		self.commit(staged, Made::Copied(reason), decided).await
 	}
 
 	async fn write(&self, content: Vec<u8>, made: Made, same_file: Option<SameFile>) -> Result<(), JobError> {
@@ -325,7 +321,7 @@ impl JobContext {
 			}
 		}
 
-		self.commit(staged, made).await
+		self.commit(staged, made, None).await
 	}
 
 	async fn take_over(&self, from: PathBuf, made: Made, holder: Option<(RelPath, SameFile)>) -> Result<(), JobError> {
@@ -351,7 +347,7 @@ impl JobContext {
 			_ => Hash([0; 32]),
 		};
 
-		self.commit(Staged { path: from, size, hash }, made).await
+		self.commit(Staged { path: from, size, hash }, made, None).await
 	}
 
 	/// The staging folder is written like any other destination folder: never through a link.
@@ -452,7 +448,8 @@ impl JobContext {
 		JobError::io(IoSide::Source(&self.source), err)
 	}
 
-	async fn commit(&self, staged: Staged, made: Made) -> Result<(), JobError> {
+	/// Places `staged`; what the engine `decided` for the file is kept only once its output is in place.
+	async fn commit(&self, staged: Staged, made: Made, decided: Option<Box<Decision>>) -> Result<(), JobError> {
 		// A take-over's "staged" file is another member's archived output: it must stay where it is.
 		let discard_unplaced = |staged: &Staged| {
 			if !matches!(made, Made::Moved { .. }) {
@@ -486,6 +483,10 @@ impl JobContext {
 			let folders = self.folders.clone();
 			match blocking(move || run::move_into_place(&from, &to, replaces.as_deref(), &folders)).await? {
 				Ok(()) => {
+					if let Some(decision) = decided {
+						self.send(JobMessage::Decided(decision));
+					}
+
 					self.send(JobMessage::Placed);
 					return Ok(());
 				}
@@ -692,6 +693,44 @@ mod tests {
 					output,
 					warnings: Vec::new(),
 					decision: Box::default(),
+				}
+			})
+		}
+	}
+
+	/// Encodes the source as it is, deciding `attempts` full encodes.
+	struct DecidingEncoder(u32);
+
+	impl Encode for DecidingEncoder {
+		fn encode<'a>(
+			&'a self,
+			job: &'a Job,
+			sink: &'a dyn OutputSink,
+			_on_event: &'a (dyn Fn(JobEvent) + Sync),
+			_cancel: &'a CancellationToken,
+		) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>> {
+			Box::pin(async move {
+				let work_root = sink.work_root(&job.source);
+				fs::create_dir_all(&work_root).unwrap();
+				let work = work_root.join("encoded.avif");
+				fs::copy(&job.source, &work).unwrap();
+				let output = sink
+					.commit(&Artifact {
+						path: work,
+						source: job.source.clone(),
+						times: None,
+					})
+					.unwrap();
+
+				JobOutcome::Encoded {
+					out_bytes: fs::metadata(&output).unwrap().len(),
+					src_bytes: fs::metadata(&job.source).unwrap().len(),
+					output,
+					warnings: Vec::new(),
+					decision: Box::new(Decision {
+						attempts: self.0,
+						..Decision::default()
+					}),
 				}
 			})
 		}
@@ -975,6 +1014,38 @@ mod tests {
 		assert!(failed_with(&sent, &ErrorKind::SourceChanged));
 		assert!(!committed(&sent));
 		assert_eq!(staged_files(&destination), 0);
+	}
+
+	#[test]
+	fn an_encode_whose_output_is_never_placed_keeps_no_decision() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("a.flac");
+		fs::write(&source, b"sound").unwrap();
+		let destination = dir.path().join("archive");
+		let job = Job {
+			source: source.clone(),
+			speed: cryarchiver_engine::preset::Speed::Fast,
+			keep_metadata: true,
+			drop_aux: true,
+			min_savings: 0.0,
+			overrides: cryarchiver_engine::preset::Overrides::default(),
+			options: cryarchiver_engine::options::JobOptions::default(),
+		};
+
+		let sent = run_job_with(
+			Arc::new(DecidingEncoder(2)),
+			&source,
+			&destination,
+			b"sound",
+			Task::Encode(job),
+		);
+
+		assert!(committed(&sent), "the commit was asked for and refused");
+		assert!(failed_with(&sent, &ErrorKind::Cancelled));
+		assert!(
+			!sent.iter().any(|message| matches!(message, JobMessage::Decided(_))),
+			"a record of a successful encode is kept only once its output is in place"
+		);
 	}
 
 	#[test]

@@ -289,6 +289,7 @@ mod tests {
 					crf: 36.75,
 					mean: 93.12,
 					p5: 87.21,
+					..Measured::default()
 				}],
 				..VideoDecision::default()
 			}),

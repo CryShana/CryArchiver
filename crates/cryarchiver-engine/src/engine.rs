@@ -288,9 +288,6 @@ struct VideoQuality {
 	offset: Option<Offset>,
 	/// What the search samples scored at the CRF the video is encoded at.
 	predicted: Option<Score>,
-	/// Where the hardest scenes the search aims at start, on the source's clock: the full check scores them too.
-	hardest_s: Vec<f64>,
-	retiming: Retiming,
 }
 
 impl VideoQuality {
@@ -343,7 +340,7 @@ impl Engine {
 			video_threads: None,
 			memory_gate: None,
 			quality: Arc::new(SharedMemory::default()),
-			long_encode_s: video_quality::LONG_ENCODE_S,
+			long_encode_s: video_quality::long_encode_s(),
 		}
 	}
 
@@ -352,7 +349,8 @@ impl Engine {
 		Self { quality, ..self }
 	}
 
-	/// Moves the expected full encode time from which a learned CRF is searched again (`LONG_ENCODE_S` by default).
+	/// Moves the expected full encode time from which a learned CRF is searched again (the tables' `margin-from-s` by
+	/// default).
 	#[must_use]
 	pub fn with_long_encode_s(self, long_encode_s: f64) -> Self {
 		Self { long_encode_s, ..self }
@@ -913,9 +911,10 @@ impl Engine {
 		let source = cx.job.source.as_path();
 
 		(cx.on_event)(JobEvent::Stage(Stage::Probe));
-		let (info, probe_json) = probe::probe_video(&self.tools, source, cx.source_bytes, cx.cancel)
-			.await
-			.map_err(video_probe_error)?;
+		let (info, probe_json) =
+			probe::probe_video(&self.tools, source, cx.source_bytes, counts_packets(cx.job), cx.cancel)
+				.await
+				.map_err(video_probe_error)?;
 		let planned = self
 			.video_main(&info, cx.job)
 			.map_err(Refusal::from)
@@ -984,14 +983,8 @@ impl Engine {
 			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, chosen)).await?;
 		}
 
-		cx.record.video(|record| {
-			record.grain = video.encoder.grain_level();
-			record.scan = Some(Scan::from(analysis.scan));
-			record.deinterlaced = analysis.scan != ScanType::Progressive;
-			record.resized = size;
-			record.trim = window.map(Trim::from);
-			record.burned_subtitles = rules.burn.is_some();
-		});
+		cx.record.video(|record| record.grain = video.encoder.grain_level());
+		record_picture(cx, analysis.scan, size, window, rules.burn.is_some());
 
 		let mut quality = self.video_quality(cx.job, main, &analysis, &video, span_s);
 		Self::apply_learned_grain(cx.job, &mut video, &mut quality);
@@ -1030,6 +1023,12 @@ impl Engine {
 		cx.record.update(|decision| decision.attempts = 1);
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &inputs)).await?;
+		if !cx.job.options.forced_video(mergeable(&info))
+			&& let Some(reason) = temps_not_smaller(&temps, compared_bytes, cx.job.min_savings)
+		{
+			return Ok(self.kept_video(&quality, reason));
+		}
+
 		let learned = if verify {
 			match Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await? {
 				Checked::Passed(_) if window.is_some() || size.is_some() => None,
@@ -1137,7 +1136,7 @@ impl Engine {
 		let source = cx.job.source.as_path();
 
 		(cx.on_event)(JobEvent::Stage(Stage::Probe));
-		let (info, _) = probe::probe_video(&self.tools, source, cx.source_bytes, cx.cancel)
+		let (info, _) = probe::probe_video(&self.tools, source, cx.source_bytes, counts_packets(cx.job), cx.cancel)
 			.await
 			.map_err(video_probe_error)?;
 		let main = match self.video_main(&info, cx.job) {
@@ -1171,6 +1170,7 @@ impl Engine {
 		if let Some(chosen) = burn {
 			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, chosen)).await?;
 		}
+		record_picture(cx, analysis.scan, size, span.window, burn.is_some());
 
 		let mut warnings = dropped_streams(&info, burn);
 		warnings.extend(ignored_flags(cx.job));
@@ -1439,14 +1439,6 @@ impl Engine {
 			target,
 			without_grain: false,
 			predicted: None,
-			hardest_s: video_quality::hardest_segments(
-				&analysis.detail,
-				video_quality::sample_count(job.speed, length_s.unwrap_or(0.0)),
-			)
-			.iter()
-			.map(|detail| detail.start_s)
-			.collect(),
-			retiming: Retiming::of(analysis.scan),
 		}
 	}
 
@@ -1567,6 +1559,8 @@ impl Engine {
 				Searched::Found(found) => (found.crf, Some(found.sample_bytes)),
 				Searched::Unreachable { .. } => (quality.start(), None),
 			};
+			let grain_probes = cx.record.probe_count();
+
 			let plain = {
 				let scorer = self.scorer(cx, workspace, &plain_video);
 				Box::pin(video_quality::search_below(
@@ -1581,6 +1575,7 @@ impl Engine {
 				.await?
 				.searched
 			};
+			cx.record.tag_without_grain(grain_probes);
 
 			if video_quality::grain_choice(searched, plain) == GrainChoice::Plain {
 				video.warnings.push(video_quality::dropped_grain_text(
@@ -1660,10 +1655,6 @@ impl Engine {
 		temps: &mut EncodedTemps,
 		quality: &VideoQuality,
 	) -> Result<Checked, JobError> {
-		let span_start_s = inputs.span.map_or(0.0, |span| span.start_s);
-		let hardest_s: Vec<f64> = quality.hardest_s.iter().map(|start_s| start_s - span_start_s).collect();
-		let windows =
-			video_quality::verify_windows(temps.encoded.frames, temps.encoded.decoded_s, cx.job.speed, &hardest_s);
 		let bounds = video_quality::bounds(&video.encoder);
 		let mut attempt = 1;
 		let mut first_offset = None;
@@ -1675,9 +1666,8 @@ impl Engine {
 				let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
 				Box::pin(scorer.verify(
 					&temps.video.path,
-					&windows,
 					temps.encoded.frames,
-					quality.retiming,
+					temps.encoded.decoded_s,
 					on_fraction,
 				))
 				.await?
@@ -1702,6 +1692,14 @@ impl Engine {
 				}));
 			}
 
+			if video_quality::near_miss(score, quality.target) {
+				temps
+					.warnings
+					.push(video_quality::near_miss_text(crf, score, quality.target));
+				cx.record.video(|record| record.near_miss = true);
+				return Ok(Checked::Short);
+			}
+
 			let lower = if attempt <= MAX_RETRIES && video.max_bitrate_kbps.is_none() {
 				search::retry_crf(crf, score, quality.target, quality.slope, bounds)
 			} else {
@@ -1713,14 +1711,6 @@ impl Engine {
 						&video_quality::short_text(crf, score, quality.target),
 						video.max_bitrate_kbps,
 					));
-					return Ok(Checked::Short);
-				}
-
-				if video_quality::near_miss(score, quality.target) {
-					temps
-						.warnings
-						.push(video_quality::near_miss_text(crf, score, quality.target));
-					cx.record.video(|record| record.near_miss = true);
 					return Ok(Checked::Short);
 				}
 
@@ -2391,6 +2381,11 @@ fn write_chapter_file(path: &Path, clipped: &[chapters::Chapter]) -> Result<(), 
 	fs::write(path, chapters::ffmetadata(clipped)).map_err(|err| JobError::io(IoSide::Destination(path), &err))
 }
 
+/// The packet count only gives the frames an untrimmed encode must have (`plan_window`); a trim reads its window alone.
+fn counts_packets(job: &Job) -> bool {
+	job.options.trim.is_none()
+}
+
 fn trim_window(job: &Job, duration_s: Option<f64>) -> Result<Option<TrimWindow>, JobError> {
 	job.options
 		.trim
@@ -2616,6 +2611,23 @@ fn record_choice(cx: &Context<'_>, video: &VideoPlan, quality: &VideoQuality) {
 	});
 }
 
+/// What was done to the picture: its scan, a resize, a trim and burned subtitles.
+fn record_picture(
+	cx: &Context<'_>,
+	scan: ScanType,
+	resized: Option<(u32, u32)>,
+	window: Option<TrimWindow>,
+	burned: bool,
+) {
+	cx.record.video(|record| {
+		record.scan = Some(Scan::from(scan));
+		record.deinterlaced = scan != ScanType::Progressive;
+		record.resized = resized;
+		record.trim = window.map(Trim::from);
+		record.burned_subtitles = burned;
+	});
+}
+
 fn audio_decision(plan: &FilePlan) -> AudioDecision {
 	let tracks = plan
 		.tracks
@@ -2674,6 +2686,21 @@ fn not_smaller_warning(source_bytes: u64, share: Option<u64>, out_bytes: u64) ->
 		Some(part_bytes) => kept_as_requested_part(part_bytes, out_bytes),
 		None => kept_as_requested(source_bytes, out_bytes),
 	}
+}
+
+/// The encoded temps already save too little on `compared_bytes`: the mux only adds the copied streams to them, and
+/// checking them, which can only lead to a lower CRF, only makes them larger.
+fn temps_not_smaller(temps: &EncodedTemps, compared_bytes: u64, min_savings: f64) -> Option<KeepReason> {
+	let bytes = std::iter::once(&temps.video)
+		.chain(&temps.audio)
+		.filter_map(|temp| fs::metadata(&temp.path).ok())
+		.map(|meta| meta.len())
+		.sum();
+
+	(!saves_enough(compared_bytes, bytes, min_savings)).then_some(KeepReason::NotSmaller {
+		src_bytes: compared_bytes,
+		out_bytes: bytes,
+	})
 }
 
 #[allow(clippy::cast_precision_loss)]

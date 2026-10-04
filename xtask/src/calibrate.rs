@@ -239,7 +239,7 @@ async fn measure_video(
 	};
 
 	let bytes = fs::metadata(source).map_err(|err| err.to_string())?.len();
-	let (info, _) = probe::probe_video(tools, source, bytes, cancel)
+	let (info, _) = probe::probe_video(tools, source, bytes, true, cancel)
 		.await
 		.map_err(|err| err.to_string())?;
 	let caps = VideoCaps {

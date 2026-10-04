@@ -2081,6 +2081,45 @@ async fn a_last_check_that_misses_by_half_a_point_at_most_is_written_with_a_warn
 		2,
 		"encoded, then encoded again: {events:?}"
 	);
+	let retry_crf: f64 = reason
+		.split("at CRF ")
+		.nth(1)
+		.and_then(|rest| rest.split(',').next())
+		.unwrap()
+		.parse()
+		.unwrap();
+
+	let near_retry = |mean: f64, floor: f64| {
+		let key = key.replace("|t93.0/89.0", &format!("|t{mean:.1}/{floor:.1}"));
+		Engine::new(tools.clone()).with_quality_memory(Arc::new(SharedMemory::with_entries([(
+			key,
+			GroupStats {
+				setting: retry_crf,
+				..stats
+			},
+		)])))
+	};
+	let (first_near, events) = run_recording(
+		&near_retry(near.0, near.1),
+		&strict(&clip, near.0, near.1),
+		&out_dir(dir.path(), "first"),
+	)
+	.await;
+	let JobOutcome::Encoded { decision, .. } = &first_near else {
+		panic!("{first_near:?}")
+	};
+	assert!(
+		warned(&first_near, "(within 0.5, so not encoded again)"),
+		"{first_near:?}"
+	);
+	assert_eq!(
+		stages(&events, Stage::Encode),
+		1,
+		"a first check that misses by at most half a point is written as it is: {events:?}"
+	);
+	let video = decision.video.as_ref().unwrap();
+	assert!(video.near_miss && video.reencode.is_none(), "{decision:?}");
+	assert_eq!((video.checks.len(), decision.attempts), (1, 1), "{decision:?}");
 
 	let (kept, _) = run_recording(
 		&careless(far.0, far.1),
@@ -2508,6 +2547,47 @@ async fn a_learned_crf_whose_output_is_not_smaller_is_forgotten() {
 	assert!(settings(&memory).is_empty(), "{:?}", memory.entries());
 }
 
+#[tokio::test]
+async fn a_first_encode_already_larger_than_the_source_keeps_it_without_a_check_or_a_second_encode() {
+	let dir = tempfile::tempdir().unwrap();
+	let small = support::video(
+		dir.path(),
+		"small.mp4",
+		3,
+		&["-map", "0:v", "-c:v", "mpeg4", "-q:v", "31"],
+	);
+	let lavish = Arc::new(EveryGroupLearned(GroupStats {
+		setting: 10.0,
+		slope: None,
+		bpp: None,
+		offset: None,
+		observations: 1,
+		without_grain: false,
+	}));
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(lavish);
+
+	let (outcome, events) = run_recording(&engine, &job(&small), dir.path()).await;
+
+	let JobOutcome::KeptOriginal {
+		reason: KeepReason::NotSmaller { src_bytes, out_bytes },
+	} = outcome
+	else {
+		panic!("{outcome:?}")
+	};
+	assert!(out_bytes > src_bytes, "{src_bytes} → {out_bytes}");
+	assert_eq!(stages(&events, Stage::Encode), 1, "{events:?}");
+	assert_eq!(
+		stages(&events, Stage::Verify),
+		0,
+		"neither checked nor muxed: {events:?}"
+	);
+	assert!(
+		!events.iter().any(|event| matches!(event, JobEvent::EncodeAgain(_))),
+		"{events:?}"
+	);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
 /// The groups that still have a setting to use.
 fn settings(memory: &SharedMemory) -> Vec<(String, GroupStats)> {
 	memory
@@ -2757,12 +2837,24 @@ async fn noise_that_grain_cannot_reach_the_target_on_is_encoded_and_learned_with
 
 	let (outcome, events) = run_recording(&engine, &reachable_without_grain(&first), dir.path()).await;
 
-	let JobOutcome::Encoded { output, .. } = &outcome else {
+	let JobOutcome::Encoded { output, decision, .. } = &outcome else {
 		panic!("{outcome:?}")
 	};
 	assert!(
 		warned(&outcome, "was left out: with it quality target not reached"),
 		"{outcome:?}"
+	);
+	let video = decision.video.as_ref().unwrap();
+	let plain_probes = video.probes.iter().filter(|probe| probe.without_grain).count();
+	assert!(video.grain_dropped, "{decision:?}");
+	assert!(
+		plain_probes > 0 && plain_probes < video.probes.len(),
+		"each probe is tagged with its pass: {decision:?}"
+	);
+	assert_eq!(
+		video.chosen_probes(),
+		(plain_probes, video.probes.len() - plain_probes),
+		"the search counts the probes of the pass without grain"
 	);
 	assert!(!grain_params(output).await, "{outcome:?}");
 	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");

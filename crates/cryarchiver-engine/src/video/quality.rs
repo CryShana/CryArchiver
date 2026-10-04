@@ -11,12 +11,11 @@ use crate::outcome::{ErrorKind, JobError, KeepReason};
 use crate::preset::{Overrides, Speed};
 use crate::quality::memory::{GroupStats, Offset};
 use crate::quality::search::{self as crf_search, Bounds, Choice, Next, Probe, Target};
-use crate::quality::vmaf::{self, FrameWindow, Reference, Score, Scoring, SeekedWindow};
+use crate::quality::vmaf::{self, Reference, Score, Scoring};
 use crate::toolchain::Toolchain;
 use crate::video::analyze::{Analysis, DEFAULT_SEGMENTS, Detail};
 use crate::video::encode::{Sample, encode_sample, median_rate};
 use crate::video::plan::{Encoder, VideoPlan};
-use crate::video::verify::{self, Retiming};
 use crate::workspace::Workspace;
 
 pub const MAX_RETRIES: u32 = 1;
@@ -35,9 +34,6 @@ const FLAT_SI: f64 = 2.0;
 const MAX_ANALYSIS_SEGMENTS: usize = 48;
 const LONG_SPAN_S: f64 = 600.0;
 const NEAR_MISS: f64 = 0.5;
-/// The expected full encode time from which a learned CRF is searched again: where the shipped tables start the
-/// margin (`margin-from-s`).
-pub const LONG_ENCODE_S: f64 = 15.0 * 60.0;
 const NO_MARGIN: Target = Target { mean: 0.0, floor: 0.0 };
 
 const TARGETS: [Target; 3] = [
@@ -66,8 +62,10 @@ const SLOW_SAMPLING: Sampling = Sampling {
 	most: 24,
 };
 const SEARCH_SEGMENT_S: f64 = 4.0;
-const VERIFY_WINDOW_S: f64 = 5.0;
-const EDGE_SKIP: f64 = 0.05;
+/// The full check scores about this many frames per second of the output, and never fewer than `MIN_SCORED_FRAMES` in
+/// all.
+const SCORED_PER_S: f64 = 11.0;
+const MIN_SCORED_FRAMES: u64 = 300;
 const FALLBACK_FPS: f64 = 25.0;
 const VERIFY_LOG: &str = "vmaf-verify.json";
 const SVT_BOUNDS: Bounds = Bounds {
@@ -218,9 +216,15 @@ pub fn search_target(target: Target, offset: Option<Offset>) -> Target {
 	}
 }
 
+/// The expected full encode time from which a learned CRF is searched again: where the tables start the margin
+/// (`margin-from-s`).
+pub fn long_encode_s() -> f64 {
+	tables().video.margin_from_s
+}
+
 /// Whether a full encode of `length_s` at `rate` (encoding seconds per second of source) is expected to take at least
-/// `from_s` (by default `LONG_ENCODE_S`): long enough that a learned CRF is searched again, so that a second full encode
-/// of it is less likely.
+/// `from_s` (by default `long_encode_s`): long enough that a learned CRF is searched again, so that a second full
+/// encode of it is less likely.
 pub fn long_encode(rate: f64, length_s: f64, from_s: f64) -> bool {
 	rate * length_s >= from_s
 }
@@ -468,100 +472,22 @@ fn add_once<'a>(chosen: &mut Vec<&'a Detail>, detail: &'a Detail) {
 	}
 }
 
+/// Every how many frames the full check scores one, over an output of `frames` decoded over `decoded_s`: about
+/// `SCORED_PER_S` a second, but at least `MIN_SCORED_FRAMES` in all (every frame of a shorter output).
 #[allow(
 	clippy::cast_precision_loss,
 	clippy::cast_possible_truncation,
 	clippy::cast_sign_loss
 )]
-/// The frames of the output the full check scores: windows spread evenly over it, more of them the longer it is, and
-/// one at each of `hardest_s` (seconds into the output), so that the scenes the search aimed at are checked too.
-pub fn verify_windows(frames: u64, decoded_s: f64, speed: Speed, hardest_s: &[f64]) -> Vec<FrameWindow> {
-	let (base, per_window_s, most) = match speed {
-		Speed::Slow => (5, 300.0, 24),
-		Speed::Moderate => (3, 600.0, 12),
-		Speed::Fast => return Vec::new(),
-	};
-	if frames == 0 {
-		return Vec::new();
-	}
-
+pub fn subsample(frames: u64, decoded_s: f64) -> u64 {
 	let fps = if decoded_s > 0.0 {
 		frames as f64 / decoded_s
 	} else {
 		FALLBACK_FPS
 	};
-	let count = (base + (decoded_s.max(0.0) / per_window_s) as u64).min(most);
-	let length = ((VERIFY_WINDOW_S * fps).round() as u64).max(1);
-	let edge = (frames as f64 * EDGE_SKIP) as u64;
-	let span = frames - 2 * edge;
-	if length * count >= span {
-		return vec![FrameWindow {
-			first: 0,
-			last: frames - 1,
-		}];
-	}
+	let by_rate = (fps / SCORED_PER_S).round().max(1.0) as u64;
 
-	let stride = (span - length) / (count - 1);
-	let spread = (0..count).map(|index| edge + index * stride);
-	let hardest = hardest_s
-		.iter()
-		.filter(|start_s| start_s.is_finite())
-		.map(|start_s| ((start_s.max(0.0) * fps).round() as u64).min(frames - length));
-	let mut firsts: Vec<u64> = spread.chain(hardest).collect();
-	firsts.sort_unstable();
-
-	let mut windows: Vec<FrameWindow> = Vec::new();
-	for first in firsts {
-		let last = first + length - 1;
-		match windows.last_mut() {
-			Some(previous) if first <= previous.last + 1 => previous.last = previous.last.max(last),
-			_ => windows.push(FrameWindow { first, last }),
-		}
-	}
-	windows
-}
-
-/// Where each window starts on the output's own frame `times` and on the source's clock (the trim's start plus the
-/// output time), half a frame back from its first frame, so that rounding can't move the seek onto the frame before.
-/// A deinterlaced output's windows start on the first of a source frame's two fields.
-#[allow(clippy::cast_possible_truncation)]
-pub fn seeked_windows(
-	windows: &[FrameWindow],
-	times: &[f64],
-	retiming: Retiming,
-	trim: Option<TrimWindow>,
-) -> Vec<SeekedWindow> {
-	let start_s = trim.map_or(0.0, |trim| trim.start_s);
-	let last_index = times.len().saturating_sub(1);
-
-	windows
-		.iter()
-		.filter_map(|window| {
-			let skipped = match retiming {
-				Retiming::Doubled => window.first % 2,
-				Retiming::Kept | Retiming::New => 0,
-			};
-			let first = (window.first - skipped) as usize;
-			let last = (window.last as usize).min(last_index);
-			if times.is_empty() || first + (skipped as usize) > last {
-				return None;
-			}
-
-			let gap = if first > 0 {
-				times[first] - times[first - 1]
-			} else {
-				times.get(1).map_or(0.0, |next| next - times[0])
-			};
-			let from = (times[first] - gap / 2.0).max(0.0);
-			Some(SeekedWindow {
-				distorted_s: from,
-				source_s: start_s + from,
-				length_s: times[last] - from + gap.max(0.0),
-				skipped,
-				frames: (last - first + 1) as u64 - skipped,
-			})
-		})
-		.collect()
+	by_rate.min(frames / MIN_SCORED_FRAMES).max(1)
 }
 
 pub fn unreachable_text(crf: f64, score: Score, target: Target) -> String {
@@ -576,7 +502,8 @@ pub fn short_text(crf: f64, score: Score, target: Target) -> String {
 	format!("quality target not reached ({})", measured(crf, score, target))
 }
 
-/// A last full check that missed by so little, on the mean and on the p5 alike, that the output is written anyway.
+/// A full check, the first or the last, that missed by so little, on the mean and on the p5 alike, that the output is
+/// written as it is instead of being encoded again.
 pub fn near_miss(score: Score, target: Target) -> bool {
 	score.mean >= target.mean - NEAR_MISS && score.p5 >= target.floor - NEAR_MISS
 }
@@ -584,7 +511,7 @@ pub fn near_miss(score: Score, target: Target) -> bool {
 pub fn near_miss_text(crf: f64, score: Score, target: Target) -> String {
 	format!(
 		"written slightly below the quality target: VMAF {:.1} / {:.1} at CRF {crf}, target {:.1} / {:.1} (within \
-		 {NEAR_MISS:.1})",
+		 {NEAR_MISS:.1}, so not encoded again)",
 		score.mean, score.p5, target.mean, target.floor
 	)
 }
@@ -707,107 +634,33 @@ impl Scorer<'_> {
 		})
 	}
 
-	/// The full check of `temp`, `total_frames` long, on `windows`. Each window is read by seeking both files, except
-	/// where frame positions can't be found by time: inverse telecine renumbers the frames from wherever it starts, and
-	/// a TS or PS source closes its timestamps up where they jump. Those, and an output whose frame times don't list
-	/// every frame, are decoded through to their windows.
+	/// The full check of `temp`, `total_frames` decoded over `decoded_s`: the whole output against the same span of the
+	/// source, both decoded through, so that trims, TS and PS starts, inverse telecine and burned subtitles line up as in
+	/// the encode, scored on every `subsample`th frame.
 	pub async fn verify(
 		&self,
 		temp: &Path,
-		windows: &[FrameWindow],
 		total_frames: u64,
-		retiming: Retiming,
-		mut on_fraction: impl FnMut(f64),
+		decoded_s: f64,
+		on_fraction: impl FnMut(f64),
 	) -> Result<Score, JobError> {
-		let scores = match self
-			.seeking_scores(temp, windows, total_frames, retiming, &mut on_fraction)
-			.await?
-		{
-			Some(scores) => scores,
-			None => {
-				self.verify_through(temp, windows, total_frames, &mut on_fraction)
-					.await?
-			}
-		};
+		let scores = self
+			.whole_scores(temp, subsample(total_frames, decoded_s), total_frames, on_fraction)
+			.await?;
 		pooled(&scores)
 	}
 
-	/// The full check by seeking alone: `None` when the output can't be checked that way.
-	pub async fn verify_by_seeking(
-		&self,
-		temp: &Path,
-		windows: &[FrameWindow],
-		total_frames: u64,
-		retiming: Retiming,
-	) -> Result<Option<Score>, JobError> {
-		match self
-			.seeking_scores(temp, windows, total_frames, retiming, &mut |_| {})
-			.await?
-		{
-			Some(scores) => pooled(&scores).map(Some),
-			None => Ok(None),
-		}
-	}
-
-	/// The windows' scores, or `None` when they can't be found by seeking or a window didn't give exactly its frames.
+	/// The VMAF of every `every`th frame of `temp`, `total_frames` long, in order.
 	#[allow(clippy::cast_precision_loss)]
-	async fn seeking_scores(
+	pub async fn whole_scores(
 		&self,
 		temp: &Path,
-		windows: &[FrameWindow],
+		every: u64,
 		total_frames: u64,
-		retiming: Retiming,
-		on_fraction: &mut impl FnMut(f64),
-	) -> Result<Option<Vec<f64>>, JobError> {
-		if retiming == Retiming::New || self.plan.starts.main.streams_s.is_some() {
-			return Ok(None);
-		}
-		let Some(times) = verify::output_frame_times(self.tools, temp, self.cancel)
-			.await?
-			.filter(|times| u64::try_from(times.len()) == Ok(total_frames))
-		else {
-			return Ok(None);
-		};
-
-		let seeks = seeked_windows(windows, &times, retiming, self.plan.window);
-		let total: u64 = seeks.iter().map(|seek| seek.frames).sum();
-		let mut scores = Vec::new();
-
-		for (index, seek) in seeks.iter().enumerate() {
-			let log = format!("vmaf-verify-{index}.json");
-			let scoring = self.scoring(&log);
-			let cmd = vmaf::seeked_window_command(&self.tools.ffmpeg, temp, *seek, &self.reference(), &scoring);
-			let done = scores.len() as f64;
-			let window = vmaf::frames(
-				&cmd,
-				&scoring,
-				|progress| {
-					if let Some(frame) = progress.frame.filter(|_| total > 0) {
-						on_fraction(((done + frame as f64) / total as f64).clamp(0.0, 1.0));
-					}
-				},
-				self.cancel,
-			)
-			.await?;
-
-			if u64::try_from(window.len()) != Ok(seek.frames) {
-				return Ok(None);
-			}
-			scores.extend(window);
-		}
-		Ok(Some(scores))
-	}
-
-	#[allow(clippy::cast_precision_loss)]
-	async fn verify_through(
-		&self,
-		temp: &Path,
-		windows: &[FrameWindow],
-		total_frames: u64,
-		on_fraction: &mut impl FnMut(f64),
+		mut on_fraction: impl FnMut(f64),
 	) -> Result<Vec<f64>, JobError> {
 		let scoring = self.scoring(VERIFY_LOG);
-		let cmd = vmaf::window_command(&self.tools.ffmpeg, temp, &self.reference(), windows, &scoring);
+		let cmd = vmaf::whole_command(&self.tools.ffmpeg, temp, &self.reference(), every, &scoring);
 
 		vmaf::frames(
 			&cmd,
@@ -1146,17 +999,19 @@ mod tests {
 
 	#[test]
 	fn a_learned_crf_is_searched_again_once_the_full_encode_is_expected_to_take_a_quarter_hour() {
-		assert!(!long_encode(1.0, 300.0, LONG_ENCODE_S));
-		assert!(!long_encode(2.9, 300.0, LONG_ENCODE_S));
-		assert!(long_encode(3.0, 300.0, LONG_ENCODE_S));
-		assert!(long_encode(12.0, 120.0, LONG_ENCODE_S));
-		assert!(!long_encode(f64::NAN, 300.0, LONG_ENCODE_S));
+		assert!(!long_encode(1.0, 300.0, 900.0));
+		assert!(!long_encode(2.9, 300.0, 900.0));
+		assert!(long_encode(3.0, 300.0, 900.0));
+		assert!(long_encode(12.0, 120.0, 900.0));
+		assert!(!long_encode(f64::NAN, 300.0, 900.0));
 		assert!(long_encode(0.01, 120.0, 1.0));
 	}
 
 	#[test]
-	fn a_learned_crf_is_searched_again_where_the_shipped_margin_starts() {
-		assert!((LONG_ENCODE_S - tables().video.margin_from_s).abs() < 1e-9);
+	fn a_learned_crf_is_searched_again_where_the_tables_start_the_margin() {
+		assert!((long_encode_s() - tables().video.margin_from_s).abs() < 1e-9);
+		assert!(!long_encode(0.999, long_encode_s(), long_encode_s()));
+		assert!(long_encode(1.0, long_encode_s(), long_encode_s()));
 	}
 
 	#[test]
@@ -1569,96 +1424,23 @@ mod tests {
 	}
 
 	#[test]
-	fn windows_skip_the_edges_and_short_outputs_are_scored_whole() {
-		assert_eq!(
-			verify_windows(1500, 60.0, Speed::Moderate, &[]),
-			vec![
-				FrameWindow { first: 75, last: 199 },
-				FrameWindow { first: 687, last: 811 },
-				FrameWindow {
-					first: 1299,
-					last: 1423
-				},
-			]
-		);
-		assert_eq!(verify_windows(1500, 60.0, Speed::Slow, &[]).len(), 5);
-		assert_eq!(
-			verify_windows(250, 10.0, Speed::Moderate, &[30.0]),
-			vec![FrameWindow { first: 0, last: 249 }]
-		);
-		assert!(verify_windows(1500, 60.0, Speed::Fast, &[]).is_empty());
-	}
-
-	#[test]
-	fn the_check_scores_the_hardest_scenes_and_more_windows_on_longer_outputs() {
-		let windows = verify_windows(1500, 60.0, Speed::Moderate, &[20.0, 27.0, 56.0, f64::NAN]);
-
-		assert_eq!(
-			windows,
-			vec![
-				FrameWindow { first: 75, last: 199 },
-				FrameWindow { first: 500, last: 624 },
-				FrameWindow { first: 675, last: 811 },
-				FrameWindow {
-					first: 1299,
-					last: 1499
-				},
-			]
-		);
-
-		let count = |speed: Speed, seconds: f64| {
+	fn the_check_scores_about_eleven_frames_a_second_and_at_least_three_hundred() {
+		let every = |fps: f64, seconds: f64| {
 			#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-			let frames = (seconds * 25.0) as u64;
-			verify_windows(frames, seconds, speed, &[]).len()
+			let frames = (fps * seconds) as u64;
+			subsample(frames, seconds)
 		};
+
 		assert_eq!(
-			[600.0, 3600.0, 10_800.0].map(|seconds| count(Speed::Moderate, seconds)),
-			[4, 9, 12]
+			[60.0, 59.94, 50.0, 30.0, 29.97, 25.0, 24.0, 23.976, 15.0, 12.0, 8.0, 0.5].map(|fps| every(fps, 3600.0)),
+			[5, 5, 5, 3, 3, 2, 2, 2, 1, 1, 1, 1]
 		);
-		assert_eq!(
-			[600.0, 3600.0, 10_800.0].map(|seconds| count(Speed::Slow, seconds)),
-			[7, 17, 24]
-		);
-	}
-
-	#[test]
-	fn seeked_windows_start_half_a_frame_back_on_both_clocks() {
-		let times: Vec<f64> = (0..100_u32).map(|frame| 0.5 + 0.04 * f64::from(frame)).collect();
-		let window = FrameWindow { first: 11, last: 30 };
-		let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
-
-		let [kept] = seeked_windows(&[window], &times, Retiming::Kept, None)[..] else {
-			panic!()
-		};
-		let [trimmed] = seeked_windows(
-			&[window],
-			&times,
-			Retiming::Kept,
-			Some(TrimWindow {
-				start_s: 4.0,
-				length_s: 4.0,
-			}),
-		)[..] else {
-			panic!()
-		};
-		let [fields] = seeked_windows(&[window], &times, Retiming::Doubled, None)[..] else {
-			panic!()
-		};
-
-		assert!(near(kept.distorted_s, 0.92) && near(kept.source_s, 0.92), "{kept:?}");
-		assert!(
-			near(kept.length_s, 0.82) && (kept.skipped, kept.frames) == (0, 20),
-			"{kept:?}"
-		);
-		assert!(near(trimmed.source_s, 4.92), "{trimmed:?}");
-		assert!(
-			near(fields.distorted_s, 0.88) && (fields.skipped, fields.frames) == (1, 20),
-			"{fields:?}"
-		);
-		assert!(
-			seeked_windows(&[FrameWindow { first: 0, last: 9 }], &times, Retiming::Kept, None)[0].distorted_s >= 0.48
-		);
-		assert!(seeked_windows(&[window], &[], Retiming::Kept, None).is_empty());
+		assert_eq!(every(60.0, 10.0), 2, "600 frames: 300 of them");
+		assert_eq!(every(25.0, 3.0), 1, "75 frames: every one");
+		assert_eq!(every(50.0, 60.0), 5);
+		assert_eq!(subsample(0, 0.0), 1);
+		assert_eq!(subsample(1500, f64::NAN), 2);
+		assert_eq!(subsample(90_000, 0.0), 2);
 	}
 
 	#[test]
@@ -1676,7 +1458,8 @@ mod tests {
 		assert!(!near_miss(scored(f64::NAN, 87.0), target));
 		assert_eq!(
 			near_miss_text(28.5, scored(92.04, 86.21), target),
-			"written slightly below the quality target: VMAF 92.0 / 86.2 at CRF 28.5, target 91.0 / 86.5 (within 0.5)"
+			"written slightly below the quality target: VMAF 92.0 / 86.2 at CRF 28.5, target 91.0 / 86.5 (within 0.5, so \
+			 not encoded again)"
 		);
 	}
 

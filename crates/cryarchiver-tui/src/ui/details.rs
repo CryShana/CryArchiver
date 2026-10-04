@@ -320,11 +320,13 @@ mod tests {
 						crf: 38.0,
 						mean: 90.4,
 						p5: 85.9,
+						..Measured::default()
 					},
 					Measured {
 						crf: 36.75,
 						mean: 93.1,
 						p5: 87.2,
+						..Measured::default()
 					},
 				],
 				reencode: Some(Reencode {

@@ -157,6 +157,7 @@ fn searched(crf: f64) -> Decision {
 				crf,
 				mean: 93.4,
 				p5: 89.6,
+				..Measured::default()
 			}],
 			..VideoDecision::default()
 		}),

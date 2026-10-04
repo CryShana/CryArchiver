@@ -30,12 +30,6 @@ pub struct Score {
 	pub frames: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameWindow {
-	pub first: u64,
-	pub last: u64,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Reference<'a> {
 	pub source: &'a Path,
@@ -136,11 +130,14 @@ pub fn sample_command(
 	cmd
 }
 
-pub fn window_command(
+/// Scores the whole of `distorted` against the same span of the source, both decoded through, on every `every`th
+/// frame. libvmaf still runs its motion feature on every frame, so a scored frame's VMAF is the one it gets when every
+/// frame is scored.
+pub fn whole_command(
 	ffmpeg: &Path,
 	distorted: &Path,
 	reference: &Reference<'_>,
-	windows: &[FrameWindow],
+	every: u64,
 	scoring: &Scoring<'_>,
 ) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
@@ -152,66 +149,16 @@ pub fn window_command(
 	}
 	push_reference(&mut cmd, reference, scoring, cut);
 
-	let select = select(windows);
-	let distorted_chain = chain(&[&select, SCORED_FORMAT, BY_POSITION]);
-	let reference_chain = chain(&[reference.filters, &select, SCORED_FORMAT, BY_POSITION]);
+	let distorted_chain = chain(&[SCORED_FORMAT, BY_POSITION]);
+	let reference_chain = chain(&[reference.filters, SCORED_FORMAT, BY_POSITION]);
+	let subsample = if every > 1 {
+		format!(":n_subsample={every}")
+	} else {
+		String::new()
+	};
 	cmd.arg("-filter_complex").arg(format!(
-		"[0:v:0]split[pace][all];[all]{distorted_chain}[d];{};[d][r]{}[scored]",
+		"[0:v:0]{distorted_chain}[d];{};[d][r]{}{subsample}[scored]",
 		reference_branch(reference, &reference_chain, cut),
-		libvmaf(scoring)
-	));
-
-	// `pace` carries every decoded frame, so progress keeps moving, and the stall watchdog stays quiet, between
-	// windows.
-	cmd.args([
-		"-map", "[pace]", "-f", "null", "-", "-map", "[scored]", "-f", "null", "-",
-	]);
-	cmd
-}
-
-/// One window of a full check, found by seeking instead of decoding both files up to it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SeekedWindow {
-	/// Where the distorted file is seeked, on its own timestamps.
-	pub distorted_s: f64,
-	/// Where the reference is seeked, as a search sample would be.
-	pub source_s: f64,
-	pub length_s: f64,
-	/// Frames read past before the window, kept out of the score.
-	pub skipped: u64,
-	pub frames: u64,
-}
-
-/// Scores one window of `distorted` against the source: the distorted file is seeked on its own timestamps
-/// (`-seek_timestamp`), the reference exactly like a search sample at the same source time, and each keeps `frames`
-/// frames from there.
-pub fn seeked_window_command(
-	ffmpeg: &Path,
-	distorted: &Path,
-	window: SeekedWindow,
-	reference: &Reference<'_>,
-	scoring: &Scoring<'_>,
-) -> ToolCommand {
-	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
-	cmd.in_dir(scoring.dir);
-	cmd.args(["-hide_banner", "-nostdin", "-seek_timestamp", "1"]);
-	cmd.seek(window.distorted_s, window.length_s);
-	cmd.threads(scoring.budget).arg("-i").arg(process::tool_path(distorted));
-
-	let cut = reference.start.seek(window.source_s, window.length_s);
-	cmd.seek(cut.input_s, cut.input_length_s);
-	push_reference(&mut cmd, reference, scoring, Some(cut));
-
-	let keep = format!(
-		"trim=start_frame={}:end_frame={}",
-		window.skipped,
-		window.skipped + window.frames
-	);
-	let distorted_chain = chain(&[&keep, SCORED_FORMAT, BY_POSITION]);
-	let reference_chain = chain(&[reference.filters, &keep, SCORED_FORMAT, BY_POSITION]);
-	cmd.arg("-filter_complex").arg(format!(
-		"[0:v:0]{distorted_chain}[d];{};[d][r]{}[scored]",
-		reference_branch(reference, &reference_chain, Some(cut)),
 		libvmaf(scoring)
 	));
 	cmd.args(["-map", "[scored]", "-f", "null", "-"]);
@@ -300,14 +247,6 @@ fn libvmaf(scoring: &Scoring<'_>) -> String {
 	)
 }
 
-fn select(windows: &[FrameWindow]) -> String {
-	let ranges: Vec<String> = windows
-		.iter()
-		.map(|window| format!("between(n\\,{}\\,{})", window.first, window.last))
-		.collect();
-	format!("select='{}'", ranges.join("+"))
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -340,26 +279,12 @@ mod tests {
 			budget: Some(3),
 			..scoring()
 		};
-		let window = SeekedWindow {
-			distorted_s: 10.0,
-			source_s: 10.0,
-			length_s: 4.0,
-			skipped: 0,
-			frames: 100,
-		};
 		let ffmpeg = Path::new("ffmpeg");
 		let distorted = Path::new("video.a1.mkv");
 
 		let commands = [
 			sample_command(ffmpeg, distorted, &reference, 12.5, 4.0, &budgeted),
-			window_command(
-				ffmpeg,
-				distorted,
-				&reference,
-				&[FrameWindow { first: 0, last: 9 }],
-				&budgeted,
-			),
-			seeked_window_command(ffmpeg, distorted, window, &reference, &budgeted),
+			whole_command(ffmpeg, distorted, &reference, 3, &budgeted),
 		];
 		let free = joined(&sample_command(ffmpeg, distorted, &reference, 12.5, 4.0, &scoring()));
 
@@ -450,95 +375,50 @@ mod tests {
 	}
 
 	#[test]
-	fn windows_select_the_same_frames_after_the_reference_filters() {
+	fn the_whole_check_scores_every_nth_frame_of_both_files_decoded_through() {
 		let reference = Reference {
 			source: Path::new("in.mkv"),
 			stream: 3,
 			decoder: None,
-			shape: "",
+			shape: "bwdif=mode=send_field:parity=tff:deint=all",
 			filters: "scale=in_range=tv:out_range=tv,format=yuv420p10le",
 			window: None,
 			start: InputStart::default(),
 			overlay: None,
 			subtitles: None,
 		};
-		let windows = [
-			FrameWindow { first: 10, last: 19 },
-			FrameWindow { first: 300, last: 309 },
-		];
-
-		let args = joined(&window_command(
-			Path::new("ffmpeg"),
-			Path::new("video.a1.mkv"),
-			&reference,
-			&windows,
-			&scoring(),
-		));
-
-		let select = "select='between(n\\,10\\,19)+between(n\\,300\\,309)'";
-		assert!(!args.contains(" -ss "), "{args}");
-		assert!(
-			args.contains(&format!("[0:v:0]split[pace][all];[all]{select},format=yuv420p10le")),
-			"{args}"
-		);
-		assert!(
-			args.contains(&format!(
-				"[1:3]scale=in_range=tv:out_range=tv,format=yuv420p10le,{select},format="
-			)),
-			"{args}"
-		);
-		assert!(
-			args.ends_with("-map [pace] -f null - -map [scored] -f null -"),
-			"{args}"
-		);
-	}
-
-	#[test]
-	fn a_seeked_window_reads_only_its_own_stretch_of_both_files() {
-		let reference = Reference {
-			source: Path::new("in.mkv"),
-			stream: 3,
-			decoder: None,
-			shape: "bwdif=mode=send_field:parity=tff:deint=all",
-			filters: "format=yuv420p10le",
-			window: None,
-			start: InputStart::default(),
-			overlay: None,
-			subtitles: None,
-		};
-		let window = SeekedWindow {
-			distorted_s: 61.98,
-			source_s: 65.98,
-			length_s: 5.04,
-			skipped: 1,
-			frames: 250,
+		let command = |every: u64| {
+			joined(&whole_command(
+				Path::new("ffmpeg"),
+				Path::new("video.a1.mkv"),
+				&reference,
+				every,
+				&scoring(),
+			))
 		};
 
-		let args = joined(&seeked_window_command(
-			Path::new("ffmpeg"),
-			Path::new("video.a1.mkv"),
-			window,
-			&reference,
-			&scoring(),
-		));
+		let sampled = command(5);
+		let every_frame = command(1);
 
-		let reference_at = args.find(" -ss 65.980 -t 5.040 -i ").expect(&args);
+		assert!(!sampled.contains(" -ss "), "{sampled}");
 		assert!(
-			args.starts_with("-hide_banner -nostdin -seek_timestamp 1 -ss 61.980 -t 5.040 -i ")
-				&& reference_at > args.find("video.a1.mkv").unwrap(),
-			"{args}"
+			sampled.contains("[0:v:0]format=yuv420p10le,settb=1/1000,setpts=N[d];"),
+			"{sampled}"
 		);
 		assert!(
-			args.contains("[0:v:0]trim=start_frame=1:end_frame=251,format=yuv420p10le,settb=1/1000,setpts=N[d];"),
-			"{args}"
-		);
-		assert!(
-			args.contains(
-				"[1:3]bwdif=mode=send_field:parity=tff:deint=all,format=yuv420p10le,trim=start_frame=1:end_frame=251,"
+			sampled.contains(
+				"[1:3]bwdif=mode=send_field:parity=tff:deint=all,scale=in_range=tv:out_range=tv,format=yuv420p10le,\
+				 format=yuv420p10le,settb=1/1000,setpts=N[r];"
 			),
-			"{args}"
+			"{sampled}"
 		);
-		assert!(!args.contains("select=") && !args.contains("[pace]"), "{args}");
+		assert!(
+			sampled.contains("log_path=vmaf-probe0-1.json:n_subsample=5[scored]"),
+			"{sampled}"
+		);
+		assert!(sampled.ends_with(" -map [scored] -f null -"), "{sampled}");
+		assert!(!sampled.contains("select=") && !sampled.contains("[pace]"), "{sampled}");
+		assert!(!every_frame.contains("n_subsample"), "{every_frame}");
 	}
 
 	#[test]
@@ -558,11 +438,11 @@ mod tests {
 			subtitles: None,
 		};
 
-		let args = joined(&window_command(
+		let args = joined(&whole_command(
 			Path::new("ffmpeg"),
 			Path::new("video.a1.mkv"),
 			&reference,
-			&[FrameWindow { first: 0, last: 99 }],
+			1,
 			&scoring(),
 		));
 
@@ -657,11 +537,11 @@ mod tests {
 			subtitles,
 		};
 		let command = |reference: &Reference<'_>| {
-			joined(&window_command(
+			joined(&whole_command(
 				Path::new("ffmpeg"),
 				Path::new("video.a1.mkv"),
 				reference,
-				&[FrameWindow { first: 0, last: 99 }],
+				1,
 				&scoring(),
 			))
 		};
@@ -678,7 +558,7 @@ mod tests {
 		let plain = command(&shaped(None, None));
 
 		assert!(
-			text.contains("[1:0]scale=w=640:h=480,setsar=1,subtitles=subs.ass,format=yuv420p10le,select="),
+			text.contains("[1:0]scale=w=640:h=480,setsar=1,subtitles=subs.ass,format=yuv420p10le,format="),
 			"{text}"
 		);
 		assert!(
@@ -686,7 +566,7 @@ mod tests {
 			"{bitmap}"
 		);
 		assert!(
-			plain.contains("[1:0]scale=w=640:h=480,setsar=1,format=yuv420p10le,select="),
+			plain.contains("[1:0]scale=w=640:h=480,setsar=1,format=yuv420p10le,format="),
 			"{plain}"
 		);
 	}
@@ -717,18 +597,18 @@ mod tests {
 			4.0,
 			&scoring(),
 		));
-		let checked = joined(&window_command(
+		let checked = joined(&whole_command(
 			Path::new("ffmpeg"),
 			Path::new("video.a1.mkv"),
 			&burned(Some(trim)),
-			&[FrameWindow { first: 0, last: 99 }],
+			2,
 			&scoring(),
 		));
-		let untrimmed = joined(&window_command(
+		let untrimmed = joined(&whole_command(
 			Path::new("ffmpeg"),
 			Path::new("video.a1.mkv"),
 			&burned(None),
-			&[FrameWindow { first: 0, last: 99 }],
+			2,
 			&scoring(),
 		));
 
@@ -740,7 +620,7 @@ mod tests {
 		assert!(sampled.contains(&shifted("12.500")), "{sampled}");
 		assert!(checked.contains(&shifted("4.000")), "{checked}");
 		assert!(
-			untrimmed.contains("[1:0]subtitles=subs.ass,format=yuv420p10le,select="),
+			untrimmed.contains("[1:0]subtitles=subs.ass,format=yuv420p10le,format="),
 			"{untrimmed}"
 		);
 	}

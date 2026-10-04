@@ -10,16 +10,16 @@ use cryarchiver_engine::options::{SubtitlePick, TrimWindow};
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::quality::search::Target;
-use cryarchiver_engine::quality::vmaf::{Reference, Score, Scoring, frames, model_for, pool, window_command};
+use cryarchiver_engine::quality::vmaf::{Score, pool};
 use cryarchiver_engine::toolchain::Toolchain;
 use cryarchiver_engine::video::analyze::{Analysis, DEFAULT_SEGMENTS, NoiseClass, ScanType, analyze};
 use cryarchiver_engine::video::burn;
 use cryarchiver_engine::video::encode::{Sample, encode_sample, encode_video, video_command};
 use cryarchiver_engine::video::plan::{VideoCaps, VideoPlan, plan_video, precheck};
 use cryarchiver_engine::video::quality::{
-	Aim, Scorer, SearchStep, Searched, search, search_below, search_samples, target, verify_windows,
+	Aim, Scorer, SearchStep, Searched, search, search_below, search_samples, subsample, target,
 };
-use cryarchiver_engine::video::verify::{Retiming, undecoded_lead};
+use cryarchiver_engine::video::verify::undecoded_lead;
 use cryarchiver_engine::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
 
@@ -99,7 +99,6 @@ async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
 	let encoded = encode_video(&cmd, &plan, info.format.duration, |_| {}, &cancel)
 		.await
 		.unwrap();
-	let windows = verify_windows(encoded.frames, encoded.decoded_s, Speed::Moderate, &[]);
 	let scorer = Scorer {
 		tools: &tools,
 		source: &clip,
@@ -110,7 +109,7 @@ async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
 	};
 
 	let checked = scorer
-		.verify(&temp, &windows, encoded.frames, Retiming::Kept, |_| {})
+		.verify(&temp, encoded.frames, encoded.decoded_s, |_| {})
 		.await
 		.unwrap();
 
@@ -176,23 +175,15 @@ async fn a_long_encode_aims_the_search_above_the_target_from_its_first_probe() {
 	assert!(margined.crf < exact.crf, "{margined:?} {exact:?}");
 }
 
-/// The full check of `clip` encoded by `plan`, through the seeking path and through the old one that decodes both files
-/// to the windows.
-async fn both_checks(
-	tools: &Toolchain,
-	clip: &Path,
-	workspace: &Workspace,
-	plan: &VideoPlan,
-	retiming: Retiming,
-	hardest_s: &[f64],
-) -> (Score, Score) {
+/// The full check of `clip` encoded by `plan`, the same frames picked from a decode-through measure that scores every
+/// frame, and every how many frames the check scored one.
+async fn both_checks(tools: &Toolchain, clip: &Path, workspace: &Workspace, plan: &VideoPlan) -> (Score, Score, u64) {
 	let cancel = CancellationToken::new();
 	let declared = probe(tools, clip, &cancel).await.unwrap().format.duration;
 	let temp = workspace.file("video.a1.mkv");
 	let cmd = video_command(&tools.ffmpeg, clip, &temp, plan);
 	let duration_s = plan.window.map(|window| window.length_s).or(declared);
 	let encoded = encode_video(&cmd, plan, duration_s, |_| {}, &cancel).await.unwrap();
-	let windows = verify_windows(encoded.frames, encoded.decoded_s, Speed::Moderate, hardest_s);
 	let scorer = Scorer {
 		tools,
 		source: clip,
@@ -202,40 +193,34 @@ async fn both_checks(
 		cancel: &cancel,
 	};
 
-	let seeked = scorer
-		.verify_by_seeking(&temp, &windows, encoded.frames, retiming)
+	let mut progress = 0.0_f64;
+	let checked = scorer
+		.verify(&temp, encoded.frames, encoded.decoded_s, |fraction| {
+			progress = progress.max(fraction);
+		})
 		.await
-		.unwrap()
-		.expect("the check seeks to its windows");
+		.unwrap();
+	let every = subsample(encoded.frames, encoded.decoded_s);
+	let all = scorer.whole_scores(&temp, 1, encoded.frames, |_| {}).await.unwrap();
 
-	let reference = Reference {
-		source: clip,
-		stream: plan.streams[0],
-		decoder: plan.decoder,
-		shape: &plan.shape,
-		filters: &plan.filters,
-		window: plan.window,
-		start: plan.starts.main,
-		overlay: plan.overlay,
-		subtitles: plan.subtitles.as_deref(),
-	};
-	let scoring = Scoring {
-		model: model_for(plan.width, plan.height),
-		threads: 4,
-		budget: None,
-		dir: workspace.dir(),
-		log: "vmaf-through.json",
-	};
-	let through_cmd = window_command(&tools.ffmpeg, &temp, &reference, &windows, &scoring);
-	let through = pool(&frames(&through_cmd, &scoring, |_| {}, &cancel).await.unwrap()).unwrap();
-	(seeked, through)
+	assert_eq!(
+		u64::try_from(all.len()).unwrap(),
+		encoded.frames,
+		"{}: every frame of the output is paired with one of the source",
+		clip.display()
+	);
+	assert!(progress > 0.9, "{}: {progress}", clip.display());
+	let picked: Vec<f64> = all.into_iter().step_by(usize::try_from(every).unwrap()).collect();
+	(checked, pool(&picked).unwrap(), every)
 }
 
-fn same_frames(seeked: Score, through: Score) -> bool {
-	seeked.frames == through.frames && (seeked.mean - through.mean).abs() < 0.3 && (seeked.p5 - through.p5).abs() < 1.0
+fn same_frames(checked: Score, through: Score) -> bool {
+	checked.frames == through.frames
+		&& (checked.mean - through.mean).abs() < 0.01
+		&& (checked.p5 - through.p5).abs() < 0.01
 }
 
-async fn plan_for(tools: &Toolchain, clip: &Path) -> (VideoPlan, Retiming) {
+async fn plan_for(tools: &Toolchain, clip: &Path) -> VideoPlan {
 	let cancel = CancellationToken::new();
 	let info = probe(tools, clip, &cancel).await.unwrap();
 	let main = precheck(&info, &CAPS).unwrap();
@@ -252,11 +237,11 @@ async fn plan_for(tools: &Toolchain, clip: &Path) -> (VideoPlan, Retiming) {
 	.unwrap();
 	let mut plan = plan_video(&info, main, &[], &analysis, Speed::Moderate, None);
 	plan.encoder = plan.encoder.with_crf(40.0);
-	(plan, Retiming::of(analysis.scan))
+	plan
 }
 
 #[tokio::test]
-async fn a_seeked_check_scores_the_same_frames_as_one_decoded_through_to_its_windows() {
+async fn the_whole_check_scores_the_same_frames_as_a_measure_of_every_frame() {
 	let dir = tempfile::tempdir().unwrap();
 	let tools = support::toolchain().await;
 	let interlaced = dir.path().join("tff.mkv");
@@ -304,24 +289,23 @@ async fn a_seeked_check_scores_the_same_frames_as_one_decoded_through_to_its_win
 		late,
 	];
 
+	let mut subsampled = 0;
 	for clip in clips {
 		let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
-		let (plan, retiming) = plan_for(&tools, &clip).await;
+		let plan = plan_for(&tools, &clip).await;
 
-		checks_agree(&tools, &clip, &workspace, &plan, retiming).await;
+		let (_, _, every) = checks_agree(&tools, &clip, &workspace, &plan).await;
+		if every > 1 {
+			subsampled += 1;
+		}
 	}
+	assert!(subsampled >= 2, "the plain and the deinterlaced clips: {subsampled}");
 }
 
-/// Both checks of `clip`, whole and trimmed, score the same frames alike; returns the whole one's and the trimmed
-/// one's seeked scores.
-async fn checks_agree(
-	tools: &Toolchain,
-	clip: &Path,
-	workspace: &Workspace,
-	plan: &VideoPlan,
-	retiming: Retiming,
-) -> (Score, Score) {
-	let (whole, through) = both_checks(tools, clip, workspace, plan, retiming, &[7.3, 21.9]).await;
+/// The full check of `clip`, whole and trimmed, scores the same frames as a measure of every frame; returns the whole
+/// check's and the trimmed check's scores, and every how many frames the whole check scored one.
+async fn checks_agree(tools: &Toolchain, clip: &Path, workspace: &Workspace, plan: &VideoPlan) -> (Score, Score, u64) {
+	let (whole, through, every) = both_checks(tools, clip, workspace, plan).await;
 
 	assert!(same_frames(whole, through), "{}: {whole:?} {through:?}", clip.display());
 
@@ -333,18 +317,18 @@ async fn checks_agree(
 		expected_frames: None,
 		..plan.clone()
 	};
-	let (cut, through) = both_checks(tools, clip, workspace, &trimmed, retiming, &[6.1]).await;
+	let (cut, through, _) = both_checks(tools, clip, workspace, &trimmed).await;
 
 	assert!(
 		same_frames(cut, through),
 		"{} trimmed: {cut:?} {through:?}",
 		clip.display()
 	);
-	(whole, cut)
+	(whole, cut, every)
 }
 
 #[tokio::test]
-async fn a_seeked_check_of_a_source_whose_first_frames_never_decode_scores_the_same_frames() {
+async fn the_whole_check_of_a_source_whose_first_frames_never_decode_stays_aligned() {
 	let dir = tempfile::tempdir().unwrap();
 	let tools = support::toolchain().await;
 	let lead = dir.path().join("lost-keyframe.mkv");
@@ -372,10 +356,11 @@ async fn a_seeked_check_of_a_source_whose_first_frames_never_decode_scores_the_s
 		"the first GOP lost its keyframe"
 	);
 	let workspace = Workspace::create(&dir.path().join("work"), &lead).unwrap();
-	let (plan, retiming) = plan_for(&tools, &lead).await;
+	let plan = plan_for(&tools, &lead).await;
 
-	let (whole, cut) = checks_agree(&tools, &lead, &workspace, &plan, retiming).await;
+	let (whole, cut, every) = checks_agree(&tools, &lead, &workspace, &plan).await;
 
+	assert_eq!(every, 2);
 	assert!(
 		whole.mean > LEAD_ALIGNED_MEAN && cut.mean > LEAD_ALIGNED_MEAN,
 		"the encode starts at the first decodable frame, as the reference does: {whole:?} {cut:?}"
@@ -383,7 +368,7 @@ async fn a_seeked_check_of_a_source_whose_first_frames_never_decode_scores_the_s
 }
 
 #[tokio::test]
-async fn a_seeked_check_draws_burned_subtitles_at_the_times_the_encode_shows_them() {
+async fn the_whole_check_draws_burned_subtitles_at_the_times_the_encode_shows_them() {
 	let dir = tempfile::tempdir().unwrap();
 	let tools = support::toolchain().await;
 	let cancel = CancellationToken::new();
@@ -416,7 +401,7 @@ async fn a_seeked_check_draws_burned_subtitles_at_the_times_the_encode_shows_the
 		"srt",
 	);
 	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
-	let (plan, retiming) = plan_for(&tools, &clip).await;
+	let plan = plan_for(&tools, &clip).await;
 	let info = probe(&tools, &clip, &cancel).await.unwrap();
 	let chosen = burn::pick(&info, &SubtitlePick::Default).unwrap();
 	burn::prepare(&tools, &clip, &workspace, &info, chosen, &cancel)
@@ -427,8 +412,9 @@ async fn a_seeked_check_draws_burned_subtitles_at_the_times_the_encode_shows_the
 		..plan
 	};
 
-	let (whole, cut) = checks_agree(&tools, &clip, &workspace, &burning, retiming).await;
+	let (whole, cut, every) = checks_agree(&tools, &clip, &workspace, &burning).await;
 
+	assert_eq!(every, 2);
 	assert!(
 		whole.p5 > SUBTITLES_ALIGNED_P5 && cut.p5 > SUBTITLES_ALIGNED_P5,
 		"the reference draws each cue when the encode shows it: {whole:?} {cut:?}"
