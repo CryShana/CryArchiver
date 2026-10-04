@@ -620,6 +620,40 @@ pub fn marker_and_click(path: &Path) -> (f64, f64) {
 	)
 }
 
+/// When the first audio track is first louder than -30 dB, on the file's own timestamps.
+pub fn first_sound(path: &Path) -> f64 {
+	let out = Command::new("ffmpeg")
+		.args(["-v", "error", "-copyts", "-i"])
+		.arg(path)
+		.args([
+			"-map",
+			"0:a:0",
+			"-af",
+			"aresample=48000,asetnsamples=48,astats=metadata=1:reset=1,\
+			 ametadata=mode=print:key=lavfi.astats.Overall.Peak_level:file=-",
+			"-f",
+			"null",
+			"-",
+		])
+		.output()
+		.unwrap();
+
+	let mut time = 0.0;
+	for line in String::from_utf8_lossy(&out.stdout).lines() {
+		if let Some(pts) = line
+			.split_whitespace()
+			.find_map(|field| field.strip_prefix("pts_time:"))
+		{
+			time = pts.parse().unwrap();
+		} else if let Some(value) = line.strip_prefix("lavfi.astats.Overall.Peak_level=")
+			&& value.parse::<f64>().is_ok_and(|peak| peak > -30.0)
+		{
+			return time;
+		}
+	}
+	panic!("no sound in {}", path.display())
+}
+
 /// The picture below `MARKER`'s rows, where subtitles are drawn.
 pub const BELOW_MARKER: &str = "crop=320:200:0:40";
 

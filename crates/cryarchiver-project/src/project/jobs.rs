@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use cryarchiver_engine::commit::{SourceTimes, check_space, file_id, free_space};
 use cryarchiver_engine::decision::Decision;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent};
-use cryarchiver_engine::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
+use cryarchiver_engine::outcome::{ErrorKind, IoSide, JobError, JobOutcome};
 use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::workspace::UnsafeFolder;
 use tokio::sync::mpsc::UnboundedSender;
@@ -247,7 +247,7 @@ impl JobContext {
 			}
 			JobOutcome::KeptOriginal { reason } => {
 				let decision = announced.into_inner().unwrap_or_else(PoisonError::into_inner);
-				self.send(JobMessage::Kept(keep_reason(&reason)));
+				self.send(JobMessage::Kept(reason.description()));
 				self.copy(CopyReason::KeptOriginal, decision).await
 			}
 			JobOutcome::Skipped { .. } => self.copy(CopyReason::NotMedia, None).await,
@@ -624,17 +624,6 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 
 fn discard(staged: &Staged) {
 	let _ = std::fs::remove_file(&staged.path);
-}
-
-fn keep_reason(reason: &KeepReason) -> String {
-	match reason {
-		KeepReason::NotSmaller { .. } | KeepReason::PredictedNotSmaller { .. } => "not smaller".into(),
-		KeepReason::AlreadyEfficient(why)
-		| KeepReason::Unsupported(why)
-		| KeepReason::QualityUnreachable(why)
-		| KeepReason::InvalidIcc(why) => why.clone(),
-		KeepReason::DecodeBomb { megapixels } => format!("the header claims {megapixels} MP"),
-	}
 }
 
 #[cfg(test)]

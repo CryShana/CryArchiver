@@ -76,6 +76,7 @@ pub struct StreamRules {
 	pub cut_end: bool,
 	pub merge: bool,
 	pub burn: Option<Burn>,
+	pub forced: bool,
 }
 
 impl StreamRules {
@@ -91,6 +92,7 @@ impl StreamRules {
 			cut_end: false,
 			merge: false,
 			burn: None,
+			forced: false,
 		}
 	}
 }
@@ -187,7 +189,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 				plan_audio_stream(stream, audio_tracks, rules, target, will_merge, &mut plan)?;
 			}
 			"subtitle" if rules.burn.is_some_and(|burn| burn.stream == stream.index) => {}
-			"subtitle" => match subtitle_track(stream, target)? {
+			"subtitle" => match subtitle_track(stream, target, rules.forced)? {
 				Some(track) => {
 					plan.warnings.extend(styling_warning(stream, target));
 					let track = if rules.trim {
@@ -197,12 +199,7 @@ pub fn plan_streams(info: &MediaInfo, rules: &StreamRules) -> Result<StreamPlan,
 					};
 					plan.subtitles.push(track);
 				}
-				None => plan.warnings.push(format!(
-					"subtitle stream {} ({}) dropped: {} holds only text subtitles; --burn-subs can draw it into the picture",
-					stream.index,
-					stream.codec_name,
-					target.name()
-				)),
+				None => plan.warnings.push(dropped_subtitle(stream, target)),
 			},
 			"attachment" if target.holds_files() => plan.attachments.push(stream.index),
 			"attachment" => dropped_files += 1,
@@ -307,7 +304,9 @@ fn is_text(codec: &str) -> bool {
 	MKV_TEXT.contains(&codec) || TEXT_SUBTITLES.contains(&codec)
 }
 
-fn subtitle_track(stream: &Stream, target: Target) -> Result<Option<SubtitleTrack>, Refusal> {
+/// A track Matroska can't hold keeps the original unless the job is `forced`; the other containers always drop what
+/// they can't hold.
+fn subtitle_track(stream: &Stream, target: Target, forced: bool) -> Result<Option<SubtitleTrack>, Refusal> {
 	let codec = stream.codec_name.as_str();
 	let text = is_text(codec);
 	let track = |converted: Option<&'static str>| {
@@ -321,6 +320,7 @@ fn subtitle_track(stream: &Stream, target: Target) -> Result<Option<SubtitleTrac
 	match target {
 		Target::Matroska if MKV_SUBTITLES.contains(&codec) => track(None),
 		Target::Matroska if TEXT_SUBTITLES.contains(&codec) => track(Some("srt")),
+		Target::Matroska if forced => Ok(None),
 		Target::Matroska => Err(Refusal::Keep(KeepReason::Unsupported(format!(
 			"subtitle codec {codec} can't be stored in MKV"
 		)))),
@@ -328,6 +328,21 @@ fn subtitle_track(stream: &Stream, target: Target) -> Result<Option<SubtitleTrac
 		Target::Mp4 if text => track((codec != "mov_text").then_some("mov_text")),
 		Target::Webm | Target::Mp4 => Ok(None),
 	}
+}
+
+fn dropped_subtitle(stream: &Stream, target: Target) -> String {
+	let why = match target {
+		Target::Matroska => "MKV can't hold it".to_owned(),
+		Target::Webm | Target::Mp4 => format!(
+			"{} holds only text subtitles; --burn-subs can draw it into the picture",
+			target.name()
+		),
+	};
+
+	format!(
+		"subtitle stream {} ({}) dropped: {why}",
+		stream.index, stream.codec_name
+	)
 }
 
 fn styling_warning(stream: &Stream, target: Target) -> Option<String> {
@@ -675,6 +690,33 @@ mod tests {
 			Err(Refusal::Keep(KeepReason::Unsupported(
 				"subtitle codec dvb_teletext can't be stored in MKV".into()
 			)))
+		);
+	}
+
+	#[test]
+	fn a_forced_job_drops_subtitles_matroska_cannot_hold() {
+		let teletext = info(
+			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"mpeg2video"},
+			{"index":1,"codec_type":"subtitle","codec_name":"dvb_teletext"},
+			{"index":2,"codec_type":"subtitle","codec_name":"subrip"}]}"#,
+		);
+		let forced = StreamRules {
+			forced: true,
+			..rules(Speed::Moderate, false)
+		};
+
+		let plan = plan_streams(&teletext, &forced).unwrap();
+
+		assert_eq!(
+			plan.subtitles
+				.iter()
+				.map(|track| track.stream_index)
+				.collect::<Vec<_>>(),
+			[2]
+		);
+		assert_eq!(
+			plan.warnings,
+			["subtitle stream 1 (dvb_teletext) dropped: MKV can't hold it"]
 		);
 	}
 

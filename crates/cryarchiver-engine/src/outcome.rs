@@ -2,7 +2,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use indicatif::DecimalBytes;
+
 use crate::decision::Decision;
+use crate::images::plan::BOMB_PIXELS;
 use crate::text::display_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +186,46 @@ pub enum KeepReason {
 	DecodeBomb { megapixels: u64 },
 }
 
+impl KeepReason {
+	/// Why the original was kept, worded alike for the CLI, the project log and the TUI.
+	pub fn description(&self) -> String {
+		match self {
+			Self::NotSmaller { src_bytes, out_bytes } if out_bytes > src_bytes => format!(
+				"the encode came out larger than the source ({} → {})",
+				DecimalBytes(*src_bytes),
+				DecimalBytes(*out_bytes)
+			),
+			Self::NotSmaller { src_bytes, out_bytes } => format!(
+				"encoding saved too little ({} → {})",
+				DecimalBytes(*src_bytes),
+				DecimalBytes(*out_bytes)
+			),
+			Self::PredictedNotSmaller {
+				src_bytes,
+				predicted_bytes,
+			} if predicted_bytes > src_bytes => format!(
+				"encoding would come out larger than the source ({} → predicted {})",
+				DecimalBytes(*src_bytes),
+				DecimalBytes(*predicted_bytes)
+			),
+			Self::PredictedNotSmaller {
+				src_bytes,
+				predicted_bytes,
+			} => format!(
+				"encoding would save too little ({} → predicted {})",
+				DecimalBytes(*src_bytes),
+				DecimalBytes(*predicted_bytes)
+			),
+			Self::AlreadyEfficient(why) | Self::Unsupported(why) | Self::QualityUnreachable(why) => why.clone(),
+			Self::InvalidIcc(why) => format!("invalid ICC profile: {why}"),
+			Self::DecodeBomb { megapixels } => format!(
+				"the header claims {megapixels} MP, above the {} MP safety limit",
+				BOMB_PIXELS / 1_000_000
+			),
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
 	Keep(KeepReason),
@@ -247,6 +290,31 @@ mod tests {
 	use std::time::Duration;
 
 	use super::*;
+
+	#[test]
+	fn a_size_keep_says_whether_the_output_was_larger_or_saved_too_little() {
+		let larger = KeepReason::NotSmaller {
+			src_bytes: 1_000,
+			out_bytes: 1_200,
+		};
+		let close = KeepReason::PredictedNotSmaller {
+			src_bytes: 1_000,
+			predicted_bytes: 950,
+		};
+
+		assert_eq!(
+			larger.description(),
+			"the encode came out larger than the source (1.00 kB → 1.20 kB)"
+		);
+		assert_eq!(
+			close.description(),
+			"encoding would save too little (1.00 kB → predicted 950 B)"
+		);
+		assert_eq!(
+			KeepReason::DecodeBomb { megapixels: 900 }.description(),
+			"the header claims 900 MP, above the 500 MP safety limit"
+		);
+	}
 
 	#[test]
 	fn errors_are_classified() {

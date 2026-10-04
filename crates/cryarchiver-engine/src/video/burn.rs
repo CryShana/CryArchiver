@@ -56,6 +56,8 @@ pub struct Overlay {
 	/// The picture size the cues are drawn on, when `subs.mkv` doesn't carry it (DVD subtitles copied out of MP4).
 	pub canvas: Option<(u32, u32)>,
 	pub ten_bit: bool,
+	/// The cues are blended in the main picture's own format rather than 4:2:0, for frames that keep its chroma.
+	pub in_frame_format: bool,
 }
 
 impl Overlay {
@@ -210,6 +212,7 @@ pub fn overlay(info: &MediaInfo, main: u32, burn: Burn, track_start_s: f64) -> O
 		offset_s: track_start_s - info.format.start_time.unwrap_or(0.0),
 		canvas,
 		ten_bit: main.and_then(|main| main.pix_fmt.as_deref()).is_some_and(deep_pix_fmt),
+		in_frame_format: false,
 	}
 }
 
@@ -301,10 +304,10 @@ pub fn overlay_graph(
 		),
 		None => (chained(&[cut, FINE_TIME_BASE]), String::new()),
 	};
-	let (pictures, blend) = if overlay.ten_bit {
-		("[bss]format=yuva420p10le[bsd];", ":format=yuv420p10")
-	} else {
-		("[bss]null[bsd];", "")
+	let (pictures, blend) = match (overlay.in_frame_format, overlay.ten_bit) {
+		(true, _) => ("[bss]null[bsd];", ":format=auto"),
+		(false, true) => ("[bss]format=yuva420p10le[bsd];", ":format=yuv420p10"),
+		(false, false) => ("[bss]null[bsd];", ""),
 	};
 
 	format!(
@@ -420,8 +423,13 @@ mod tests {
 			offset_s: 0.0,
 			canvas: None,
 			ten_bit: false,
+			in_frame_format: false,
 		};
 		let ten = Overlay { ten_bit: true, ..eight };
+		let frames = Overlay {
+			in_frame_format: true,
+			..ten
+		};
 
 		assert_eq!(
 			overlay_graph(("[0:0]", ""), "[1:0]", eight, None, "format=yuv420p10le", "[burned]"),
@@ -433,6 +441,11 @@ mod tests {
 			"[1:0]trim=start=5,settb=AVTB,setpts=PTS+4.000/TB[bv];[2:0]setpts=PTS-0.002/TB[bs];\
 			 [bs][bv]scale2ref[bss][bvs];[bss]format=yuva420p10le[bsd];\
 			 [bvs][bsd]overlay=eof_action=pass:format=yuv420p10,setpts=PTS-4.000/TB[r]"
+		);
+		assert_eq!(
+			overlay_graph(("[0:0]", ""), "[1:0]", frames, None, "format=gbrp16le", "[burned]"),
+			"[0:0]settb=AVTB[bv];[1:0]setpts=PTS-0.002/TB[bs];[bs][bv]scale2ref[bss][bvs];[bss]null[bsd];\
+			 [bvs][bsd]overlay=eof_action=pass:format=auto,format=gbrp16le[burned]"
 		);
 	}
 

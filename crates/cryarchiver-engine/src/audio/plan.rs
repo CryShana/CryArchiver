@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::container::{Container, MATROSKA_AUDIO, OGG_OPUS};
+use crate::container::{Container, MATROSKA_AUDIO, OGG_AUDIO, OGG_OPUS};
 use crate::format::OutputFormat;
 use crate::language;
 use crate::options::TrimWindow;
@@ -78,10 +78,17 @@ pub struct FileOptions {
 	/// An ffmetadata file whose chapters replace the source's.
 	pub chapters: Option<PathBuf>,
 	pub merge_from: Vec<u32>,
+	/// How much later than the earliest of `merge_from` each one starts on the command's timeline.
+	pub merge_delays_s: Vec<f64>,
 	pub merge_language: Option<String>,
 	/// New titles for encoded tracks, by source stream.
 	pub titles: Box<[(u32, String)]>,
+	/// When set, the output carries none of the source's metadata but these tags.
+	pub clean_tags: Option<StreamTags>,
 }
+
+/// Tags by source stream: the stream, the key and the value.
+pub type StreamTags = Box<[(u32, &'static str, String)]>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilePlan {
@@ -93,7 +100,7 @@ pub struct FilePlan {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioPlan {
 	Keep(KeepReason),
-	Encode(FilePlan),
+	Encode(Box<FilePlan>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -140,12 +147,16 @@ pub fn plan_file_with(info: &MediaInfo, speed: Speed, overrides: &Overrides, rul
 		));
 	}
 
-	let container = if tracks.len() == 1 { OGG_OPUS } else { MATROSKA_AUDIO };
-	AudioPlan::Encode(FilePlan {
+	let container = match tracks.as_slice() {
+		[track] if copies_vorbis(track, info) => OGG_AUDIO,
+		[_] => OGG_OPUS,
+		_ => MATROSKA_AUDIO,
+	};
+	AudioPlan::Encode(Box::new(FilePlan {
 		container,
 		tracks,
 		options: FileOptions::default(),
-	})
+	}))
 }
 
 /// Whether the file has two or more usable audio tracks for `--merge-audio` to mix, so `merged()` would return
@@ -239,6 +250,24 @@ pub fn merge_file(plan: FilePlan, info: &MediaInfo, speed: Speed, overrides: &Ov
 	}
 }
 
+/// `FileOptions::merge_delays_s` for a command whose timeline begins at `zero_s` on the source's timestamps: a source
+/// already running there starts with it.
+pub fn merge_delays(info: &MediaInfo, sources: &[u32], zero_s: f64) -> Vec<f64> {
+	let leads: Vec<f64> = sources
+		.iter()
+		.map(|index| {
+			info.streams
+				.iter()
+				.find(|stream| stream.index == *index)
+				.and_then(|stream| stream.start_time)
+				.map_or(0.0, |start_s| (start_s - zero_s).max(0.0))
+		})
+		.collect();
+	let earliest = leads.iter().copied().fold(f64::INFINITY, f64::min);
+
+	leads.iter().map(|lead| lead - earliest).collect()
+}
+
 pub fn retarget(plan: FilePlan, format: Option<OutputFormat>, info: &MediaInfo) -> Result<FilePlan, String> {
 	let Some((format, container)) = format.and_then(|format| Some((format, format.audio_container()?))) else {
 		return Ok(plan);
@@ -251,17 +280,33 @@ pub fn retarget(plan: FilePlan, format: Option<OutputFormat>, info: &MediaInfo) 
 		));
 	}
 
-	let copies_vorbis = plan.tracks.iter().any(|track| {
-		track.plan == TrackPlan::Copy
-			&& info
-				.streams
-				.iter()
-				.any(|stream| stream.index == track.stream_index && stream.codec_name == "vorbis")
-	});
-	if container.extension == OGG_OPUS.extension && copies_vorbis {
+	if container.extension == OGG_OPUS.extension && plan.tracks.iter().any(|track| copies_vorbis(track, info)) {
 		return Err("a Vorbis track can't be stored as .opus; use .ogg or .mka".into());
 	}
 	Ok(FilePlan { container, ..plan })
+}
+
+fn copies_vorbis(track: &TrackJob, info: &MediaInfo) -> bool {
+	track.plan == TrackPlan::Copy
+		&& info
+			.streams
+			.iter()
+			.any(|stream| stream.index == track.stream_index && stream.codec_name == "vorbis")
+}
+
+/// Why the track can't be encoded at all, when it can't.
+pub fn unusable(stream: &Stream) -> Option<String> {
+	if stream.sample_rate.is_none_or(|rate| rate == 0) {
+		return Some("unknown sample rate".into());
+	}
+
+	match stream.channels.filter(|&count| count > 0) {
+		None => Some("unknown channel count".into()),
+		Some(channels) if channels > MAX_CHANNELS => Some(format!(
+			"{channels} channels is more than Opus supports ({MAX_CHANNELS})"
+		)),
+		Some(_) => None,
+	}
 }
 
 pub fn plan_track(
@@ -815,7 +860,7 @@ mod tests {
 			TrackPlan::Encode(EncodePlan { channels: 1, .. })
 		));
 		assert_eq!(merged(&mixed, &mixed_plan.tracks[..1], Speed::Moderate, PRESET), None);
-		assert_eq!(merge_file(mixed_plan, &mixed, Speed::Moderate, PRESET).tracks.len(), 1);
+		assert_eq!(merge_file(*mixed_plan, &mixed, Speed::Moderate, PRESET).tracks.len(), 1);
 	}
 
 	#[test]
@@ -849,28 +894,60 @@ mod tests {
 		};
 
 		assert!(
-			retarget(both.clone(), Some(OutputFormat::Opus), &two)
+			retarget(*both.clone(), Some(OutputFormat::Opus), &two)
 				.unwrap_err()
 				.contains("holds one audio track")
 		);
 		assert_eq!(
-			retarget(both, Some(OutputFormat::Mka), &two)
+			retarget(*both, Some(OutputFormat::Mka), &two)
 				.unwrap()
 				.container
 				.extension,
 			"mka"
 		);
 		assert!(
-			retarget(copied.clone(), Some(OutputFormat::Opus), &vorbis_file)
+			retarget(*copied.clone(), Some(OutputFormat::Opus), &vorbis_file)
 				.unwrap_err()
 				.contains("Vorbis")
 		);
 		assert_eq!(
-			retarget(copied, Some(OutputFormat::Ogg), &vorbis_file)
+			retarget(*copied, Some(OutputFormat::Ogg), &vorbis_file)
 				.unwrap()
 				.container
 				.muxer,
 			"ogg"
 		);
+	}
+
+	#[test]
+	fn merge_delays_count_from_the_earliest_source_after_the_seek() {
+		let late = |index, start_time| Stream {
+			index,
+			start_time: Some(start_time),
+			..stream("flac", 2, Some("stereo"), None)
+		};
+		let file = info(vec![late(1, 0.5), late(2, 0.0), late(3, 0.2)], None);
+
+		assert_eq!(merge_delays(&file, &[1, 2, 3], 0.0), [0.5, 0.0, 0.2]);
+		assert_eq!(merge_delays(&file, &[1, 3], 0.0), [0.3, 0.0]);
+		assert_eq!(merge_delays(&file, &[1, 2, 3], 0.3), [0.2, 0.0, 0.0]);
+		assert_eq!(merge_delays(&file, &[1, 2, 3], 10.0), [0.0, 0.0, 0.0]);
+	}
+
+	#[test]
+	fn a_copied_vorbis_track_stays_in_ogg_without_a_format() {
+		let vorbis = info(vec![stream("vorbis", 2, Some("stereo"), Some(96))], None);
+		let forced = AudioRules {
+			forced: true,
+			..AudioRules::default()
+		};
+
+		let AudioPlan::Encode(plan) = plan_file_with(&vorbis, Speed::Moderate, &Overrides::default(), forced) else {
+			panic!("a requested output is always produced")
+		};
+
+		assert_eq!(plan.tracks[0].plan, TrackPlan::Copy);
+		assert_eq!(plan.container, OGG_AUDIO);
+		assert_eq!(retarget(*plan, None, &vorbis).unwrap().container, OGG_AUDIO);
 	}
 }

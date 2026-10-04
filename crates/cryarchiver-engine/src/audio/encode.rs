@@ -9,6 +9,7 @@ use crate::container::Cover;
 use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
+use crate::video::delay;
 
 const RESAMPLE: &str = "aresample=resampler=soxr:osr=48000";
 
@@ -33,11 +34,17 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 	if let Some(file) = chapter_file {
 		cmd.args(["-f", "ffmetadata", "-i"]).arg(process::tool_path(file));
 	}
-	cmd.args(["-map_metadata", "0", "-map_chapters", chapters]);
+	if plan.options.clean_tags.is_some() {
+		cmd.args(["-map_metadata:g", "-1", "-map_metadata:s", "-1"]);
+	} else {
+		cmd.args(["-map_metadata", "0"]);
+	}
+	cmd.args(["-map_chapters", chapters]);
 
 	if plan.options.merge_from.is_empty() {
 		for (out, track) in plan.tracks.iter().enumerate() {
 			cmd.arg("-map").arg(format!("0:{}", track.stream_index));
+			push_clean_tags(&mut cmd, plan, out, track.stream_index);
 			match &track.plan {
 				TrackPlan::Encode(encode) => {
 					push_encode(&mut cmd, out, encode);
@@ -59,7 +66,7 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 		let TrackPlan::Encode(encode) = &plan.tracks.first().expect("a merged file has one track").plan else {
 			unreachable!("a merged file's one track is always an encode plan")
 		};
-		push_merge(&mut cmd, encode, &plan.options.merge_from, plan.options.kept);
+		push_merge(&mut cmd, encode, plan);
 
 		cmd.args(["-map_metadata:s:a:0", "-1"]);
 		if let Some(language) = &plan.options.merge_language {
@@ -88,6 +95,20 @@ pub fn command(ffmpeg: &Path, source: &Path, output: &Path, plan: &FilePlan) -> 
 	cmd
 }
 
+fn push_clean_tags(cmd: &mut ToolCommand, plan: &FilePlan, out: usize, stream_index: u32) {
+	let Some(tags) = &plan.options.clean_tags else {
+		return;
+	};
+
+	let retitled = plan.options.titles.iter().any(|(index, _)| *index == stream_index);
+	for (_, key, value) in tags
+		.iter()
+		.filter(|(index, key, _)| *index == stream_index && !(retitled && *key == "title"))
+	{
+		cmd.arg(format!("-metadata:s:a:{out}")).arg(format!("{key}={value}"));
+	}
+}
+
 fn push_cut(cmd: &mut ToolCommand, kept: Option<TrimWindow>) {
 	if let Some(kept) = kept {
 		cmd.arg("-ss")
@@ -107,15 +128,32 @@ fn cut_filter(kept: TrimWindow) -> String {
 	)
 }
 
-fn push_merge(cmd: &mut ToolCommand, encode: &EncodePlan, sources: &[u32], kept: Option<TrimWindow>) {
+/// `amix` lays every input from the first one's start, whatever their own timestamps, so a source that starts later is
+/// given silence up to its start, and its timestamps are moved back to match.
+fn push_merge(cmd: &mut ToolCommand, encode: &EncodePlan, plan: &FilePlan) {
+	let sources = &plan.options.merge_from;
 	let layout = encode.layout.target();
-	let skipped = kept.map_or_else(String::new, |kept| format!("{},", cut_filter(kept)));
+	let skipped = plan
+		.options
+		.kept
+		.map_or_else(String::new, |kept| format!("{},", cut_filter(kept)));
 
 	let mut graph = String::new();
 	for (input, stream) in sources.iter().enumerate() {
+		let aligned = plan
+			.options
+			.merge_delays_s
+			.get(input)
+			.and_then(|&delay_s| delay(delay_s))
+			.map_or_else(String::new, |delay_s| {
+				format!(
+					"adelay=delays={:.3}:all=1,asetpts=PTS-{delay_s:.6}/TB,",
+					delay_s * 1000.0
+				)
+			});
 		let _ = write!(
 			graph,
-			"[0:{stream}]{skipped}{RESAMPLE},aformat=channel_layouts={layout}[m{input}];"
+			"[0:{stream}]{aligned}{skipped}{RESAMPLE},aformat=channel_layouts={layout}[m{input}];"
 		);
 	}
 	for input in 0..sources.len() {
@@ -421,6 +459,76 @@ mod tests {
 			"{args}"
 		);
 		assert!(args.ends_with("-map [stats] -f null -"), "{args}");
+	}
+
+	#[test]
+	fn a_merge_source_that_starts_later_is_delayed_to_its_start() {
+		let stereo = EncodePlan {
+			bitrate_kbps: 128,
+			channels: 2,
+			layout: LayoutFix::Keep("stereo"),
+		};
+		let file = FilePlan {
+			container: OGG_OPUS,
+			tracks: vec![track(1, TrackPlan::Encode(stereo))],
+			options: FileOptions {
+				merge_from: vec![1, 2],
+				merge_delays_s: vec![0.0, 0.5],
+				..FileOptions::default()
+			},
+		};
+
+		let args = joined(&command(
+			Path::new("ffmpeg"),
+			Path::new("in.mkv"),
+			Path::new("out.opus"),
+			&file,
+		));
+
+		assert!(
+			args.contains(
+				"[0:1]aresample=resampler=soxr:osr=48000,aformat=channel_layouts=stereo[m0];\
+				 [0:2]adelay=delays=500.000:all=1,asetpts=PTS-0.500000/TB,aresample=resampler=soxr:osr=48000,"
+			),
+			"{args}"
+		);
+	}
+
+	#[test]
+	fn audio_without_kept_metadata_carries_only_language_and_title() {
+		let stereo = EncodePlan {
+			bitrate_kbps: 128,
+			channels: 2,
+			layout: LayoutFix::Keep("stereo"),
+		};
+		let file = FilePlan {
+			container: OGG_OPUS,
+			tracks: vec![track(1, TrackPlan::Encode(stereo))],
+			options: FileOptions {
+				clean_tags: Some(Box::new([
+					(1, "language", "slv".to_owned()),
+					(1, "title", "Voice".to_owned()),
+				])),
+				titles: Box::new([(1, "Voice (Opus)".to_owned())]),
+				..FileOptions::default()
+			},
+		};
+
+		let args = joined(&command(
+			Path::new("ffmpeg"),
+			Path::new("in.mp4"),
+			Path::new("out.opus"),
+			&file,
+		));
+
+		assert!(
+			args.contains(
+				" -map_metadata:g -1 -map_metadata:s -1 -map_chapters 0 -map 0:1 -metadata:s:a:0 language=slv -c:a:0 "
+			),
+			"{args}"
+		);
+		assert!(args.contains("-metadata:s:a:0 title=Voice (Opus)"), "{args}");
+		assert_eq!(args.matches("title=").count(), 1, "{args}");
 	}
 
 	#[test]

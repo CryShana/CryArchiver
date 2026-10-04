@@ -466,6 +466,7 @@ mod tests {
 				offset_s: 1.0,
 				canvas: Some((720, 480)),
 				ten_bit: true,
+				in_frame_format: false,
 			}),
 			subtitles: None,
 		};
@@ -553,6 +554,7 @@ mod tests {
 				offset_s: 0.0,
 				canvas: None,
 				ten_bit: false,
+				in_frame_format: false,
 			}),
 		));
 		let plain = command(&shaped(None, None));

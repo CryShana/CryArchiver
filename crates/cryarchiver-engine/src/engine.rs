@@ -9,8 +9,8 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::plan::{
-	AudioPlan, AudioRules, FilePlan, TrackJob, TrackPlan, merge_file, mergeable, mixed_languages_warning,
-	plan_file_with, retarget,
+	AudioPlan, AudioRules, FilePlan, StreamTags, TrackJob, TrackPlan, merge_delays, merge_file, mergeable,
+	mixed_languages_warning, plan_file_with, retarget, unusable,
 };
 use crate::audio::{cover, encode, tags, verify};
 use crate::calibration::tables;
@@ -40,7 +40,7 @@ use crate::video::analyze::{Analysis, ScanType};
 use crate::video::burn::{self, Burn};
 use crate::video::colour::FrameFormat;
 use crate::video::encode::{EncodedVideo, Sample};
-use crate::video::mux::{self, Attachment, ChapterSource, CueFile, MuxInputs, MuxPlan};
+use crate::video::mux::{self, Attachment, CLEAN_STREAM_TAGS, ChapterSource, CueFile, MuxInputs, MuxPlan};
 use crate::video::plan::{
 	self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, threads_for, usable_main,
 };
@@ -52,7 +52,9 @@ use crate::video::verify::{
 	Expected, FrameTiming, Retiming, Timelines, alpha_ssim, check_alpha, check_frame_times, check_sync,
 	earliest_video_start, probe_temp, start_offsets, sync_tolerance_s, synced_streams, undecoded_lead, verify_output,
 };
-use crate::video::{VideoStarts, analyze, chapters, colour, cues, discontinuous, encode as video_encode, titles};
+use crate::video::{
+	InputStart, VideoStarts, analyze, chapters, colour, cues, discontinuous, encode as video_encode, titles,
+};
 use crate::workspace::Workspace;
 
 const SOURCE_METADATA: &str = "source-metadata.json";
@@ -218,8 +220,10 @@ enum Produced {
 enum Planned {
 	Audio {
 		info: Box<MediaInfo>,
-		plan: FilePlan,
+		plan: Box<FilePlan>,
 		from_video: bool,
+		/// Warnings for the audio tracks of a video that can't be extracted and were left out.
+		skipped: Vec<String>,
 	},
 	Video(StreamRules),
 	/// A video written as an animated AVIF, with the subtitle track to burn in, if any.
@@ -445,18 +449,20 @@ impl Engine {
 				match plan_file_with(&info, job.speed, &job.overrides, rules) {
 					AudioPlan::Encode(plan) => {
 						let plan = if job.options.merge_audio {
-							merge_file(plan, &info, job.speed, &job.overrides)
+							merge_file(*plan, &info, job.speed, &job.overrides)
 						} else {
-							plan
+							*plan
 						};
 						let mut plan = retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?;
 						plan.options.strip = job.options.strip;
 						plan.options.window = trim_window(job, info.format.duration)?;
+						align_merge(&mut plan, &info);
 
 						Planned::Audio {
-							plan,
+							plan: Box::new(plan),
 							info: Box::new(info),
 							from_video: false,
+							skipped: Vec::new(),
 						}
 					}
 					AudioPlan::Keep(reason) => return Ok(JobOutcome::KeptOriginal { reason }),
@@ -476,22 +482,26 @@ impl Engine {
 					forced: true,
 					reencode: job.options.trim.is_some(),
 				};
+				let (info, skipped) = extractable(info);
 				match plan_file_with(&info, job.speed, &job.overrides, rules) {
 					AudioPlan::Encode(plan) => {
 						let plan = if job.options.merge_audio {
-							merge_file(plan, &info, job.speed, &job.overrides)
+							merge_file(*plan, &info, job.speed, &job.overrides)
 						} else {
-							plan
+							*plan
 						};
 						let mut plan =
 							extracted(retarget(plan, job.options.format, &info).map_err(ErrorKind::EncodeFailed)?);
 						plan.options.strip = job.options.strip;
 						plan.options.window = trim_window(job, info.format.duration)?;
+						plan.options.clean_tags = (!job.keep_metadata).then(|| clean_tags(&info, &plan.tracks));
+						align_merge(&mut plan, &info);
 
 						Planned::Audio {
-							plan,
+							plan: Box::new(plan),
 							info: Box::new(info),
 							from_video: true,
+							skipped,
 						}
 					}
 					AudioPlan::Keep(reason) => return Err(ErrorKind::EncodeFailed(extraction_refusal(&reason)).into()),
@@ -579,8 +589,14 @@ impl Engine {
 			record: &recorder,
 		};
 		let produced = match &planned {
-			Planned::Audio { info, plan, from_video } => {
-				self.produce_audio(&cx, info, plan, *from_video, &workspace).await
+			Planned::Audio {
+				info,
+				plan,
+				from_video,
+				skipped,
+			} => {
+				self.produce_audio(&cx, info, plan, (*from_video, skipped), &workspace)
+					.await
 			}
 			Planned::Video(rules) => Box::pin(self.produce_video(&cx, &workspace, *rules)).await,
 			Planned::Animation(burn) => Box::pin(self.produce_video_animation(&cx, &workspace, *burn)).await,
@@ -672,6 +688,7 @@ impl Engine {
 			tools: &self.tools,
 			source: &cx.job.source,
 			source_bytes: cx.source_bytes,
+			source_is_part: false,
 			speed: cx.job.speed,
 			overrides: cx.job.overrides,
 			min_savings: cx.job.min_savings,
@@ -814,7 +831,7 @@ impl Engine {
 		cx: &Context<'_>,
 		info: &MediaInfo,
 		plan: &FilePlan,
-		from_video: bool,
+		(from_video, skipped): (bool, &[String]),
 		workspace: &Workspace,
 	) -> Result<Produced, JobError> {
 		let output = workspace.file(&format!("out.{}", plan.container.extension));
@@ -835,6 +852,7 @@ impl Engine {
 		let decoded_s = source_levels.iter().map(|levels| levels.duration_s).fold(0.0, f64::max);
 		let shortfall = if plan.options.merge_from.is_empty() {
 			match plan.options.window {
+				Some(window) if from_video => within_declared(window, longest_audio_s(info)).shortfall(decoded_s),
 				Some(window) => window.shortfall(decoded_s),
 				None if from_video => extraction_shortfall(info, decoded_s),
 				None => info.duration_shortfall(decoded_s),
@@ -847,7 +865,11 @@ impl Engine {
 		}
 
 		(cx.on_event)(JobEvent::Stage(Stage::Metadata));
-		let mut warnings = Vec::new();
+		let mut warnings = skipped.to_vec();
+		for warning in skipped {
+			(cx.on_event)(JobEvent::Warning(warning.clone()));
+		}
+
 		if let Some(warning) = mixed_languages_warning(info, &plan.options.merge_from) {
 			(cx.on_event)(JobEvent::Warning(warning.clone()));
 			warnings.push(warning);
@@ -862,7 +884,6 @@ impl Engine {
 		}
 
 		if plan.container.cover == Cover::VorbisPicture
-			&& !plan.options.strip
 			&& let Err(err) = tags::rename_keys(&output)
 		{
 			let warning = format!("music tags keep their ID3 names: {err}");
@@ -1145,7 +1166,7 @@ impl Engine {
 		};
 
 		let span = video_span(cx.job, &info, main)?;
-		check_frame_count(estimated_frames(span, main.fps(), ScanType::Progressive))?;
+		check_fewest_frames(span, main.fps())?;
 
 		let shown = video_plan::shown_size(main);
 		let size = animation_size(cx.job.options.resize, main).map_err(ErrorKind::EncodeFailed)?;
@@ -1169,6 +1190,9 @@ impl Engine {
 
 		if let Some(chosen) = burn {
 			Box::pin(self.prepare_burn(cx, workspace, &info, &mut video, chosen)).await?;
+		}
+		if let Some(overlay) = &mut video.overlay {
+			overlay.in_frame_format = true;
 		}
 		record_picture(cx, analysis.scan, size, span.window, burn.is_some());
 
@@ -1345,6 +1369,7 @@ impl Engine {
 			tools: &self.tools,
 			source: &frames.path,
 			source_bytes: job.share.unwrap_or(cx.source_bytes),
+			source_is_part: job.share.is_some(),
 			speed: cx.job.speed,
 			overrides: cx.job.overrides,
 			min_savings: cx.job.min_savings,
@@ -2194,6 +2219,12 @@ fn estimated_frames(span: Span, fps: Option<f64>, scan_type: ScanType) -> Option
 	Some((span.length_s? * fps? * per_source_frame).round().max(0.0) as u64)
 }
 
+/// Before the analysis the scan is unknown, so only a clip over the limit at the fewest frames any scan gives (an
+/// inverse telecine's) is refused.
+fn check_fewest_frames(span: Span, fps: Option<f64>) -> Result<(), JobError> {
+	check_frame_count(estimated_frames(span, fps, ScanType::Telecined))
+}
+
 fn check_frame_count(frames: Option<u64>) -> Result<(), JobError> {
 	match frames.and_then(animated::too_many_frames) {
 		Some(reason) => Err(ErrorKind::EncodeFailed(reason).into()),
@@ -2323,6 +2354,7 @@ fn stream_rules(job: &Job, info: &MediaInfo) -> Result<StreamRules, JobError> {
 		cut_end: job.options.trim.is_some_and(|trim| trim.end_s.is_some()),
 		merge: job.options.merge_audio,
 		burn,
+		forced: job.options.forced_video(mergeable(info)),
 		..StreamRules::new(job.speed, job.keep_metadata)
 	})
 }
@@ -2421,6 +2453,53 @@ fn extracted(plan: FilePlan) -> FilePlan {
 	}
 }
 
+/// The video without the audio tracks that can't be encoded, and a warning for each one left out. When no track is
+/// usable, the video as it is, which the plan then refuses with the reason.
+fn extractable(info: MediaInfo) -> (MediaInfo, Vec<String>) {
+	let mut usable = info.clone();
+	let mut warnings = Vec::new();
+	let mut track = 0;
+	usable.streams.retain(|stream| {
+		if !stream.is_audio() {
+			return true;
+		}
+
+		track += 1;
+		let Some(why) = unusable(stream) else {
+			return true;
+		};
+		warnings.push(format!(
+			"audio track {track} ({}) was left out: {why}",
+			stream.codec_name
+		));
+		false
+	});
+
+	if usable.audio_streams().next().is_none() {
+		return (info, Vec::new());
+	}
+	(usable, warnings)
+}
+
+fn align_merge(plan: &mut FilePlan, info: &MediaInfo) {
+	let seek_s = plan.options.window.map_or(0.0, |window| window.start_s);
+	let zero_s = InputStart::of(info, &plan.options.merge_from).at(seek_s);
+
+	plan.options.merge_delays_s = merge_delays(info, &plan.options.merge_from, zero_s);
+}
+
+fn clean_tags(info: &MediaInfo, tracks: &[TrackJob]) -> StreamTags {
+	tracks
+		.iter()
+		.filter_map(|track| info.streams.iter().find(|stream| stream.index == track.stream_index))
+		.flat_map(|stream| {
+			CLEAN_STREAM_TAGS
+				.iter()
+				.filter_map(|key| Some((stream.index, *key, stream.tag(key)?.to_owned())))
+		})
+		.collect()
+}
+
 fn extraction_refusal(reason: &KeepReason) -> String {
 	match reason {
 		KeepReason::Unsupported(why) => format!("the audio can't be extracted: {why}"),
@@ -2428,13 +2507,27 @@ fn extraction_refusal(reason: &KeepReason) -> String {
 	}
 }
 
-fn extraction_shortfall(info: &MediaInfo, decoded_s: f64) -> Option<String> {
+fn longest_audio_s(info: &MediaInfo) -> Option<f64> {
 	let declared = info
 		.audio_streams()
 		.filter_map(Stream::declared_duration)
 		.fold(0.0, f64::max);
 
-	(declared > 0.0 && declared - decoded_s > (declared * 0.02).max(1.0))
+	(declared > 0.0).then_some(declared)
+}
+
+/// The part of `window` that audio declared to last `declared_s` can fill.
+fn within_declared(window: TrimWindow, declared_s: Option<f64>) -> TrimWindow {
+	declared_s.map_or(window, |declared_s| TrimWindow {
+		length_s: (declared_s - window.start_s).max(0.0).min(window.length_s),
+		..window
+	})
+}
+
+fn extraction_shortfall(info: &MediaInfo, decoded_s: f64) -> Option<String> {
+	let declared = longest_audio_s(info)?;
+
+	(declared - decoded_s > (declared * 0.02).max(1.0))
 		.then(|| format!("decodes to {decoded_s:.1} s but its audio declares {declared:.1} s"))
 }
 
@@ -2447,10 +2540,7 @@ fn merge_shortfall(info: &MediaInfo, merge_from: &[u32], window: Option<TrimWind
 		.and_then(Stream::declared_duration);
 
 	match (declared, window) {
-		(Some(declared), Some(window)) => {
-			let length_s = (declared - window.start_s).max(0.0).min(window.length_s);
-			TrimWindow { length_s, ..window }.shortfall(decoded_s)
-		}
+		(Some(declared), Some(window)) => within_declared(window, Some(declared)).shortfall(decoded_s),
 		(Some(declared), None) => (declared - decoded_s > (declared * 0.02).max(1.0))
 			.then(|| format!("decodes to {decoded_s:.1} s but declares {declared:.1} s")),
 		(None, Some(window)) => window.shortfall(decoded_s),
@@ -2809,6 +2899,18 @@ mod tests {
 		assert!(check_frame_count(Some(100_000)).is_ok());
 		assert!(check_frame_count(None).is_ok());
 		assert!(check_frame_count(Some(100_001)).is_err());
+	}
+
+	#[test]
+	fn before_the_analysis_only_a_clip_too_long_even_after_removing_a_telecine_is_refused() {
+		let span = |minutes: f64| Span {
+			declared_s: Some(minutes * 60.0),
+			window: None,
+			length_s: Some(minutes * 60.0),
+		};
+
+		assert!(check_fewest_frames(span(58.0), Some(29.97)).is_ok());
+		assert!(check_fewest_frames(span(70.0), Some(29.97)).is_err());
 	}
 
 	#[test]

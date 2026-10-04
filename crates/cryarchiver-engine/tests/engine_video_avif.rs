@@ -217,6 +217,51 @@ async fn burned_subtitles_are_drawn_into_the_animation() {
 }
 
 #[tokio::test]
+async fn a_bitmap_track_is_burned_into_420_and_444_frames_alike() {
+	let dir = tempfile::tempdir().unwrap();
+	let pgs = support::pgs_box(dir.path(), 500, 1_500);
+	let picture = |codec| support::Picture {
+		source: "color=c=black",
+		seconds: 2,
+		codec,
+		second_angle: false,
+		marked_frame: None,
+	};
+	let half = support::subtitled_clip(
+		dir.path(),
+		"half.mkv",
+		&picture(&["-c:v", "mpeg4", "-q:v", "2"]),
+		&pgs,
+		"copy",
+	);
+	let full = support::subtitled_clip(
+		dir.path(),
+		"full.mkv",
+		&picture(&["-c:v", "ffv1", "-pix_fmt", "yuv444p"]),
+		&pgs,
+		"copy",
+	);
+	let burned = JobOptions {
+		burn_subs: Some(BurnSubs {
+			pick: SubtitlePick::Default,
+			size_percent: 10,
+		}),
+		..JobOptions::default()
+	};
+
+	for (name, source) in [("half", &half), ("full", &full)] {
+		let (outcome, _) = run(&as_avif(source, burned.clone()), &dir.path().join(name)).await;
+
+		let (output, _) = written(&outcome);
+		let lit = support::lit_span(&output, 1).unwrap();
+		assert!(
+			(lit.0 - 0.5).abs() < 0.05 && (lit.1 - 1.46).abs() < 0.05,
+			"{name}: {lit:?}"
+		);
+	}
+}
+
+#[tokio::test]
 async fn a_trim_keeps_only_its_frames() {
 	let dir = tempfile::tempdir().unwrap();
 	let source = support::mpeg4(dir.path(), "long.mp4", 3);
@@ -236,6 +281,34 @@ async fn a_trim_keeps_only_its_frames() {
 		tracks[0].nb_frames.is_some_and(|frames| frames.abs_diff(25) <= 1),
 		"{:?}",
 		tracks[0]
+	);
+}
+
+#[tokio::test]
+async fn a_trimmed_animation_larger_than_its_part_of_the_source_says_so() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = clip(
+		dir.path(),
+		"noisy.mp4",
+		"testsrc2=s=160x120:r=25:d=4,noise=alls=60:allf=t+u",
+		&["-c:v", "mpeg4", "-q:v", "31"],
+	);
+	let trimmed = JobOptions {
+		trim: Some(Trim {
+			start_s: 1.0,
+			end_s: Some(3.0),
+		}),
+		..JobOptions::default()
+	};
+
+	let (outcome, _) = run(&as_avif(&source, trimmed), dir.path()).await;
+
+	let (_, warnings) = written(&outcome);
+	assert!(
+		warnings
+			.iter()
+			.any(|warning| warning.starts_with("the output is not smaller than the same part of the source")),
+		"{warnings:?}"
 	);
 }
 
@@ -392,7 +465,7 @@ async fn a_clip_with_too_many_frames_fails_before_any_work() {
 	let long = support::converted(
 		dir.path(),
 		"long.mkv",
-		&["-stream_loop", "1700"],
+		&["-stream_loop", "2100"],
 		&second,
 		&["-c", "copy"],
 	);

@@ -1,7 +1,7 @@
 mod support;
 
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -2948,6 +2948,155 @@ async fn a_video_asked_for_as_opus_keeps_only_its_audio() {
 	assert!(!info.streams.iter().any(Stream::is_video));
 }
 
+fn phone_tagged(dir: &Path) -> PathBuf {
+	let clip = dir.join("phone.mp4");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:r=25:d=2",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=2",
+		"-c:v",
+		"mpeg4",
+		"-c:a",
+		"aac",
+		"-metadata",
+		"com.apple.quicktime.location.ISO6709=+46.0569+014.5058/",
+		"-metadata",
+		"com.apple.quicktime.make=Apple",
+		"-metadata",
+		"com.apple.quicktime.model=Phone",
+		"-metadata",
+		"creation_time=2024-05-01T10:00:00Z",
+		"-metadata:s:a:0",
+		"language=slv",
+		"-metadata:s:a:0",
+		"creation_time=2024-05-01T10:00:00Z",
+		"-movflags",
+		"use_metadata_tags",
+		clip.to_str().unwrap(),
+	]);
+	clip
+}
+
+fn personal_tags(info: &probe::MediaInfo) -> Vec<String> {
+	info.format
+		.tags
+		.keys()
+		.chain(info.streams.iter().flat_map(|stream| stream.tags.keys()))
+		.filter(|key| {
+			let key = key.to_ascii_lowercase();
+			key.contains("location") || key.contains("make") || key.contains("model") || key == "creation_time"
+		})
+		.cloned()
+		.collect()
+}
+
+#[tokio::test]
+async fn audio_taken_from_a_video_drops_personal_metadata_unless_kept() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = phone_tagged(dir.path());
+
+	for format in [OutputFormat::Opus, OutputFormat::Mka] {
+		let (clean_dir, kept_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+		let kept_job = Job {
+			keep_metadata: true,
+			..requested(&clip, format)
+		};
+
+		let clean = encoded_info(run(&requested(&clip, format), clean_dir.path()).await).await;
+		let kept = encoded_info(run(&kept_job, kept_dir.path()).await).await;
+
+		assert!(
+			personal_tags(&clean).is_empty(),
+			"{format}: {:?}",
+			personal_tags(&clean)
+		);
+		assert_eq!(clean.streams[0].tag("language"), Some("slv"), "{format}");
+		assert!(!personal_tags(&kept).is_empty(), "{format}: {:?}", kept.format.tags);
+	}
+}
+
+#[tokio::test]
+async fn extraction_leaves_out_an_audio_track_opus_can_not_hold() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("wide.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:r=25:d=2",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=2",
+		"-f",
+		"lavfi",
+		"-i",
+		"anoisesrc=d=2:a=0.1,aformat=channel_layouts=5.1.4",
+		"-map",
+		"0",
+		"-map",
+		"1",
+		"-map",
+		"2",
+		"-c:v",
+		"mpeg4",
+		"-c:a",
+		"pcm_s16le",
+		clip.to_str().unwrap(),
+	]);
+
+	let outcome = run(&requested(&clip, OutputFormat::Mka), dir.path()).await;
+
+	assert!(
+		warned(
+			&outcome,
+			"audio track 2 (pcm_s16le) was left out: 10 channels is more than Opus supports (8)"
+		),
+		"{outcome:?}"
+	);
+	assert_eq!(encoded_info(outcome).await.audio_streams().count(), 1);
+}
+
+#[tokio::test]
+async fn a_trimmed_extraction_ends_where_the_audio_ends() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("short-audio.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:r=25:d=10",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=duration=4",
+		"-c:v",
+		"mpeg4",
+		"-c:a",
+		"aac",
+		clip.to_str().unwrap(),
+	]);
+	let options = JobOptions {
+		format: Some(OutputFormat::Opus),
+		trim: Some(Trim {
+			start_s: 2.0,
+			end_s: None,
+		}),
+		..JobOptions::default()
+	};
+
+	let outcome = run(&with_options(fast(&clip), options), dir.path()).await;
+
+	let info = encoded_info(outcome).await;
+	let length_s = info.format.duration.unwrap();
+	assert!((length_s - 2.0).abs() < 0.2, "{length_s}");
+}
+
 #[tokio::test]
 async fn single_track_formats_refuse_several_tracks() {
 	let dir = tempfile::tempdir().unwrap();
@@ -3922,6 +4071,64 @@ async fn merging_keeps_every_source_audible() {
 	);
 }
 
+/// A silent first track and a beep track that starts 0.5 s later, after an optional 3 s video.
+fn delayed_second_track(dir: &Path, name: &str, video: bool) -> PathBuf {
+	let path = dir.join(name);
+	let mut args = Vec::new();
+	if video {
+		args.extend(["-f", "lavfi", "-i", "testsrc2=s=160x120:r=25:d=3"]);
+	}
+	args.extend([
+		"-f",
+		"lavfi",
+		"-i",
+		"anullsrc=r=48000:cl=stereo:d=3",
+		"-itsoffset",
+		"0.5",
+		"-f",
+		"lavfi",
+		"-i",
+		"sine=frequency=880:duration=1:sample_rate=48000",
+	]);
+	let inputs = if video {
+		["0", "1", "2"].as_slice()
+	} else {
+		["0", "1"].as_slice()
+	};
+	for input in inputs {
+		args.extend(["-map", input]);
+	}
+	args.extend(["-c:v", "mpeg4", "-c:a", "flac", path.to_str().unwrap()]);
+
+	support::ffmpeg(&args);
+	path
+}
+
+#[tokio::test]
+async fn merging_keeps_each_track_where_it_starts() {
+	let dir = tempfile::tempdir().unwrap();
+	let audio = delayed_second_track(dir.path(), "delayed.mka", false);
+	let video = delayed_second_track(dir.path(), "delayed.mkv", true);
+	let merge = JobOptions {
+		merge_audio: true,
+		..JobOptions::default()
+	};
+
+	for source in [audio, video] {
+		let outcome = run(&with_options(fast(&source), merge.clone()), dir.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{}: {outcome:?}", source.display())
+		};
+		let beep_s = support::first_sound(&output);
+		assert!(
+			(beep_s - 0.5).abs() < 0.05,
+			"{}: the beep starts at {beep_s} s",
+			source.display()
+		);
+	}
+}
+
 #[tokio::test]
 async fn stripped_video_keeps_only_the_main_video_and_the_audio() {
 	let dir = tempfile::tempdir().unwrap();
@@ -4233,6 +4440,43 @@ async fn a_cue_on_screen_at_a_late_cut_is_still_found() {
 	assert_eq!(cues.len(), 2, "{cues:?}");
 	assert!(near(cues[0], (0.0, 1.5)), "{cues:?}");
 	assert!(near(cues[1], (2.0, 3.0)), "{cues:?}");
+}
+
+#[tokio::test]
+async fn a_text_track_with_no_cue_in_the_trim_stays_as_an_empty_track() {
+	let dir = tempfile::tempdir().unwrap();
+	let cues = dir.path().join("late.srt");
+	fs::write(&cues, "1\n00:00:04,000 --> 00:00:05,000\nlate\n").unwrap();
+	let clip = support::black_clip_of(dir.path(), "late.mkv", 6, &cues, "srt");
+
+	for format in [OutputFormat::Mp4, OutputFormat::Webm, OutputFormat::Mkv] {
+		let out = tempfile::tempdir().unwrap();
+		let job = trimmed(fast(&clip), 0.0, 2.0);
+		let job = with_options(
+			job.clone(),
+			JobOptions {
+				format: Some(format),
+				..job.options
+			},
+		);
+
+		let outcome = run(&job, out.path()).await;
+
+		let JobOutcome::Encoded { output, .. } = &outcome else {
+			panic!("{format}: {outcome:?}")
+		};
+		assert!(subtitle_spans(output).is_empty(), "{format}");
+		let info = encoded_info(outcome).await;
+		assert_eq!(
+			info.streams
+				.iter()
+				.filter(|stream| stream.codec_type == "subtitle")
+				.count(),
+			1,
+			"{format}: {:?}",
+			info.streams
+		);
+	}
 }
 
 #[tokio::test]
@@ -6285,6 +6529,75 @@ async fn id3_musicbrainz_tags_arrive_with_vorbis_names() {
 			.items()
 			.any(|(key, value)| key == "MUSICBRAINZ_ALBUMID" && value == "abc")
 	);
+}
+
+fn stripped(source: &Path) -> Job {
+	Job {
+		options: JobOptions {
+			strip: true,
+			..JobOptions::default()
+		},
+		..fast(source)
+	}
+}
+
+#[tokio::test]
+async fn a_stripped_file_still_gets_vorbis_tag_names() {
+	let dir = tempfile::tempdir().unwrap();
+	let mp3 = support::tone(
+		dir.path(),
+		"tagged.mp3",
+		"stereo",
+		2,
+		3,
+		&[
+			"-c:a",
+			"libmp3lame",
+			"-b:a",
+			"256k",
+			"-metadata",
+			"MusicBrainz Album Id=abc",
+		],
+	);
+
+	let outcome = run(&stripped(&mp3), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let opus = OpusFile::read_from(
+		&mut File::open(&output).unwrap(),
+		ParseOptions::new().read_properties(false),
+	)
+	.unwrap();
+	assert!(
+		opus.vorbis_comments()
+			.items()
+			.any(|(key, value)| key == "MUSICBRAINZ_ALBUMID" && value == "abc"),
+		"{:?}",
+		opus.vorbis_comments().items().collect::<Vec<_>>()
+	);
+}
+
+#[tokio::test]
+async fn a_stripped_efficient_vorbis_file_stays_ogg() {
+	let dir = tempfile::tempdir().unwrap();
+	let ogg = support::tone(
+		dir.path(),
+		"song.ogg",
+		"mono",
+		1,
+		3,
+		&["-c:a", "libvorbis", "-b:a", "32k"],
+	);
+
+	let outcome = run(&stripped(&ogg), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(*output, dir.path().join("song.cry.ogg"));
+	VorbisFile::read_from(&mut File::open(output).unwrap(), ParseOptions::new()).unwrap();
 }
 
 #[tokio::test]

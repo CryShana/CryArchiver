@@ -179,7 +179,7 @@ pub struct FirstFrames {
 	pub output_s: Option<f64>,
 }
 
-/// The output's audio and video streams, main video first. A merged track has no single source to start with.
+/// The output's audio and video streams, main video first. A merged track starts with the earliest of its sources.
 pub fn synced_streams(outputs: &[OutputStream], source: &MediaInfo, merge_from: &[u32]) -> Vec<Synced> {
 	outputs
 		.iter()
@@ -187,14 +187,33 @@ pub fn synced_streams(outputs: &[OutputStream], source: &MediaInfo, merge_from: 
 		.filter_map(|(output, position)| {
 			let stream = source.streams.iter().find(|stream| stream.index == output.origin)?;
 			let audio = stream.codec_type == "audio";
-			let synced = stream.is_real_video() || (audio && !merge_from.contains(&output.origin));
-			synced.then_some(Synced {
-				source: output.origin,
+			let origin = if merge_from.first() == Some(&output.origin) {
+				earliest_source(source, merge_from)?
+			} else {
+				output.origin
+			};
+
+			(stream.is_real_video() || audio).then_some(Synced {
+				source: origin,
 				output: position,
 				audio,
 			})
 		})
 		.collect()
+}
+
+fn earliest_source(source: &MediaInfo, merge_from: &[u32]) -> Option<u32> {
+	merge_from.iter().copied().min_by(|a, b| {
+		let start = |index: u32| {
+			source
+				.streams
+				.iter()
+				.find(|stream| stream.index == index)
+				.and_then(|stream| stream.start_time)
+				.unwrap_or(f64::INFINITY)
+		};
+		start(*a).total_cmp(&start(*b))
+	})
 }
 
 pub fn sync_tolerance_s(fps: Option<f64>) -> f64 {
@@ -1055,6 +1074,49 @@ mod tests {
 		);
 
 		assert_eq!(offsets, [Some(0.0), Some(0.5), Some(0.5), None]);
+	}
+
+	#[test]
+	fn a_merged_track_is_synced_against_its_earliest_source() {
+		let source = MediaInfo::parse(
+			br#"{"streams":[{"index":0,"codec_type":"video","start_time":"0.000000"},
+			{"index":1,"codec_type":"audio","start_time":"0.500000"},
+			{"index":2,"codec_type":"audio","start_time":"0.200000"},
+			{"index":3,"codec_type":"subtitle"}]}"#,
+		)
+		.unwrap();
+		let outputs = [
+			OutputStream {
+				origin: 0,
+				input: MuxInput::VideoTemp(0),
+			},
+			OutputStream {
+				origin: 1,
+				input: MuxInput::AudioTemp(0),
+			},
+			OutputStream {
+				origin: 3,
+				input: MuxInput::Source,
+			},
+		];
+
+		let synced = synced_streams(&outputs, &source, &[1, 2]);
+
+		assert_eq!(
+			synced,
+			[
+				Synced {
+					source: 0,
+					output: 0,
+					audio: false,
+				},
+				Synced {
+					source: 2,
+					output: 1,
+					audio: true,
+				},
+			]
+		);
 	}
 
 	#[test]

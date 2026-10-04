@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::audio::plan::{FileOptions, FilePlan, TrackPlan};
+use crate::audio::plan::{FileOptions, FilePlan, TrackPlan, merge_delays};
 use crate::container::{Container, Cover, MATROSKA_AUDIO};
 use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
@@ -478,6 +478,7 @@ pub fn audio_plan(info: &MediaInfo, streams: &StreamPlan, window: Option<TrimWin
 			kept: cut.and_then(|cut| cut.kept),
 			delay_s: start.offset_s(cut.map(|cut| cut.input_s)),
 			merge_from: streams.merge_from.clone(),
+			merge_delays_s: merge_delays(info, &streams.merge_from, start.at(cut.map_or(0.0, |cut| cut.input_s))),
 			merge_language: streams.merge_language.clone(),
 			..FileOptions::default()
 		},
@@ -617,6 +618,7 @@ mod tests {
 				offset_s: 0.0,
 				canvas: None,
 				ten_bit: false,
+				in_frame_format: false,
 			}),
 			..plan(svt(), None)
 		};
@@ -706,6 +708,7 @@ mod tests {
 				offset_s: 5.3,
 				canvas: None,
 				ten_bit: false,
+				in_frame_format: false,
 			}),
 			window: Some(TrimWindow {
 				start_s: 4.0,
@@ -896,6 +899,7 @@ mod tests {
 				offset_s: 0.0,
 				canvas: None,
 				ten_bit: false,
+				in_frame_format: false,
 			}),
 		));
 

@@ -13,7 +13,7 @@ use crate::video::streams::{CueFormat, StreamPlan};
 use crate::video::{run_ffmpeg, titles};
 
 const BRAND_TAGS: &[&str] = &["major_brand", "minor_version", "compatible_brands"];
-const CLEAN_STREAM_TAGS: &[&str] = &["language", "title"];
+pub(crate) const CLEAN_STREAM_TAGS: &[&str] = &["language", "title"];
 const ATTACHMENT_TAGS: &[&str] = &["filename", "mimetype"];
 const CUE_DISPOSITIONS: &[&str] = &["default", "forced", "hearing_impaired", "visual_impaired", "comment"];
 const DVD_SUBTITLE: &str = "dvd_subtitle";
@@ -192,7 +192,7 @@ pub fn command(ffmpeg: &Path, inputs: &MuxInputs<'_>, plan: &MuxPlan<'_>, output
 		for tag in BRAND_TAGS {
 			cmd.arg("-metadata").arg(format!("{tag}="));
 		}
-		push_statistics_reset(&mut cmd, plan.info, &outputs);
+		push_statistics_reset(&mut cmd, plan, &outputs);
 		push_encoded_titles(&mut cmd, plan, &outputs);
 	} else {
 		push_clean_metadata(&mut cmd, plan, &outputs);
@@ -299,9 +299,15 @@ fn push_maps(
 	}
 }
 
-fn push_statistics_reset(cmd: &mut ToolCommand, info: &MediaInfo, outputs: &[OutputStream]) {
-	for (position, output) in outputs.iter().enumerate().filter(|(_, output)| output.is_encoded()) {
-		let Some(stream) = source_stream(info, output.origin) else {
+/// The statistics of an encoded stream, or of any stream under a trim, describe the source's and not the output's.
+fn push_statistics_reset(cmd: &mut ToolCommand, plan: &MuxPlan<'_>, outputs: &[OutputStream]) {
+	let trimmed = plan.window.is_some();
+	for (position, output) in outputs
+		.iter()
+		.enumerate()
+		.filter(|(_, output)| trimmed || output.is_encoded())
+	{
+		let Some(stream) = source_stream(plan.info, output.origin) else {
 			continue;
 		};
 
@@ -787,6 +793,39 @@ mod tests {
 		);
 		assert!(!args.contains("-metadata:s:2 BPS="), "{args}");
 		assert!(!build(false, false, &[]).contains("BPS"));
+	}
+
+	#[test]
+	fn keep_mode_under_a_trim_clears_the_statistics_of_copied_streams_too() {
+		let (info, video, streams) = (info(), test_plan(), stream_plan());
+		let inputs = MuxInputs {
+			video: Path::new("video.a1.mkv"),
+			audio: Some(Path::new("audio.mka")),
+			source: Path::new("source.mkv"),
+			source_bytes: 0,
+			attachments: &[],
+			chapters: None,
+			cues: &[],
+		};
+		let plan = MuxPlan {
+			info: &info,
+			video: &video,
+			streams: &streams,
+			keep_metadata: true,
+			container: MATROSKA_VIDEO,
+			chapters: ChapterSource::Dropped,
+			window: Some(TrimWindow {
+				start_s: 4.0,
+				length_s: 4.0,
+			}),
+		};
+
+		let args = joined(&command(Path::new("ffmpeg"), &inputs, &plan, Path::new("mux.mkv")));
+
+		assert!(
+			args.contains("-metadata:s:1 _STATISTICS_TAGS= -metadata:s:2 BPS="),
+			"{args}"
+		);
 	}
 
 	#[test]

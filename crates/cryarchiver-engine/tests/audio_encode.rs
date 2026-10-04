@@ -31,7 +31,7 @@ async fn encode_merged(source: &Path, output: &Path) -> (Vec<Levels>, MediaInfo)
 	let AudioPlan::Encode(plan) = plan_file(&info, Speed::Moderate, &Overrides::default()) else {
 		panic!("expected an encode plan")
 	};
-	let plan = merge_file(plan, &info, Speed::Moderate, &Overrides::default());
+	let plan = merge_file(*plan, &info, Speed::Moderate, &Overrides::default());
 
 	let cmd = encode::command(&tools.ffmpeg, source, output, &plan);
 	let levels = encode::run(&cmd, &plan, info.format.duration, |_| {}, &cancel)

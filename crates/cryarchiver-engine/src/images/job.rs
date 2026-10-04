@@ -19,7 +19,7 @@ use crate::images::verify::{self, Expected};
 use crate::images::{blocking, structure};
 use crate::metadata::icc::{self, Cicp};
 use crate::metadata::{self, ImageFormat, MetadataMode, OutputMetadata, SourceMetadata, exif, sniff};
-use crate::options::{Resize, kept_as_requested, upscaled};
+use crate::options::{Resize, kept_as_requested, kept_as_requested_part, upscaled};
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::MediaInfo;
@@ -51,6 +51,8 @@ pub struct ImageContext<'a> {
 	pub tools: &'a Toolchain,
 	pub source: &'a Path,
 	pub source_bytes: u64,
+	/// `source_bytes` is a trim window's share of the source rather than its whole size.
+	pub source_is_part: bool,
 	pub speed: Speed,
 	pub overrides: Overrides,
 	pub min_savings: f64,
@@ -884,7 +886,11 @@ pub async fn encode_animation(
 			}));
 		}
 
-		warnings.push(kept_as_requested(cx.source_bytes, bytes));
+		warnings.push(if cx.source_is_part {
+			kept_as_requested_part(cx.source_bytes, bytes)
+		} else {
+			kept_as_requested(cx.source_bytes, bytes)
+		});
 	}
 
 	(cx.on_event)(JobEvent::Stage(Stage::Verify));

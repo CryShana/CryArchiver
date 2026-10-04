@@ -10,8 +10,6 @@ use serde::{Deserialize, Serialize};
 pub const FILE_NAME: &str = "recent.bin";
 pub const CAPACITY: usize = 10;
 
-const DISABLED: &str = "the recent projects are off for this session: there is no writable folder to keep them in";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recent {
 	#[serde(with = "cryarchiver_project::keys::path_bytes")]
@@ -61,13 +59,6 @@ impl RecentStore {
 
 	/// A file that can't be read or decoded gives an empty list and a notice; it stays as it is until the next write.
 	pub fn load(&self) -> Loaded {
-		if self.file.is_none() {
-			return Loaded {
-				entries: Vec::new(),
-				notice: Some(DISABLED.to_owned()),
-			};
-		}
-
 		match self.read() {
 			Ok(entries) => Loaded {
 				entries: tidy(entries),
@@ -104,10 +95,10 @@ impl RecentStore {
 	}
 
 	/// Re-reads the file first, so another instance's changes since this one loaded are kept. A file that couldn't
-	/// be read is not replaced: the change is not saved.
+	/// be read is not replaced: the change is not saved. Without a file, the list silently stays empty.
 	fn update(&self, change: impl FnOnce(&mut Vec<Recent>)) -> io::Result<Vec<Recent>> {
 		let Some(file) = &self.file else {
-			return Err(io::Error::other(DISABLED));
+			return Ok(Vec::new());
 		};
 
 		let mut entries = match self.read() {
@@ -541,11 +532,11 @@ mod tests {
 		let store = RecentStore::locate_in(Some(&blocked.join("bin")));
 
 		assert_eq!(store.file(), None);
-		assert!(store.load().notice.unwrap().contains("off for this session"));
+		assert_eq!(store.load(), Loaded::default());
 	}
 
 	#[test]
-	fn without_a_writable_folder_the_list_is_off_for_the_session() {
+	fn without_a_writable_folder_the_list_is_silently_empty_for_the_session() {
 		let dir = tempfile::tempdir().unwrap();
 		let blocked = dir.path().join("file");
 		fs::write(&blocked, b"").unwrap();
@@ -553,10 +544,8 @@ mod tests {
 		let store = RecentStore::locate_in(Some(&blocked.join("bin")));
 
 		assert_eq!(store.file(), None);
-		let loaded = store.load();
-		assert!(loaded.entries.is_empty());
-		assert!(loaded.notice.unwrap().contains("off for this session"));
-		assert!(store.record(&dir.path().join("a.cryarchive"), 1).is_err());
+		assert_eq!(store.load(), Loaded::default());
+		assert_eq!(store.record(&dir.path().join("a.cryarchive"), 1).unwrap(), []);
 		assert!(!Path::new(FILE_NAME).exists());
 		assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 	}

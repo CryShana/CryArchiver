@@ -3,7 +3,7 @@ use std::fmt::Write;
 use std::io::{self, Write as _};
 use std::path::Path;
 
-use cryarchiver_engine::outcome::{JobOutcome, KeepReason};
+use cryarchiver_engine::outcome::JobOutcome;
 use cryarchiver_engine::text::display_name;
 use indicatif::{DecimalBytes, MultiProgress, ProgressDrawTarget};
 
@@ -124,7 +124,7 @@ pub fn outcome_line_with(source: &Path, outcome: &JobOutcome, tail_lines: usize,
 			}
 			line
 		}
-		JobOutcome::KeptOriginal { reason } => format!("= {name}  kept: {}", keep_reason(reason)),
+		JobOutcome::KeptOriginal { reason } => format!("= {name}  kept: {}", reason.description()),
 		JobOutcome::Skipped { reason } => format!("· {name}  skipped: {reason}"),
 		JobOutcome::Failed(err) => {
 			let mut line = format!("✗ {name}  failed: {err}");
@@ -138,52 +138,6 @@ pub fn outcome_line_with(source: &Path, outcome: &JobOutcome, tail_lines: usize,
 
 pub fn file_label(path: &Path) -> String {
 	display_name(path.file_name().unwrap_or(path.as_os_str()))
-}
-
-fn keep_reason(reason: &KeepReason) -> String {
-	match reason {
-		KeepReason::NotSmaller { src_bytes, out_bytes } if out_bytes > src_bytes => {
-			format!(
-				"the encode came out larger than the source ({} → {})",
-				DecimalBytes(*src_bytes),
-				DecimalBytes(*out_bytes)
-			)
-		}
-		KeepReason::NotSmaller { src_bytes, out_bytes } => {
-			format!(
-				"encoding saved too little ({} → {})",
-				DecimalBytes(*src_bytes),
-				DecimalBytes(*out_bytes)
-			)
-		}
-		KeepReason::PredictedNotSmaller {
-			src_bytes,
-			predicted_bytes,
-		} if predicted_bytes > src_bytes => {
-			format!(
-				"encoding would come out larger than the source ({} → predicted {})",
-				DecimalBytes(*src_bytes),
-				DecimalBytes(*predicted_bytes)
-			)
-		}
-		KeepReason::PredictedNotSmaller {
-			src_bytes,
-			predicted_bytes,
-		} => {
-			format!(
-				"encoding would save too little ({} → predicted {})",
-				DecimalBytes(*src_bytes),
-				DecimalBytes(*predicted_bytes)
-			)
-		}
-		KeepReason::AlreadyEfficient(why) | KeepReason::Unsupported(why) | KeepReason::QualityUnreachable(why) => {
-			why.clone()
-		}
-		KeepReason::InvalidIcc(why) => format!("invalid ICC profile: {why}"),
-		KeepReason::DecodeBomb { megapixels } => {
-			format!("the header claims {megapixels} MP, above the 500 MP safety limit")
-		}
-	}
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -200,7 +154,7 @@ mod tests {
 	use std::path::PathBuf;
 
 	use cryarchiver_engine::decision::{Decision, Measured, VideoDecision};
-	use cryarchiver_engine::outcome::{ErrorKind, JobError};
+	use cryarchiver_engine::outcome::{ErrorKind, JobError, KeepReason};
 
 	use super::*;
 
