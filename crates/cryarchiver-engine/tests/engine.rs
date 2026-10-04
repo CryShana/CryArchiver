@@ -1876,6 +1876,8 @@ impl QualityMemory for EveryGroupLearned {
 
 	fn record(&self, _: &CacheKey, _: Observation) {}
 
+	fn record_offset(&self, _: &CacheKey, _: Observation) {}
+
 	fn forget(&self, _: &CacheKey) {}
 }
 
@@ -2136,6 +2138,49 @@ async fn a_last_check_that_misses_by_half_a_point_at_most_is_written_with_a_warn
 		),
 		"{kept:?}"
 	);
+}
+
+#[tokio::test]
+async fn a_searched_near_miss_teaches_its_offset_but_no_setting() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("flat.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=gray:s=320x240:r=25:d=40,noise=alls=40:allf=t:enable='between(t,6.6,8.2)'",
+		"-pix_fmt",
+		"yuv420p",
+		"-c:v",
+		"ffv1",
+		clip.to_str().unwrap(),
+	]);
+	let memory = Arc::new(SharedMemory::default());
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
+
+	let (outcome, events) = run_recording(&engine, &strict(&clip, 97.2, 90.0), dir.path()).await;
+
+	let JobOutcome::Encoded { decision, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	let video = decision.video.as_ref().unwrap();
+	assert_eq!(video.chosen, Some(CrfChoice::Searched), "{decision:?}");
+	assert!(
+		video.near_miss,
+		"the samples miss the noisy second and a half: {decision:?}"
+	);
+	assert_eq!(stages(&events, Stage::Encode), 1, "{events:?}");
+
+	let entries = memory.entries();
+	let [(_, group)] = entries.as_slice() else {
+		panic!("{entries:?}")
+	};
+	assert!(
+		!group.learned(),
+		"a setting known to land below the target is not reused: {group:?}"
+	);
+	let offset = group.offset.expect("the full check's offset from the samples is kept");
+	assert!(offset.mean < 0.0, "{offset:?}");
 }
 
 #[tokio::test]

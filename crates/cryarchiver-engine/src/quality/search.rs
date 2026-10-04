@@ -119,7 +119,7 @@ pub fn retry_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bou
 
 /// The CRF a passing score points to: the one used, raised by the margin beyond the search's own tolerance over the
 /// slope, by one full step at most. Aiming at the tolerance rather than at the target itself keeps the next file of
-/// the group from landing on the edge, where half of them would miss and be encoded again.
+/// the group from landing on the edge, where half of them would miss: written below the target, or encoded again.
 pub fn implied_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bounds) -> f64 {
 	let spare = (target.margin(score) - CLOSE_ENOUGH).max(0.0);
 	let step = (spare / slope.clamp(MIN_SLOPE, MAX_SLOPE)).min(MAX_STEP);

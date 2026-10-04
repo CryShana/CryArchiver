@@ -687,8 +687,8 @@ mod tests {
 		}
 	}
 
-	/// Encodes the source as it is, deciding `attempts` full encodes.
-	struct DecidingEncoder(u32);
+	/// Encodes the source as it is, with a decision record of one full encode.
+	struct DecidingEncoder;
 
 	impl Encode for DecidingEncoder {
 		fn encode<'a>(
@@ -717,7 +717,7 @@ mod tests {
 					output,
 					warnings: Vec::new(),
 					decision: Box::new(Decision {
-						attempts: self.0,
+						attempts: 1,
 						..Decision::default()
 					}),
 				}
@@ -1022,7 +1022,7 @@ mod tests {
 		};
 
 		let sent = run_job_with(
-			Arc::new(DecidingEncoder(2)),
+			Arc::new(DecidingEncoder),
 			&source,
 			&destination,
 			b"sound",

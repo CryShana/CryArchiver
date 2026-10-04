@@ -185,6 +185,10 @@ pub trait QualityMemory: Send + Sync {
 
 	fn record(&self, key: &CacheKey, observation: Observation);
 
+	/// Takes in `observation`'s offset as `record` does, but leaves the group without a setting: the observation's
+	/// output landed just below its target.
+	fn record_offset(&self, key: &CacheKey, observation: Observation);
+
 	/// Drops the group's setting, so that its next file starts afresh. Its offset stays.
 	fn forget(&self, key: &CacheKey);
 }
@@ -262,6 +266,22 @@ impl QualityMemory for SharedMemory {
 		entries.changed.insert(key);
 	}
 
+	fn record_offset(&self, key: &CacheKey, observation: Observation) {
+		let key = key.to_string();
+		let mut entries = self.lock();
+		let stats = match entries.stats.get(&key) {
+			Some(stats) => stats.updated(observation),
+			None if observation.offset.is_none() => return,
+			None => GroupStats::first(observation),
+		};
+
+		match stats.forgotten() {
+			Some(kept) => entries.stats.insert(key.clone(), kept),
+			None => entries.stats.remove(&key),
+		};
+		entries.changed.insert(key);
+	}
+
 	fn forget(&self, key: &CacheKey) {
 		let key = key.to_string();
 		let mut entries = self.lock();
@@ -323,6 +343,35 @@ mod tests {
 		assert_eq!(first.offset, Some(Offset { mean: -1.0, p5: -2.0 }));
 		assert_eq!(second.offset, Some(Offset { mean: -2.0, p5: -4.0 }));
 		assert_eq!(third.offset, second.offset);
+	}
+
+	#[test]
+	fn a_near_miss_teaches_its_offset_but_no_setting() {
+		let memory = SharedMemory::default();
+		let near = |mean: f64| Observation {
+			offset: Some(Offset { mean, p5: mean }),
+			..observation(90.0)
+		};
+		let key = key(ImageFormat::Jpeg);
+
+		memory.record_offset(&key, near(-1.0));
+
+		assert_eq!(memory.lookup(&key), None, "no setting to use");
+		assert_eq!(memory.offset(&key), Some(Offset { mean: -1.0, p5: -1.0 }));
+
+		memory.record(&key, near(-3.0));
+		memory.record_offset(&key, near(-3.0));
+
+		assert_eq!(memory.lookup(&key), None, "a learned setting is forgotten");
+		assert_eq!(
+			memory.offset(&key),
+			Some(Offset { mean: -2.5, p5: -2.5 }),
+			"blended as a check that passed would"
+		);
+
+		let fresh = SharedMemory::default();
+		fresh.record_offset(&key, observation(90.0));
+		assert!(fresh.entries().is_empty() && fresh.take_changed().is_empty());
 	}
 
 	#[test]

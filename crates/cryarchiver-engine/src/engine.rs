@@ -209,7 +209,7 @@ struct Staged {
 	source_share: Option<u64>,
 	warnings: Vec<String>,
 	/// Recorded only once the output is committed.
-	learned: Vec<(CacheKey, Observation)>,
+	learned: Vec<(CacheKey, Lesson)>,
 }
 
 enum Produced {
@@ -329,8 +329,17 @@ enum Tuning {
 enum Checked {
 	Passed(Observation),
 	Missed(KeepReason),
-	/// Written below the target, as requested or after a near miss; learns nothing.
+	/// Missed by at most half a point and written: its offset is learned, its setting forgotten.
+	NearMiss(Observation),
+	/// Written below the target because it was requested; learns nothing.
 	Short,
+}
+
+/// What a committed output teaches its group.
+enum Lesson {
+	Setting(Observation),
+	/// Only how far the full check landed from the samples.
+	Offset(Observation),
 }
 
 impl Engine {
@@ -630,8 +639,11 @@ impl Engine {
 		let outcome = finish(job, sink, &work_root, &meta, before, staged, decision)?;
 
 		if matches!(outcome, JobOutcome::Encoded { .. }) {
-			for (key, observation) in &learned {
-				self.quality.record(key, *observation);
+			for (key, lesson) in &learned {
+				match lesson {
+					Lesson::Setting(observation) => self.quality.record(key, *observation),
+					Lesson::Offset(observation) => self.quality.record_offset(key, *observation),
+				}
 			}
 		}
 		Ok(outcome)
@@ -721,7 +733,10 @@ impl Engine {
 					bytes,
 					source_share: None,
 					warnings,
-					learned,
+					learned: learned
+						.into_iter()
+						.map(|(key, observation)| (key, Lesson::Setting(observation)))
+						.collect(),
 				})
 			}
 			ImageOutcome::Kept(reason) => Produced::Kept(reason),
@@ -1044,16 +1059,21 @@ impl Engine {
 		cx.record.update(|decision| decision.attempts = 1);
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &inputs)).await?;
+
 		if !cx.job.options.forced_video(mergeable(&info))
 			&& let Some(reason) = temps_not_smaller(&temps, compared_bytes, cx.job.min_savings)
 		{
 			return Ok(self.kept_video(&quality, reason));
 		}
 
+		let teaches = window.is_none() && size.is_none();
 		let learned = if verify {
 			match Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await? {
-				Checked::Passed(_) if window.is_some() || size.is_some() => None,
-				Checked::Passed(observation) => Some(observation),
+				Checked::Passed(observation) => teaches.then_some(Lesson::Setting(observation)),
+				Checked::NearMiss(observation) => {
+					self.forget_learned(&quality);
+					teaches.then_some(Lesson::Offset(observation))
+				}
 				Checked::Short => {
 					self.forget_learned(&quality);
 					None
@@ -1079,10 +1099,7 @@ impl Engine {
 		};
 		Ok(match Box::pin(self.mux_and_verify(cx, workspace, &job, temps)).await? {
 			Produced::Output(staged) => Produced::Output(Staged {
-				learned: learned
-					.map(|observation| (quality.key, observation))
-					.into_iter()
-					.collect(),
+				learned: learned.map(|lesson| (quality.key, lesson)).into_iter().collect(),
 				..staged
 			}),
 			Produced::Kept(reason) => self.kept_video(&quality, reason),
@@ -1412,7 +1429,7 @@ impl Engine {
 		Produced::Kept(reason)
 	}
 
-	/// A group whose learned setting led to an output that wasn't smaller, or that missed its check and its retry,
+	/// A group whose learned setting led to an output that wasn't smaller, or that missed its check, even narrowly,
 	/// forgets it, so that its next file searches afresh instead of repeating the same encodes.
 	fn forget_learned(&self, quality: &VideoQuality) {
 		if quality.stats.is_some() {
@@ -1707,22 +1724,27 @@ impl Engine {
 
 			let crf = video.encoder.crf();
 			cx.record.video(|record| record.checks.push(Measured::new(crf, score)));
-			if quality.target.met(score) {
-				return Ok(Checked::Passed(Observation {
+			let passed = quality.target.met(score);
+			if passed || video_quality::near_miss(score, quality.target) {
+				let observation = Observation {
 					setting: search::implied_crf(crf, score, quality.target, quality.slope, bounds),
 					slope: Some(quality.slope),
 					bpp: output_bpp(&temps.video.path, video, temps.encoded.frames),
 					offset: first_offset,
 					without_grain: quality.without_grain,
-				}));
-			}
+				};
+				if passed {
+					return Ok(Checked::Passed(observation));
+				}
 
-			if video_quality::near_miss(score, quality.target) {
-				temps
-					.warnings
-					.push(video_quality::near_miss_text(crf, score, quality.target));
+				temps.warnings.push(video_quality::near_miss_text(
+					crf,
+					score,
+					quality.target,
+					video.max_bitrate_kbps,
+				));
 				cx.record.video(|record| record.near_miss = true);
-				return Ok(Checked::Short);
+				return Ok(Checked::NearMiss(observation));
 			}
 
 			let lower = if attempt <= MAX_RETRIES && video.max_bitrate_kbps.is_none() {

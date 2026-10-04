@@ -28,6 +28,8 @@ const CAPS: VideoCaps = VideoCaps { vp9_alpha: false };
 const SUBTITLES_ALIGNED_P5: f64 = 90.0;
 /// testsrc2 scored against itself one frame later gives a VMAF mean of about 44.
 const LEAD_ALIGNED_MEAN: f64 = 90.0;
+/// Every clip the full check is tested on, aligned with its source, scores well above a one-frame shift's 44.
+const ALIGNED_MEAN: f64 = 80.0;
 
 #[tokio::test]
 async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
@@ -241,6 +243,51 @@ async fn plan_for(tools: &Toolchain, clip: &Path) -> VideoPlan {
 }
 
 #[tokio::test]
+async fn the_sampled_check_of_a_24_fps_encode_scores_like_every_frame() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let clip = dir.path().join("film.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=640x360:r=24:d=40,noise=alls=8:allf=t",
+		"-c:v",
+		"libx264",
+		"-crf",
+		"16",
+		clip.to_str().unwrap(),
+	]);
+	let cancel = CancellationToken::new();
+	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
+	let mut plan = plan_for(&tools, &clip).await;
+	plan.encoder = plan.encoder.without_grain().with_crf(38.0);
+	let temp = workspace.file("video.a1.mkv");
+	let cmd = video_command(&tools.ffmpeg, &clip, &temp, &plan);
+	let encoded = encode_video(&cmd, &plan, Some(40.0), |_| {}, &cancel).await.unwrap();
+	let scorer = Scorer {
+		tools: &tools,
+		source: &clip,
+		workspace: &workspace,
+		plan: &plan,
+		threads: 4,
+		cancel: &cancel,
+	};
+
+	let sampled = scorer
+		.verify(&temp, encoded.frames, encoded.decoded_s, |_| {})
+		.await
+		.unwrap();
+	let all = pool(&scorer.whole_scores(&temp, 1, encoded.frames, |_| {}).await.unwrap()).unwrap();
+
+	assert_eq!(subsample(encoded.frames, encoded.decoded_s), 3);
+	assert!(
+		(sampled.p5 - all.p5).abs() < 0.3 && (sampled.mean - all.mean).abs() < 0.2,
+		"every third frame {sampled:?} against every frame {all:?}"
+	);
+}
+
+#[tokio::test]
 async fn the_whole_check_scores_the_same_frames_as_a_measure_of_every_frame() {
 	let dir = tempfile::tempdir().unwrap();
 	let tools = support::toolchain().await;
@@ -283,7 +330,7 @@ async fn the_whole_check_scores_the_same_frames_as_a_measure_of_every_frame() {
 		late.to_str().unwrap(),
 	]);
 	let clips = [
-		support::mpeg4(dir.path(), "plain.mp4", 30),
+		support::mpeg4(dir.path(), "plain.mp4", 40),
 		support::variable_rate(dir.path(), "variable.mkv", 30),
 		interlaced,
 		late,
@@ -308,6 +355,7 @@ async fn checks_agree(tools: &Toolchain, clip: &Path, workspace: &Workspace, pla
 	let (whole, through, every) = both_checks(tools, clip, workspace, plan).await;
 
 	assert!(same_frames(whole, through), "{}: {whole:?} {through:?}", clip.display());
+	assert!(whole.mean > ALIGNED_MEAN, "{}: {whole:?}", clip.display());
 
 	let trimmed = VideoPlan {
 		window: Some(TrimWindow {
@@ -324,6 +372,7 @@ async fn checks_agree(tools: &Toolchain, clip: &Path, workspace: &Workspace, pla
 		"{} trimmed: {cut:?} {through:?}",
 		clip.display()
 	);
+	assert!(cut.mean > ALIGNED_MEAN, "{} trimmed: {cut:?}", clip.display());
 	(whole, cut, every)
 }
 
@@ -336,7 +385,7 @@ async fn the_whole_check_of_a_source_whose_first_frames_never_decode_stays_align
 		"-f",
 		"lavfi",
 		"-i",
-		"testsrc2=s=320x240:r=25:d=30",
+		"testsrc2=s=320x240:r=25:d=40",
 		"-c:v",
 		"libx264",
 		"-crf",
@@ -360,7 +409,7 @@ async fn the_whole_check_of_a_source_whose_first_frames_never_decode_stays_align
 
 	let (whole, cut, every) = checks_agree(&tools, &lead, &workspace, &plan).await;
 
-	assert_eq!(every, 2);
+	assert_eq!(every, 3);
 	assert!(
 		whole.mean > LEAD_ALIGNED_MEAN && cut.mean > LEAD_ALIGNED_MEAN,
 		"the encode starts at the first decodable frame, as the reference does: {whole:?} {cut:?}"
@@ -392,7 +441,7 @@ async fn the_whole_check_draws_burned_subtitles_at_the_times_the_encode_shows_th
 		"subtitled.mkv",
 		&support::Picture {
 			source: "testsrc2",
-			seconds: 30,
+			seconds: 40,
 			codec: &["-c:v", "mpeg4", "-q:v", "2"],
 			second_angle: false,
 			marked_frame: None,
@@ -414,7 +463,7 @@ async fn the_whole_check_draws_burned_subtitles_at_the_times_the_encode_shows_th
 
 	let (whole, cut, every) = checks_agree(&tools, &clip, &workspace, &burning).await;
 
-	assert_eq!(every, 2);
+	assert_eq!(every, 3);
 	assert!(
 		whole.p5 > SUBTITLES_ALIGNED_P5 && cut.p5 > SUBTITLES_ALIGNED_P5,
 		"the reference draws each cue when the encode shows it: {whole:?} {cut:?}"

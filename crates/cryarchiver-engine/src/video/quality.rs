@@ -473,7 +473,10 @@ fn add_once<'a>(chosen: &mut Vec<&'a Detail>, detail: &'a Detail) {
 }
 
 /// Every how many frames the full check scores one, over an output of `frames` decoded over `decoded_s`: about
-/// `SCORED_PER_S` a second, but at least `MIN_SCORED_FRAMES` in all (every frame of a shorter output).
+/// `SCORED_PER_S` a second, but at least `MIN_SCORED_FRAMES` in all (every frame of a shorter output). The step is
+/// always odd: SVT-AV1's mini-GOP puts every other frame in its top temporal layer, the worst-coded one, and an even
+/// key interval keeps those frames on the same parity, as do the two fields of a deinterlaced frame, so an even step
+/// could score none of them.
 #[allow(
 	clippy::cast_precision_loss,
 	clippy::cast_possible_truncation,
@@ -485,9 +488,10 @@ pub fn subsample(frames: u64, decoded_s: f64) -> u64 {
 	} else {
 		FALLBACK_FPS
 	};
-	let by_rate = (fps / SCORED_PER_S).round().max(1.0) as u64;
+	let by_rate = (fps / SCORED_PER_S).round().max(1.0) as u64 | 1;
+	let most = (frames / MIN_SCORED_FRAMES).max(1);
 
-	by_rate.min(frames / MIN_SCORED_FRAMES).max(1)
+	by_rate.min((most - 1) | 1)
 }
 
 pub fn unreachable_text(crf: f64, score: Score, target: Target) -> String {
@@ -508,12 +512,17 @@ pub fn near_miss(score: Score, target: Target) -> bool {
 	score.mean >= target.mean - NEAR_MISS && score.p5 >= target.floor - NEAR_MISS
 }
 
-pub fn near_miss_text(crf: f64, score: Score, target: Target) -> String {
-	format!(
+/// Under a bitrate cap the cap is named instead: a capped encode is never encoded again, whatever it misses by.
+pub fn near_miss_text(crf: f64, score: Score, target: Target, cap_kbps: Option<u32>) -> String {
+	let written = format!(
 		"written slightly below the quality target: VMAF {:.1} / {:.1} at CRF {crf}, target {:.1} / {:.1} (within \
-		 {NEAR_MISS:.1}, so not encoded again)",
+		 {NEAR_MISS:.1}",
 		score.mean, score.p5, target.mean, target.floor
-	)
+	);
+	match cap_kbps {
+		Some(_) => with_cap_note(&format!("{written})"), cap_kbps),
+		None => format!("{written}, so not encoded again)"),
+	}
 }
 
 fn measured(crf: f64, score: Score, target: Target) -> String {
@@ -1424,23 +1433,39 @@ mod tests {
 	}
 
 	#[test]
-	fn the_check_scores_about_eleven_frames_a_second_and_at_least_three_hundred() {
+	fn the_check_scores_about_eleven_frames_a_second_at_least_three_hundred_on_an_odd_step() {
 		let every = |fps: f64, seconds: f64| {
 			#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 			let frames = (fps * seconds) as u64;
 			subsample(frames, seconds)
 		};
+		let rates = [23.976, 24.0, 25.0, 29.97, 50.0, 59.94, 60.0];
 
-		assert_eq!(
-			[60.0, 59.94, 50.0, 30.0, 29.97, 25.0, 24.0, 23.976, 15.0, 12.0, 8.0, 0.5].map(|fps| every(fps, 3600.0)),
-			[5, 5, 5, 3, 3, 2, 2, 2, 1, 1, 1, 1]
-		);
-		assert_eq!(every(60.0, 10.0), 2, "600 frames: 300 of them");
-		assert_eq!(every(25.0, 3.0), 1, "75 frames: every one");
-		assert_eq!(every(50.0, 60.0), 5);
+		assert_eq!(rates.map(|fps| every(fps, 3600.0)), [3, 3, 3, 3, 5, 5, 5]);
+		assert_eq!(rates.map(|fps| every(fps, 60.0)), [3, 3, 3, 3, 5, 5, 5]);
+		assert_eq!(rates.map(|fps| every(fps, 30.0)), [1, 1, 1, 1, 5, 5, 5]);
+		assert_eq!(rates.map(|fps| every(fps, 20.0)), [1, 1, 1, 1, 3, 3, 3]);
+		assert_eq!(rates.map(|fps| every(fps, 10.0)), [1, 1, 1, 1, 1, 1, 1]);
+		assert_eq!(rates.map(|fps| every(fps, 3.0)), [1; 7]);
+		assert_eq!([15.0, 12.0, 8.0, 0.5].map(|fps| every(fps, 3600.0)), [1, 1, 1, 1]);
+		assert_eq!(every(48.0, 3600.0), 5);
 		assert_eq!(subsample(0, 0.0), 1);
-		assert_eq!(subsample(1500, f64::NAN), 2);
-		assert_eq!(subsample(90_000, 0.0), 2);
+		assert_eq!(subsample(1500, f64::NAN), 3);
+		assert_eq!(subsample(90_000, 0.0), 3);
+
+		for fps in [10.0, 23.976, 24.0, 25.0, 30.0, 48.0, 50.0, 60.0, 100.0, 120.0, 144.0] {
+			for seconds in [1.0, 5.0, 12.0, 14.0, 19.0, 26.0, 40.0, 61.0, 600.0, 7200.0] {
+				let step = every(fps, seconds);
+				#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+				let frames = (fps * seconds) as u64;
+
+				assert_eq!(step % 2, 1, "{fps} fps, {seconds} s: {step}");
+				assert!(
+					frames.div_ceil(step) >= frames.min(MIN_SCORED_FRAMES),
+					"{fps} fps, {seconds} s: {step}"
+				);
+			}
+		}
 	}
 
 	#[test]
@@ -1457,9 +1482,14 @@ mod tests {
 		assert!(!near_miss(scored(90.4, 87.0), target));
 		assert!(!near_miss(scored(f64::NAN, 87.0), target));
 		assert_eq!(
-			near_miss_text(28.5, scored(92.04, 86.21), target),
+			near_miss_text(28.5, scored(92.04, 86.21), target, None),
 			"written slightly below the quality target: VMAF 92.0 / 86.2 at CRF 28.5, target 91.0 / 86.5 (within 0.5, so \
 			 not encoded again)"
+		);
+		assert_eq!(
+			near_miss_text(28.5, scored(92.04, 86.21), target, Some(12_500)),
+			"written slightly below the quality target: VMAF 92.0 / 86.2 at CRF 28.5, target 91.0 / 86.5 (within 0.5) \
+			 under the 12.5 Mbit/s cap"
 		);
 	}
 
