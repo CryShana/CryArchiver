@@ -33,6 +33,15 @@ cryarchiver photos/                    # writes IMG_0001.cry.avif and so on
 cryarchiver music/                     # every file directly inside music/
 cryarchiver "*.flac" -o compressed/    # wildcards also work in PowerShell and cmd
 cryarchiver album/ --speed slow        # slower, higher quality
+cryarchiver film.mkv --ss 1:00 --to 2:30      # frame-accurate cut
+cryarchiver film.mkv -o clip.mp4              # one input: -o can name the file, its extension picks the format
+cryarchiver recordings/ --merge-audio         # game and microphone tracks mixed into one
+cryarchiver film.mkv --burn-subs=eng          # draw the English subtitles into the picture
+cryarchiver film.mkv --strip -f webm          # only video and audio, as WebM
+cryarchiver film.mkv -o clip.opus             # the audio of a video, as Opus
+cryarchiver clip.mp4 --max-bitrate 12.5       # for sharing: at most 12.5 Mbit/s
+cryarchiver clip.mp4 -o clip.avif             # a video as a looping animated AVIF
+cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, the aspect ratio kept
 ```
 
 - Sources are never modified.
@@ -41,7 +50,10 @@ cryarchiver album/ --speed slow        # slower, higher quality
   - Dolby Vision is saved as its HDR10- or HLG-compatible base layer. Profile 5, which has none, keeps the original.
 - At `--speed moderate` (the default) and `slow`, each video's quality setting is chosen before the full encode: a few seconds of samples are encoded and measured with VMAF, and the finished video is measured again before it is kept. What each kind of video needed is remembered, so similar videos skip the samples at moderate. `--speed fast` uses fixed settings and doesn't measure video.
   - A plain run remembers this only for its own files; an archive project remembers it across runs inside the project file.
-  - When no setting reaches the quality target, or the samples show the output wouldn't be meaningfully smaller, the original is kept before the full encode. A finished video that misses the target is encoded once more with more quality; if that misses too, the original is kept.
+  - When no setting reaches the quality target, or the samples show the output wouldn't be meaningfully smaller, the original is kept before the full encode. A finished video that misses the target is encoded once more with more quality (the progress line says "encoding again"); if that misses too, the original is kept.
+  - When that last full check misses the target by at most 0.5 VMAF, on the mean and on the floor alike, and the output is still small enough to keep, it is written anyway, with a warning.
+  - Each video's full check also teaches its kind of video how far the samples' score was from the full score, and later searches aim that much higher (at most 3 VMAF points).
+  - The result line of an encoded video ends with the CRF it was encoded at and its measured VMAF.
   - If ffmpeg has no libvmaf, moderate and slow don't measure video: each video is encoded at the preset's setting (or one an archive project learned earlier), still kept as the original when samples show it wouldn't be meaningfully smaller, and gets a warning that its quality wasn't measured.
   - Noisy sources at moderate and slow are denoised and get AV1 film grain back, with a strength that follows the measured noise. Transparent videos and videos too large for SVT-AV1 use other encoders and get no film grain.
 - Images are rotated upright and keep their colour profile. Each encode is checked with SSIMULACRA2 and kept only if it reaches the quality target for the chosen speed.
@@ -53,7 +65,7 @@ cryarchiver album/ --speed slow        # slower, higher quality
 - Damaged or truncated videos fail with "source damaged" instead of producing a broken copy.
 - An existing output is skipped, so running the same command again is safe.
 - Files that would share an output name (song.flac and song.wav) are not merged: the first in name order is compressed, the second is skipped with a note.
-- Cover art and common music tags are kept. MusicBrainz IDs and lyrics keep their ID3-style names for now.
+- Cover art and common music tags are kept.
 - `--keep-metadata` also keeps each file's timestamps.
 
 **Custom quality.** Three flags replace a speed preset's quality targets and keep the rest of the preset. The run then names the preset as custom, for example `MODERATE · custom: video VMAF 90/85, image 80`.
@@ -64,18 +76,41 @@ cryarchiver album/ --speed slow        # slower, higher quality
 
 | Option | Meaning | Default |
 |---|---|---|
-| `-o, --output DIR` | Write outputs into DIR | next to each source |
+| `-o, --output PATH` | Output folder, or a file for a single input (its extension picks the format) | next to each source |
+| `-f, --format mkv\|webm\|mp4\|opus\|ogg\|mka\|avif\|jxl` | Output format for every file; a requested output is written even when it isn't smaller | automatic |
+| `-c, --codec latest` | Codec family (`compat` arrives in a later version) | latest |
 | `-s, --speed slow\|moderate\|fast` | Trade speed for quality | moderate |
 | `--video-vmaf MEAN/FLOOR` | Video quality target (moderate and slow) | the preset's |
 | `--image-target N` | Image quality target (SSIMULACRA2) | the preset's |
 | `--audio-kbps N` | Stereo audio bitrate; other layouts scale with it | the preset's |
 | `--keep-metadata` | Keep personal metadata and file timestamps | off |
 | `--drop-aux` | Convert photos that have gain or depth maps, dropping the extras | off |
+| `--ss TIME`, `--to TIME` | Cut audio or video: `90`, `1:30` or `00:01:30.500` | whole file |
+| `--merge-audio` | Mix all audio tracks into one | off |
+| `--burn-subs[=TRACK\|LANG]` | Draw subtitles into the picture | off |
+| `--sub-size PERCENT` | Height of burned text subtitles | 5 |
+| `--strip` | Keep only the main video and the audio | off |
+| `--resize W:H` | Scale video, animations and images; `W:-1` or `-1:H` keeps the aspect ratio. A resized output is always written | off |
+| `--max-bitrate MBPS` | Cap the video bitrate for sharing, e.g. `12.5`; a capped output is always written | none |
 | `--overwrite` | Replace existing outputs (never sources) | off |
 | `--min-savings PERCENT` | Keep the original unless the output is at least this much smaller (0–90) | 10 |
 | `-j, --jobs N` | Files processed in parallel (also videos, which otherwise run one at a time) | half the CPU cores, at most 4 |
+| `--threads N` | Threads per file | automatic |
+| `--priority normal\|low\|idle` | Process priority; `low` is below normal | normal |
+| `--cpu-limit PERCENT` | Use at most this share of the CPU | none |
 | `--ffmpeg PATH` | ffmpeg binary or its folder | from PATH |
 | `-q, --quiet` | Only print failures and the summary | off |
+| `-v, --verbose` | Show warnings as they happen and 20 lines of a failed tool's output | off |
+
+Hidden advanced options (`--help` lists them): `--crf N` encodes video at a fixed CRF without the quality search (the quality isn't measured, and it can't be combined with `--video-vmaf`), `--video-encoder svt-av1|aom`, `--image-encoder avif|jxl|jxl-lossless`.
+
+A plain run writes nothing but its outputs: no settings file, no cache and no log files. Errors are printed to the console; redirect the output to keep it. Locked files, files still being written, crashed tools and a full disk are retried automatically, up to three attempts; a crashed or out-of-memory tool is retried with half the threads in a plain run. A quality miss is not an error and is never retried.
+
+`-o` with an audio extension (`.opus`, `.ogg`, `.mka`) or `-f opus|ogg|mka` on a video writes only its audio. `-o` with `.avif` or `-f avif` on a video writes an animated AVIF that loops forever, with no sound and no subtitles (`--burn-subs` draws one into the picture); the free disk space for its frames is checked first, and `--crf`, `--video-encoder`, `--video-vmaf`, `--merge-audio` and `--strip` don't apply to it. Both are for plain runs only.
+
+`--max-bitrate` applies to video only: audio and images behave as without it, and `-f avif` or `-f jxl` with it is refused. A video already under the cap is still re-encoded. It applies to plain runs only; archive projects don't take it. When the cap keeps a video from its quality target, the video is still written, with a warning.
+
+`--resize` takes whole pixels, at most 65536 a side; leave one side out (`1280:-1`, `-1:720` or `1280:`) to keep the aspect ratio. A video written as a video file needs even sides. Audio ignores it.
 
 Exit codes: `0` everything succeeded or was kept/skipped · `1` at least one file failed · `2` no inputs, a bad option, or a problem with ffmpeg.
 
@@ -99,6 +134,8 @@ cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashbo
 - A project file opens only from its own archive folder; a copy of it elsewhere is refused.
 - Nothing is written or removed through a link (a symbolic link or a junction) in the destination. A project whose file or `.cryarchiver` folder, or a folder in it, is a link doesn't open. A mirrored folder that is a link gets nothing written into it: the files that belong there are open issues until it is a real folder.
 - A file that fails stays an open issue until you retry it, copy the original or exclude it in the dashboard (`i`). Files in the destination that the project didn't write are reported as issues until you acknowledge them; they are never deleted.
+- The project file stays small: its records are compressed, failure logs keep the last 100 lines of the last 5 attempts per file (32 MB at most in all, dropping the logs of files that no longer fail first), and once it has grown, the file is compacted after a finished run and after a crash. A project file from an earlier CryArchiver is upgraded the first time it opens; the upgrade writes a new file next to it and replaces the old one only once it is complete.
+- A file's details in the dashboard (Enter on a file) show how it was encoded: the CRF and how it was chosen, the quality scores, a second encode, film grain, the sizes and any warnings. Only the latest job's record of a file is kept.
 - With watch mode on, the run keeps going once everything is archived and picks up new files as they appear.
 - The performance limit runs in the background: low priority, one job at a time, and at most the chosen share of the CPU.
 - `project create` takes the custom quality flags (`--video-vmaf`, `--image-target`, `--audio-kbps`) and stores them in the project. Like a speed change, a change to them applies to files archived from then on; files already archived are not redone. `run` names the custom profile in its summary, and `project dump` shows the stored values. The dashboard's settings (`s`) change them too, and reset them to the preset.
@@ -121,6 +158,6 @@ On Linux, the check that an original is still open in another program is best ef
 
 `run` prints a progress line every few seconds and the log as it happens, then a summary that lists the open issues. It exits with `0` once everything is archived without open issues, `1` with open issues (unacknowledged unknown files in the destination included) or when stopped with Ctrl+C before the end (a watch-mode run stopped with Ctrl+C exits with `0` when it has no open issues), and `2` when the project can't be opened or the delete confirmation doesn't agree. A second Ctrl+C exits at once; the next run resumes the jobs that were running.
 
-`cryarchiver` with no arguments, or `cryarchiver tui`, opens the start menu: the last 10 projects you opened, and a form that creates a new project and checks every field as you type. `cryarchiver --demo` or `cryarchiver tui --demo` shows the dashboard on demo data instead. The list of recent projects is kept in `recent.bin`, next to the executable when that folder is writable, otherwise in `%APPDATA%\CryArchiver` or `~/.config/cryarchiver` (`$XDG_CONFIG_HOME/cryarchiver`); it only changes when you open or create a project, or remove projects from it in the menu.
+`cryarchiver` with no arguments, or `cryarchiver tui`, opens the start menu: the last 10 projects you opened, and a form that creates a new project and checks every field as you type. `cryarchiver --demo` or `cryarchiver tui --demo` shows the dashboard on demo data instead. The list of recent projects is kept in `recent.bin` next to the executable when that folder is writable; otherwise the start menu has no recent list. It only changes when you open or create a project, or remove projects from it in the menu.
 
 The dashboard needs a terminal of at least 100×30; press `?` for keys and `q` to quit. Quitting stops running jobs, and the project resumes them on the next open.
