@@ -195,7 +195,7 @@ async fn samples_searched_side_by_side_give_the_same_crf_and_scores_as_one_at_a_
 			"-map",
 			"0:v",
 			"-vf",
-			"noise=alls=10:allf=t",
+			"scale=1280:720,noise=alls=10:allf=t",
 			"-c:v",
 			"libx264",
 			"-crf",
@@ -235,7 +235,7 @@ async fn samples_searched_side_by_side_give_the_same_crf_and_scores_as_one_at_a_
 			.unwrap()
 	};
 	let four_lanes = Lanes {
-		width: Width::Fixed(8),
+		width: Width::Fixed(16),
 		..Lanes::SERIAL
 	};
 

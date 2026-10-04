@@ -915,6 +915,7 @@ impl Engine {
 	) -> Result<Produced, JobError> {
 		// An audio encode keeps about one core busy.
 		let _hold = self.budget.hold(1);
+
 		let output = workspace.file(&format!("out.{}", plan.container.extension));
 		let mut plan = with_clipped_chapters(plan, info, workspace)?;
 		plan.options.titles = encoded_titles(info, &plan.tracks);

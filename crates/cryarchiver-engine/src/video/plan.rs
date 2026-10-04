@@ -25,6 +25,11 @@ const SOURCE_FRAME_TOLERANCE: u64 = 2;
 const VIDEO_BASE_BYTES: u64 = 512 << 20;
 const VIDEO_BYTES_PER_PIXEL: u64 = 540;
 const SVT_MAX_LP: usize = 6;
+/// The fewest threads each SVT-AV1 level of parallelism needs. A 4 s sample at presets 3 and 5, 1080p and 4K, uses
+/// at most 1.1 cores at level 1, 3.8 at level 2, 6.8 at level 3 and 11 at level 4, decoding included. Samples that
+/// short can't show what levels 5 and 6 would use, so level 5 asks for twice level 4's threads and level 6 is left
+/// out.
+const LANE_LEVELS: [(usize, u8); 4] = [(24, 5), (12, 4), (7, 3), (4, 2)];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Threads {
@@ -46,15 +51,15 @@ pub fn svt_lp(threads: usize, cores: usize) -> u8 {
 		.clamp(1, SVT_MAX_LP) as u8
 }
 
-/// The threads of one of several tools that share a budget, `threads` each: SVT-AV1 starts about twice as many
-/// threads at each level of parallelism, one at level 1.
-#[allow(clippy::cast_possible_truncation)]
+/// The threads of one of several tools that share a budget, `threads` each, with SVT-AV1's highest level of
+/// parallelism whose CPU use fits them.
 pub fn lane_threads(threads: usize) -> Threads {
 	let threads = threads.max(1);
-	Threads {
-		tool: threads,
-		svt_lp: (threads.ilog2() as usize + 1).min(SVT_MAX_LP) as u8,
-	}
+	let svt_lp = LANE_LEVELS
+		.iter()
+		.find(|(fits, _)| threads >= *fits)
+		.map_or(1, |(_, level)| *level);
+	Threads { tool: threads, svt_lp }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1033,11 +1038,11 @@ mod tests {
 	}
 
 	#[test]
-	fn a_lane_starts_about_as_many_svt_threads_as_it_has() {
-		let levels = [1, 2, 3, 4, 7, 8, 15, 16, 32, 64, 0].map(|threads| lane_threads(threads).svt_lp);
+	fn a_lane_gets_the_highest_svt_level_whose_cpu_use_fits_it() {
+		let levels = [0, 1, 2, 3, 4, 6, 7, 11, 12, 23, 24, 64].map(|threads| lane_threads(threads).svt_lp);
 
-		assert_eq!(levels, [1, 2, 2, 3, 3, 4, 4, 5, 6, 6, 1]);
-		assert_eq!(lane_threads(8), Threads { tool: 8, svt_lp: 4 });
+		assert_eq!(levels, [1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
+		assert_eq!(lane_threads(8), Threads { tool: 8, svt_lp: 3 });
 		assert_eq!(lane_threads(0).tool, 1);
 	}
 

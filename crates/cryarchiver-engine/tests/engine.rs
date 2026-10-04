@@ -2778,20 +2778,32 @@ async fn a_learned_crf_whose_full_encode_is_expected_to_take_long_is_searched_ag
 #[tokio::test]
 async fn measuring_side_by_side_chooses_the_same_crf_from_the_same_scores() {
 	let dir = tempfile::tempdir().unwrap();
-	let clip = support::mpeg4(dir.path(), "clip.mp4", 20);
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 40);
 	let tools = support::toolchain().await;
 	let run = async |threads: usize, out: &str| {
 		let engine = Engine::new(tools.clone()).with_thread_budget(threads);
-		let (outcome, _) = run_recording(&engine, &job(&clip), &out_dir(dir.path(), out)).await;
+		let (outcome, events) = run_recording(&engine, &job(&clip), &out_dir(dir.path(), out)).await;
 		let JobOutcome::Encoded { decision, .. } = outcome else {
 			panic!("{outcome:?}")
 		};
-		decision.video.unwrap()
+		let samples = events
+			.iter()
+			.skip_while(|event| **event != JobEvent::Stage(Stage::Sample))
+			.filter_map(|event| match event {
+				JobEvent::Parts { total, .. } => Some(*total),
+				_ => None,
+			})
+			.max();
+		(decision.video.unwrap(), samples)
 	};
 
-	let one_at_a_time = run(1, "serial").await;
-	let side_by_side = run(8, "side").await;
+	let (one_at_a_time, samples) = run(1, "serial").await;
+	let (side_by_side, _) = run(32, "side").await;
 
+	assert!(
+		samples.is_some_and(|samples| samples >= 2),
+		"the 32 threads run each probe after the first in as many lanes as samples: {samples:?}"
+	);
 	assert!(one_at_a_time.probes.len() >= 2, "{one_at_a_time:?}");
 	assert_eq!(side_by_side.crf, one_at_a_time.crf);
 	assert_eq!(side_by_side.probes, one_at_a_time.probes);

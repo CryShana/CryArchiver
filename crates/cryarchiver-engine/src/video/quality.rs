@@ -36,8 +36,12 @@ const FLAT_SI: f64 = 2.0;
 const MAX_ANALYSIS_SEGMENTS: usize = 48;
 const LONG_SPAN_S: f64 = 600.0;
 const NEAR_MISS: f64 = 0.5;
-/// A sample gets a lane of its own only with at least this many threads: one-thread lanes encode slower in all.
-const SAMPLE_LANE_THREADS: usize = 2;
+/// A sample lane's threads: the fewest on which SVT-AV1 runs above its first level of parallelism, as level 2 uses
+/// about 3.8 cores.
+const SAMPLE_LANE_THREADS: usize = 4;
+/// Samples run side by side only from this many threads: below it one sample at a time on the plan's caps keeps the
+/// threads about as busy and finishes sooner.
+const SIDE_BY_SIDE_FROM: usize = 16;
 const NO_MARGIN: Target = Target { mean: 0.0, floor: 0.0 };
 
 const TARGETS: [Target; 3] = [
@@ -141,11 +145,19 @@ pub struct Aim {
 pub struct Probed {
 	pub score: Score,
 	pub bytes: u64,
-	/// The time the sample encodes took.
+	/// The samples' encoding times summed, overlapping ones included.
 	pub encode_s: f64,
 	/// The median sample's encoding seconds per second of source, so that one slow start-up doesn't set it; `NaN` when
 	/// the samples ran side by side.
 	pub rate: f64,
+}
+
+struct SampleRun {
+	bytes: u64,
+	elapsed_s: f64,
+	/// Encoded with no other sample beside it, on the plan's caps.
+	alone: bool,
+	scores: Vec<f64>,
 }
 
 struct Sampling {
@@ -619,21 +631,26 @@ impl Scorer<'_> {
 		round: usize,
 		mut on_samples: impl FnMut(usize),
 	) -> Result<Probed, JobError> {
-		let granted = self.lanes.grant(samples.len(), SAMPLE_LANE_THREADS);
-		let lane = granted.lane_threads();
+		let granted = self.lanes.grant(samples.len(), SAMPLE_LANE_THREADS, SIDE_BY_SIDE_FROM);
 		let plan = VideoPlan {
 			encoder: self.plan.encoder.with_crf(crf),
-			threads: lane.map_or(self.plan.threads, |threads| Some(lane_threads(threads))),
 			..self.plan.clone()
 		};
 		on_samples(0);
 
-		let (plan, done) = (&plan, &Mutex::new((0, on_samples)));
-		let measured = in_lanes(samples.len(), granted.lanes, move |index| async move {
+		let (plan, granted, done) = (&plan, &granted, &Mutex::new((0, on_samples)));
+		let next = || granted.next();
+		let measured = in_lanes(samples.len(), granted.lanes, next, move |index, threads| async move {
+			let lane = (!granted.plan_caps()).then_some(threads);
+			let plan = VideoPlan {
+				threads: lane.map_or(plan.threads, |threads| Some(lane_threads(threads))),
+				..plan.clone()
+			};
+
 			let sample = &samples[index];
 			let output = self.workspace.file(&format!("probe{round}-{index}.mkv"));
 			let started = Instant::now();
-			let bytes = encode_sample(&self.tools.ffmpeg, self.source, &output, plan, sample, self.cancel).await?;
+			let bytes = encode_sample(&self.tools.ffmpeg, self.source, &output, &plan, sample, self.cancel).await?;
 			let elapsed_s = started.elapsed().as_secs_f64();
 
 			let log = format!("vmaf-probe{round}-{index}.json");
@@ -652,24 +669,30 @@ impl Scorer<'_> {
 			let (count, on_samples) = &mut *done.lock().unwrap_or_else(PoisonError::into_inner);
 			*count += 1;
 			on_samples(*count);
-			Ok::<_, JobError>((bytes, elapsed_s, scores))
+			Ok::<_, JobError>(SampleRun {
+				bytes,
+				elapsed_s,
+				alone: lane.is_none(),
+				scores,
+			})
 		})
 		.await?;
 
 		let rates = samples
 			.iter()
 			.zip(&measured)
-			.filter(|(sample, _)| sample.length_s > 0.0 && lane.is_none())
-			.map(|(sample, (_, elapsed_s, _))| elapsed_s / sample.length_s)
+			.filter(|(sample, measured)| sample.length_s > 0.0 && measured.alone)
+			.map(|(sample, measured)| measured.elapsed_s / sample.length_s)
 			.collect();
 		let scores: Vec<f64> = measured
 			.iter()
-			.flat_map(|(_, _, scores)| scores.iter().copied())
+			.flat_map(|measured| measured.scores.iter().copied())
 			.collect();
+
 		Ok(Probed {
 			score: pooled(&scores)?,
-			bytes: measured.iter().map(|(bytes, _, _)| bytes).sum(),
-			encode_s: measured.iter().map(|(_, elapsed_s, _)| elapsed_s).sum(),
+			bytes: measured.iter().map(|measured| measured.bytes).sum(),
+			encode_s: measured.iter().map(|measured| measured.elapsed_s).sum(),
 			rate: median_rate(rates),
 		})
 	}

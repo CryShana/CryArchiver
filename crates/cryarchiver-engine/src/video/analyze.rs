@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::budget::{Granted, Lanes, in_lanes};
+use crate::budget::{Lanes, Width, in_lanes};
 use crate::calibration::tables;
 use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError};
@@ -39,7 +39,8 @@ pub const DEFAULT_SEGMENTS: usize = 4;
 const PARALLEL_SEGMENTS: usize = 4;
 /// The frame statistics and the noise measure.
 const SEGMENT_TOOLS: usize = 2;
-/// A segment's two tools need about this many times less memory than a job reserves for its encode.
+/// A segment's two tools need this many times less memory than a job reserves for its encode: at 4 threads each
+/// they peak at about 190 MB of 1080p's 1.6 GB and 510 MB of 4K's 5 GB.
 const SEGMENT_MEMORY_SHARE: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,12 +369,18 @@ pub async fn analyze_reporting(
 		lane_bytes: lanes.lane_bytes / SEGMENT_MEMORY_SHARE,
 		..lanes
 	}
-	.grant(total, SEGMENT_TOOLS);
-	let (parallel, threads) = segment_lanes(&granted);
+	.grant(total, SEGMENT_TOOLS, 0);
+	let parallel = if matches!(lanes.width, Width::Serial) {
+		PARALLEL_SEGMENTS
+	} else {
+		granted.lanes
+	};
 	on_segments(0, total);
 
-	let segments = &segments;
-	let run = move |index: usize| async move {
+	let (segments, granted) = (&segments, &granted);
+	let next = || granted.next();
+	let run = move |index: usize, width: usize| async move {
+		let threads = segment_threads(width);
 		let segment = segments[index];
 		let cmd = segment_command(
 			&tools.ffmpeg,
@@ -401,7 +408,12 @@ pub async fn analyze_reporting(
 			}),
 		)
 	};
-	let stats: Vec<SegmentStats> = in_lanes(total, parallel, run).await?.into_iter().flatten().collect();
+
+	let stats: Vec<SegmentStats> = in_lanes(total, parallel, next, run)
+		.await?
+		.into_iter()
+		.flatten()
+		.collect();
 
 	Ok(classify(&stats, main.fps(), main.field_order.as_deref()))
 }
@@ -444,12 +456,9 @@ async fn segment_pixels(
 	})
 }
 
-/// How many segments are analysed at once, and the threads of each of their tools.
-fn segment_lanes(granted: &Granted<'_>) -> (usize, Option<usize>) {
-	match granted.threads() {
-		Some(lane) => (granted.lanes, Some((lane / SEGMENT_TOOLS).max(1))),
-		None => (PARALLEL_SEGMENTS, None),
-	}
+/// The threads of each of a segment's tools in a lane `width` threads wide; none for a serial lane.
+fn segment_threads(width: usize) -> Option<usize> {
+	(width > 0).then(|| (width / SEGMENT_TOOLS).max(1))
 }
 
 /// Ends the task, and the tool it runs, when the analysis is dropped.
@@ -593,13 +602,12 @@ mod tests {
 	#[test]
 	fn the_segments_analysed_at_once_share_the_thread_budget() {
 		let lanes = |threads: usize, segments: usize| {
-			segment_lanes(
-				&Lanes {
-					width: crate::budget::Width::Fixed(threads),
-					..Lanes::SERIAL
-				}
-				.grant(segments, SEGMENT_TOOLS),
-			)
+			let granted = Lanes {
+				width: Width::Fixed(threads),
+				..Lanes::SERIAL
+			}
+			.grant(segments, SEGMENT_TOOLS, 0);
+			(granted.lanes, granted.next().and_then(segment_threads))
 		};
 
 		assert_eq!(lanes(8, 8), (4, Some(1)));
@@ -608,7 +616,13 @@ mod tests {
 		assert_eq!(lanes(3, 8), (1, Some(1)));
 		assert_eq!(lanes(1, 8), (1, Some(1)));
 		assert_eq!(lanes(6, 1), (1, Some(3)));
-		assert_eq!(segment_lanes(&Lanes::SERIAL.grant(8, SEGMENT_TOOLS)), (4, None));
+		assert_eq!(
+			Lanes::SERIAL
+				.grant(8, SEGMENT_TOOLS, 0)
+				.next()
+				.and_then(segment_threads),
+			None
+		);
 
 		for threads in 1..=64 {
 			let (parallel, each) = lanes(threads, 48);
