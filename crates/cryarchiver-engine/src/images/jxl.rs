@@ -108,7 +108,7 @@ pub fn upright_png(
 pub fn libjxl_cicp(cicp: Cicp) -> Cicp {
 	let transfer = match cicp.transfer {
 		6 | 14 | 15 => 1,
-		7 | 11 => Cicp::UNSPECIFIED.transfer,
+		7 | 9 | 10 | 11 | 12 => Cicp::UNSPECIFIED.transfer,
 		other => other,
 	};
 	Cicp { transfer, ..cicp }
@@ -219,7 +219,10 @@ mod tests {
 			(14, 1),
 			(15, 1),
 			(7, 2),
+			(9, 2),
+			(10, 2),
 			(11, 2),
+			(12, 2),
 			(1, 1),
 			(13, 13),
 			(16, 16),

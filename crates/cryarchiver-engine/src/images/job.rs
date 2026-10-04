@@ -110,7 +110,7 @@ struct Env<'a> {
 	colour: AvifColour<'a>,
 	expected: Expected<'a>,
 	reference: Option<Arc<DynamicImage>>,
-	/// A resized image written out losslessly for libjxl (`jxl::upright_png`).
+	/// A resized or retagged image written out losslessly for libjxl (`jxl::upright_png`).
 	upright: Option<PathBuf>,
 }
 
