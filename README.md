@@ -27,12 +27,12 @@ The binary is `target/release/cryarchiver` (`cryarchiver.exe` on Windows).
 ## Use
 
 ```
-cryarchiver song.flac                  # writes song.cry.opus next to it
-cryarchiver holiday.mp4                # writes holiday.cry.mkv next to it
-cryarchiver photos/                    # writes IMG_0001.cry.avif and so on
-cryarchiver music/                     # every file directly inside music/
-cryarchiver "*.flac" -o compressed/    # wildcards also work in PowerShell and cmd
-cryarchiver album/ --speed slow        # slower, higher quality
+cryarchiver song.flac                         # writes song.cry.opus next to it
+cryarchiver holiday.mp4                       # writes holiday.cry.mkv next to it
+cryarchiver photos/                           # writes IMG_0001.cry.avif and so on
+cryarchiver music/                            # every file directly inside music/
+cryarchiver "*.flac" -o compressed/           # wildcards also work in PowerShell and cmd
+cryarchiver album/ --speed slow               # slower, higher quality
 cryarchiver film.mkv --ss 1:00 --to 2:30      # frame-accurate cut
 cryarchiver film.mkv -o clip.mp4              # one input: -o can name the file, its extension picks the format
 cryarchiver recordings/ --merge-audio         # game and microphone tracks mixed into one
@@ -53,7 +53,7 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, the aspect rat
   - When no setting reaches the quality target, or the samples show the output wouldn't be meaningfully smaller, the original is kept before the full encode. A finished video that misses the target is encoded once more with more quality (the progress line says "encoding again"); if that misses too, the original is kept.
   - When that last full check misses the target by at most 0.5 VMAF, on the mean and on the floor alike, and the output is still small enough to keep, it is written anyway, with a warning.
   - Each video's full check also teaches its kind of video how far the samples' score was from the full score, and later searches aim that much higher (at most 3 VMAF points).
-  - The result line of an encoded video ends with the CRF it was encoded at and its measured VMAF.
+  - The result line of an encoded video ends with the CRF it was encoded at and, when the full check ran, its measured VMAF.
   - If ffmpeg has no libvmaf, moderate and slow don't measure video: each video is encoded at the preset's setting (or one an archive project learned earlier), still kept as the original when samples show it wouldn't be meaningfully smaller, and gets a warning that its quality wasn't measured.
   - Noisy sources at moderate and slow are denoised and get AV1 film grain back, with a strength that follows the measured noise. Transparent videos and videos too large for SVT-AV1 use other encoders and get no film grain.
 - Images are rotated upright and keep their colour profile. Each encode is checked with SSIMULACRA2 and kept only if it reaches the quality target for the chosen speed.
@@ -91,7 +91,7 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, the aspect rat
 | `--sub-size PERCENT` | Height of burned text subtitles | 5 |
 | `--strip` | Keep only the main video and the audio | off |
 | `--resize W:H` | Scale video, animations and images; `W:-1` or `-1:H` keeps the aspect ratio. A resized output is always written | off |
-| `--max-bitrate MBPS` | Cap the video bitrate for sharing, e.g. `12.5`; a capped output is always written | none |
+| `--max-bitrate MBPS` | Cap the video bitrate for sharing, 0.1 to 1000, e.g. `12.5`; a capped output is always written | none |
 | `--overwrite` | Replace existing outputs (never sources) | off |
 | `--min-savings PERCENT` | Keep the original unless the output is at least this much smaller (0–90) | 10 |
 | `-j, --jobs N` | Files processed in parallel (also videos, which otherwise run one at a time) | half the CPU cores, at most 4 |
@@ -104,11 +104,11 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, the aspect rat
 
 Hidden advanced options (`--help` lists them): `--crf N` encodes video at a fixed CRF without the quality search (the quality isn't measured, and it can't be combined with `--video-vmaf`), `--video-encoder svt-av1|aom`, `--image-encoder avif|jxl|jxl-lossless`.
 
-A plain run writes nothing but its outputs: no settings file, no cache and no log files. Errors are printed to the console; redirect the output to keep it. Locked files, files still being written, crashed tools and a full disk are retried automatically, up to three attempts; a crashed or out-of-memory tool is retried with half the threads in a plain run. A quality miss is not an error and is never retried.
+A plain run writes nothing but its outputs: no settings file, no cache and no log files. Errors are printed to the console; redirect the output to keep it. Locked files, files still being written, crashed or stalled tools and a full disk are retried automatically, up to three attempts; a crashed or out-of-memory tool is retried with half the threads in a plain run. A quality miss is not an error and is never retried.
 
 `-o` with an audio extension (`.opus`, `.ogg`, `.mka`) or `-f opus|ogg|mka` on a video writes only its audio. `-o` with `.avif` or `-f avif` on a video writes an animated AVIF that loops forever, with no sound and no subtitles (`--burn-subs` draws one into the picture); the free disk space for its frames is checked first, and `--crf`, `--video-encoder`, `--video-vmaf`, `--merge-audio` and `--strip` don't apply to it. Both are for plain runs only.
 
-`--max-bitrate` applies to video only: audio and images behave as without it, and `-f avif` or `-f jxl` with it is refused. A video already under the cap is still re-encoded. It applies to plain runs only; archive projects don't take it. When the cap keeps a video from its quality target, the video is still written, with a warning.
+`--max-bitrate` applies to video only: audio and images behave as without it, and an AVIF or JXL output (`-f` or `-o`) with it is refused. A video already under the cap is still re-encoded. It applies to plain runs only; archive projects don't take it. When the cap keeps a video from its quality target, the video is still written, with a warning.
 
 `--resize` takes whole pixels, at most 65536 a side; leave one side out (`1280:-1`, `-1:720` or `1280:`) to keep the aspect ratio. A video written as a video file needs even sides. Audio ignores it.
 
@@ -134,7 +134,7 @@ cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashbo
 - A project file opens only from its own archive folder; a copy of it elsewhere is refused.
 - Nothing is written or removed through a link (a symbolic link or a junction) in the destination. A project whose file or `.cryarchiver` folder, or a folder in it, is a link doesn't open. A mirrored folder that is a link gets nothing written into it: the files that belong there are open issues until it is a real folder.
 - A file that fails stays an open issue until you retry it, copy the original or exclude it in the dashboard (`i`). Files in the destination that the project didn't write are reported as issues until you acknowledge them; they are never deleted.
-- The project file stays small: its records are compressed, failure logs keep the last 100 lines of the last 5 attempts per file (32 MB at most in all, dropping the logs of files that no longer fail first), and once it has grown, the file is compacted after a finished run and after a crash. A project file from an earlier CryArchiver is upgraded the first time it opens; the upgrade writes a new file next to it and replaces the old one only once it is complete.
+- The project file stays small: its records are compressed, failure logs keep the last 100 lines of the last 5 attempts per file (32 MB of logs at most in all, dropping the logs of files that no longer fail first), and once it has grown, the file is compacted after a finished run and after a crash. A project file in an older format is upgraded the first time it opens; the upgrade writes a new file next to it and replaces the old one only once it is complete.
 - A file's details in the dashboard (Enter on a file) show how it was encoded: the CRF and how it was chosen, the quality scores, a second encode, film grain, the sizes and any warnings. Only the latest job's record of a file is kept.
 - With watch mode on, the run keeps going once everything is archived and picks up new files as they appear.
 - The performance limit runs in the background: low priority, one job at a time, and at most the chosen share of the CPU.
