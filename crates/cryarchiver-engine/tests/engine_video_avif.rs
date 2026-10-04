@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
+use cryarchiver_engine::container::isobmff::parse_meta;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::animated;
@@ -471,7 +472,7 @@ async fn a_limited_range_video_keeps_its_colours() {
 }
 
 #[tokio::test]
-async fn hdr_video_keeps_its_primaries_and_transfer() {
+async fn hdr_video_keeps_its_primaries_transfer_and_matrix() {
 	let dir = tempfile::tempdir().unwrap();
 	let source = clip(
 		dir.path(),
@@ -483,7 +484,8 @@ async fn hdr_video_keeps_its_primaries_and_transfer() {
 
 	let (outcome, _) = run(&as_avif(&source, JobOptions::default()), dir.path()).await;
 
-	let tracks = sequences(&written(&outcome).0).await;
+	let output = written(&outcome).0;
+	let tracks = sequences(&output).await;
 	assert_eq!(tracks[0].color_primaries.as_deref(), Some("bt2020"), "{:?}", tracks[0]);
 	assert_eq!(
 		tracks[0].color_transfer.as_deref(),
@@ -491,4 +493,31 @@ async fn hdr_video_keeps_its_primaries_and_transfer() {
 		"{:?}",
 		tracks[0]
 	);
+	assert_eq!(tracks[0].color_space.as_deref(), Some("bt2020nc"), "{:?}", tracks[0]);
+	let nclx = parse_meta(&fs::read(&output).unwrap()).unwrap().primary_nclx().unwrap();
+	assert_eq!((nclx.primaries, nclx.transfer, nclx.matrix), (9, 16, 9));
+}
+
+#[tokio::test]
+async fn an_sd_video_is_tagged_with_the_matrix_its_frames_were_converted_with() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = clip(
+		dir.path(),
+		"ntsc.mkv",
+		"color=c=0xC04020:s=64x64:r=30:d=1,scale=out_color_matrix=smpte170m:out_range=tv,format=yuv420p,\
+		 setparams=range=tv:color_primaries=smpte170m:color_trc=smpte170m:colorspace=smpte170m",
+		&["-c:v", "mpeg4", "-q:v", "1"],
+	);
+
+	let (outcome, _) = run(&as_avif(&source, JobOptions::default()), dir.path()).await;
+
+	let output = written(&outcome).0;
+	let tracks = sequences(&output).await;
+	assert_eq!(tracks[0].color_space.as_deref(), Some("smpte170m"), "{:?}", tracks[0]);
+	let (rgb, width) = first_frame(&output, tracks[0].index, "rgb24");
+	let centre = (32 * width + 32) * 3;
+	let pixel = &rgb[centre..centre + 3];
+	for (found, wanted) in pixel.iter().zip([0xC0u8, 0x40, 0x20]) {
+		assert!(found.abs_diff(wanted) <= 6, "{pixel:?}");
+	}
 }

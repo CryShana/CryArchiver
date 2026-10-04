@@ -2,9 +2,10 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
+use cryarchiver_engine::container::isobmff::parse_meta;
 use cryarchiver_engine::images::animated::{
-	Animation, ScanError, Timeline, encode_command, expected_delays, has_alpha, plan_animation, plays, sampled_frames,
-	scan, split_pams, too_many_frames, verify_animation, video_timeline,
+	Animation, IMAGE_MATRIX, ScanError, Timeline, encode_command, expected_delays, has_alpha, plan_animation, plays,
+	sampled_frames, scan, split_pams, too_many_frames, verify_animation, video_timeline,
 };
 use cryarchiver_engine::outcome::KeepReason;
 use cryarchiver_engine::preset::Speed;
@@ -13,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 const TRANSPARENT_SOURCE: &str =
 	"testsrc2=s=96x64:d=0.5:r=10,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,48),255,0)'";
+const BT601: u16 = 6;
 const KEEP_GIF_TRANSPARENCY: [&str; 2] = [
 	"-filter_complex",
 	"split[a][b];[a]palettegen=reserve_transparent=1[p];[b][p]paletteuse=alpha_threshold=128",
@@ -158,6 +160,7 @@ async fn encode_and_verify(dir: &Path, source: &Path) -> (Animation, f64) {
 		timeline: scan(&std::fs::read(source).unwrap()).unwrap().unwrap(),
 		alpha: has_alpha(&tools, source, &cancel).await.unwrap(),
 		size: None,
+		matrix: IMAGE_MATRIX.to_owned(),
 	};
 	let output = dir.join("out.avif");
 	let cmd = encode_command(
@@ -178,9 +181,12 @@ async fn encode_and_verify(dir: &Path, source: &Path) -> (Animation, f64) {
 	let score = verify_animation(&tools, source, &output, &animation, &cancel)
 		.await
 		.unwrap();
+	let written = std::fs::read(&output).unwrap();
+	assert_eq!(plays(&written), Some(animation.timeline.plays.map(u64::from)));
 	assert_eq!(
-		plays(&std::fs::read(&output).unwrap()),
-		Some(animation.timeline.plays.map(u64::from))
+		parse_meta(&written).unwrap().primary_nclx().map(|nclx| nclx.matrix),
+		Some(BT601),
+		"the frames are converted with ravif's matrix for stills and tagged with it"
 	);
 	(animation, score)
 }

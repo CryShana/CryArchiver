@@ -830,6 +830,7 @@ async fn produce_animation(
 		alpha: animated::has_alpha(cx.tools, cx.source, cx.cancel).await?,
 		timeline,
 		size,
+		matrix: animated::IMAGE_MATRIX.to_owned(),
 	};
 
 	let mut warnings = animation_warnings(cx, input);

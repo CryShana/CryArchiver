@@ -28,6 +28,10 @@ pub const DECODE_ERRORS: &[&str] = &[
 pub const MIN_PREDICTED_DURATION_S: f64 = 120.0;
 
 const DURATION_TOLERANCE_S: f64 = 0.1;
+/// A video that decodes this much shorter than it declares is damaged: a share of its length, but at least the floor
+/// or one frame, whichever is longer, since the decoded time ends a frame early.
+const DAMAGE_SHARE: f64 = 0.02;
+const DAMAGE_FLOOR_S: f64 = 1.0;
 const ROUNDING_S: f64 = 1e-9;
 const PREDICTION_MARGIN: f64 = 0.05;
 const MATROSKA_TIME_BASE: &str = "1/1000";
@@ -399,7 +403,7 @@ pub fn check_video_temp(
 	fps: Option<f64>,
 ) -> Result<Option<String>, JobError> {
 	if let Some(declared) = declared_s
-		&& declared - encoded.decoded_s > (declared * 0.02).max(1.0)
+		&& declared - encoded.decoded_s > (declared * DAMAGE_SHARE).max(DAMAGE_FLOOR_S.max(frame_s(fps)) + ROUNDING_S)
 	{
 		return Err(ErrorKind::SourceDamaged(format!(
 			"the video decodes to {:.1} s but declares {declared:.1} s",
@@ -443,8 +447,7 @@ fn lasts(plan: &VideoPlan, encoded: &EncodedVideo, (start_s, declared_s): (f64, 
 		.window
 		.map_or_else(|| plan.starts.every.offset_s(None), |_| None)
 		.unwrap_or(0.0);
-	let frame_s = fps.filter(|fps| *fps > 0.0).map_or(0.0, |fps| 1.0 / fps);
-	let tolerance_s = DURATION_TOLERANCE_S.max(frame_s) + ROUNDING_S;
+	let tolerance_s = DURATION_TOLERANCE_S.max(frame_s(fps)) + ROUNDING_S;
 
 	[
 		encoded.decoded_s - start_s,
@@ -453,6 +456,10 @@ fn lasts(plan: &VideoPlan, encoded: &EncodedVideo, (start_s, declared_s): (f64, 
 	]
 	.iter()
 	.any(|decoded| (decoded - declared_s).abs() <= tolerance_s)
+}
+
+fn frame_s(fps: Option<f64>) -> f64 {
+	fps.filter(|fps| *fps > 0.0).map_or(0.0, |fps| 1.0 / fps)
 }
 
 pub fn audio_plan(info: &MediaInfo, streams: &StreamPlan, window: Option<TrimWindow>) -> Option<FilePlan> {
@@ -1215,6 +1222,24 @@ mod tests {
 		assert!(check(3.8, 4.0, None).is_err());
 		assert!(check(3.6, 4.0, Some(5.0)).is_err());
 		assert_eq!(check(7.5, 8.0, Some(2.0)).unwrap(), None);
+	}
+
+	#[test]
+	fn a_video_under_one_frame_a_second_is_not_damaged_by_ending_a_frame_short() {
+		let video = plan(svt(), Some(10));
+		let check = |frames: u64, decoded_s: f64, fps: Option<f64>| {
+			check_video_temp(&video, &encoded(frames, decoded_s, 0), Some(20.0), 0.0, fps)
+		};
+
+		assert_eq!(check(10, 18.0, Some(0.5)).unwrap(), None);
+		assert!(matches!(
+			check(9, 16.0, Some(0.5)).unwrap_err().kind,
+			ErrorKind::SourceDamaged(_)
+		));
+		assert!(matches!(
+			check(10, 18.0, None).unwrap_err().kind,
+			ErrorKind::SourceDamaged(_)
+		));
 	}
 
 	#[test]

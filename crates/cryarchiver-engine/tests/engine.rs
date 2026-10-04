@@ -14,7 +14,8 @@ use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, Resize, Subtit
 use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{self, Stream, probe};
-use cryarchiver_engine::quality::memory::{GroupStats, Offset, SharedMemory};
+use cryarchiver_engine::quality::keys::CacheKey;
+use cryarchiver_engine::quality::memory::{GroupStats, Observation, Offset, QualityMemory, SharedMemory};
 use cryarchiver_engine::quality::search::Target;
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
 use cryarchiver_engine::toolchain::LIBAOM;
@@ -1166,6 +1167,31 @@ async fn a_trimmed_five_fps_video_ending_a_frame_before_its_window_is_encoded() 
 }
 
 #[tokio::test]
+async fn a_slideshow_at_one_frame_every_two_seconds_is_encoded() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("slideshow.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=160x120:r=0.5:d=20",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		source.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast_keeping_any_saving(&source), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let slides: Vec<f64> = (0..10).map(|frame| f64::from(frame) * 2.0).collect();
+	assert_same_times(&support::frame_times(&output, 0), &slides);
+}
+
+#[tokio::test]
 async fn a_ts_spliced_a_second_back_is_encoded_on_the_times_ffmpeg_closes_up() {
 	let dir = tempfile::tempdir().unwrap();
 	let segment = |name: &str, offset: &str| {
@@ -1835,35 +1861,39 @@ async fn fast_video_is_never_measured_or_learned() {
 	assert!(memory.entries().is_empty());
 }
 
+/// A memory in which every group has learned `0`, so that a test starts from a learned setting without first running
+/// a whole job to teach it.
+struct EveryGroupLearned(GroupStats);
+
+impl QualityMemory for EveryGroupLearned {
+	fn lookup(&self, _: &CacheKey) -> Option<GroupStats> {
+		Some(self.0)
+	}
+
+	fn offset(&self, _: &CacheKey) -> Option<Offset> {
+		None
+	}
+
+	fn record(&self, _: &CacheKey, _: Observation) {}
+
+	fn forget(&self, _: &CacheKey) {}
+}
+
 #[tokio::test]
 async fn a_missed_check_encodes_the_video_once_more_at_most() {
 	let dir = tempfile::tempdir().unwrap();
-	let first = support::mpeg4(dir.path(), "first.mp4", 3);
-	let second = support::mpeg4(dir.path(), "second.mp4", 3);
-	let tools = support::toolchain().await;
-	let learned = Arc::new(SharedMemory::default());
-	let (learning, _) = run_recording(
-		&Engine::new(tools.clone()).with_quality_memory(learned.clone()),
-		&job(&first),
-		dir.path(),
-	)
-	.await;
-	assert!(
-		matches!(learning, JobOutcome::Encoded { .. }),
-		"the first file must be committed to teach its group: {learning:?}"
-	);
-	let (key, stats) = learned
-		.entries()
-		.into_iter()
-		.next()
-		.expect("the committed first file teaches its group");
-	let careless = Arc::new(SharedMemory::with_entries([(
-		key,
-		GroupStats { setting: 55.0, ..stats },
-	)]));
-	let engine = Engine::new(tools).with_quality_memory(careless);
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let careless = Arc::new(EveryGroupLearned(GroupStats {
+		setting: 55.0,
+		slope: None,
+		bpp: None,
+		offset: None,
+		observations: 1,
+		without_grain: false,
+	}));
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(careless);
 
-	let (outcome, events) = run_recording(&engine, &job(&second), dir.path()).await;
+	let (outcome, events) = run_recording(&engine, &job(&clip), dir.path()).await;
 
 	assert_eq!(stages(&events, Stage::Encode), 2, "{events:?}");
 	match outcome {
@@ -5867,6 +5897,48 @@ async fn a_resized_video_is_checked_against_the_scaled_source_and_learns_nothing
 	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
 }
 
+/// The first frame of a VP9 video with alpha, as RGBA bytes.
+fn first_rgba_frame(path: &Path) -> Vec<u8> {
+	std::process::Command::new("ffmpeg")
+		.args(["-v", "error", "-c:v", "libvpx-vp9", "-i"])
+		.arg(path)
+		.args(["-vf", "format=rgba", "-frames:v", "1", "-f", "rawvideo", "-"])
+		.output()
+		.unwrap()
+		.stdout
+}
+
+#[tokio::test]
+async fn a_transparent_video_keeps_the_colour_of_a_faint_edge_beside_transparent_black() {
+	let dir = tempfile::tempdir().unwrap();
+	let edge = dir.path().join("faint-edge.mov");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=black:s=128x64:r=25:d=1,format=rgba,\
+		 geq=r='if(lte(X,62),255,0)':g=0:b=0:a='if(lt(X,62),255,if(eq(X,62),48,0))'",
+		"-c:v",
+		"qtrle",
+		edge.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast(&edge), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	let decoded = first_rgba_frame(output);
+	let pixels = decoded.as_chunks::<4>().0;
+	let faint: Vec<&[u8; 4]> = (8..56).map(|row| &pixels[row * 128 + 62]).collect();
+	for pixel in faint {
+		assert!(
+			(16..=96).contains(&pixel[3]) && pixel[0] >= 230 && pixel[1].max(pixel[2]) <= 25,
+			"{pixel:?}"
+		);
+	}
+}
+
 #[tokio::test]
 async fn a_resized_transparent_video_keeps_the_colour_of_its_edges() {
 	let dir = tempfile::tempdir().unwrap();
@@ -5886,22 +5958,16 @@ async fn a_resized_transparent_video_keeps_the_colour_of_its_edges() {
 	let JobOutcome::Encoded { output, .. } = &outcome else {
 		panic!("{outcome:?}")
 	};
-	let decoded = std::process::Command::new("ffmpeg")
-		.args(["-v", "error", "-c:v", "libvpx-vp9", "-i"])
-		.arg(output)
-		.args(["-vf", "format=rgba", "-frames:v", "1", "-f", "rawvideo", "-"])
-		.output()
-		.unwrap();
+	let decoded = first_rgba_frame(output);
 	let edge: Vec<&[u8; 4]> = decoded
-		.stdout
 		.as_chunks::<4>()
 		.0
 		.iter()
 		.filter(|pixel| (16..=239).contains(&pixel[3]))
 		.collect();
 	assert!(!edge.is_empty(), "no partly transparent pixel");
-	// A barely visible edge pixel shares its 4:2:0 chroma with the transparent black one beside it, so only its
-	// brightness and hue are asserted there; unpremultiplied scaling leaves it nearly black.
+	// A barely visible edge pixel is unpremultiplied from a few 8-bit levels, which the scaler's ringing tints, so only
+	// its brightness and hue are asserted there; unpremultiplied scaling leaves it nearly black.
 	for pixel in edge {
 		let (red, other) = (u16::from(pixel[0]), u16::from(pixel[1].max(pixel[2])));
 		assert!(red >= 100 && red >= 2 * other, "{pixel:?}");

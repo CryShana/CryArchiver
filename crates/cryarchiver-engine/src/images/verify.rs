@@ -75,8 +75,11 @@ pub async fn verify_jxl(
 
 	let source_icc = expected.icc.map(<[u8]>::to_vec);
 	blocking(cancel, move || {
+		let rendered = match source_icc {
+			Some(_) => ssim::render_jxl_srgb(&bytes)?,
+			None => ssim::render_jxl_as_coded(&bytes)?,
+		};
 		let reference = ssim::to_srgb(&reference, source_icc.as_deref())?;
-		let rendered = ssim::render_jxl_srgb(&bytes)?;
 		ssim::score(&reference, &rendered)
 	})
 	.await?

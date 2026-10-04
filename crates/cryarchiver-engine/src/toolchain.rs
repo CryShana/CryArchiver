@@ -2,11 +2,12 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
 
 use crate::process::{self, RunError, StdoutMode, ToolCommand, ToolOutput};
 use crate::quality::vmaf;
@@ -789,8 +790,7 @@ struct ScratchDir(PathBuf);
 
 impl ScratchDir {
 	fn create() -> Option<Self> {
-		let nanos = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_nanos();
-		let dir = std::env::temp_dir().join(format!("cryarchiver-probe-{}-{nanos}", std::process::id()));
+		let dir = std::env::temp_dir().join(format!("cryarchiver-probe-{}", Ulid::generate()));
 		fs::create_dir_all(&dir).ok()?;
 		Some(Self(dir))
 	}
@@ -1067,5 +1067,26 @@ mod tests {
 		assert!(line.detail.contains("not available"), "{}", line.detail);
 		assert!(tools.problems(MediaKind::Video).is_empty());
 		assert!(!tools.has_vmaf());
+	}
+
+	#[test]
+	fn probes_started_at_the_same_moment_get_their_own_scratch_folders() {
+		const PROBES: usize = 32;
+		let start = std::sync::Barrier::new(PROBES);
+
+		let scratches: Vec<ScratchDir> = std::thread::scope(|scope| {
+			let made: Vec<_> = (0..PROBES)
+				.map(|_| {
+					scope.spawn(|| {
+						start.wait();
+						ScratchDir::create().unwrap()
+					})
+				})
+				.collect();
+			made.into_iter().map(|thread| thread.join().unwrap()).collect()
+		});
+
+		let distinct: BTreeSet<&PathBuf> = scratches.iter().map(|scratch| &scratch.0).collect();
+		assert_eq!(distinct.len(), PROBES);
 	}
 }

@@ -303,3 +303,52 @@ async fn jxl_outputs_are_verified_against_our_own_decoded_pixels() {
 		"{sideways_err:?}"
 	);
 }
+
+#[tokio::test]
+async fn a_lossless_jxl_of_a_pq_png_is_scored_in_the_pq_colours_of_its_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let source = dir.path().join("pq.png");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=96x64,format=rgb48be,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=gbr",
+		"-frames:v",
+		"1",
+		source.to_str().unwrap(),
+	]);
+	let job = JxlJob {
+		source: &source,
+		layout: UPRIGHT,
+		settings: JxlSettings {
+			distance: 0.0,
+			effort: 3,
+		},
+		pixels: JxlPixels::Rgb16,
+	};
+	let metadata = OutputMetadata::default();
+	let cancel = CancellationToken::new();
+	let bytes = encode_jxl(&tools.ffmpeg, &job, &dir.path().join("c.tmp"), &metadata, &cancel)
+		.await
+		.unwrap();
+	let pq = Expected {
+		cicp: Cicp {
+			primaries: 9,
+			transfer: 16,
+		},
+		..expected(&metadata)
+	};
+
+	let score = verify_jxl(
+		Arc::new(bytes),
+		Arc::new(image::open(&source).unwrap()),
+		&pq,
+		true,
+		&cancel,
+	)
+	.await
+	.unwrap();
+
+	assert!(score > 99.0, "{score}");
+}

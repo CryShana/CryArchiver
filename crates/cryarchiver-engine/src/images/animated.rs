@@ -27,8 +27,7 @@ const GIF_DEFAULT_DELAY_MS: u32 = 100;
 const DELAY_TOLERANCE_MS: u32 = 1;
 const HEAD_BYTES: u64 = 16;
 const TRANSPARENT_FRAMES: &str = r"format=rgba,alphaextract,signalstats,metadata=mode=select:key=lavfi.signalstats.YMIN:value=255:function=expr:expr='lt(VALUE1\,VALUE2)'";
-const ALPHA_SPLIT: &str =
-	"format=yuva444p10le,split[c][a];[c]format=yuv444p10le[color];[a]alphaextract,format=gray10le[alpha]";
+const ALPHA_SPLIT: &str = "split[c][a];[c]format=yuv444p10le[color];[a]alphaextract,format=gray10le[alpha]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timeline {
@@ -39,12 +38,17 @@ pub struct Timeline {
 	pub height: u32,
 }
 
+/// The YUV matrix an animated image's RGB frames are encoded with: the one ravif uses for stills.
+pub const IMAGE_MATRIX: &str = "smpte170m";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Animation {
 	pub timeline: Timeline,
 	pub alpha: bool,
 	/// The output size, when `--resize` scales the frames.
 	pub size: Option<(u32, u32)>,
+	/// The YUV matrix the RGB frames are encoded with and tagged as, as `scale` names it.
+	pub matrix: String,
 }
 
 impl Animation {
@@ -60,6 +64,15 @@ impl Animation {
 		} else {
 			format!("format=rgba64le,{scale}")
 		})
+	}
+
+	/// The frames, scaled if asked, in `pix_fmt` by the animation's matrix and tagged with that matrix by name:
+	/// `scale` tags `smpte170m` as the same matrix's other name, `bt470bg`.
+	fn yuv(&self, pix_fmt: &str) -> String {
+		let scaled = self.scale().map(|scale| format!("{scale},")).unwrap_or_default();
+		let matrix = &self.matrix;
+
+		format!("{scaled}scale=out_color_matrix={matrix}:out_range=tv,format={pix_fmt},setparams=colorspace={matrix}")
 	}
 }
 
@@ -252,17 +265,12 @@ pub fn encode_command(
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
 		.arg(process::tool_path(source));
 
-	let scale = animation.scale();
 	if animation.alpha {
-		let scaled = scale.map(|scale| format!("{scale},")).unwrap_or_default();
 		cmd.arg("-filter_complex")
-			.arg(format!("[0:v]{scaled}{ALPHA_SPLIT}"))
+			.arg(format!("[0:v]{},{ALPHA_SPLIT}", animation.yuv("yuva444p10le")))
 			.args(["-map", "[color]", "-map", "[alpha]", "-fps_mode:v"]);
 	} else {
-		if let Some(scale) = scale {
-			cmd.arg("-vf").arg(scale);
-		}
-		cmd.args(["-pix_fmt", "yuv444p10le", "-fps_mode"]);
+		cmd.arg("-vf").arg(animation.yuv("yuv444p10le")).arg("-fps_mode");
 	}
 	cmd.args(["passthrough", "-enc_time_base:v", "demux", "-c:v", "libaom-av1", "-crf"])
 		.arg(settings.crf.to_string())

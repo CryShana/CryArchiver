@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use fast_ssim2::{LinearRgbImage, MAX_IMAGE_PIXELS, compute_ssimulacra2_strip, srgb_to_linear};
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
+use jxl_oxide::color::{ColourEncoding, ColourSpace};
 use jxl_oxide::{EnumColourEncoding, JxlImage, Moxcms, RenderingIntent};
 use moxcms::{ColorProfile, Layout, TransformOptions};
 
@@ -109,11 +110,28 @@ pub fn to_srgb<'a>(image: &'a DynamicImage, icc: Option<&[u8]>) -> Result<Cow<'a
 }
 
 pub fn render_jxl_srgb(bytes: &[u8]) -> Result<DynamicImage, String> {
+	render_jxl(bytes, false)
+}
+
+/// `render_jxl_srgb`, except that an RGB picture whose colour space is coded by name rather than by an ICC profile (PQ,
+/// HLG or Display P3 from a source's CICP, for example) is rendered in that colour space, as its source's pixels are.
+pub fn render_jxl_as_coded(bytes: &[u8]) -> Result<DynamicImage, String> {
+	render_jxl(bytes, true)
+}
+
+fn render_jxl(bytes: &[u8], as_coded: bool) -> Result<DynamicImage, String> {
 	let mut image = JxlImage::builder()
 		.read(bytes)
 		.map_err(|err| format!("jxl-oxide could not read the output: {err}"))?;
 	image.set_cms(Moxcms);
-	image.request_color_encoding(EnumColourEncoding::srgb(RenderingIntent::Relative));
+
+	let coded_rgb = matches!(
+		&image.image_header().metadata.colour_encoding,
+		ColourEncoding::Enum(encoding) if encoding.colour_space == ColourSpace::Rgb
+	);
+	if !(as_coded && coded_rgb) {
+		image.request_color_encoding(EnumColourEncoding::srgb(RenderingIntent::Relative));
+	}
 
 	let render = image
 		.render_frame(0)

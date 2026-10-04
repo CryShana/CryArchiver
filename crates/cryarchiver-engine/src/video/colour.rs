@@ -8,6 +8,15 @@ const RGB_PREFIXES: &[&str] = &[
 	"rgb", "bgr", "gbr", "argb", "abgr", "0rgb", "0bgr", "x2rgb", "x2bgr", "pal8",
 ];
 const PAL_RATES: &[f64] = &[25.0, 50.0];
+const ALPHA_420: &str = "yuva420p";
+/// `geq` registers for the 2×2 block that 4:2:0 shares one chroma sample between: its corner (0 and 1), its four
+/// alphas (2 to 5) and their sum (6), from which `BLOCK_COLOUR` is the block's alpha-weighted colour.
+const BLOCK_WEIGHTS: &str = "st(0,X-mod(X,2));st(1,Y-mod(Y,2));st(2,alpha(ld(0),ld(1)));st(3,alpha(ld(0)+1,ld(1)));\
+	st(4,alpha(ld(0),ld(1)+1));st(5,alpha(ld(0)+1,ld(1)+1));st(6,ld(2)+ld(3)+ld(4)+ld(5))";
+const BLOCK_COLOUR: &str = "(ld(2)*p(ld(0),ld(1))+ld(3)*p(ld(0)+1,ld(1))+ld(4)*p(ld(0),ld(1)+1)+\
+	ld(5)*p(ld(0)+1,ld(1)+1))/ld(6)";
+/// Averages each 2×2 block evenly into its chroma sample, which the edge fill relies on.
+const BLOCK_CHROMA: &str = "scale=flags=area";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
@@ -81,6 +90,27 @@ pub fn conversion(stream: &Stream, tags: &ColourTags, target_pix_fmt: &str) -> O
 		None => format!("scale=out_range={}:out_color_matrix={}", tags.range.name(), tags.matrix),
 	};
 	Some(format!("{scale},format={target_pix_fmt}"))
+}
+
+/// `conversion` to 4:2:0 with alpha, through 4:4:4 so that transparent pixels can first take their visible
+/// neighbours' colour. A 4:2:0 source has no full chroma left to fill from.
+pub fn alpha_conversion(stream: &Stream, tags: &ColourTags) -> Option<String> {
+	if stream.pix_fmt.as_deref() == Some(ALPHA_420) {
+		return None;
+	}
+
+	let full = conversion(stream, tags, "yuva444p").map_or_else(String::new, |full| format!("{full},"));
+	Some(format!("{full}{},{BLOCK_CHROMA},format={ALPHA_420}", edge_fill()))
+}
+
+/// Spreads each 2×2 block's visible colour into its fully transparent pixels and gives the block's chroma its
+/// alpha-weighted mean (`cr` follows `cb`): otherwise 4:2:0 averages the hidden colour, usually black, into a faint
+/// edge.
+fn edge_fill() -> String {
+	format!(
+		"geq=lum='{BLOCK_WEIGHTS};if(gt(alpha(X,Y),0)+eq(ld(6),0),p(X,Y),{BLOCK_COLOUR})':\
+		 cb='{BLOCK_WEIGHTS};if(eq(ld(6),0),p(X,Y),{BLOCK_COLOUR})':a='alpha(X,Y)'"
+	)
 }
 
 /// Scales the picture to `width`×`height` with square pixels, leaving its colour as it is. A transparent picture is
@@ -433,6 +463,24 @@ mod tests {
 		);
 
 		assert!(refused.is_err_and(|reason| reason.contains("bt2020c")));
+	}
+
+	#[test]
+	fn transparent_pixels_take_their_blocks_colour_before_4_2_0_and_a_4_2_0_source_is_left_alone() {
+		let argb = stream(r#"{"index":0,"codec_type":"video","width":640,"height":360,"pix_fmt":"argb"}"#);
+		let vp9 = stream(r#"{"index":0,"codec_type":"video","width":640,"height":360,"pix_fmt":"yuva420p"}"#);
+
+		let converted = alpha_conversion(&argb, &output_tags(&argb)).unwrap();
+
+		assert!(
+			converted.starts_with("scale=out_range=tv:out_color_matrix=smpte170m,format=yuva444p,geq=lum='"),
+			"{converted}"
+		);
+		assert!(
+			converted.ends_with(":a='alpha(X,Y)',scale=flags=area,format=yuva420p"),
+			"{converted}"
+		);
+		assert_eq!(alpha_conversion(&vp9, &output_tags(&vp9)), None);
 	}
 
 	#[test]

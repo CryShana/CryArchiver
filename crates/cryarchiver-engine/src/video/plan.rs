@@ -11,7 +11,6 @@ use crate::video::colour::{self, ColourTags, conversion, output_tags, setparams}
 const SVT_MAX_WIDTH: u32 = 16_384;
 const SVT_MAX_HEIGHT: u32 = 8_704;
 const OUTPUT_PIX_FMT: &str = "yuv420p10le";
-const ALPHA_PIX_FMT: &str = "yuva420p";
 const ALPHA_PIX_FMT_PREFIXES: &[&str] = &["yuva", "gbrap", "rgba", "bgra", "argb", "abgr", "ya"];
 const EFFICIENT_CODECS: &[&str] = &["av1", "vp9"];
 const EFFICIENCY_HEADROOM: f64 = 1.2;
@@ -271,7 +270,6 @@ pub fn plan_video(
 	};
 
 	let colour = output_tags(main);
-	let target = if alpha { ALPHA_PIX_FMT } else { OUTPUT_PIX_FMT };
 	let mut shape: Vec<String> = Vec::new();
 	match analysis.scan {
 		ScanType::Progressive => {}
@@ -285,7 +283,12 @@ pub fn plan_video(
 		shape.push(colour::resize(main, &colour, size, alpha));
 	}
 
-	let mut filters: Vec<String> = conversion(main, &colour, target).into_iter().collect();
+	let converted = if alpha {
+		colour::alpha_conversion(main, &colour)
+	} else {
+		conversion(main, &colour, OUTPUT_PIX_FMT)
+	};
+	let mut filters: Vec<String> = converted.into_iter().collect();
 	filters.push(setparams(&colour));
 
 	let mut warnings = Vec::new();

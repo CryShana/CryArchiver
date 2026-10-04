@@ -1,5 +1,6 @@
 mod support;
 
+use std::fmt::Write;
 use std::fs;
 
 use std::path::Path;
@@ -18,7 +19,7 @@ use cryarchiver_engine::video::plan::{VideoCaps, VideoPlan, plan_video, precheck
 use cryarchiver_engine::video::quality::{
 	Aim, Scorer, SearchStep, Searched, search, search_below, search_samples, target, verify_windows,
 };
-use cryarchiver_engine::video::verify::Retiming;
+use cryarchiver_engine::video::verify::{Retiming, undecoded_lead};
 use cryarchiver_engine::workspace::Workspace;
 use tokio_util::sync::CancellationToken;
 
@@ -26,6 +27,8 @@ const CAPS: VideoCaps = VideoCaps {
 	vp9_alpha: false,
 	libaom: false,
 };
+/// Against a reference without the cues, the burned clip's p5 is about 79.
+const SUBTITLES_ALIGNED_P5: f64 = 90.0;
 
 #[tokio::test]
 async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
@@ -301,25 +304,130 @@ async fn a_seeked_check_scores_the_same_frames_as_one_decoded_through_to_its_win
 		late,
 	];
 
-	for (index, clip) in clips.into_iter().enumerate() {
-		let workspace = Workspace::create(&dir.path().join(format!("work{index}")), &clip).unwrap();
+	for clip in clips {
+		let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
 		let (plan, retiming) = plan_for(&tools, &clip).await;
-		let (seeked, through) = both_checks(&tools, &clip, &workspace, &plan, retiming, &[7.3, 21.9]).await;
 
-		assert!(same_frames(seeked, through), "{clip:?}: {seeked:?} {through:?}");
-
-		let trimmed = VideoPlan {
-			window: Some(TrimWindow {
-				start_s: 4.3,
-				length_s: 14.0,
-			}),
-			expected_frames: None,
-			..plan
-		};
-		let (seeked, through) = both_checks(&tools, &clip, &workspace, &trimmed, retiming, &[6.1]).await;
-
-		assert!(same_frames(seeked, through), "{clip:?} trimmed: {seeked:?} {through:?}");
+		checks_agree(&tools, &clip, &workspace, &plan, retiming).await;
 	}
+}
+
+/// Both checks of `clip`, whole and trimmed, score the same frames alike; returns the whole one's and the trimmed
+/// one's seeked scores.
+async fn checks_agree(
+	tools: &Toolchain,
+	clip: &Path,
+	workspace: &Workspace,
+	plan: &VideoPlan,
+	retiming: Retiming,
+) -> (Score, Score) {
+	let (whole, through) = both_checks(tools, clip, workspace, plan, retiming, &[7.3, 21.9]).await;
+
+	assert!(same_frames(whole, through), "{}: {whole:?} {through:?}", clip.display());
+
+	let trimmed = VideoPlan {
+		window: Some(TrimWindow {
+			start_s: 4.3,
+			length_s: 14.0,
+		}),
+		expected_frames: None,
+		..plan.clone()
+	};
+	let (cut, through) = both_checks(tools, clip, workspace, &trimmed, retiming, &[6.1]).await;
+
+	assert!(
+		same_frames(cut, through),
+		"{} trimmed: {cut:?} {through:?}",
+		clip.display()
+	);
+	(whole, cut)
+}
+
+#[tokio::test]
+async fn a_seeked_check_of_a_source_whose_first_frames_never_decode_scores_the_same_frames() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let lead = dir.path().join("lost-keyframe.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=30",
+		"-c:v",
+		"libx264",
+		"-crf",
+		"18",
+		"-g",
+		"25",
+		"-bf",
+		"2",
+		"-bsf:v",
+		r"noise=drop=lt(n\,1)",
+		lead.to_str().unwrap(),
+	]);
+	let cancel = CancellationToken::new();
+	assert_eq!(
+		undecoded_lead(&tools, &lead, 0, &cancel).await.unwrap(),
+		24,
+		"the first GOP lost its keyframe"
+	);
+	let workspace = Workspace::create(&dir.path().join("work"), &lead).unwrap();
+	let (plan, retiming) = plan_for(&tools, &lead).await;
+
+	checks_agree(&tools, &lead, &workspace, &plan, retiming).await;
+}
+
+#[tokio::test]
+async fn a_seeked_check_draws_burned_subtitles_at_the_times_the_encode_shows_them() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let cues = dir.path().join("cues.srt");
+	let clock = |ms: u32| format!("00:00:{:02},{:03}", ms / 1000, ms % 1000);
+	let mut srt = String::new();
+	for cue in 0..12 {
+		let start = cue * 2500 + 700;
+		writeln!(
+			srt,
+			"{}\n{} --> {}\nline {cue}\n",
+			cue + 1,
+			clock(start),
+			clock(start + 1000)
+		)
+		.unwrap();
+	}
+	fs::write(&cues, srt).unwrap();
+	let clip = support::subtitled_clip(
+		dir.path(),
+		"subtitled.mkv",
+		&support::Picture {
+			source: "testsrc2",
+			seconds: 30,
+			codec: &["-c:v", "mpeg4", "-q:v", "2"],
+			second_angle: false,
+			marked_frame: None,
+		},
+		&cues,
+		"srt",
+	);
+	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
+	let (plan, retiming) = plan_for(&tools, &clip).await;
+	let info = probe(&tools, &clip, &cancel).await.unwrap();
+	let chosen = burn::pick(&info, &SubtitlePick::Default).unwrap();
+	burn::prepare(&tools, &clip, &workspace, &info, chosen, &cancel)
+		.await
+		.unwrap();
+	let burning = VideoPlan {
+		subtitles: burn::subtitle_filter(chosen.kind, 20),
+		..plan
+	};
+
+	let (whole, cut) = checks_agree(&tools, &clip, &workspace, &burning, retiming).await;
+
+	assert!(
+		whole.p5 > SUBTITLES_ALIGNED_P5 && cut.p5 > SUBTITLES_ALIGNED_P5,
+		"the reference draws each cue when the encode shows it: {whole:?} {cut:?}"
+	);
 }
 
 #[tokio::test]
