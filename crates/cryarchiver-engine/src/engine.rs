@@ -62,11 +62,13 @@ const CHAPTER_FILE: &str = "chapters.txt";
 const MEMORY_POLL: Duration = Duration::from_millis(250);
 const ANIMATION_FRAMES: &str = "frames.mkv";
 const FRAMES_SAMPLE: &str = "frames-sample.mkv";
-/// The prepared frames' size is measured on this many frames at each of these points of the span, and the busiest
-/// sample is given this much room for busier scenes.
-const FRAMES_PER_SAMPLE: u64 = 4;
-const FRAME_SAMPLE_AT: [f64; 3] = [0.25, 0.5, 0.75];
+/// The prepared frames' size is measured on this many frames at the middle of each of this many equal parts of the
+/// span. The busiest sample is given this much room for busier scenes, and the estimate never drops below this share
+/// of the frames' uncompressed size.
+const FRAMES_PER_SAMPLE: u64 = 2;
+const FRAME_SAMPLES: u32 = 8;
 const FRAMES_SPACE_FACTOR: u64 = 2;
+const MIN_FRAMES_SHARE: u64 = 8;
 const SQUARE_PIXEL_SLACK: f64 = 1e-3;
 const AUDIO_DROPPED: &str = "an audio track was dropped: animated AVIF has no sound";
 const SUBTITLES_DROPPED: &str =
@@ -1146,26 +1148,28 @@ impl Engine {
 		}
 
 		let share = source_share(cx.source_bytes, span.window, span.declared_s);
-		cx.record
-			.update(|decision| decision.source_bytes = Some(share.unwrap_or(cx.source_bytes)));
+		let compared = share.unwrap_or(cx.source_bytes);
+		cx.record.update(|decision| decision.source_bytes = Some(compared));
+
 		let frames_need = match frame_count {
 			Some(frames) => {
 				let raw = frames_bytes(frames, &video, format);
-				Some(Box::pin(self.frames_need(cx, workspace, &video, (span, frames), raw)).await?)
+				Some(Box::pin(self.frames_need(cx, workspace, &video, (span, frames), raw, compared)).await?)
 			}
 			None => None,
 		};
+
 		let job = AnimationJob {
 			video: &video,
 			span_s: span.length_s,
 			share,
-			need: frames_need.map(|need| need.saturating_add(share.unwrap_or(cx.source_bytes))),
+			need: frames_need.map(|need| need.saturating_add(compared)),
 		};
 		Box::pin(self.animate(cx, workspace, &job, warnings)).await
 	}
 
-	/// What the `frames` prepared from `span` will take, measured on FFV1 samples of them; `raw` (their uncompressed
-	/// size) when they can't be sampled.
+	/// What the `frames` prepared from `span` will take: `raw` (their uncompressed size) when the work disk holds that
+	/// beside the `output` bytes anyway or when they can't be sampled, and otherwise a measure of FFV1 samples of them.
 	async fn frames_need(
 		&self,
 		cx: &Context<'_>,
@@ -1173,17 +1177,36 @@ impl Engine {
 		video: &VideoPlan,
 		(span, frames): (Span, u64),
 		raw: u64,
+		output: u64,
 	) -> Result<u64, JobError> {
 		let path = workspace.file(FRAMES_SAMPLE);
+		if free_space(&path).is_ok_and(|free| free >= raw.saturating_add(output)) {
+			return Ok(raw);
+		}
+
+		let measured = Box::pin(self.sample_frames(cx, &path, video, frame_samples(span, frames))).await;
+		let _ = fs::remove_file(&path);
+		Ok(measured?.map_or(raw, |measured| measured_frames_bytes(&measured, frames, raw)))
+	}
+
+	/// Each of `windows` prepared into `path` like the frames: its bytes and frames, or `None` when one can't be.
+	async fn sample_frames(
+		&self,
+		cx: &Context<'_>,
+		path: &Path,
+		video: &VideoPlan,
+		windows: Vec<TrimWindow>,
+	) -> Result<Option<Vec<(u64, u64)>>, JobError> {
 		let mut measured = Vec::new();
 
-		for sample in frame_samples(span, frames) {
+		for sample in windows {
 			let plan = VideoPlan {
 				window: Some(sample),
 				expected_frames: None,
 				..video.clone()
 			};
-			let cmd = video_encode::frames_command(&self.tools.ffmpeg, &cx.job.source, &path, &plan);
+			let cmd = video_encode::frames_command(&self.tools.ffmpeg, &cx.job.source, path, &plan);
+
 			let encoded = Box::pin(video_encode::encode_video(
 				&cmd,
 				&plan,
@@ -1194,16 +1217,15 @@ impl Engine {
 			let sampled = match encoded.await {
 				Ok(encoded) => encoded.frames,
 				Err(err) if err.kind == ErrorKind::Cancelled => return Err(err),
-				Err(_) => return Ok(raw),
+				Err(_) => return Ok(None),
 			};
-			let Ok(meta) = fs::metadata(&path) else {
-				return Ok(raw);
+
+			let Ok(meta) = fs::metadata(path) else {
+				return Ok(None);
 			};
 			measured.push((meta.len(), sampled));
 		}
-
-		let _ = fs::remove_file(&path);
-		Ok(measured_frames_bytes(&measured, frames, raw))
+		Ok(Some(measured))
 	}
 
 	async fn animate(
@@ -2156,29 +2178,31 @@ fn frames_bytes(frames: u64, video: &VideoPlan, format: FrameFormat) -> u64 {
 		.saturating_mul(format.bytes_per_pixel)
 }
 
-/// Short windows at `FRAME_SAMPLE_AT` of the span, each about `FRAMES_PER_SAMPLE` of its `frames` long.
+/// Short windows at the middle of each of `FRAME_SAMPLES` equal parts of the span, each about `FRAMES_PER_SAMPLE` of
+/// its `frames` long.
 #[allow(clippy::cast_precision_loss)]
 fn frame_samples(span: Span, frames: u64) -> Vec<TrimWindow> {
 	let Some(length_s) = span.length_s.filter(|length_s| *length_s > 0.0) else {
 		return Vec::new();
 	};
+
 	if frames == 0 {
 		return Vec::new();
 	}
 
 	let start_s = span.window.map_or(0.0, |window| window.start_s);
 	let sample_s = (length_s * FRAMES_PER_SAMPLE as f64 / frames as f64).min(length_s);
-	FRAME_SAMPLE_AT
-		.iter()
-		.map(|at| TrimWindow {
-			start_s: start_s + (length_s * at - sample_s / 2.0).clamp(0.0, length_s - sample_s),
+	let part_s = length_s / f64::from(FRAME_SAMPLES);
+	(0..FRAME_SAMPLES)
+		.map(|part| TrimWindow {
+			start_s: start_s + (part_s * (f64::from(part) + 0.5) - sample_s / 2.0).clamp(0.0, length_s - sample_s),
 			length_s: sample_s,
 		})
 		.collect()
 }
 
 /// The prepared frames' size from `samples` of them (their bytes and frames): the busiest sample's size per frame for
-/// every frame, with room to spare, but never more than the frames take uncompressed (`raw`).
+/// every frame, with room to spare, but between a share of what the frames take uncompressed (`raw`) and all of it.
 fn measured_frames_bytes(samples: &[(u64, u64)], frames: u64, raw: u64) -> u64 {
 	samples
 		.iter()
@@ -2189,7 +2213,7 @@ fn measured_frames_bytes(samples: &[(u64, u64)], frames: u64, raw: u64) -> u64 {
 			per_frame
 				.saturating_mul(frames)
 				.saturating_mul(FRAMES_SPACE_FACTOR)
-				.min(raw)
+				.clamp(raw / MIN_FRAMES_SHARE, raw)
 		})
 }
 
@@ -2742,11 +2766,18 @@ mod tests {
 	}
 
 	#[test]
-	fn the_frames_are_estimated_from_their_busiest_sample_with_room_to_spare_but_never_above_uncompressed() {
+	fn the_frames_are_estimated_from_their_busiest_sample_with_room_to_spare_between_a_share_of_uncompressed_and_all() {
+		let busiest = FRAMES_SPACE_FACTOR * 20_000 * 1_000;
+
 		assert_eq!(
-			measured_frames_bytes(&[(40_000, 4), (80_000, 4), (8_000, 4)], 1_000, u64::MAX),
-			FRAMES_SPACE_FACTOR * 20_000 * 1_000
+			measured_frames_bytes(&[(40_000, 4), (80_000, 4), (8_000, 4)], 1_000, 200_000_000),
+			busiest
 		);
+		assert_eq!(
+			measured_frames_bytes(&[(80_000, 4)], 1_000, 1_000_000_000),
+			1_000_000_000 / MIN_FRAMES_SHARE
+		);
+		assert!(busiest < 1_000_000_000 / MIN_FRAMES_SHARE);
 		assert_eq!(measured_frames_bytes(&[(40_000, 4)], 1_000, 1_000_000), 1_000_000);
 		assert_eq!(measured_frames_bytes(&[(40_000, 0)], 1_000, 5_000_000), 5_000_000);
 		assert_eq!(measured_frames_bytes(&[], 1_000, 5_000_000), 5_000_000);
@@ -2766,11 +2797,14 @@ mod tests {
 
 		let samples = frame_samples(trimmed, 500);
 
-		let four_frames_s = 20.0 * 4.0 / 500.0;
-		assert_eq!(samples.len(), 3, "{samples:?}");
-		for (sample, centre) in samples.iter().zip([15.0, 20.0, 25.0]) {
+		let two_frames_s = 20.0 * 2.0 / 500.0;
+		assert_eq!(samples.len(), 8, "{samples:?}");
+		for (sample, centre) in samples
+			.iter()
+			.zip([11.25, 13.75, 16.25, 18.75, 21.25, 23.75, 26.25, 28.75])
+		{
 			assert!(
-				close(sample.start_s, centre - four_frames_s / 2.0) && close(sample.length_s, four_frames_s),
+				close(sample.start_s, centre - two_frames_s / 2.0) && close(sample.length_s, two_frames_s),
 				"{samples:?}"
 			);
 		}

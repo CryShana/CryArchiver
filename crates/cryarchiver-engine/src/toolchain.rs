@@ -791,7 +791,7 @@ struct ScratchDir(PathBuf);
 impl ScratchDir {
 	fn create() -> Option<Self> {
 		let dir = std::env::temp_dir().join(format!("cryarchiver-probe-{}", Ulid::generate()));
-		fs::create_dir_all(&dir).ok()?;
+		fs::create_dir(&dir).ok()?;
 		Some(Self(dir))
 	}
 }

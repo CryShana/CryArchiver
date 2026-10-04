@@ -304,11 +304,15 @@ async fn jxl_outputs_are_verified_against_our_own_decoded_pixels() {
 	);
 }
 
-#[tokio::test]
-async fn a_lossless_jxl_of_a_pq_png_is_scored_in_the_pq_colours_of_its_source() {
-	let dir = tempfile::tempdir().unwrap();
+const PQ: Cicp = Cicp {
+	primaries: 9,
+	transfer: 16,
+};
+
+/// A 96×64 16-bit PNG tagged BT.2020 PQ by cICP, and its lossless JPEG XL.
+async fn lossless_pq_jxl(dir: &std::path::Path) -> (std::path::PathBuf, Vec<u8>) {
 	let tools = support::toolchain().await;
-	let source = dir.path().join("pq.png");
+	let source = dir.join("pq.png");
 	support::ffmpeg(&[
 		"-f",
 		"lavfi",
@@ -327,16 +331,25 @@ async fn a_lossless_jxl_of_a_pq_png_is_scored_in_the_pq_colours_of_its_source() 
 		},
 		pixels: JxlPixels::Rgb16,
 	};
+	let bytes = encode_jxl(
+		&tools.ffmpeg,
+		&job,
+		&dir.join("c.tmp"),
+		&OutputMetadata::default(),
+		&CancellationToken::new(),
+	)
+	.await
+	.unwrap();
+	(source, bytes)
+}
+
+#[tokio::test]
+async fn a_lossless_jxl_of_a_pq_png_is_scored_in_the_pq_colours_of_its_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let (source, bytes) = lossless_pq_jxl(dir.path()).await;
 	let metadata = OutputMetadata::default();
-	let cancel = CancellationToken::new();
-	let bytes = encode_jxl(&tools.ffmpeg, &job, &dir.path().join("c.tmp"), &metadata, &cancel)
-		.await
-		.unwrap();
 	let pq = Expected {
-		cicp: Cicp {
-			primaries: 9,
-			transfer: 16,
-		},
+		cicp: PQ,
 		..expected(&metadata)
 	};
 
@@ -345,10 +358,34 @@ async fn a_lossless_jxl_of_a_pq_png_is_scored_in_the_pq_colours_of_its_source() 
 		Arc::new(image::open(&source).unwrap()),
 		&pq,
 		true,
-		&cancel,
+		&CancellationToken::new(),
 	)
 	.await
 	.unwrap();
 
 	assert!(score > 99.0, "{score}");
+}
+
+#[tokio::test]
+async fn a_jxl_tagged_with_other_colours_than_its_profileless_source_is_refused_even_with_the_right_pixels() {
+	let dir = tempfile::tempdir().unwrap();
+	let (source, bytes) = lossless_pq_jxl(dir.path()).await;
+	let metadata = OutputMetadata::default();
+	let srgb = expected(&metadata);
+
+	let refused = verify_jxl(
+		Arc::new(bytes.clone()),
+		Arc::new(image::open(&source).unwrap()),
+		&srgb,
+		true,
+		&CancellationToken::new(),
+	)
+	.await
+	.unwrap_err();
+
+	assert!(
+		matches!(&refused.kind, ErrorKind::EncodeFailed(reason) if reason.contains("primaries 9, transfer 16")),
+		"{refused:?}"
+	);
+	assert!(check_jxl(&bytes, &Expected { cicp: PQ, ..srgb }, true).is_ok());
 }

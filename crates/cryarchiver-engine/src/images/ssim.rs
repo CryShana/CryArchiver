@@ -113,10 +113,21 @@ pub fn render_jxl_srgb(bytes: &[u8]) -> Result<DynamicImage, String> {
 	render_jxl(bytes, false)
 }
 
-/// `render_jxl_srgb`, except that an RGB picture whose colour space is coded by name rather than by an ICC profile (PQ,
-/// HLG or Display P3 from a source's CICP, for example) is rendered in that colour space, as its source's pixels are.
+/// `render_jxl_srgb`, except that an RGB picture whose colour space is coded by CICP values rather than by an ICC
+/// profile (PQ, HLG or Display P3 from a source's CICP, for example) is rendered in that colour space, as its source's
+/// pixels are.
 pub fn render_jxl_as_coded(bytes: &[u8]) -> Result<DynamicImage, String> {
 	render_jxl(bytes, true)
+}
+
+/// The CICP primaries and transfer that an RGB picture's colour space is coded by, when it is coded by them.
+pub fn coded_cicp(image: &JxlImage) -> Option<[u8; 2]> {
+	match &image.image_header().metadata.colour_encoding {
+		ColourEncoding::Enum(encoding) if encoding.colour_space == ColourSpace::Rgb => {
+			encoding.cicp().map(|[primaries, transfer, ..]| [primaries, transfer])
+		}
+		_ => None,
+	}
 }
 
 fn render_jxl(bytes: &[u8], as_coded: bool) -> Result<DynamicImage, String> {
@@ -125,11 +136,7 @@ fn render_jxl(bytes: &[u8], as_coded: bool) -> Result<DynamicImage, String> {
 		.map_err(|err| format!("jxl-oxide could not read the output: {err}"))?;
 	image.set_cms(Moxcms);
 
-	let coded_rgb = matches!(
-		&image.image_header().metadata.colour_encoding,
-		ColourEncoding::Enum(encoding) if encoding.colour_space == ColourSpace::Rgb
-	);
-	if !(as_coded && coded_rgb) {
+	if !(as_coded && coded_cicp(&image).is_some()) {
 		image.request_color_encoding(EnumColourEncoding::srgb(RenderingIntent::Relative));
 	}
 

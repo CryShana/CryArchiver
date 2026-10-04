@@ -119,6 +119,22 @@ pub fn check_jxl(bytes: &[u8], expected: &Expected<'_>, lossless: bool) -> Resul
 	if lossless && expected.icc.is_some() && image.original_icc() != expected.icc {
 		return Err("the ICC profile was not carried over unchanged".into());
 	}
+
+	if expected.icc.is_none()
+		&& let Some([primaries, transfer]) = ssim::coded_cicp(&image)
+	{
+		let wanted = expected.cicp;
+		let differs = |found: u8, wanted: u8, unspecified: u8| wanted != unspecified && found != wanted;
+		if differs(primaries, wanted.primaries, Cicp::UNSPECIFIED.primaries)
+			|| differs(transfer, wanted.transfer, Cicp::UNSPECIFIED.transfer)
+		{
+			return Err(format!(
+				"the output is tagged primaries {primaries}, transfer {transfer} but primaries {}, transfer {} were \
+				 expected",
+				wanted.primaries, wanted.transfer
+			));
+		}
+	}
 	Ok(())
 }
 

@@ -29,6 +29,8 @@ const CAPS: VideoCaps = VideoCaps {
 };
 /// Against a reference without the cues, the burned clip's p5 is about 79.
 const SUBTITLES_ALIGNED_P5: f64 = 90.0;
+/// testsrc2 scored against itself one frame later gives a VMAF mean of about 44.
+const LEAD_ALIGNED_MEAN: f64 = 90.0;
 
 #[tokio::test]
 async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
@@ -374,7 +376,12 @@ async fn a_seeked_check_of_a_source_whose_first_frames_never_decode_scores_the_s
 	let workspace = Workspace::create(&dir.path().join("work"), &lead).unwrap();
 	let (plan, retiming) = plan_for(&tools, &lead).await;
 
-	checks_agree(&tools, &lead, &workspace, &plan, retiming).await;
+	let (whole, cut) = checks_agree(&tools, &lead, &workspace, &plan, retiming).await;
+
+	assert!(
+		whole.mean > LEAD_ALIGNED_MEAN && cut.mean > LEAD_ALIGNED_MEAN,
+		"the encode starts at the first decodable frame, as the reference does: {whole:?} {cut:?}"
+	);
 }
 
 #[tokio::test]

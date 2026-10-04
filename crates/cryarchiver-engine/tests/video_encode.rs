@@ -6,11 +6,11 @@ use std::process::Command;
 
 use cryarchiver_engine::options::SubtitlePick;
 use cryarchiver_engine::preset::Speed;
-use cryarchiver_engine::probe::{av1_film_grain, first_frames, probe};
+use cryarchiver_engine::probe::{Stream, av1_film_grain, first_frames, probe};
 use cryarchiver_engine::video::VideoStarts;
 use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, analyze};
 use cryarchiver_engine::video::burn::{self, FONT_DIR, SUBTITLE_FILE};
-use cryarchiver_engine::video::colour::{ColourTags, Range};
+use cryarchiver_engine::video::colour::{ColourTags, Range, alpha_conversion, output_tags};
 use cryarchiver_engine::video::encode::{check_video_temp, encode_video, extract, video_command};
 use cryarchiver_engine::video::plan::{
 	Encoder, VideoCaps, VideoPlan, grain_level, plan_video, precheck, synthesized_grain, usable_main,
@@ -375,4 +375,41 @@ async fn a_ten_bit_bitmap_burn_stays_ten_bit_through_the_overlay() {
 		.filter_map(|line| line.split_whitespace().find_map(|field| field.strip_prefix("fmt:")))
 		.collect();
 	assert_eq!(formats, BTreeSet::from(["yuv420p10le"]), "{log}");
+}
+
+/// The first frame of `source` (a lavfi graph) through `filters`, as raw bytes.
+fn filtered_frame(source: &str, filters: &str) -> Vec<u8> {
+	let out = Command::new("ffmpeg")
+		.args([
+			"-hide_banner",
+			"-v",
+			"error",
+			"-f",
+			"lavfi",
+			"-i",
+			source,
+			"-vf",
+			filters,
+		])
+		.args(["-frames:v", "1", "-f", "rawvideo", "-"])
+		.output()
+		.unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	out.stdout
+}
+
+#[test]
+fn the_edge_fill_leaves_an_opaque_picture_as_the_plain_4_2_0_conversion_makes_it() {
+	let opaque: Stream =
+		serde_json::from_str(r#"{"index":0,"codec_type":"video","width":64,"height":32,"pix_fmt":"yuva444p"}"#)
+			.unwrap();
+	let noisy = "testsrc2=s=64x32:d=1,format=yuv444p,noise=alls=40:allf=t,format=yuva444p";
+
+	let filled = alpha_conversion(&opaque, &output_tags(&opaque)).unwrap();
+
+	assert!(filled.contains("geq="), "{filled}");
+	assert_eq!(
+		filtered_frame(noisy, &filled),
+		filtered_frame(noisy, "scale=flags=area,format=yuva420p")
+	);
 }

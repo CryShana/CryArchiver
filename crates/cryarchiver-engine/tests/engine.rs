@@ -1861,8 +1861,8 @@ async fn fast_video_is_never_measured_or_learned() {
 	assert!(memory.entries().is_empty());
 }
 
-/// A memory in which every group has learned `0`, so that a test starts from a learned setting without first running
-/// a whole job to teach it.
+/// A memory in which every group has learned the stats it holds, so that a test starts from a learned setting without
+/// first running a whole job to teach it.
 struct EveryGroupLearned(GroupStats);
 
 impl QualityMemory for EveryGroupLearned {

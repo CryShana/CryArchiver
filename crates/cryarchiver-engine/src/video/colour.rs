@@ -10,12 +10,15 @@ const RGB_PREFIXES: &[&str] = &[
 const PAL_RATES: &[f64] = &[25.0, 50.0];
 const ALPHA_420: &str = "yuva420p";
 /// `geq` registers for the 2×2 block that 4:2:0 shares one chroma sample between: its corner (0 and 1), its four
-/// alphas (2 to 5) and their sum (6), from which `BLOCK_COLOUR` is the block's alpha-weighted colour.
+/// alphas (2 to 5) and their sum (6), from which `BLOCK_COLOUR` is the block's alpha-weighted colour, rounded as
+/// `scale` rounds since `geq` would truncate it.
 const BLOCK_WEIGHTS: &str = "st(0,X-mod(X,2));st(1,Y-mod(Y,2));st(2,alpha(ld(0),ld(1)));st(3,alpha(ld(0)+1,ld(1)));\
 	st(4,alpha(ld(0),ld(1)+1));st(5,alpha(ld(0)+1,ld(1)+1));st(6,ld(2)+ld(3)+ld(4)+ld(5))";
-const BLOCK_COLOUR: &str = "(ld(2)*p(ld(0),ld(1))+ld(3)*p(ld(0)+1,ld(1))+ld(4)*p(ld(0),ld(1)+1)+\
-	ld(5)*p(ld(0)+1,ld(1)+1))/ld(6)";
-/// Averages each 2×2 block evenly into its chroma sample, which the edge fill relies on.
+const BLOCK_COLOUR: &str = "round((ld(2)*p(ld(0),ld(1))+ld(3)*p(ld(0)+1,ld(1))+ld(4)*p(ld(0),ld(1)+1)+\
+	ld(5)*p(ld(0)+1,ld(1)+1))/ld(6))";
+/// Averages each 2×2 block evenly into its chroma sample, which the edge fill relies on. That holds at even sizes
+/// only: at an odd width or height `scale` resamples the chroma by a fractional ratio, so a faint edge there still
+/// takes in part of a neighbouring transparent block's colour.
 const BLOCK_CHROMA: &str = "scale=flags=area";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,9 +55,12 @@ pub fn output_tags(stream: &Stream) -> ColourTags {
 			.to_owned()
 	};
 
+	let primaries = tagged(stream.color_primaries.as_deref(), primaries);
+	let matrix = if primaries == "bt2020" { "bt2020nc" } else { matrix };
+
 	if is_rgb(stream) {
 		return ColourTags {
-			primaries: tagged(stream.color_primaries.as_deref(), primaries),
+			primaries,
 			transfer: tagged(stream.color_transfer.as_deref(), transfer),
 			matrix: matrix.to_owned(),
 			range: Range::Limited,
@@ -68,7 +74,7 @@ pub fn output_tags(stream: &Stream) -> ColourTags {
 			.as_deref()
 			.is_some_and(|format| format.starts_with("yuvj"));
 	ColourTags {
-		primaries: tagged(stream.color_primaries.as_deref(), primaries),
+		primaries,
 		transfer: tagged(stream.color_transfer.as_deref(), transfer),
 		matrix: tagged(stream.color_space.as_deref(), matrix),
 		range: if full { Range::Full } else { Range::Limited },
@@ -284,6 +290,22 @@ mod tests {
 		assert_eq!(output_tags(&cif).primaries, "bt470bg");
 		assert_eq!(output_tags(&hd).matrix, "bt709");
 		assert_eq!(output_tags(&hd).transfer, "bt709");
+	}
+
+	#[test]
+	fn a_bt2020_source_without_a_matrix_tag_gets_the_bt2020_matrix() {
+		let untagged_matrix = stream(
+			r#"{"index":0,"codec_type":"video","width":3840,"height":2160,"pix_fmt":"yuv420p10le",
+			"color_transfer":"smpte2084","color_primaries":"bt2020"}"#,
+		);
+		let untagged = stream(r#"{"index":0,"codec_type":"video","width":3840,"height":2160,"pix_fmt":"yuv420p10le"}"#);
+		let rgb = stream(
+			r#"{"index":0,"codec_type":"video","width":3840,"height":2160,"pix_fmt":"gbrp16le","color_primaries":"bt2020"}"#,
+		);
+
+		assert_eq!(output_tags(&untagged_matrix).matrix, "bt2020nc");
+		assert_eq!(output_tags(&untagged).matrix, "bt709");
+		assert_eq!(output_tags(&rgb).matrix, "bt2020nc");
 	}
 
 	#[test]
