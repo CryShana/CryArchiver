@@ -190,29 +190,49 @@ impl JobOptions {
 		self.forced(false) || self.resize.is_some()
 	}
 
-	/// Why a forced output that misses its target or isn't smaller is written anyway: a trim alone says so, since the
-	/// same run on the whole file would have kept the original. `video` is whether `forced_video` forced it.
-	pub fn written_because(&self, merge_possible: bool, video: bool) -> &'static str {
-		let others = Self {
+	/// What forced an audio output that misses its target or isn't smaller: a trim alone says so, since the same run on
+	/// the whole file would have kept the original.
+	pub fn written_by(&self, merge_possible: bool) -> WrittenBy {
+		WrittenBy::of(self.trim.is_some() && !self.without_trim().forced(merge_possible))
+	}
+
+	/// `written_by` for a video output, which `forced_video` forces.
+	pub fn video_written_by(&self, merge_possible: bool) -> WrittenBy {
+		WrittenBy::of(self.trim.is_some() && !self.without_trim().forced_video(merge_possible))
+	}
+
+	fn without_trim(&self) -> Self {
+		Self {
 			trim: None,
 			..self.clone()
-		};
-		let others_force = if video {
-			others.forced_video(merge_possible)
-		} else {
-			others.forced(merge_possible)
-		};
-
-		if self.trim.is_some() && !others_force {
-			WRITTEN_TRIMMED
-		} else {
-			WRITTEN_REQUESTED
 		}
 	}
 }
 
-pub const WRITTEN_REQUESTED: &str = "it was written because it was requested";
-pub const WRITTEN_TRIMMED: &str = "it was written because it was trimmed";
+/// What wrote an output the size and quality rules alone would have kept the original for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrittenBy {
+	Request,
+	/// A trim and nothing else.
+	Trim,
+}
+
+impl WrittenBy {
+	fn of(trim_alone: bool) -> Self {
+		if trim_alone { Self::Trim } else { Self::Request }
+	}
+
+	pub fn because(self) -> &'static str {
+		match self {
+			Self::Request => "because it was requested",
+			Self::Trim => "because it was trimmed",
+		}
+	}
+
+	pub fn note(self) -> String {
+		format!("it was written {}", self.because())
+	}
+}
 
 impl TrimWindow {
 	/// The same range on the source's own timestamps, which begin at its start time rather than at 0.
@@ -335,20 +355,21 @@ pub fn parse_time(text: &str) -> Result<f64, String> {
 	Ok(total)
 }
 
-/// `why` is one of `WRITTEN_REQUESTED` and `WRITTEN_TRIMMED`.
-pub fn kept_as_requested(src_bytes: u64, out_bytes: u64, why: &str) -> String {
+pub fn kept_as_requested(src_bytes: u64, out_bytes: u64, by: WrittenBy) -> String {
 	format!(
-		"the output is not smaller than the source ({} → {}); {why}",
+		"the output is not smaller than the source ({} → {}); {}",
 		DecimalBytes(src_bytes),
-		DecimalBytes(out_bytes)
+		DecimalBytes(out_bytes),
+		by.note()
 	)
 }
 
-pub fn kept_as_requested_part(part_bytes: u64, out_bytes: u64, why: &str) -> String {
+pub fn kept_as_requested_part(part_bytes: u64, out_bytes: u64, by: WrittenBy) -> String {
 	format!(
-		"the output is not smaller than the same part of the source ({} → {}); {why}",
+		"the output is not smaller than the same part of the source ({} → {}); {}",
 		DecimalBytes(part_bytes),
-		DecimalBytes(out_bytes)
+		DecimalBytes(out_bytes),
+		by.note()
 	)
 }
 
@@ -371,11 +392,11 @@ mod tests {
 	#[test]
 	fn not_smaller_warnings_print_sizes_like_every_other_size() {
 		assert_eq!(
-			kept_as_requested(12_866_260, 34_335_604, WRITTEN_REQUESTED),
+			kept_as_requested(12_866_260, 34_335_604, WrittenBy::Request),
 			"the output is not smaller than the source (12.87 MB → 34.34 MB); it was written because it was requested"
 		);
 		assert_eq!(
-			kept_as_requested_part(900, 1_200, WRITTEN_TRIMMED),
+			kept_as_requested_part(900, 1_200, WrittenBy::Trim),
 			"the output is not smaller than the same part of the source (900 B → 1.20 kB); it was written because it \
 			 was trimmed"
 		);
@@ -392,31 +413,31 @@ mod tests {
 			..options
 		};
 
-		assert_eq!(trimmed.written_because(false, true), WRITTEN_TRIMMED);
-		assert_eq!(trimmed.written_because(false, false), WRITTEN_TRIMMED);
+		assert_eq!(trimmed.video_written_by(false), WrittenBy::Trim);
+		assert_eq!(trimmed.written_by(false), WrittenBy::Trim);
 		assert_eq!(
 			with(JobOptions {
 				format: Some(OutputFormat::Mkv),
 				..JobOptions::default()
 			})
-			.written_because(false, true),
-			WRITTEN_REQUESTED
+			.video_written_by(false),
+			WrittenBy::Request
 		);
 		assert_eq!(
 			with(JobOptions {
 				max_bitrate_kbps: Some(12_500),
 				..JobOptions::default()
 			})
-			.written_because(false, true),
-			WRITTEN_REQUESTED
+			.video_written_by(false),
+			WrittenBy::Request
 		);
 		assert_eq!(
 			with(JobOptions {
 				max_bitrate_kbps: Some(12_500),
 				..JobOptions::default()
 			})
-			.written_because(false, false),
-			WRITTEN_TRIMMED,
+			.written_by(false),
+			WrittenBy::Trim,
 			"audio ignores a bitrate cap"
 		);
 		assert_eq!(
@@ -424,11 +445,13 @@ mod tests {
 				merge_audio: true,
 				..JobOptions::default()
 			})
-			.written_because(false, true),
-			WRITTEN_TRIMMED,
+			.video_written_by(false),
+			WrittenBy::Trim,
 			"nothing to merge"
 		);
-		assert_eq!(JobOptions::default().written_because(false, true), WRITTEN_REQUESTED);
+		assert_eq!(JobOptions::default().video_written_by(false), WrittenBy::Request);
+		assert_eq!(WrittenBy::Trim.note(), "it was written because it was trimmed");
+		assert_eq!(WrittenBy::Request.because(), "because it was requested");
 	}
 
 	#[test]

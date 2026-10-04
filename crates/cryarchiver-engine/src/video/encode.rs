@@ -34,6 +34,7 @@ const DAMAGE_SHARE: f64 = 0.02;
 const DAMAGE_FLOOR_S: f64 = 1.0;
 const ROUNDING_S: f64 = 1e-9;
 const PREDICTION_MARGIN: f64 = 0.05;
+const RETRY_SIZE_SLACK: f64 = 1.10;
 const MATROSKA_TIME_BASE: &str = "1/1000";
 const AUDIO_TEMP: Container = Container {
 	cover: Cover::Attachment,
@@ -349,6 +350,50 @@ pub fn predicted_bytes(sample_bytes: u64, samples: &[Sample], duration_s: f64, o
 pub fn predicted_keep(src_bytes: u64, predicted_bytes: u64, min_savings: f64) -> Option<KeepReason> {
 	let limit = src_bytes as f64 * (1.0 - min_savings + PREDICTION_MARGIN);
 	(predicted_bytes as f64 >= limit).then_some(KeepReason::PredictedNotSmaller {
+		src_bytes,
+		predicted_bytes,
+	})
+}
+
+/// The video bytes a full encode at `crf` should come to: the search probes' sample bytes at their CRFs
+/// (`probe_sizes`), interpolated in log size to `crf`, scaled by how the first full encode (`first`: its CRF and bytes)
+/// came out against the same interpolation at its own CRF. `None` without two probes at different CRFs.
+#[allow(
+	clippy::cast_precision_loss,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss
+)]
+pub fn retry_bytes(probe_sizes: &[(f64, u64)], (first_crf, first_bytes): (f64, u64), crf: f64) -> Option<u64> {
+	let mut points: Vec<(f64, f64)> = probe_sizes
+		.iter()
+		.filter(|(_, bytes)| *bytes > 0)
+		.map(|&(probe_crf, bytes)| (probe_crf, (bytes as f64).ln()))
+		.collect();
+	points.sort_by(|a, b| a.0.total_cmp(&b.0));
+	points.dedup_by(|a, b| (a.0 - b.0).abs() < f64::EPSILON);
+	if points.len() < 2 || first_bytes == 0 {
+		return None;
+	}
+
+	let log_bytes = |at: f64| {
+		let after = points
+			.iter()
+			.position(|point| point.0 > at)
+			.unwrap_or(points.len() - 1)
+			.max(1);
+		let ((low_crf, low), (high_crf, high)) = (points[after - 1], points[after]);
+		low + (high - low) * (at - low_crf) / (high_crf - low_crf)
+	};
+	let scale = first_bytes as f64 / log_bytes(first_crf).exp();
+	Some((log_bytes(crf).exp() * scale).round() as u64)
+}
+
+/// The original is kept without a retry predicted at `predicted_bytes`, when that already misses the size rule against
+/// `src_bytes` by `RETRY_SIZE_SLACK`: the prediction comes from samples, so only a clear miss counts.
+#[allow(clippy::cast_precision_loss)]
+pub fn retry_keep(src_bytes: u64, predicted_bytes: u64, min_savings: f64) -> Option<KeepReason> {
+	let limit = src_bytes as f64 * (1.0 - min_savings);
+	(predicted_bytes as f64 >= limit * RETRY_SIZE_SLACK).then_some(KeepReason::PredictedNotSmaller {
 		src_bytes,
 		predicted_bytes,
 	})
@@ -1154,6 +1199,70 @@ mod tests {
 		assert_eq!(kept(949_999, 0.10), None);
 		assert!(kept(1_050_001, 0.0).is_some());
 		assert_eq!(kept(1_049_999, 0.0), None);
+	}
+
+	/// Sample bytes doubling every 6 CRF down from 1 MB at CRF 36.
+	fn doubling(crf: f64) -> u64 {
+		#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+		let bytes = (1_000_000.0 * 2f64.powf((36.0 - crf) / 6.0)).round() as u64;
+		bytes
+	}
+
+	#[allow(
+		clippy::cast_precision_loss,
+		clippy::cast_possible_truncation,
+		clippy::cast_sign_loss
+	)]
+	fn scaled(bytes: u64, crfs: f64) -> u64 {
+		(bytes as f64 * 2f64.powf(crfs / 6.0)).round() as u64
+	}
+
+	#[test]
+	fn a_retry_is_predicted_from_the_probes_in_log_size_and_the_first_encode() {
+		let probes: Vec<(f64, u64)> = [28.0, 36.0, 37.0, 36.75].map(|crf| (crf, doubling(crf))).into();
+		let near = |a: u64, b: u64| a.abs_diff(b) <= b / 10_000;
+
+		let between = retry_bytes(&probes, (36.75, 19_710_000), 29.5).unwrap();
+		let below = retry_bytes(&probes, (36.75, 19_710_000), 26.0).unwrap();
+		let above = retry_bytes(&probes, (36.0, 5_000_000), 40.0).unwrap();
+
+		assert!(near(between, scaled(19_710_000, 7.25)), "{between}");
+		assert!(
+			near(below, scaled(19_710_000, 10.75)),
+			"beyond the lowest probe: {below}"
+		);
+		assert!(
+			near(above, scaled(5_000_000, -4.0)),
+			"beyond the highest probe: {above}"
+		);
+		assert_eq!(retry_bytes(&probes[..1], (36.75, 19_710_000), 29.5), None);
+		assert_eq!(retry_bytes(&[(30.0, 10), (30.0, 12)], (30.0, 100), 28.0), None);
+		assert_eq!(retry_bytes(&probes, (36.75, 0), 29.5), None);
+	}
+
+	#[test]
+	fn only_a_retry_clearly_past_the_size_rule_keeps_the_original() {
+		let disc3 = retry_keep(32_040_000, scaled(20_290_000, 6.0), 0.10);
+		let disc4 = retry_keep(31_730_000, scaled(19_710_000, 2.0), 0.10);
+
+		assert!(
+			matches!(
+				disc3,
+				Some(KeepReason::PredictedNotSmaller {
+					src_bytes: 32_040_000,
+					..
+				})
+			),
+			"{disc3:?}"
+		);
+		assert_eq!(disc4, None);
+		assert!(retry_keep(1_000_000, 990_001, 0.10).is_some());
+		assert_eq!(
+			retry_keep(1_000_000, 989_999, 0.10),
+			None,
+			"within the 10 % slack of 900 kB"
+		);
+		assert_eq!(retry_keep(1_000_000, 1_099_999, 0.0), None);
 	}
 
 	#[test]

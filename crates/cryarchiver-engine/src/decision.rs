@@ -95,6 +95,15 @@ pub struct Reencode {
 	pub to_crf: f64,
 }
 
+/// A second encode that was not made: the size its samples predicted already failed the size rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkippedRetry {
+	pub from_crf: f64,
+	pub to_crf: f64,
+	pub predicted_bytes: u64,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -113,6 +122,7 @@ pub struct VideoDecision {
 	/// The full check of each encode, in order.
 	pub checks: Vec<Measured>,
 	pub reencode: Option<Reencode>,
+	pub skipped_retry: Option<SkippedRetry>,
 	/// A full check missed the target by at most half a point, and the encode was written as it was, without
 	/// encoding it again.
 	pub near_miss: bool,

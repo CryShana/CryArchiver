@@ -113,6 +113,8 @@ pub struct Search {
 	pub rate: f64,
 	/// Every probe, in the order it was run: the samples' quality curve.
 	pub probes: Vec<Probe>,
+	/// The bytes of each probe's samples, in the same order.
+	pub sample_bytes: Vec<u64>,
 }
 
 /// What a search aims at.
@@ -795,7 +797,12 @@ pub async fn search_below(
 			}
 		}
 	};
-	Ok(Search { searched, rate, probes })
+	Ok(Search {
+		searched,
+		rate,
+		probes,
+		sample_bytes,
+	})
 }
 
 fn pooled(scores: &[f64]) -> Result<Score, JobError> {

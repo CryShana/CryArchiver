@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use cryarchiver_engine::calibration::tables;
 use cryarchiver_engine::decision::{CrfChoice, Decision, Scan, Vmaf};
 use cryarchiver_engine::engine::{Encode, EncodeAgain, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::format::OutputFormat;
@@ -16,7 +17,7 @@ use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{self, Stream, probe};
 use cryarchiver_engine::quality::keys::CacheKey;
 use cryarchiver_engine::quality::memory::{GroupStats, Observation, Offset, QualityMemory, SharedMemory};
-use cryarchiver_engine::quality::search::{Bounds, Probe, Target, curve_retry_crf};
+use cryarchiver_engine::quality::search::{Bounds, Choice, Next, Probe, Target, curve_retry_crf, next, retry_crf};
 use cryarchiver_engine::quality::vmaf::Score;
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
 use cryarchiver_engine::toolchain::LIBAOM;
@@ -2184,38 +2185,49 @@ async fn a_searched_near_miss_teaches_its_offset_but_no_setting() {
 	assert!(offset.mean < 0.0, "{offset:?}");
 }
 
-#[tokio::test]
-async fn a_searched_video_that_misses_its_check_is_encoded_again_at_the_crf_its_probe_curve_points_to() {
-	let dir = tempfile::tempdir().unwrap();
-	let clip = dir.path().join("pattern.mkv");
+/// A test pattern whose search samples all skip 1.8 s of heavy noise, under a twentieth of its frames, so that its
+/// full check misses the samples' prediction on the mean by a point or two but keeps their floor.
+fn noisy_stretch(dir: &Path) -> PathBuf {
+	let clip = dir.join("pattern.mkv");
 	support::ffmpeg(&[
 		"-f",
 		"lavfi",
 		"-i",
-		"testsrc2=s=320x240:r=25:d=40,noise=alls=60:allf=t:enable='between(t,6.2,8.4)+between(t,25.9,28.2)'",
+		"testsrc2=s=320x240:r=25:d=40,noise=alls=60:allf=t:enable='between(t,6.3,8.1)'",
 		"-pix_fmt",
 		"yuv420p",
 		"-c:v",
 		"ffv1",
 		clip.to_str().unwrap(),
 	]);
-	let engine = Engine::new(support::toolchain().await);
+	clip
+}
 
-	let (_, events) = run_recording(&engine, &strict(&clip, 93.0, 89.0), dir.path()).await;
-
-	let decision = events
+fn last_decision(events: &[JobEvent]) -> &Decision {
+	events
 		.iter()
 		.rev()
 		.find_map(|event| match event {
-			JobEvent::Decision(decision) => Some(decision),
+			JobEvent::Decision(decision) => Some(&**decision),
 			_ => None,
 		})
-		.unwrap();
+		.unwrap()
+}
+
+#[tokio::test]
+async fn a_searched_video_that_misses_its_check_is_encoded_again_at_the_crf_its_probe_curve_points_to() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = noisy_stretch(dir.path());
+	let engine = Engine::new(support::toolchain().await);
+
+	let (outcome, events) = run_recording(&engine, &strict(&clip, 93.0, 89.0), dir.path()).await;
+
+	let decision = last_decision(&events);
 	let video = decision.video.as_ref().unwrap();
 	let again = video
 		.reencode
 		.as_ref()
-		.expect("the noisy stretches the samples skip miss the check");
+		.unwrap_or_else(|| panic!("the noisy stretch the samples skip misses the check: {decision:?}"));
 	let curve: Vec<Probe> = video
 		.probes
 		.iter()
@@ -2239,12 +2251,20 @@ async fn a_searched_video_that_misses_its_check_is_encoded_again_at_the_crf_its_
 		p5: check.p5,
 		frames: 0,
 	};
-	let target = video.target.unwrap();
+	let target = video.target.map(|target| Target {
+		mean: target.mean,
+		floor: target.p5,
+	});
+	let target = target.unwrap();
 	let bounds = Bounds {
 		min: 10.0,
 		max: 55.0,
 		step: 0.25,
 	};
+	let Next::Done(Choice::Chosen { slope, .. }) = next(&curve, target, bounds, tables().video.default_slope) else {
+		panic!("{decision:?}")
+	};
+	let on_slope = retry_crf(again.from_crf, full, target, slope, bounds);
 
 	assert_eq!(video.chosen, Some(CrfChoice::Searched), "{decision:?}");
 	assert!(
@@ -2253,19 +2273,71 @@ async fn a_searched_video_that_misses_its_check_is_encoded_again_at_the_crf_its_
 	);
 	assert_eq!(
 		Some(again.to_crf),
-		curve_retry_crf(
-			again.from_crf,
-			full,
-			predicted,
-			&curve,
-			Target {
-				mean: target.mean,
-				floor: target.p5,
-			},
-			bounds,
-		),
+		curve_retry_crf(again.from_crf, full, predicted, &curve, target, bounds),
 		"{decision:?}"
 	);
+	assert_ne!(Some(again.to_crf), on_slope, "{decision:?}");
+	assert!(again.from_crf - again.to_crf < 8.0, "inside the cap: {decision:?}");
+	assert_eq!(
+		stages(&events, Stage::Encode),
+		2,
+		"a retry that fits still runs: {outcome:?}"
+	);
+	assert_eq!(video.skipped_retry, None);
+}
+
+#[tokio::test]
+async fn a_retry_predicted_to_come_out_too_large_keeps_the_original_without_encoding_it() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = noisy_stretch(dir.path());
+	let source_bytes = fs::metadata(&clip).unwrap().len();
+	let engine = Engine::new(support::toolchain().await);
+	let (_, events) = run_recording(&engine, &strict(&clip, 93.0, 89.0), &out_dir(dir.path(), "measured")).await;
+	let first_crf = last_decision(&events)
+		.video
+		.as_ref()
+		.unwrap()
+		.reencode
+		.as_ref()
+		.unwrap()
+		.from_crf;
+	let fixed = advanced(
+		strict(&clip, 93.0, 89.0),
+		Advanced {
+			crf: Some(first_crf),
+			..Advanced::default()
+		},
+	);
+	let first_bytes = output_bytes(&run_recording(&engine, &fixed, &out_dir(dir.path(), "first")).await.0);
+	#[allow(clippy::cast_precision_loss)]
+	let just_above_the_first = Job {
+		min_savings: 1.0 - first_bytes as f64 * 1.03 / source_bytes as f64,
+		..strict(&clip, 93.0, 89.0)
+	};
+
+	let fresh = Engine::new(support::toolchain().await);
+	let (outcome, events) = run_recording(&fresh, &just_above_the_first, &out_dir(dir.path(), "skipped")).await;
+
+	assert!(
+		matches!(
+			outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::PredictedNotSmaller { .. }
+			}
+		),
+		"{outcome:?} after a first encode of {first_bytes}: {:?}",
+		last_decision(&events)
+	);
+	assert_eq!(stages(&events, Stage::Encode), 1, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 1, "{events:?}");
+	assert!(!events.iter().any(|event| matches!(event, JobEvent::EncodeAgain(_))));
+	let video = last_decision(&events).video.clone().unwrap();
+	let skipped = video.skipped_retry.expect("the record says the retry was skipped");
+	assert!(
+		skipped.predicted_bytes > first_bytes && skipped.to_crf < skipped.from_crf,
+		"{skipped:?} after {first_bytes}"
+	);
+	assert_eq!((skipped.from_crf, video.reencode), (first_crf, None));
 }
 
 #[tokio::test]

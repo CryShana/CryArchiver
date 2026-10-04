@@ -400,21 +400,7 @@ fn video_lines(video: &VideoDecision, lines: &mut Vec<DecisionLine>) {
 		lines.push(plain("Check", text));
 	}
 
-	if let Some(again) = &video.reencode {
-		let missed = video
-			.checks
-			.iter()
-			.find(|check| (check.crf - again.from_crf).abs() < f64::EPSILON)
-			.map_or_else(
-				|| again.reason.clone(),
-				|check| format!("measured {:.1} / {:.1}", check.mean, check.p5),
-			);
-		lines.push(DecisionLine {
-			label: "Again".into(),
-			value: format!("CRF {} {missed}: encoded again at CRF {}", again.from_crf, again.to_crf),
-			marked: true,
-		});
-	}
+	lines.extend(again_line(video));
 
 	if video.near_miss {
 		lines.push(DecisionLine {
@@ -446,6 +432,35 @@ fn video_lines(video: &VideoDecision, lines: &mut Vec<DecisionLine>) {
 	if !picture.is_empty() {
 		lines.push(plain("Picture", picture.join(" · ")));
 	}
+}
+
+/// The second encode: made, with what the first check measured, or skipped for its predicted size.
+fn again_line(video: &VideoDecision) -> Option<DecisionLine> {
+	let value = if let Some(again) = &video.reencode {
+		let missed = video
+			.checks
+			.iter()
+			.find(|check| (check.crf - again.from_crf).abs() < f64::EPSILON)
+			.map_or_else(
+				|| again.reason.clone(),
+				|check| format!("measured {:.1} / {:.1}", check.mean, check.p5),
+			);
+		format!("CRF {} {missed}: encoded again at CRF {}", again.from_crf, again.to_crf)
+	} else {
+		let skipped = video.skipped_retry?;
+		format!(
+			"CRF {} missed: not encoded again at CRF {}, predicted at {}",
+			skipped.from_crf,
+			skipped.to_crf,
+			size_text(skipped.predicted_bytes)
+		)
+	};
+
+	Some(DecisionLine {
+		label: "Again".into(),
+		value,
+		marked: true,
+	})
 }
 
 fn track_text(track: &AudioTrack) -> String {
@@ -616,6 +631,30 @@ mod tests {
 		let mut one_probe = video(CrfChoice::Searched, false, false);
 		one_probe.video.as_mut().unwrap().probes.push(Measured::default());
 		assert_eq!(decision_lines(&one_probe)[1].value, "30 (searched, 1 probe)");
+	}
+
+	#[test]
+	fn a_retry_predicted_too_large_is_shown_as_not_encoded_again() {
+		let decision = Decision {
+			video: Some(VideoDecision {
+				skipped_retry: Some(cryarchiver_engine::decision::SkippedRetry {
+					from_crf: 35.5,
+					to_crf: 29.5,
+					predicted_bytes: 37_560_000,
+				}),
+				..VideoDecision::default()
+			}),
+			..Decision::default()
+		};
+
+		assert_eq!(
+			labelled(&decision_lines(&decision)),
+			[line(
+				"Again",
+				"CRF 35.5 missed: not encoded again at CRF 29.5, predicted at 37.6 MB",
+				true
+			)]
+		);
 	}
 
 	#[test]

@@ -19,7 +19,7 @@ use crate::images::verify::{self, Expected};
 use crate::images::{blocking, structure};
 use crate::metadata::icc::{self, Cicp};
 use crate::metadata::{self, ImageFormat, MetadataMode, OutputMetadata, SourceMetadata, exif, sniff};
-use crate::options::{Resize, WRITTEN_REQUESTED, kept_as_requested, kept_as_requested_part, upscaled};
+use crate::options::{Resize, WrittenBy, kept_as_requested, kept_as_requested_part, upscaled};
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::MediaInfo;
@@ -475,7 +475,7 @@ async fn encode_and_choose(
 		&& let Some((_, size)) = &choice.best
 		&& !saves_enough(cx.source_bytes, *size, cx.min_savings)
 	{
-		notes.push(kept_as_requested(cx.source_bytes, *size, WRITTEN_REQUESTED));
+		notes.push(kept_as_requested(cx.source_bytes, *size, WrittenBy::Request));
 	}
 
 	let mut warnings = still.warnings;
@@ -887,9 +887,9 @@ pub async fn encode_animation(
 		}
 
 		warnings.push(if cx.source_is_part {
-			kept_as_requested_part(cx.source_bytes, bytes, WRITTEN_REQUESTED)
+			kept_as_requested_part(cx.source_bytes, bytes, WrittenBy::Request)
 		} else {
-			kept_as_requested(cx.source_bytes, bytes, WRITTEN_REQUESTED)
+			kept_as_requested(cx.source_bytes, bytes, WrittenBy::Request)
 		});
 	}
 
