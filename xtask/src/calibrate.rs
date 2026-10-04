@@ -43,18 +43,28 @@ pub struct Measurements {
 
 impl Measurements {
 	fn absorb(&mut self, other: Self) {
-		for (cell, values) in other.crf {
+		let Self {
+			crf,
+			bpp,
+			grain_mean,
+			grain_floor,
+			preset4_ratio,
+			slope,
+			videos,
+		} = other;
+
+		for (cell, values) in crf {
 			self.crf.entry(cell).or_default().extend(values);
 		}
-		for (all, values) in self.bpp.iter_mut().zip(other.bpp) {
+		for (all, values) in self.bpp.iter_mut().zip(bpp) {
 			all.extend(values);
 		}
 
-		self.grain_mean.extend(other.grain_mean);
-		self.grain_floor.extend(other.grain_floor);
-		self.preset4_ratio.extend(other.preset4_ratio);
-		self.slope.extend(other.slope);
-		self.videos += other.videos;
+		self.grain_mean.extend(grain_mean);
+		self.grain_floor.extend(grain_floor);
+		self.preset4_ratio.extend(preset4_ratio);
+		self.slope.extend(slope);
+		self.videos += videos;
 	}
 }
 
