@@ -50,10 +50,17 @@ fn a_cover_reaches_a_vorbis_ogg_too() {
 		ogg.to_str().unwrap(),
 	]);
 
-	add_pictures(&ogg, source_pictures(&mp3)).unwrap();
+	let cover = source_pictures(&mp3);
+
+	add_pictures(&ogg, cover.clone()).unwrap();
 
 	let file = VorbisFile::read_from(&mut File::open(&ogg).unwrap(), ParseOptions::new()).unwrap();
-	assert_eq!(file.vorbis_comments().pictures().len(), 1);
+	let pictures = file.vorbis_comments().pictures();
+	assert_eq!(pictures.len(), 1);
+	let (written, _) = &pictures[0];
+	assert_eq!(written.pic_type(), cover[0].pic_type());
+	assert_eq!(written.mime_type(), cover[0].mime_type());
+	assert_eq!(written.data(), cover[0].data());
 	assert_eq!(file.vorbis_comments().get("TITLE"), Some("Song"));
 }
 

@@ -575,7 +575,10 @@ impl Engine {
 			Planned::Animation(burn) => Box::pin(self.produce_video_animation(&cx, &workspace, *burn)).await,
 			Planned::Image(input) => Box::pin(self.produce_image(&cx, input, &workspace)).await,
 		};
-		let mut staged = match produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes))? {
+		let image = matches!(planned, Planned::Image(_) | Planned::Animation(_));
+		let ran_on = attempt_threads(image, self.video_threads, self.image_threads, job.options.threads);
+		let produced = produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes).ran_on(ran_on));
+		let mut staged = match produced? {
 			Produced::Output(staged) => staged,
 			Produced::Kept(reason) => {
 				recorder.update(|decision| {
@@ -1308,7 +1311,14 @@ impl Engine {
 		}
 
 		let animation = Animation {
-			alpha: video.alpha && animated::has_alpha(&self.tools, &frames.path, cx.cancel).await?,
+			alpha: video.alpha
+				&& animated::has_alpha(
+					&self.tools,
+					&frames.path,
+					self.job_threads(cx.job, self.image_threads),
+					cx.cancel,
+				)
+				.await?,
 			timeline,
 			size: None,
 			matrix: video.colour.matrix.clone(),
@@ -2676,6 +2686,17 @@ fn thread_budget(engine: Option<usize>, job_cap: Option<usize>, fallback: usize)
 	job_cap.map_or(engine, |cap| cap.min(engine)).max(1)
 }
 
+/// The thread budget an attempt ran on: an image's encoder threads, or else what the video tools got, the whole
+/// machine without a budget.
+fn attempt_threads(image: bool, engine: Option<usize>, image_threads: usize, job_cap: Option<usize>) -> usize {
+	let fallback = if image {
+		image_threads
+	} else {
+		std::thread::available_parallelism().map_or(1, usize::from)
+	};
+	thread_budget(engine, job_cap, fallback)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -2688,6 +2709,18 @@ mod tests {
 		assert_eq!(thread_budget(Some(4), Some(8), 16), 4);
 		assert_eq!(thread_budget(None, Some(8), 16), 8);
 		assert_eq!(thread_budget(None, Some(0), 16), 1);
+	}
+
+	#[test]
+	fn an_attempt_ran_on_the_image_share_or_the_video_tools_budget() {
+		let cores = std::thread::available_parallelism().map_or(1, usize::from);
+
+		assert_eq!(attempt_threads(true, None, 4, None), 4);
+		assert_eq!(attempt_threads(true, None, 4, Some(2)), 2);
+		assert_eq!(attempt_threads(true, Some(3), 3, None), 3);
+		assert_eq!(attempt_threads(false, None, 4, None), cores);
+		assert_eq!(attempt_threads(false, Some(2), 4, None), 2);
+		assert_eq!(attempt_threads(false, None, 4, Some(1)), 1);
 	}
 
 	#[test]

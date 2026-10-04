@@ -722,6 +722,11 @@ async fn doctor(ffmpeg: Option<PathBuf>) -> u8 {
 	u8::from(lines.iter().any(|line| line.status == Status::Missing)) * 2
 }
 
+/// What refuses the whole run once the toolchain is known, before any file is read.
+fn toolchain_refusal(args: &CompressArgs, tools: &Toolchain) -> Option<&'static str> {
+	tools.video_encoder_problem(args.video_encoder)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn compress(args: CompressArgs) -> u8 {
 	if args.codec == Codec::Compat {
@@ -770,7 +775,10 @@ async fn compress(args: CompressArgs) -> u8 {
 	let threads = file_threads(args.threads, args.cpu_limit, applied.cpu_cap_live, parallel, cores);
 
 	let cancel = CancellationToken::new();
-	let tools = match Toolchain::detect(&ToolConfig { ffmpeg: args.ffmpeg }, &cancel).await {
+	let config = ToolConfig {
+		ffmpeg: args.ffmpeg.clone(),
+	};
+	let tools = match Toolchain::detect(&config, &cancel).await {
 		Ok(tools) => tools,
 		Err(err) => {
 			eprintln!("error: {err}");
@@ -787,7 +795,7 @@ async fn compress(args: CompressArgs) -> u8 {
 		return 2;
 	}
 
-	if let Some(problem) = tools.video_encoder_problem(args.video_encoder) {
+	if let Some(problem) = toolchain_refusal(&args, &tools) {
 		eprintln!("error: {problem}");
 		return 2;
 	}
@@ -800,6 +808,10 @@ async fn compress(args: CompressArgs) -> u8 {
 			line.detail,
 			kinds.join(" and ")
 		);
+	}
+
+	if let Some(failures) = tools.optional_failures() {
+		eprintln!("warning: {failures}");
 	}
 
 	let files: Vec<PathBuf> = inputs.files.into_iter().map(absolute).collect();
@@ -934,8 +946,8 @@ async fn run_all(
 				&mut job,
 				cancel,
 				move |job: Job| async move { engine.run(&job, sink.as_ref(), on_event, cancel).await },
-				|wait: Wait, err: &JobError| {
-					let waiting = retry::describe(wait);
+				|wait: Wait, err: &JobError, fewer_threads: Option<usize>| {
+					let waiting = retry::describe(wait, fewer_threads);
 					report.print(&format!("↻ {}  {waiting}: {err}", file_label(&source)), false);
 					item.wait(waiting);
 				},
@@ -1521,6 +1533,26 @@ mod tests {
 			refusal(&["project", "create", "src", "dst", "--resize", "1280:720"]).exit_code(),
 			2
 		);
+	}
+
+	#[tokio::test]
+	async fn an_aom_choice_without_libaom_refuses_the_run_before_any_file() {
+		let mut tools = Toolchain::detect(&ToolConfig::default(), &CancellationToken::new())
+			.await
+			.unwrap();
+		tools.encoders.remove(cryarchiver_engine::toolchain::LIBAOM);
+		let Launch::Compress(aom) = launch_from(args(&["a.mp4", "--video-encoder", "aom"])) else {
+			panic!("not a compress run");
+		};
+		let Launch::Compress(plain) = launch_from(args(&["a.mp4"])) else {
+			panic!("not a compress run");
+		};
+
+		assert_eq!(
+			toolchain_refusal(&aom, &tools),
+			Some("--video-encoder aom needs ffmpeg with libaom-av1")
+		);
+		assert_eq!(toolchain_refusal(&plain, &tools), None);
 	}
 
 	#[tokio::test]

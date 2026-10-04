@@ -63,17 +63,6 @@ impl ErrorKind {
 			Self::SourceUnreadable(_) | Self::SourceDamaged(_) | Self::EncodeFailed(_) => ErrorClass::Unrecoverable,
 		}
 	}
-
-	/// The thread budget of the attempt after this error, from the budget of the one that failed: halved after a
-	/// crash, which fewer threads may avoid, and otherwise kept. No budget counts as the whole machine.
-	pub fn retry_threads(&self, threads: Option<usize>) -> Option<usize> {
-		if !matches!(self, Self::ToolCrashed(_)) {
-			return threads;
-		}
-
-		let current = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from));
-		Some((current / 2).max(1))
-	}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,11 +76,50 @@ pub enum IoSide<'a> {
 pub struct JobError {
 	pub kind: ErrorKind,
 	pub log_tail: Vec<String>,
+	/// The thread budget the failed attempt ran on, once the engine knows which kind of job it is.
+	pub threads: Option<usize>,
 }
 
 impl JobError {
 	pub fn with_log(kind: ErrorKind, log_tail: Vec<String>) -> Self {
-		Self { kind, log_tail }
+		Self {
+			kind,
+			log_tail,
+			threads: None,
+		}
+	}
+
+	/// The thread cap of the attempt after this one, from `job_threads`, the cap this attempt was given: after a crash,
+	/// which fewer threads may avoid, half the budget it ran on (the cap, or the whole machine, when the engine didn't
+	/// say), at least one; otherwise the same cap.
+	pub fn retry_threads(&self, job_threads: Option<usize>) -> Option<usize> {
+		if !matches!(self.kind, ErrorKind::ToolCrashed(_)) {
+			return job_threads;
+		}
+
+		Some((self.ran_on_or_machine(job_threads) / 2).max(1))
+	}
+
+	/// `retry_threads`, when it is fewer threads than this attempt ran on.
+	pub fn fewer_threads(&self, job_threads: Option<usize>) -> Option<usize> {
+		self.retry_threads(job_threads).filter(|next| {
+			matches!(self.kind, ErrorKind::ToolCrashed(_)) && *next < self.ran_on_or_machine(job_threads)
+		})
+	}
+
+	fn ran_on_or_machine(&self, job_threads: Option<usize>) -> usize {
+		self.threads
+			.or(job_threads)
+			.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from))
+	}
+
+	/// Records the thread budget the attempt ran on, unless an earlier step did.
+	#[must_use]
+	pub fn ran_on(self, threads: usize) -> Self {
+		Self {
+			threads: self.threads.or(Some(threads)),
+			..self
+		}
 	}
 
 	pub fn is_disk_full(&self) -> bool {
@@ -123,7 +151,17 @@ impl From<ErrorKind> for JobError {
 		Self {
 			kind,
 			log_tail: Vec::new(),
+			threads: None,
 		}
+	}
+}
+
+/// "with 2 threads", for a retry note.
+pub fn threads_note(threads: usize) -> String {
+	if threads == 1 {
+		"with 1 thread".to_owned()
+	} else {
+		format!("with {threads} threads")
 	}
 }
 
@@ -234,15 +272,53 @@ mod tests {
 	}
 
 	#[test]
-	fn a_crash_halves_the_threads_down_to_one_and_other_errors_keep_them() {
-		let crash = ErrorKind::ToolCrashed("ffmpeg crashed: out of memory (exit code -12)".into());
+	fn a_crash_halves_the_threads_the_attempt_ran_on_down_to_one() {
+		let crash = |threads: Option<usize>| JobError {
+			threads,
+			..ErrorKind::ToolCrashed("ffmpeg crashed: out of memory (exit code -12)".into()).into()
+		};
+		let cores = std::thread::available_parallelism().map_or(2, usize::from);
 
-		assert_eq!(crash.retry_threads(Some(8)), Some(4));
-		assert_eq!(crash.retry_threads(Some(5)), Some(2));
-		assert_eq!(crash.retry_threads(Some(1)), Some(1));
-		assert!(crash.retry_threads(None).is_some_and(|threads| threads >= 1));
-		assert_eq!(ErrorKind::Locked.retry_threads(Some(8)), Some(8));
-		assert_eq!(ErrorKind::Locked.retry_threads(None), None);
+		assert_eq!(
+			crash(Some(4)).retry_threads(None),
+			Some(2),
+			"an engine budget below the cores"
+		);
+		assert_eq!(
+			crash(Some(4)).retry_threads(Some(8)),
+			Some(2),
+			"the budget it ran on, not the cap"
+		);
+		assert_eq!(crash(Some(5)).retry_threads(Some(5)), Some(2));
+		assert_eq!(crash(Some(1)).retry_threads(Some(1)), Some(1));
+		assert_eq!(crash(None).retry_threads(Some(8)), Some(4));
+		assert_eq!(crash(None).retry_threads(None), Some((cores / 2).max(1)));
+	}
+
+	#[test]
+	fn only_a_retry_on_fewer_threads_than_the_attempt_ran_on_is_noted() {
+		let crash = |threads: Option<usize>| JobError {
+			threads,
+			..ErrorKind::ToolCrashed("ffmpeg crashed: out of memory (exit code -12)".into()).into()
+		};
+
+		assert_eq!(crash(Some(4)).fewer_threads(None), Some(2));
+		assert_eq!(crash(Some(1)).fewer_threads(None), None);
+		assert_eq!(crash(Some(1)).fewer_threads(Some(1)), None);
+		assert_eq!(JobError::from(ErrorKind::Locked).fewer_threads(Some(8)), None);
+		assert_eq!(threads_note(2), "with 2 threads");
+		assert_eq!(threads_note(1), "with 1 thread");
+	}
+
+	#[test]
+	fn other_errors_keep_the_threads() {
+		let locked = JobError {
+			threads: Some(4),
+			..ErrorKind::Locked.into()
+		};
+
+		assert_eq!(locked.retry_threads(Some(8)), Some(8));
+		assert_eq!(locked.retry_threads(None), None);
 	}
 
 	#[test]

@@ -129,7 +129,7 @@ pub enum RunError {
 	CaptureLimit(usize),
 	#[error("{tool} crashed: {description}")]
 	Crashed {
-		/// The program's name, such as `ffprobe`.
+		/// The program's file stem.
 		tool: String,
 		description: String,
 		status: ExitStatus,

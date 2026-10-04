@@ -832,7 +832,7 @@ async fn produce_animation(
 		.map_err(ErrorKind::EncodeFailed)?;
 
 	let animation = Animation {
-		alpha: animated::has_alpha(cx.tools, cx.source, cx.cancel).await?,
+		alpha: animated::has_alpha(cx.tools, cx.source, cx.threads, cx.cancel).await?,
 		timeline,
 		size,
 		matrix: animated::IMAGE_MATRIX.to_owned(),
@@ -855,10 +855,7 @@ pub async fn encode_animation(
 	workspace: &Workspace,
 	mut warnings: Vec<String>,
 ) -> Result<ImageOutcome, JobError> {
-	let settings = match animated::plan_animation(cx.speed, cx.caps.libaom) {
-		Ok(settings) => settings,
-		Err(reason) => return Ok(ImageOutcome::Kept(reason)),
-	};
+	let settings = animated::plan_animation(cx.speed);
 
 	(cx.on_event)(JobEvent::Stage(Stage::Encode));
 	let output = workspace.file("out.avif");
@@ -891,7 +888,7 @@ pub async fn encode_animation(
 	}
 
 	(cx.on_event)(JobEvent::Stage(Stage::Verify));
-	let score = animated::verify_animation(cx.tools, frames, &output, animation, cx.cancel).await?;
+	let score = animated::verify_animation(cx.tools, frames, &output, animation, cx.threads, cx.cancel).await?;
 	let target = plan::image_target(cx.speed, &cx.overrides);
 	if score < target {
 		if !cx.forced {

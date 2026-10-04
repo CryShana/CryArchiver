@@ -5542,6 +5542,36 @@ async fn burned_bitmap_subtitles_are_searched_and_checked_against_the_same_burn(
 	assert_eq!(subtitle_count(output).await, 0);
 }
 
+#[tokio::test]
+async fn a_searched_burn_runs_its_analysis_encodes_and_checks_on_a_two_thread_budget() {
+	let dir = tempfile::tempdir().unwrap();
+	let pgs = support::pgs_box(dir.path(), 1_000, 2_000);
+	let clip = support::subtitled_clip(
+		dir.path(),
+		"boxed.mkv",
+		&support::Picture {
+			source: "testsrc2",
+			seconds: 3,
+			codec: &["-c:v", "mpeg4", "-q:v", "2"],
+			second_angle: false,
+			marked_frame: None,
+		},
+		&pgs,
+		"copy",
+	);
+	let engine = Engine::new(support::toolchain().await).with_threads(2);
+
+	let (outcome, events) = run_recording(&engine, &with_burn(job(&clip)), dir.path()).await;
+
+	let JobOutcome::Encoded { output, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(stages(&events, Stage::Analyze), 1, "{events:?}");
+	assert_eq!(stages(&events, Stage::Sample), 1, "{events:?}");
+	assert_eq!(stages(&events, Stage::Verify), 2, "{events:?}");
+	assert_eq!(subtitle_count(output).await, 0);
+}
+
 fn advanced(job: Job, advanced: Advanced) -> Job {
 	with_options(
 		job,

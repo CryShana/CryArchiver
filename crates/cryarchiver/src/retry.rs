@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use cryarchiver_engine::commit::free_space;
 use cryarchiver_engine::engine::Job;
-use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError, JobOutcome};
+use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError, JobOutcome, threads_note};
 use indicatif::DecimalBytes;
 use tokio_util::sync::CancellationToken;
 
@@ -36,20 +36,26 @@ pub fn next_wait(kind: &ErrorKind, attempt: u32) -> Option<Wait> {
 	})
 }
 
-pub fn describe(wait: Wait) -> String {
-	match wait {
+/// `fewer_threads` is the thread count of the next attempt when it is lower than this one's.
+pub fn describe(wait: Wait, fewer_threads: Option<usize>) -> String {
+	let waiting = match wait {
 		Wait::Delay(delay) => format!("retrying in {} s", delay.as_secs()),
 		Wait::Stable => "retrying once the file stops changing".to_owned(),
 		Wait::Space { need } => format!("retrying once {} are free", DecimalBytes(need)),
+	};
+	match fewer_threads {
+		Some(threads) => format!("{waiting} {}", threads_note(threads)),
+		None => waiting,
 	}
 }
 
 /// `wait_out` resolves to false when the wait ended without its condition being met, by Ctrl+C or by its time limit.
+/// `on_retry` also gets the next attempt's thread count when it is lower.
 pub async fn with_retries<R, W>(
 	job: &mut Job,
 	cancel: &CancellationToken,
 	mut run: impl FnMut(Job) -> R,
-	mut on_retry: impl FnMut(Wait, &JobError),
+	mut on_retry: impl FnMut(Wait, &JobError, Option<usize>),
 	mut wait_out: impl FnMut(Wait) -> W,
 ) -> JobOutcome
 where
@@ -67,7 +73,8 @@ where
 			return outcome;
 		};
 
-		on_retry(wait, err);
+		let threads = err.retry_threads(job.options.threads);
+		on_retry(wait, err, err.fewer_threads(job.options.threads));
 		if !wait_out(wait).await {
 			if cancel.is_cancelled() {
 				return JobOutcome::Failed(ErrorKind::Cancelled.into());
@@ -75,7 +82,7 @@ where
 			return outcome;
 		}
 
-		job.options.threads = err.kind.retry_threads(job.options.threads);
+		job.options.threads = threads;
 		attempt += 1;
 	}
 }
@@ -240,6 +247,7 @@ mod tests {
 	struct Script {
 		threads: Vec<Option<usize>>,
 		waits: Vec<Wait>,
+		fewer: Vec<Option<usize>>,
 	}
 
 	async fn scripted(
@@ -251,6 +259,7 @@ mod tests {
 		let mut outcomes = outcomes.into_iter();
 		let mut threads = Vec::new();
 		let mut waits = Vec::new();
+		let mut fewer = Vec::new();
 
 		let outcome = with_retries(
 			job,
@@ -259,12 +268,53 @@ mod tests {
 				threads.push(job.options.threads);
 				std::future::ready(outcomes.next().expect("no more attempts than scripted"))
 			},
-			|wait, _| waits.push(wait),
+			|wait, _, next_threads| {
+				waits.push(wait);
+				fewer.push(next_threads);
+			},
 			|_| std::future::ready(waited),
 		)
 		.await;
 
-		(outcome, Script { threads, waits })
+		(outcome, Script { threads, waits, fewer })
+	}
+
+	#[tokio::test]
+	async fn a_crash_halves_the_budget_the_engine_ran_the_job_on() {
+		let mut job = job(None);
+		let crash = |ran_on: usize| {
+			JobOutcome::Failed(
+				JobError::from(ErrorKind::ToolCrashed(
+					"ffmpeg crashed: out of memory (exit code -12)".into(),
+				))
+				.ran_on(ran_on),
+			)
+		};
+
+		let (outcome, script) = scripted(
+			&mut job,
+			vec![crash(4), crash(2), done()],
+			true,
+			&CancellationToken::new(),
+		)
+		.await;
+
+		assert!(matches!(outcome, JobOutcome::Skipped { .. }), "{outcome:?}");
+		assert_eq!(script.threads, [None, Some(2), Some(1)], "an image share of 4 threads");
+		assert_eq!(script.fewer, [Some(2), Some(1)]);
+	}
+
+	#[test]
+	fn a_retry_on_fewer_threads_says_so() {
+		assert_eq!(
+			describe(Wait::Delay(Duration::from_secs(5)), Some(2)),
+			"retrying in 5 s with 2 threads"
+		);
+		assert_eq!(
+			describe(Wait::Delay(Duration::from_secs(5)), Some(1)),
+			"retrying in 5 s with 1 thread"
+		);
+		assert_eq!(describe(Wait::Stable, None), "retrying once the file stops changing");
 	}
 
 	#[tokio::test]
@@ -347,7 +397,7 @@ mod tests {
 	#[test]
 	fn the_space_wait_names_a_readable_size() {
 		assert_eq!(
-			describe(Wait::Space { need: 4_300_000_000 }),
+			describe(Wait::Space { need: 4_300_000_000 }, None),
 			"retrying once 4.30 GB are free"
 		);
 	}

@@ -13,7 +13,7 @@ use cryarchiver_engine::decision::Decision;
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, Stage};
 use cryarchiver_engine::naming::{collision_key, destination_name, placeholder_name};
 use cryarchiver_engine::options::JobOptions;
-use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError};
+use cryarchiver_engine::outcome::{ErrorClass, ErrorKind, JobError, threads_note};
 use cryarchiver_engine::quality::memory::SharedMemory;
 use cryarchiver_engine::sink::ArchivalSink;
 use cryarchiver_engine::workspace::ARCHIVE_DIR;
@@ -822,10 +822,15 @@ impl Owner {
 			&& let Some(delay) = retry_delay(self.tuning.retry_base, retries)
 		{
 			self.pipeline.retries.insert(file, retries + 1);
-			if let Some(threads) = err.kind.retry_threads(self.pipeline.retry_threads.get(&file).copied()) {
+			let job_threads = self.pipeline.retry_threads.get(&file).copied();
+			let fewer = err
+				.fewer_threads(job_threads)
+				.map(|threads| format!(" {}", threads_note(threads)))
+				.unwrap_or_default();
+			if let Some(threads) = err.retry_threads(job_threads) {
 				self.pipeline.retry_threads.insert(file, threads);
 			}
-			self.note(file, format!("{}; retrying in {} s", err.kind, delay.as_secs()));
+			self.note(file, format!("{}; retrying in {} s{fewer}", err.kind, delay.as_secs()));
 			self.set_state(file, FileState::Queued);
 			self.pipeline.retry_at.insert((Instant::now() + delay, file));
 			return;
@@ -1547,6 +1552,60 @@ pub(super) mod tests {
 			None,
 			"an issue starts afresh"
 		);
+	}
+
+	#[test]
+	fn a_retry_halves_the_engine_budget_the_crash_ran_on_and_says_so() {
+		let mut fixture = Fixture::named("song.flac", b"fLaC");
+		let crash = |ran_on: usize| {
+			JobMessage::Finished(Err(JobError::from(ErrorKind::ToolCrashed(
+				"ffmpeg crashed: out of memory (exit code -12)".into(),
+			))
+			.ran_on(ran_on)))
+		};
+		let threads_of = |owner: &mut Owner, file: FileId| match owner.task_for(file, Work::Encode) {
+			Some(Task::Encode(job)) => job.options.threads,
+			_ => panic!("an encode task was expected"),
+		};
+
+		fixture.running();
+		fixture.job(crash(4));
+		let second = threads_of(&mut fixture.owner, fixture.file);
+		fixture.running();
+		fixture.job(crash(2));
+		let third = threads_of(&mut fixture.owner, fixture.file);
+
+		assert_eq!(second, Some(2), "a capped image share of 4 threads");
+		assert_eq!(third, Some(1));
+		let notes = &fixture.owner.pipeline.notes[&fixture.file];
+		assert!(
+			notes[0].contains("; retrying in ") && notes[0].ends_with(" s with 2 threads"),
+			"{notes:?}"
+		);
+		assert!(notes[1].ends_with(" with 1 thread"), "{notes:?}");
+	}
+
+	#[test]
+	fn halved_threads_are_forgotten_once_the_file_is_done_or_withdrawn() {
+		let crash = || failed(ErrorKind::ToolCrashed("ffmpeg crashed: exception 0xC0000005".into()));
+
+		let mut done = Fixture::new(b"first");
+		done.running();
+		done.job(crash());
+		assert!(done.owner.pipeline.retry_threads.contains_key(&done.file));
+		done.running();
+		let target = done.commit(b"first").unwrap();
+		place(&target, b"first");
+		done.job(JobMessage::Placed);
+		assert!(matches!(done.record().state, FileState::Done(_)));
+		assert!(!done.owner.pipeline.retry_threads.contains_key(&done.file));
+
+		let mut withdrawn = Fixture::new(b"first");
+		withdrawn.running();
+		withdrawn.job(crash());
+		assert!(withdrawn.owner.pipeline.retry_threads.contains_key(&withdrawn.file));
+		withdrawn.change_source(b"second version");
+		assert!(!withdrawn.owner.pipeline.retry_threads.contains_key(&withdrawn.file));
 	}
 
 	#[test]

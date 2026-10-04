@@ -615,7 +615,7 @@ pub async fn alpha_ssim(
 	})
 }
 
-pub fn alpha_ssim_command(ffmpeg: &Path, output: &Path, source: &Path, video: &VideoPlan) -> ToolCommand {
+fn alpha_ssim_command(ffmpeg: &Path, output: &Path, source: &Path, video: &VideoPlan) -> ToolCommand {
 	let threads = video.threads.map(|threads| threads.tool);
 
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);

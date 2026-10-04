@@ -14,7 +14,7 @@ use crate::images::blocking;
 use crate::images::decode::IMAGE_DECODE_ERRORS;
 use crate::images::ssim;
 use crate::metadata::{ImageFormat, gif, sniff};
-use crate::outcome::{ErrorKind, JobError, KeepReason};
+use crate::outcome::{ErrorKind, JobError};
 use crate::preset::Speed;
 use crate::probe::{self, MediaInfo};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
@@ -228,11 +228,13 @@ pub async fn read_video_timeline(
 	Ok(video_timeline(&String::from_utf8_lossy(&out.stdout), size))
 }
 
-pub async fn has_alpha(tools: &Toolchain, source: &Path, cancel: &CancellationToken) -> Result<bool, JobError> {
-	let mut cmd = ToolCommand::new(&tools.ffmpeg, STALL_TIMEOUT);
-	cmd.args(["-hide_banner", "-nostdin", "-v", "error", "-i"])
-		.arg(process::tool_path(source))
-		.args(["-vf", TRANSPARENT_FRAMES, "-fps_mode", "passthrough", "-f", "null", "-"]);
+pub async fn has_alpha(
+	tools: &Toolchain,
+	source: &Path,
+	threads: usize,
+	cancel: &CancellationToken,
+) -> Result<bool, JobError> {
+	let cmd = has_alpha_command(&tools.ffmpeg, source, threads);
 
 	let out = run_ffmpeg(&cmd, |_| {}, cancel).await?;
 	Ok(out
@@ -241,17 +243,23 @@ pub async fn has_alpha(tools: &Toolchain, source: &Path, cancel: &CancellationTo
 		.is_some_and(|frames| frames > 0))
 }
 
-pub fn plan_animation(speed: Speed, libaom: bool) -> Result<AnimatedSettings, KeepReason> {
-	if !libaom {
-		return Err(KeepReason::Unsupported("animations need ffmpeg with libaom-av1".into()));
-	}
+fn has_alpha_command(ffmpeg: &Path, source: &Path, threads: usize) -> ToolCommand {
+	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
+	cmd.args(["-hide_banner", "-nostdin", "-v", "error"])
+		.threads(Some(threads))
+		.arg("-i")
+		.arg(process::tool_path(source))
+		.args(["-vf", TRANSPARENT_FRAMES, "-fps_mode", "passthrough", "-f", "null", "-"]);
+	cmd
+}
 
+pub fn plan_animation(speed: Speed) -> AnimatedSettings {
 	let crf = match speed {
 		Speed::Fast => 16,
 		Speed::Moderate => 10,
 		Speed::Slow => 6,
 	};
-	Ok(AnimatedSettings { crf, cpu_used: 6 })
+	AnimatedSettings { crf, cpu_used: 6 }
 }
 
 pub fn encode_command(
@@ -344,6 +352,7 @@ pub async fn verify_animation(
 	source: &Path,
 	output: &Path,
 	animation: &Animation,
+	threads: usize,
 	cancel: &CancellationToken,
 ) -> Result<f64, JobError> {
 	let info = probe::probe(tools, output, cancel)
@@ -364,14 +373,21 @@ pub async fn verify_animation(
 
 	let frames = sampled_frames(timeline.frames);
 	let reference = decode_frames(
-		&tools.ffmpeg,
-		source,
-		&frames,
-		Sampled::Source(animation.scale()),
+		&decode_frames_command(
+			&tools.ffmpeg,
+			source,
+			&frames,
+			Sampled::Source(animation.scale()),
+			threads,
+		),
 		cancel,
 	)
 	.await?;
-	let decoded = decode_frames(&tools.ffmpeg, output, &frames, Sampled::Output(&tracks), cancel).await?;
+	let decoded = decode_frames(
+		&decode_frames_command(&tools.ffmpeg, output, &frames, Sampled::Output(&tracks), threads),
+		cancel,
+	)
+	.await?;
 	if reference.len() != frames.len() || decoded.len() != frames.len() {
 		return Err(failed("fewer frames decoded than sampled"));
 	}
@@ -470,20 +486,34 @@ enum Sampled<'a> {
 	Output(&'a [u32]),
 }
 
-async fn decode_frames(
+async fn decode_frames(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<Vec<DynamicImage>, JobError> {
+	let out = process::run(cmd, StdoutMode::Capture, |_| {}, cancel).await?;
+	if !out.status.success() {
+		return Err(failed(format!(
+			"ffmpeg could not decode sampled frames: {}",
+			process::failure_reason(&out.stderr_tail)
+		)));
+	}
+	blocking(cancel, move || split_pams(&out.stdout)).await?.map_err(failed)
+}
+
+/// Decodes `frames` of `input` as PAM images on stdout. The select still decodes every frame up to the last one.
+fn decode_frames_command(
 	ffmpeg: &Path,
 	input: &Path,
 	frames: &[u32],
 	sampled: Sampled<'_>,
-	cancel: &CancellationToken,
-) -> Result<Vec<DynamicImage>, JobError> {
+	threads: usize,
+) -> ToolCommand {
 	let select = frames
 		.iter()
 		.map(|frame| format!(r"eq(n\,{frame})"))
 		.collect::<Vec<_>>()
 		.join("+");
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
-	cmd.args(["-hide_banner", "-nostdin", "-v", "error", "-i"])
+	cmd.args(["-hide_banner", "-nostdin", "-v", "error"])
+		.threads(Some(threads))
+		.arg("-i")
 		.arg(process::tool_path(input));
 
 	match sampled {
@@ -504,15 +534,7 @@ async fn decode_frames(
 		}
 	}
 	cmd.args(["-fps_mode", "passthrough", "-c:v", "pam", "-f", "image2pipe", "-"]);
-
-	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
-	if !out.status.success() {
-		return Err(failed(format!(
-			"ffmpeg could not decode sampled frames: {}",
-			process::failure_reason(&out.stderr_tail)
-		)));
-	}
-	blocking(cancel, move || split_pams(&out.stdout)).await?.map_err(failed)
+	cmd
 }
 
 pub fn split_pams(bytes: &[u8]) -> Result<Vec<DynamicImage>, String> {
@@ -555,4 +577,51 @@ fn whole_ms(seconds: f64) -> i64 {
 
 fn failed(reason: impl std::fmt::Display) -> JobError {
 	ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::video::joined;
+
+	const BUDGETED: &str = "-threads 3 -filter_threads 3 -filter_complex_threads 3 -i ";
+
+	#[test]
+	fn the_alpha_scan_decodes_on_the_thread_budget() {
+		let args = joined(&has_alpha_command(Path::new("ffmpeg"), Path::new("a.gif"), 3));
+
+		assert!(args.contains(BUDGETED), "{args}");
+	}
+
+	#[test]
+	fn the_sampled_frames_of_both_files_are_decoded_on_the_thread_budget() {
+		let ffmpeg = Path::new("ffmpeg");
+		let frames = [0, 4, 9];
+
+		let source = joined(&decode_frames_command(
+			ffmpeg,
+			Path::new("a.gif"),
+			&frames,
+			Sampled::Source(None),
+			3,
+		));
+		let output = joined(&decode_frames_command(
+			ffmpeg,
+			Path::new("out.avif"),
+			&frames,
+			Sampled::Output(&[0]),
+			3,
+		));
+		let with_alpha = joined(&decode_frames_command(
+			ffmpeg,
+			Path::new("out.avif"),
+			&frames,
+			Sampled::Output(&[0, 1]),
+			3,
+		));
+
+		for args in [&source, &output, &with_alpha] {
+			assert!(args.contains(BUDGETED), "{args}");
+		}
+	}
 }

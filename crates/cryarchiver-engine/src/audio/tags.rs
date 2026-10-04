@@ -40,7 +40,7 @@ pub fn rename_keys(ogg: &Path) -> Result<usize, Box<dyn Error + Send + Sync>> {
 }
 
 /// Applies `edit` to the comments of an Ogg Opus or Vorbis file, and saves the file when `edit` counts a change.
-pub fn edit_comments(
+pub(crate) fn edit_comments(
 	ogg: &Path,
 	edit: impl FnOnce(&mut VorbisComments) -> Result<usize, Box<dyn Error + Send + Sync>>,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {

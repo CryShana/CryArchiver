@@ -7,7 +7,6 @@ use cryarchiver_engine::images::animated::{
 	Animation, IMAGE_MATRIX, ScanError, Timeline, encode_command, expected_delays, has_alpha, plan_animation, plays,
 	sampled_frames, scan, split_pams, too_many_frames, verify_animation, video_timeline,
 };
-use cryarchiver_engine::outcome::KeepReason;
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::process::{StdoutMode, run};
 use tokio_util::sync::CancellationToken;
@@ -71,19 +70,15 @@ async fn transparency_is_measured_on_ffmpegs_decode() {
 	let transparent = animation_file(dir.path(), "t.gif", TRANSPARENT_SOURCE, &KEEP_GIF_TRANSPARENCY);
 	let opaque = animation_file(dir.path(), "o.gif", "testsrc2=s=96x64:d=0.5:r=10", &[]);
 
-	assert!(has_alpha(&tools, &transparent, &cancel).await.unwrap());
-	assert!(!has_alpha(&tools, &opaque, &cancel).await.unwrap());
+	assert!(has_alpha(&tools, &transparent, 2, &cancel).await.unwrap());
+	assert!(!has_alpha(&tools, &opaque, 2, &cancel).await.unwrap());
 }
 
 #[test]
-fn settings_follow_the_speed_and_need_libaom() {
-	assert_eq!(plan_animation(Speed::Fast, true).unwrap().crf, 16);
-	assert_eq!(plan_animation(Speed::Moderate, true).unwrap().crf, 10);
-	assert_eq!(plan_animation(Speed::Slow, true).unwrap().crf, 6);
-	assert!(matches!(
-		plan_animation(Speed::Fast, false),
-		Err(KeepReason::Unsupported(reason)) if reason.contains("libaom")
-	));
+fn settings_follow_the_speed() {
+	assert_eq!(plan_animation(Speed::Fast).crf, 16);
+	assert_eq!(plan_animation(Speed::Moderate).crf, 10);
+	assert_eq!(plan_animation(Speed::Slow).crf, 6);
 }
 
 #[test]
@@ -158,7 +153,7 @@ async fn encode_and_verify(dir: &Path, source: &Path) -> (Animation, f64) {
 	let cancel = CancellationToken::new();
 	let animation = Animation {
 		timeline: scan(&std::fs::read(source).unwrap()).unwrap().unwrap(),
-		alpha: has_alpha(&tools, source, &cancel).await.unwrap(),
+		alpha: has_alpha(&tools, source, 2, &cancel).await.unwrap(),
 		size: None,
 		matrix: IMAGE_MATRIX.to_owned(),
 	};
@@ -168,7 +163,7 @@ async fn encode_and_verify(dir: &Path, source: &Path) -> (Animation, f64) {
 		source,
 		&output,
 		&animation,
-		plan_animation(Speed::Fast, true).unwrap(),
+		plan_animation(Speed::Fast),
 		2,
 	);
 	let budgeted = cmd
@@ -185,7 +180,7 @@ async fn encode_and_verify(dir: &Path, source: &Path) -> (Animation, f64) {
 			.status
 			.success()
 	);
-	let score = verify_animation(&tools, source, &output, &animation, &cancel)
+	let score = verify_animation(&tools, source, &output, &animation, 2, &cancel)
 		.await
 		.unwrap();
 	let written = std::fs::read(&output).unwrap();

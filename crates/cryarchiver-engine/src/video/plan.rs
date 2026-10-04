@@ -206,7 +206,8 @@ pub fn precheck<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream,
 	Ok(main)
 }
 
-/// Whether libaom-av1 is there for a video larger than SVT-AV1 takes is the engine's to check (`beyond_svt`).
+/// The main video, unless there is none, it is Dolby Vision without a compatible base layer, or it is transparent and
+/// this ffmpeg can't encode transparent VP9.
 pub fn usable_main<'a>(info: &'a MediaInfo, caps: &VideoCaps) -> Result<&'a Stream, KeepReason> {
 	let main = main_stream(info).ok_or_else(|| KeepReason::Unsupported("no video stream to encode".into()))?;
 

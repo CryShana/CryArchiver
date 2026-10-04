@@ -10,7 +10,7 @@ Audio, video and images are supported:
 
 ## Requirements
 
-- ffmpeg **8.1 or newer** with libopus, the soxr resampler, libsvtav1 (SVT-AV1 4.0 or newer) and libdav1d. libvpx-vp9 is needed for transparent video, libaom-av1 for animated images, and libjxl for JPEG XL.
+- ffmpeg **8.1 or newer** with libopus, the soxr resampler, libsvtav1 (SVT-AV1 4.0 or newer) and libdav1d. libvpx-vp9 is needed for transparent video, libaom-av1 for animated images, video larger than 16384×8704 and `--video-encoder aom` (without it those files fail), and libjxl for JPEG XL.
   libvmaf (part of most full builds) measures video quality at the moderate and slow speeds.
   - Windows: the gyan.dev "full" build or a BtbN GPL build.
   - Linux: a BtbN static build or your distribution's ffmpeg.
@@ -104,7 +104,7 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, the aspect rat
 
 Hidden advanced options (`--help` lists them): `--crf N` encodes video at a fixed CRF without the quality search (the quality isn't measured, and it can't be combined with `--video-vmaf`), `--video-encoder svt-av1|aom`, `--image-encoder avif|jxl|jxl-lossless`.
 
-A plain run writes nothing but its outputs: no settings file, no cache and no log files. Errors are printed to the console; redirect the output to keep it. Locked files, files still being written, crashed or stalled tools and a full disk are retried automatically, up to three attempts; a crashed or out-of-memory tool is retried with half the threads in a plain run. A quality miss is not an error and is never retried.
+A plain run writes nothing but its outputs: no settings file, no cache and no log files. Errors are printed to the console; redirect the output to keep it. Locked files, files still being written, crashed or stalled tools and a full disk are retried automatically, up to three attempts; a crashed or out-of-memory tool is retried with half the threads it ran on, in plain runs and projects alike. A quality miss is not an error and is never retried.
 
 `-o` with an audio extension (`.opus`, `.ogg`, `.mka`) or `-f opus|ogg|mka` on a video writes only its audio. `-o` with `.avif` or `-f avif` on a video writes an animated AVIF that loops forever, with no sound and no subtitles (`--burn-subs` draws one into the picture); the free disk space for its frames is checked first, and `--crf`, `--video-encoder`, `--video-vmaf`, `--merge-audio` and `--strip` don't apply to it. Both are for plain runs only.
 

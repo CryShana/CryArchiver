@@ -354,12 +354,7 @@ async fn two_angles_odd_4_4_4_frames_and_frames_wider_than_svt_are_encoded() {
 		assert!(matches!(wide, JobOutcome::Encoded { .. }), "{wide:?}");
 	} else {
 		assert!(
-			matches!(
-				&wide,
-				JobOutcome::KeptOriginal {
-					reason: KeepReason::Unsupported(_)
-				}
-			),
+			matches!(&wide, JobOutcome::Failed(err) if matches!(err.kind, ErrorKind::Toolchain(_))),
 			"{wide:?}"
 		);
 	}

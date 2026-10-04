@@ -126,6 +126,7 @@ const PAM: &str = "pam";
 pub const LIBJXL: &str = "libjxl";
 const AV1_DECODERS: &[&str] = &["libdav1d", "libaom-av1"];
 pub const LIBAOM: &str = "libaom-av1";
+const LIBAOM_FILES: &str = "animated images, video larger than 16384×8704 and --video-encoder aom fail without it";
 pub const LIBVPX_VP9: &str = "libvpx-vp9";
 pub const SVT_AV1: &str = "svt-av1";
 const EVERY_KIND: &[MediaKind] = MediaKind::ALL;
@@ -331,6 +332,11 @@ impl Toolchain {
 			.then_some("--video-encoder aom needs ffmpeg with libaom-av1")
 	}
 
+	/// The files that fail with this ffmpeg although nothing every run needs is missing.
+	pub fn optional_failures(&self) -> Option<String> {
+		(!self.has_libaom()).then(|| format!("{LIBAOM}: {LIBAOM_FILES}"))
+	}
+
 	pub fn has_libjxl(&self) -> bool {
 		self.encoders.contains(LIBJXL)
 	}
@@ -457,13 +463,7 @@ impl Toolchain {
 				OPTIONAL,
 				"transparent video",
 			),
-			check(
-				LIBAOM,
-				self.has_libaom(),
-				Status::Warn,
-				OPTIONAL,
-				"animated images, video larger than 16384×8704",
-			),
+			check(LIBAOM, self.has_libaom(), Status::Warn, OPTIONAL, LIBAOM_FILES),
 			check(
 				LIBJXL,
 				self.has_libjxl(),
@@ -994,6 +994,28 @@ mod tests {
 		tools.encoders.remove("libaom-av1");
 
 		assert!(!tools.has_libaom());
+	}
+
+	#[test]
+	fn missing_libaom_says_which_files_fail() {
+		let mut tools = complete_toolchain();
+		assert_eq!(tools.optional_failures(), None);
+		tools.encoders.remove("libaom-av1");
+
+		let line = tools.report().into_iter().find(|line| line.label == LIBAOM).unwrap();
+
+		assert_eq!(line.status, Status::Warn);
+		assert!(
+			line.detail
+				.contains("animated images, video larger than 16384×8704 and --video-encoder aom fail"),
+			"{}",
+			line.detail
+		);
+		assert!(
+			tools
+				.optional_failures()
+				.is_some_and(|text| text.starts_with("libaom-av1: animated images"))
+		);
 	}
 
 	#[test]

@@ -133,7 +133,7 @@ pub fn window_segments(duration_s: Option<f64>, count: usize, window: Option<Tri
 
 /// How many segments are analysed at once, and the threads of each of their two tools: the whole budget between
 /// them, at least one thread each.
-pub fn segment_threads(threads: Option<usize>) -> (usize, Option<usize>) {
+fn segment_threads(threads: Option<usize>) -> (usize, Option<usize>) {
 	let Some(threads) = threads else {
 		return (PARALLEL_SEGMENTS, None);
 	};

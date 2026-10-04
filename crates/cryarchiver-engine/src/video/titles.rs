@@ -48,6 +48,8 @@ const PCM_WORDS: &[&[&str]] = &[&["LPCM"], &["PCM"]];
 const CHANNEL_WORDS: &[&str] = &["2.0", "5.1", "7.1"];
 const SEPARATORS: &[char] = &[' ', '.', '-', '_'];
 const JOINERS: &[char] = &[',', '/', '+', '&'];
+/// Profile prefixes that a hyphen glues to a codec word (`E-AC-3`, `xHE-AAC`): what follows them is not that codec.
+const GLUED_PREFIXES: &[&str] = &["E", "HE", "xHE"];
 
 /// What the track was and what it becomes.
 #[derive(Debug, Clone, Copy)]
@@ -167,17 +169,35 @@ fn without_joiner(between: &str) -> &str {
 }
 
 fn continues_word(c: char) -> bool {
-	c.is_alphanumeric() || c == '+'
+	in_word(c) || c == '+'
 }
 
-/// Where a codec word from `forms` that starts at `at` ends. It must be a whole word, not glued by a hyphen to a word
-/// before it (`xHE-AAC`), though channels may follow it directly (`DDP5.1`).
+/// A letter or digit of a script that separates words with spaces. Chinese, Japanese, Korean and Thai titles run a
+/// codec word straight on from the language name (`日本語AAC`).
+fn in_word(c: char) -> bool {
+	const UNSPACED: &[(char, char)] = &[
+		('\u{0E00}', '\u{0E7F}'),
+		('\u{1100}', '\u{11FF}'),
+		('\u{3000}', '\u{30FF}'),
+		('\u{3130}', '\u{318F}'),
+		('\u{31F0}', '\u{31FF}'),
+		('\u{3400}', '\u{4DBF}'),
+		('\u{4E00}', '\u{9FFF}'),
+		('\u{AC00}', '\u{D7AF}'),
+		('\u{F900}', '\u{FAFF}'),
+		('\u{FF66}', '\u{FF9F}'),
+		('\u{20000}', '\u{3FFFF}'),
+	];
+
+	c.is_alphanumeric() && !UNSPACED.iter().any(|(first, last)| (*first..=*last).contains(&c))
+}
+
+/// Where a codec word from `forms` that starts at `at` ends. It must be a whole word, not glued by a hyphen to a
+/// profile prefix (`xHE-AAC`), though channels may follow it directly (`DDP5.1`).
 fn codec_word_end(title: &str, at: usize, forms: &[&[&str]]) -> Option<usize> {
-	let mut before = title[..at].chars().rev();
-	match before.next() {
-		Some(c) if continues_word(c) => return None,
-		Some('-') if before.next().is_some_and(char::is_alphabetic) => return None,
-		_ => {}
+	let before = &title[..at];
+	if before.chars().next_back().is_some_and(continues_word) || glued_to_prefix(before) {
+		return None;
 	}
 
 	forms.iter().find_map(|parts| {
@@ -197,20 +217,37 @@ fn codec_word_end(title: &str, at: usize, forms: &[&[&str]]) -> Option<usize> {
 	})
 }
 
+/// `before` ends in a whole-word profile prefix and a hyphen.
+fn glued_to_prefix(before: &str) -> bool {
+	let Some(word) = before.strip_suffix('-') else {
+		return false;
+	};
+
+	GLUED_PREFIXES.iter().any(|prefix| {
+		word.len() >= prefix.len()
+			&& word.is_char_boundary(word.len() - prefix.len())
+			&& word[word.len() - prefix.len()..].eq_ignore_ascii_case(prefix)
+			&& !word[..word.len() - prefix.len()]
+				.chars()
+				.next_back()
+				.is_some_and(in_word)
+	})
+}
+
 /// Where a channel word that starts at `at` ends. It must be a whole word, unless it directly follows a codec word,
 /// and never part of a number or a version such as `v5.1` or `7.1.2`.
 fn channel_word_end(title: &str, at: usize, after_codec: bool) -> Option<usize> {
 	let bytes = title.as_bytes();
 	let word = CHANNEL_WORDS.iter().find(|word| title[at..].starts_with(**word))?;
 	let before = title[..at].chars().next_back();
-	if !after_codec && before.is_some_and(|c| c.is_alphanumeric() || c == '.') {
+	if !after_codec && before.is_some_and(|c| in_word(c) || c == '.') {
 		return None;
 	}
 
 	let end = at + word.len();
 	let digit = |index: usize| bytes.get(index).is_some_and(u8::is_ascii_digit);
-	let continues = title[end..].chars().next().is_some_and(char::is_alphanumeric)
-		|| (bytes.get(end) == Some(&b'.') && digit(end + 1));
+	let continues =
+		title[end..].chars().next().is_some_and(in_word) || (bytes.get(end) == Some(&b'.') && digit(end + 1));
 	(!continues).then_some(end)
 }
 
@@ -279,12 +316,18 @@ mod tests {
 	}
 
 	#[test]
-	fn a_codec_word_glued_to_another_word_by_a_hyphen_is_left_alone() {
+	fn only_a_codec_word_glued_to_a_profile_prefix_is_left_alone() {
+		let aac = encode("aac", "2.0", "2.0");
+
 		assert_eq!(retitle("E-AC-3 5.1", encode("ac3", "5.1", "5.1")), None);
-		assert_eq!(retitle("XHE-AAC", encode("aac", "2.0", "2.0")), None);
+		assert_eq!(retitle("XHE-AAC", aac), None);
+		assert_eq!(retitle("HE-AACv3", aac), None);
+		assert_eq!(retitle("x264-AAC", aac).as_deref(), Some("x264-Opus"));
+		assert_eq!(retitle("English-AAC", aac).as_deref(), Some("English-Opus"));
+		assert_eq!(retitle("WEB-DL-AAC", aac).as_deref(), Some("WEB-DL-Opus"));
 		assert_eq!(
-			retitle("x264-AAC", encode("aac", "2.0", "2.0")).as_deref(),
-			Some("x264-Opus")
+			retitle("Stereo-DTS", encode("dts", "2.0", "2.0")).as_deref(),
+			Some("Stereo-Opus")
 		);
 	}
 
@@ -305,13 +348,20 @@ mod tests {
 	}
 
 	#[test]
-	fn letters_beyond_ascii_continue_a_word() {
+	fn letters_beyond_ascii_continue_a_word_in_scripts_written_with_spaces() {
 		let aac = encode("aac", "2.0", "2.0");
 
 		assert_eq!(retitle("AACé", aac), None);
 		assert_eq!(retitle("éAAC", aac), None);
 		assert_eq!(retitle("Ä5.1", encode("aac", "5.1", "2.0")), None);
 		assert_eq!(retitle("日本語 2.0 AAC", aac).as_deref(), Some("日本語 2.0 Opus"));
+		assert_eq!(retitle("日本語AAC", aac).as_deref(), Some("日本語Opus"));
+		assert_eq!(retitle("英語AAC 2.0", aac).as_deref(), Some("英語Opus 2.0"));
+		assert_eq!(
+			retitle("日本語5.1", encode("aac", "5.1", "2.0")).as_deref(),
+			Some("日本語2.0")
+		);
+		assert_eq!(retitle("한국어AAC", aac).as_deref(), Some("한국어Opus"));
 		assert_eq!(
 			retitle("Русский 5.1 AAC", encode("aac", "5.1", "2.0")).as_deref(),
 			Some("Русский 2.0 Opus")
