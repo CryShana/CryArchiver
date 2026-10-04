@@ -7,9 +7,12 @@ const CLOSE_ENOUGH: f64 = 0.5;
 const DOWN_MARGIN: f64 = 0.5;
 const MIN_SLOPE: f64 = 0.05;
 const MAX_SLOPE: f64 = 5.0;
-const RETRY_MARGIN: f64 = 1.0;
+/// How far above the target a retry aims: half a point, as far as a check may miss and still be written.
+const RETRY_MARGIN: f64 = 0.5;
 const RETRY_SLOPE_TRUST: f64 = 0.75;
 const MIN_RETRY_DROP: f64 = 2.0;
+/// How far below its lowest probe a retry may follow the samples' curve, with no probe there to show its shape.
+const MAX_EXTRAPOLATION: f64 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target {
@@ -114,6 +117,67 @@ pub fn retry_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bou
 	let trusted = slope.clamp(MIN_SLOPE, MAX_SLOPE) * RETRY_SLOPE_TRUST;
 	let drop = ((deficit + RETRY_MARGIN) / trusted).clamp(MIN_RETRY_DROP, MAX_STEP);
 	let lowered = bounds.quantize(crf - drop);
+	(lowered < crf).then_some(lowered)
+}
+
+/// The CRF a missed full check is encoded again at, aimed on the search's own probe curve: the probes below the CRF
+/// that missed, each moved by how far the full check landed from its samples (`full` against `predicted`), with the
+/// check itself on top. It is where that curve reaches the target plus `RETRY_MARGIN`, between the two points around
+/// it, or, when no point reaches it, on the line through the lowest two, but never more than `MAX_EXTRAPOLATION` below
+/// the lowest probe. It drops at least `MIN_RETRY_DROP` and at most `MAX_STEP`, like `retry_crf`. `None` for a check
+/// that didn't miss or with no probe below the CRF that missed, where `retry_crf` aims on the slope instead.
+pub fn curve_retry_crf(
+	crf: f64,
+	full: Score,
+	predicted: Score,
+	probes: &[Probe],
+	target: Target,
+	bounds: Bounds,
+) -> Option<f64> {
+	let crf = bounds.quantize(crf);
+	if target.met(full) {
+		return None;
+	}
+
+	let aim = Target {
+		mean: target.mean + RETRY_MARGIN,
+		floor: target.floor + RETRY_MARGIN,
+	};
+	let shifted = |score: Score| Score {
+		mean: score.mean + full.mean - predicted.mean,
+		p5: score.p5 + full.p5 - predicted.p5,
+		..score
+	};
+	let mut points: Vec<(f64, f64)> = probes
+		.iter()
+		.map(|probe| (bounds.quantize(probe.crf), aim.margin(shifted(probe.score))))
+		.filter(|(probe_crf, _)| *probe_crf < crf)
+		.collect();
+	points.sort_by(|a, b| b.0.total_cmp(&a.0));
+	points.dedup_by(|a, b| (a.0 - b.0).abs() < f64::EPSILON);
+	let lowest = points.last()?.0;
+	points.insert(0, (crf, aim.margin(full)));
+
+	let reached = points.windows(2).find_map(|pair| {
+		let [(high_crf, high_margin), (low_crf, low_margin)] = [pair[0], pair[1]];
+		(low_margin >= 0.0).then(|| low_crf + low_margin * (high_crf - low_crf) / (low_margin - high_margin))
+	});
+	let aimed = reached.unwrap_or_else(|| {
+		let [(high_crf, high_margin), (low_crf, low_margin)] = [points[points.len() - 2], points[points.len() - 1]];
+		let gain = (low_margin - high_margin) / (high_crf - low_crf);
+		if gain > 0.0 {
+			low_crf + low_margin / gain
+		} else {
+			f64::NEG_INFINITY
+		}
+	});
+
+	let lowered = bounds.quantize(
+		aimed
+			.max(lowest - MAX_EXTRAPOLATION)
+			.max(crf - MAX_STEP)
+			.min(crf - MIN_RETRY_DROP),
+	);
 	(lowered < crf).then_some(lowered)
 }
 
@@ -332,7 +396,7 @@ mod tests {
 			frames: 300,
 		};
 
-		assert_eq!(retry_crf(30.0, missed, TARGET, 0.5, SVT), Some(23.25));
+		assert_eq!(retry_crf(30.0, missed, TARGET, 0.5, SVT), Some(24.5));
 		assert_eq!(retry_crf(30.0, missed, TARGET, 0.25, SVT), Some(22.0));
 		assert_eq!(retry_crf(30.0, linear(10.0), TARGET, 0.5, SVT), None);
 		assert_eq!(retry_crf(10.0, missed, TARGET, 0.5, SVT), None);
@@ -346,7 +410,7 @@ mod tests {
 			frames: 300,
 		};
 
-		assert_eq!(retry_crf(30.0, missed_by(0.3), TARGET, 0.5, SVT), Some(26.5));
+		assert_eq!(retry_crf(30.0, missed_by(0.3), TARGET, 0.5, SVT), Some(27.75));
 		assert_eq!(retry_crf(30.0, missed_by(0.1), TARGET, 3.0, SVT), Some(28.0));
 		assert_eq!(retry_crf(30.0, missed_by(0.1), TARGET, 5.0, SVT), Some(28.0));
 		assert_eq!(retry_crf(11.0, missed_by(0.3), TARGET, 0.5, SVT), Some(10.0));
@@ -362,6 +426,122 @@ mod tests {
 
 		assert_eq!(retry_crf(30.0, missed_by_1, TARGET, 0.05, SVT), Some(22.0));
 		assert_eq!(retry_crf(30.0, missed_by_1, TARGET, 0.01, SVT), Some(22.0));
+	}
+
+	const GRAIN_TARGET: Target = Target {
+		mean: 91.0,
+		floor: 86.5,
+	};
+
+	/// Samples losing 0.35 mean and 0.4 p5 a CRF from 92.3 / 88.1 at CRF 36.75, as on a home DVD clip.
+	fn samples(crf: f64) -> Score {
+		Score {
+			mean: 92.3 + 0.35 * (36.75 - crf),
+			p5: 88.1 + 0.4 * (36.75 - crf),
+			frames: 300,
+		}
+	}
+
+	fn probed(crfs: &[f64], curve: impl Fn(f64) -> Score) -> Vec<Probe> {
+		crfs.iter().map(|&crf| Probe { crf, score: curve(crf) }).collect()
+	}
+
+	fn score(mean: f64, p5: f64) -> Score {
+		Score { mean, p5, frames: 300 }
+	}
+
+	#[test]
+	fn a_retry_aims_on_the_probe_curve_moved_by_the_full_checks_offset() {
+		let probes = probed(&[28.0, 36.0, 37.0, 36.75], samples);
+		let full = score(92.0, 85.4);
+		let passing = 33.75;
+
+		let on_curve = curve_retry_crf(36.75, full, samples(36.75), &probes, GRAIN_TARGET, SVT).unwrap();
+		let on_slope = retry_crf(36.75, full, GRAIN_TARGET, 0.4, SVT).unwrap();
+
+		assert!((on_curve - 32.75).abs() < 1e-9, "{on_curve}");
+		assert!(
+			(0.0..=1.5).contains(&(passing - on_curve)),
+			"{on_curve} against {passing}"
+		);
+		assert!((on_slope - 31.25).abs() < 1e-9, "the slope rule overshoots: {on_slope}");
+	}
+
+	/// 92 / 87 at CRF 30, 0.6 more a CRF lower.
+	fn falling(crf: f64) -> Score {
+		score(110.0 - 0.6 * crf, 105.0 - 0.6 * crf)
+	}
+
+	#[test]
+	fn a_retry_takes_the_nearest_point_of_the_curve_that_reaches_the_aim() {
+		let probes = probed(&[20.0, 26.0, 30.0], falling);
+		let full = score(91.0, 86.0);
+
+		let retried = curve_retry_crf(30.0, full, falling(30.0), &probes, TARGET, SVT);
+
+		assert_eq!(retried, Some(22.5), "between the probes at 20 and 26");
+	}
+
+	#[test]
+	fn a_retry_on_the_curve_drops_one_full_step_at_most() {
+		let probes = probed(&[10.0, 30.0], falling);
+		let far_below = score(86.0, 81.0);
+
+		assert_eq!(
+			curve_retry_crf(30.0, far_below, falling(30.0), &probes, TARGET, SVT),
+			Some(22.0),
+			"the curve reaches the aim near 12.7"
+		);
+	}
+
+	#[test]
+	fn a_retry_follows_the_curve_at_most_a_little_below_its_lowest_probe() {
+		let far_below = score(86.0, 81.0);
+		let flat = probed(&[26.0, 30.0], |_| falling(30.0));
+
+		assert_eq!(
+			curve_retry_crf(
+				30.0,
+				far_below,
+				falling(30.0),
+				&probed(&[26.0, 30.0], falling),
+				TARGET,
+				SVT
+			),
+			Some(24.0)
+		);
+		assert_eq!(
+			curve_retry_crf(30.0, far_below, falling(30.0), &flat, TARGET, SVT),
+			Some(24.0)
+		);
+	}
+
+	#[test]
+	fn a_retry_on_the_curve_still_drops_the_minimum_and_needs_a_probe_below() {
+		let steep = |crf: f64| score(185.0 - 3.0 * crf, 181.0 - 3.0 * crf);
+		let barely = score(94.8, 92.0);
+
+		assert_eq!(
+			curve_retry_crf(30.0, barely, steep(30.0), &probed(&[29.5, 30.0], steep), TARGET, SVT),
+			Some(28.0)
+		);
+		assert_eq!(
+			curve_retry_crf(30.0, barely, steep(30.0), &probed(&[30.0, 34.0], steep), TARGET, SVT),
+			None,
+			"a search that only went up falls back on the slope, as a learned setting does"
+		);
+		assert_eq!(
+			curve_retry_crf(
+				30.0,
+				score(96.0, 91.0),
+				steep(30.0),
+				&probed(&[26.0, 30.0], steep),
+				TARGET,
+				SVT
+			),
+			None,
+			"no miss"
+		);
 	}
 
 	#[test]

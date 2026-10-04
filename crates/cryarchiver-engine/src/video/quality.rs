@@ -106,11 +106,13 @@ pub enum Searched {
 }
 
 /// A search's result, with how fast its samples encoded.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Search {
 	pub searched: Searched,
 	/// Encoding seconds per second of samples, from the first probe.
 	pub rate: f64,
+	/// Every probe, in the order it was run: the samples' quality curve.
+	pub probes: Vec<Probe>,
 }
 
 /// What a search aims at.
@@ -793,7 +795,7 @@ pub async fn search_below(
 			}
 		}
 	};
-	Ok(Search { searched, rate })
+	Ok(Search { searched, rate, probes })
 }
 
 fn pooled(scores: &[f64]) -> Result<Score, JobError> {

@@ -16,7 +16,8 @@ use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::{self, Stream, probe};
 use cryarchiver_engine::quality::keys::CacheKey;
 use cryarchiver_engine::quality::memory::{GroupStats, Observation, Offset, QualityMemory, SharedMemory};
-use cryarchiver_engine::quality::search::Target;
+use cryarchiver_engine::quality::search::{Bounds, Probe, Target, curve_retry_crf};
+use cryarchiver_engine::quality::vmaf::Score;
 use cryarchiver_engine::sink::{ArchivalSink, CliSink};
 use cryarchiver_engine::toolchain::LIBAOM;
 use cryarchiver_engine::video::plan::synthesized_grain;
@@ -2181,6 +2182,166 @@ async fn a_searched_near_miss_teaches_its_offset_but_no_setting() {
 	);
 	let offset = group.offset.expect("the full check's offset from the samples is kept");
 	assert!(offset.mean < 0.0, "{offset:?}");
+}
+
+#[tokio::test]
+async fn a_searched_video_that_misses_its_check_is_encoded_again_at_the_crf_its_probe_curve_points_to() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("pattern.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=40,noise=alls=60:allf=t:enable='between(t,6.2,8.4)+between(t,25.9,28.2)'",
+		"-pix_fmt",
+		"yuv420p",
+		"-c:v",
+		"ffv1",
+		clip.to_str().unwrap(),
+	]);
+	let engine = Engine::new(support::toolchain().await);
+
+	let (_, events) = run_recording(&engine, &strict(&clip, 93.0, 89.0), dir.path()).await;
+
+	let decision = events
+		.iter()
+		.rev()
+		.find_map(|event| match event {
+			JobEvent::Decision(decision) => Some(decision),
+			_ => None,
+		})
+		.unwrap();
+	let video = decision.video.as_ref().unwrap();
+	let again = video
+		.reencode
+		.as_ref()
+		.expect("the noisy stretches the samples skip miss the check");
+	let curve: Vec<Probe> = video
+		.probes
+		.iter()
+		.map(|probe| Probe {
+			crf: probe.crf,
+			score: Score {
+				mean: probe.mean,
+				p5: probe.p5,
+				frames: 0,
+			},
+		})
+		.collect();
+	let predicted = curve
+		.iter()
+		.find(|probe| (probe.crf - again.from_crf).abs() < 1e-9)
+		.unwrap()
+		.score;
+	let check = &video.checks[0];
+	let full = Score {
+		mean: check.mean,
+		p5: check.p5,
+		frames: 0,
+	};
+	let target = video.target.unwrap();
+	let bounds = Bounds {
+		min: 10.0,
+		max: 55.0,
+		step: 0.25,
+	};
+
+	assert_eq!(video.chosen, Some(CrfChoice::Searched), "{decision:?}");
+	assert!(
+		curve.iter().any(|probe| probe.crf < again.from_crf),
+		"the search probed below the CRF it chose: {decision:?}"
+	);
+	assert_eq!(
+		Some(again.to_crf),
+		curve_retry_crf(
+			again.from_crf,
+			full,
+			predicted,
+			&curve,
+			Target {
+				mean: target.mean,
+				floor: target.p5,
+			},
+			bounds,
+		),
+		"{decision:?}"
+	);
+}
+
+#[tokio::test]
+async fn a_retry_already_larger_than_the_source_keeps_it_before_its_check() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::video(
+		dir.path(),
+		"clip.mp4",
+		3,
+		&["-map", "0:v", "-c:v", "mpeg4", "-q:v", "2"],
+	);
+	let careless = Arc::new(EveryGroupLearned(GroupStats {
+		setting: 55.0,
+		slope: None,
+		bpp: None,
+		offset: None,
+		observations: 1,
+		without_grain: false,
+	}));
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(careless);
+	let between_both_encodes = Job {
+		min_savings: 0.966,
+		..strict(&clip, 99.0, 98.0)
+	};
+
+	let (outcome, events) = run_recording(&engine, &between_both_encodes, dir.path()).await;
+
+	assert!(
+		matches!(
+			outcome,
+			JobOutcome::KeptOriginal {
+				reason: KeepReason::NotSmaller { .. }
+			}
+		),
+		"{outcome:?}"
+	);
+	assert_eq!(stages(&events, Stage::Encode), 2, "{events:?}");
+	assert_eq!(
+		stages(&events, Stage::Verify),
+		1,
+		"only the first encode is checked: {events:?}"
+	);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn a_trimmed_video_written_below_its_target_says_the_trim_wrote_it() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 6);
+	let careless = Arc::new(EveryGroupLearned(GroupStats {
+		setting: 55.0,
+		slope: None,
+		bpp: None,
+		offset: None,
+		observations: 1,
+		without_grain: false,
+	}));
+	let engine = Engine::new(support::toolchain().await).with_quality_memory(careless);
+
+	let (outcome, _) = run_recording(&engine, &trimmed(strict(&clip, 99.0, 98.0), 1.0, 5.0), dir.path()).await;
+
+	let JobOutcome::Encoded { warnings, decision, .. } = &outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings
+			.iter()
+			.any(|warning| warning.starts_with("quality target not reached")
+				&& warning.ends_with("because it was trimmed")),
+		"{warnings:?}"
+	);
+	assert!(
+		!warnings.iter().any(|warning| warning.contains("requested")),
+		"{warnings:?}"
+	);
+	assert_eq!(&decision.warnings, warnings);
 }
 
 #[tokio::test]

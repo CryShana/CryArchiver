@@ -26,13 +26,15 @@ use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput,
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{JobOptions, Resize, TrimWindow, kept_as_requested, kept_as_requested_part, upscaled};
+use crate::options::{
+	JobOptions, Resize, TrimWindow, WRITTEN_TRIMMED, kept_as_requested, kept_as_requested_part, upscaled,
+};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
 use crate::quality::keys::{CacheKey, Group, VideoGroup};
 use crate::quality::memory::{GroupStats, Observation, Offset, QualityMemory, SharedMemory};
-use crate::quality::search::{self, MAX_PROBES, Target};
+use crate::quality::search::{self, Bounds, MAX_PROBES, Probe, Target};
 use crate::quality::vmaf::Score;
 use crate::text::{display_path, fold_repeats};
 use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
@@ -292,6 +294,8 @@ struct VideoQuality {
 	offset: Option<Offset>,
 	/// What the search samples scored at the CRF the video is encoded at.
 	predicted: Option<Score>,
+	/// The probes of the search pass the video is encoded from: a missed check's retry aims on them.
+	curve: Vec<Probe>,
 }
 
 impl VideoQuality {
@@ -328,6 +332,7 @@ enum Tuning {
 
 enum Checked {
 	Passed(Observation),
+	/// The original is kept: the encode missed its check and can't be retried, or its retry is already too large.
 	Missed(KeepReason),
 	/// Missed by at most half a point and written: its offset is learned, its setting forgotten.
 	NearMiss(Observation),
@@ -918,7 +923,8 @@ impl Engine {
 				}));
 			}
 
-			let warning = not_smaller_warning(cx.source_bytes, share, bytes);
+			let why = cx.job.options.written_because(mergeable(info), false);
+			let warning = not_smaller_warning(cx.source_bytes, share, bytes, why);
 			(cx.on_event)(JobEvent::Warning(warning.clone()));
 			warnings.push(warning);
 		}
@@ -1481,6 +1487,7 @@ impl Engine {
 			target,
 			without_grain: false,
 			predicted: None,
+			curve: Vec::new(),
 		}
 	}
 
@@ -1589,7 +1596,8 @@ impl Engine {
 			))
 			.await?
 		};
-		let mut searched = first.searched;
+		let (mut searched, rate) = (first.searched, first.rate);
+		quality.curve = first.probes;
 
 		if let Some(level) = level {
 			let plain_video = VideoPlan {
@@ -1609,28 +1617,28 @@ impl Engine {
 					&scorer,
 					samples,
 					start,
-					quality.aim(plain_target, inputs.declared_s, Some(first.rate)),
+					quality.aim(plain_target, inputs.declared_s, Some(rate)),
 					quality.slope,
 					bytes,
 					progress(1),
 				))
 				.await?
-				.searched
 			};
 			cx.record.tag_without_grain(grain_probes);
 
-			if video_quality::grain_choice(searched, plain) == GrainChoice::Plain {
+			if video_quality::grain_choice(searched, plain.searched) == GrainChoice::Plain {
 				video.warnings.push(video_quality::dropped_grain_text(
 					level,
 					searched,
-					plain,
+					plain.searched,
 					quality.target,
 					video.max_bitrate_kbps,
 				));
 				video.encoder = plain_video.encoder;
 				quality.target = plain_target;
 				quality.without_grain = true;
-				searched = plain;
+				searched = plain.searched;
+				quality.curve = plain.probes;
 			}
 		}
 
@@ -1650,13 +1658,11 @@ impl Engine {
 			}
 			Searched::Unreachable { crf, score, .. } if cx.job.options.forced_video(mergeable(inputs.info)) => {
 				video.encoder = video.encoder.with_crf(crf);
-				video.warnings.push(format!(
-					"{}; encoded at CRF {crf} without a full check because it was requested",
-					with_cap_note(
-						&video_quality::short_text(crf, score, quality.target),
-						video.max_bitrate_kbps
-					)
-				));
+				let why = cx.job.options.written_because(mergeable(inputs.info), true);
+				let short = video_quality::short_text(crf, score, quality.target);
+				video
+					.warnings
+					.push(unchecked_text(&short, crf, video.max_bitrate_kbps, why));
 				return Ok(Tuning::Encode { verify: false });
 			}
 			Searched::Unreachable { crf, score, .. } => {
@@ -1748,7 +1754,7 @@ impl Engine {
 			}
 
 			let lower = if attempt <= MAX_RETRIES && video.max_bitrate_kbps.is_none() {
-				search::retry_crf(crf, score, quality.target, quality.slope, bounds)
+				retry_at(quality, crf, score, bounds)
 			} else {
 				None
 			};
@@ -1757,6 +1763,7 @@ impl Engine {
 					temps.warnings.push(short_note(
 						&video_quality::short_text(crf, score, quality.target),
 						video.max_bitrate_kbps,
+						cx.job.options.written_because(mergeable(inputs.info), true),
 					));
 					return Ok(Checked::Short);
 				}
@@ -1796,6 +1803,12 @@ impl Engine {
 			(cx.on_event)(JobEvent::EncodeAgain(repeat));
 			(cx.on_event)(JobEvent::Stage(Stage::Encode));
 			Box::pin(self.reencode_video(cx, workspace, inputs.declared_s, video, temps, attempt)).await?;
+
+			if !cx.job.options.forced_video(mergeable(inputs.info))
+				&& let Some(reason) = temps_not_smaller(temps, inputs.compared_bytes, cx.job.min_savings)
+			{
+				return Ok(Checked::Missed(reason));
+			}
 		}
 	}
 
@@ -1994,7 +2007,8 @@ impl Engine {
 				}));
 			}
 
-			warnings.push(not_smaller_warning(cx.source_bytes, share, bytes));
+			let why = cx.job.options.written_because(mergeable(job.info), true);
+			warnings.push(not_smaller_warning(cx.source_bytes, share, bytes, why));
 		}
 
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
@@ -2768,11 +2782,29 @@ fn unsearched_warning(declared_s: Option<f64>, crf: f64) -> String {
 	format!("the CRF was not searched because {why}; the video was encoded at CRF {crf} and checked")
 }
 
-fn short_note(reason: &str, cap_kbps: Option<u32>) -> String {
+fn short_note(reason: &str, cap_kbps: Option<u32>, why: &str) -> String {
+	format!("{}; {why}", with_cap_note(reason, cap_kbps))
+}
+
+/// An unreachable search encoded at its closest `crf` without a full check, because the output was forced (`why`).
+fn unchecked_text(short: &str, crf: f64, cap_kbps: Option<u32>, why: &str) -> String {
+	let because = if why == WRITTEN_TRIMMED {
+		"because it was trimmed"
+	} else {
+		"because it was requested"
+	};
 	format!(
-		"{}; it was written because it was requested",
-		with_cap_note(reason, cap_kbps)
+		"{}; encoded at CRF {crf} without a full check {because}",
+		with_cap_note(short, cap_kbps)
 	)
+}
+
+/// The CRF a missed check at `crf` is encoded again at: on the search's probe curve, or else on its slope.
+fn retry_at(quality: &VideoQuality, crf: f64, score: Score, bounds: Bounds) -> Option<f64> {
+	quality
+		.predicted
+		.and_then(|predicted| search::curve_retry_crf(crf, score, predicted, &quality.curve, quality.target, bounds))
+		.or_else(|| search::retry_crf(crf, score, quality.target, quality.slope, bounds))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -2793,10 +2825,10 @@ fn source_share(source_bytes: u64, window: Option<TrimWindow>, duration_s: Optio
 	Some((source_bytes as f64 * (window.length_s / duration_s).min(1.0)).round() as u64)
 }
 
-fn not_smaller_warning(source_bytes: u64, share: Option<u64>, out_bytes: u64) -> String {
+fn not_smaller_warning(source_bytes: u64, share: Option<u64>, out_bytes: u64, why: &str) -> String {
 	match share {
-		Some(part_bytes) => kept_as_requested_part(part_bytes, out_bytes),
-		None => kept_as_requested(source_bytes, out_bytes),
+		Some(part_bytes) => kept_as_requested_part(part_bytes, out_bytes, why),
+		None => kept_as_requested(source_bytes, out_bytes, why),
 	}
 }
 
@@ -2883,11 +2915,11 @@ mod tests {
 		);
 		assert_eq!(with_cap_note("missed", Some(60)), "missed under the 0.06 Mbit/s cap");
 		assert_eq!(
-			short_note("missed", None),
-			"missed; it was written because it was requested"
+			short_note("missed", None, WRITTEN_TRIMMED),
+			"missed; it was written because it was trimmed"
 		);
 		assert_eq!(
-			short_note("missed", Some(12_500)),
+			short_note("missed", Some(12_500), crate::options::WRITTEN_REQUESTED),
 			"missed under the 12.5 Mbit/s cap; it was written because it was requested"
 		);
 	}
