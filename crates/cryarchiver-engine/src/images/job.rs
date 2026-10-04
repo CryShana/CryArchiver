@@ -636,7 +636,8 @@ async fn upright_for_libjxl(
 		.candidates
 		.iter()
 		.any(|candidate| !matches!(candidate, Candidate::Ravif(_)));
-	if cx.resize.is_none() || !libjxl {
+	let retagged = still.icc.is_none() && still.cicp.is_some_and(|cicp| jxl::libjxl_cicp(cicp) != cicp);
+	if (cx.resize.is_none() && !retagged) || !libjxl {
 		return Ok(None);
 	}
 

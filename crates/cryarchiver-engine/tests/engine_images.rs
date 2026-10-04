@@ -307,6 +307,36 @@ async fn sixteen_bit_images_become_jxl() {
 }
 
 #[tokio::test]
+async fn a_bt2020_ten_bit_transfer_png_becomes_jxl_tagged_with_the_same_curve() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("bt2020.png");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240,format=rgb48be,setparams=color_primaries=bt2020:color_trc=bt2020-10:colorspace=gbr",
+		"-frames:v",
+		"1",
+		source.to_str().unwrap(),
+	]);
+
+	let outcome = run(&requested(&source, OutputFormat::Jxl), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(warnings.is_empty(), "{warnings:?}");
+	let written = JxlImage::builder()
+		.read(std::fs::read(output).unwrap().as_slice())
+		.unwrap();
+	assert_eq!(
+		cryarchiver_engine::images::ssim::coded_cicp(&written),
+		Some([9, 1]),
+		"BT.2020's 10-bit transfer is BT.709's curve"
+	);
+}
+
+#[tokio::test]
 async fn a_sixteen_bit_png_holding_eight_bit_data_becomes_avif() {
 	let dir = tempfile::tempdir().unwrap();
 	let photo = image::open(support::photo_png(dir.path(), "photo.png", 320, 240))

@@ -311,17 +311,17 @@ const PQ: Cicp = Cicp {
 
 /// A 96×64 16-bit PNG tagged BT.2020 PQ by cICP, and its lossless JPEG XL.
 async fn lossless_pq_jxl(dir: &std::path::Path) -> (std::path::PathBuf, Vec<u8>) {
+	lossless_tagged_jxl(dir, "bt2020", "smpte2084").await
+}
+
+/// A 96×64 16-bit PNG tagged by cICP with `primaries` and `transfer` (ffmpeg names), and its lossless JPEG XL.
+async fn lossless_tagged_jxl(dir: &std::path::Path, primaries: &str, transfer: &str) -> (std::path::PathBuf, Vec<u8>) {
 	let tools = support::toolchain().await;
-	let source = dir.join("pq.png");
-	support::ffmpeg(&[
-		"-f",
-		"lavfi",
-		"-i",
-		"testsrc2=s=96x64,format=rgb48be,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=gbr",
-		"-frames:v",
-		"1",
-		source.to_str().unwrap(),
-	]);
+	let source = dir.join("tagged.png");
+	let graph = format!(
+		"testsrc2=s=96x64,format=rgb48be,setparams=color_primaries={primaries}:color_trc={transfer}:colorspace=gbr"
+	);
+	support::ffmpeg(&["-f", "lavfi", "-i", &graph, "-frames:v", "1", source.to_str().unwrap()]);
 	let job = JxlJob {
 		source: &source,
 		layout: UPRIGHT,
@@ -388,4 +388,30 @@ async fn a_jxl_tagged_with_other_colours_than_its_profileless_source_is_refused_
 		"{refused:?}"
 	);
 	assert!(check_jxl(&bytes, &Expected { cicp: PQ, ..srgb }, true).is_ok());
+}
+
+#[tokio::test]
+async fn a_display_p3_jxl_passes_the_tag_check_of_its_display_p3_source() {
+	let dir = tempfile::tempdir().unwrap();
+	let (source, bytes) = lossless_tagged_jxl(dir.path(), "smpte432", "iec61966-2-1").await;
+	let metadata = OutputMetadata::default();
+	let display_p3 = Expected {
+		cicp: Cicp {
+			primaries: 12,
+			transfer: 13,
+		},
+		..expected(&metadata)
+	};
+
+	let score = verify_jxl(
+		Arc::new(bytes),
+		Arc::new(image::open(&source).unwrap()),
+		&display_p3,
+		true,
+		&CancellationToken::new(),
+	)
+	.await
+	.unwrap();
+
+	assert!(score > 99.0, "{score}");
 }

@@ -97,9 +97,21 @@ pub fn upright_png(
 	converted.write_with_encoder(encoder).map_err(|err| err.to_string())?;
 
 	match cicp.filter(|_| tagged_by_cicp) {
-		Some(cicp) => Ok(with_cicp(&png, cicp)),
+		Some(cicp) => Ok(with_cicp(&png, libjxl_cicp(cicp))),
 		None => Ok(png),
 	}
+}
+
+/// `cicp` as libjxl can code it. It codes the BT.601 and BT.2020 transfers (6, 14 and 15) only by the BT.709 curve
+/// they share (1), and has nothing for SMPTE 240M or IEC 61966-2-4 (7 and 11), which it would write as sRGB, so those
+/// are left unspecified.
+pub fn libjxl_cicp(cicp: Cicp) -> Cicp {
+	let transfer = match cicp.transfer {
+		6 | 14 | 15 => 1,
+		7 | 11 => Cicp::UNSPECIFIED.transfer,
+		other => other,
+	};
+	Cicp { transfer, ..cicp }
 }
 
 /// A cICP chunk (RGB, full range) right after IHDR, where the PNG specification wants it.
@@ -197,6 +209,32 @@ mod tests {
 	use image::{GenericImageView, RgbaImage};
 
 	use super::*;
+
+	#[test]
+	fn transfers_libjxl_cannot_code_become_the_same_curve_or_unspecified() {
+		let tagged = |transfer| libjxl_cicp(Cicp { primaries: 9, transfer });
+
+		for (transfer, coded) in [
+			(6, 1),
+			(14, 1),
+			(15, 1),
+			(7, 2),
+			(11, 2),
+			(1, 1),
+			(13, 13),
+			(16, 16),
+			(18, 18),
+		] {
+			assert_eq!(
+				tagged(transfer),
+				Cicp {
+					primaries: 9,
+					transfer: coded
+				},
+				"{transfer}"
+			);
+		}
+	}
 
 	#[test]
 	fn an_upright_png_carries_the_profile_or_else_the_cicp_in_the_pixel_format_asked_for() {

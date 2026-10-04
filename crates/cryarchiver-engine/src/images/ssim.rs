@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use fast_ssim2::{LinearRgbImage, MAX_IMAGE_PIXELS, compute_ssimulacra2_strip, srgb_to_linear};
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
-use jxl_oxide::color::{ColourEncoding, ColourSpace};
+use jxl_oxide::color::{ColourEncoding, ColourSpace, Primaries, WhitePoint};
 use jxl_oxide::{EnumColourEncoding, JxlImage, Moxcms, RenderingIntent};
 use moxcms::{ColorProfile, Layout, TransformOptions};
 
@@ -120,14 +120,26 @@ pub fn render_jxl_as_coded(bytes: &[u8]) -> Result<DynamicImage, String> {
 	render_jxl(bytes, true)
 }
 
-/// The CICP primaries and transfer that an RGB picture's colour space is coded by, when it is coded by them.
+/// The CICP primaries and transfer that an RGB picture's colour space is coded by, when it is coded by them. The
+/// primaries are read with the white point: jxl-oxide calls every P3 DCI-P3 (11), but libjxl codes Display P3 (12) as
+/// P3 with a D65 white.
 pub fn coded_cicp(image: &JxlImage) -> Option<[u8; 2]> {
-	match &image.image_header().metadata.colour_encoding {
-		ColourEncoding::Enum(encoding) if encoding.colour_space == ColourSpace::Rgb => {
-			encoding.cicp().map(|[primaries, transfer, ..]| [primaries, transfer])
-		}
-		_ => None,
+	let ColourEncoding::Enum(encoding) = &image.image_header().metadata.colour_encoding else {
+		return None;
+	};
+
+	if encoding.colour_space != ColourSpace::Rgb {
+		return None;
 	}
+
+	let primaries = match (&encoding.primaries, &encoding.white_point) {
+		(Primaries::Srgb, WhitePoint::D65) => 1,
+		(Primaries::Bt2100, WhitePoint::D65) => 9,
+		(Primaries::P3, WhitePoint::Dci) => 11,
+		(Primaries::P3, WhitePoint::D65) => 12,
+		_ => return None,
+	};
+	Some([primaries, encoding.tf.cicp()?])
 }
 
 fn render_jxl(bytes: &[u8], as_coded: bool) -> Result<DynamicImage, String> {

@@ -10,6 +10,7 @@ use crate::container::avif::{self, AvifExpectations, AvifMetadata};
 use crate::container::jxl;
 use crate::images::blocking;
 use crate::images::decode::{PamRequest, pam_command, run_pam};
+use crate::images::jxl::libjxl_cicp;
 use crate::images::ssim;
 use crate::metadata::OutputMetadata;
 use crate::metadata::icc::Cicp;
@@ -123,7 +124,7 @@ pub fn check_jxl(bytes: &[u8], expected: &Expected<'_>, lossless: bool) -> Resul
 	if expected.icc.is_none()
 		&& let Some([primaries, transfer]) = ssim::coded_cicp(&image)
 	{
-		let wanted = expected.cicp;
+		let wanted = libjxl_cicp(expected.cicp);
 		let differs = |found: u8, wanted: u8, unspecified: u8| wanted != unspecified && found != wanted;
 		if differs(primaries, wanted.primaries, Cicp::UNSPECIFIED.primaries)
 			|| differs(transfer, wanted.transfer, Cicp::UNSPECIFIED.transfer)
