@@ -35,6 +35,11 @@ const DAMAGE_FLOOR_S: f64 = 1.0;
 const ROUNDING_S: f64 = 1e-9;
 const PREDICTION_MARGIN: f64 = 0.05;
 const RETRY_SIZE_SLACK: f64 = 1.10;
+/// A retry's size is predicted at most this far below the lowest probe, as far as the retry follows the probe curve.
+const MAX_SIZE_EXTRAPOLATION: f64 = 2.0;
+/// Beyond the probes, the size curve's slope is only taken from two probes at least this far apart: the last steps of
+/// a search can be a quarter CRF apart, and their slope carried several CRF would err far past the slack.
+const MIN_EXTRAPOLATION_BASE: f64 = 2.0;
 const MATROSKA_TIME_BASE: &str = "1/1000";
 const AUDIO_TEMP: Container = Container {
 	cover: Cover::Attachment,
@@ -357,7 +362,9 @@ pub fn predicted_keep(src_bytes: u64, predicted_bytes: u64, min_savings: f64) ->
 
 /// The video bytes a full encode at `crf` should come to: the search probes' sample bytes at their CRFs
 /// (`probe_sizes`), interpolated in log size to `crf`, scaled by how the first full encode (`first`: its CRF and bytes)
-/// came out against the same interpolation at its own CRF. `None` without two probes at different CRFs.
+/// came out against the same interpolation at its own CRF. `None` without two probes at different CRFs, for a `crf`
+/// more than `MAX_SIZE_EXTRAPOLATION` below the lowest probe, or beyond the probes when the two nearest are less than
+/// `MIN_EXTRAPOLATION_BASE` apart: the retry then runs.
 #[allow(
 	clippy::cast_precision_loss,
 	clippy::cast_possible_truncation,
@@ -372,6 +379,14 @@ pub fn retry_bytes(probe_sizes: &[(f64, u64)], (first_crf, first_bytes): (f64, u
 	points.sort_by(|a, b| a.0.total_cmp(&b.0));
 	points.dedup_by(|a, b| (a.0 - b.0).abs() < f64::EPSILON);
 	if points.len() < 2 || first_bytes == 0 {
+		return None;
+	}
+
+	let (lowest, highest) = (points[0].0, points[points.len() - 1].0);
+	let span = |pair: &[(f64, f64)]| pair[1].0 - pair[0].0;
+	let extrapolated = (crf < lowest && span(&points[..2]) < MIN_EXTRAPOLATION_BASE)
+		|| (crf > highest && span(&points[points.len() - 2..]) < MIN_EXTRAPOLATION_BASE);
+	if crf < lowest - MAX_SIZE_EXTRAPOLATION || extrapolated {
 		return None;
 	}
 
@@ -1224,12 +1239,12 @@ mod tests {
 
 		let between = retry_bytes(&probes, (36.75, 19_710_000), 29.5).unwrap();
 		let below = retry_bytes(&probes, (36.75, 19_710_000), 26.0).unwrap();
-		let above = retry_bytes(&probes, (36.0, 5_000_000), 40.0).unwrap();
+		let above = retry_bytes(&probes[..2], (36.0, 5_000_000), 40.0).unwrap();
 
 		assert!(near(between, scaled(19_710_000, 7.25)), "{between}");
 		assert!(
 			near(below, scaled(19_710_000, 10.75)),
-			"beyond the lowest probe: {below}"
+			"2 below the lowest probe: {below}"
 		);
 		assert!(
 			near(above, scaled(5_000_000, -4.0)),
@@ -1238,6 +1253,33 @@ mod tests {
 		assert_eq!(retry_bytes(&probes[..1], (36.75, 19_710_000), 29.5), None);
 		assert_eq!(retry_bytes(&[(30.0, 10), (30.0, 12)], (30.0, 100), 28.0), None);
 		assert_eq!(retry_bytes(&probes, (36.75, 0), 29.5), None);
+	}
+
+	#[test]
+	fn a_retry_size_is_not_guessed_far_beyond_the_probes_or_from_probes_close_together() {
+		let spread: Vec<(f64, u64)> = [28.0, 36.0].map(|crf| (crf, doubling(crf))).into();
+		let close: Vec<(f64, u64)> = [36.0, 37.0, 36.75].map(|crf| (crf, doubling(crf))).into();
+
+		assert!(retry_bytes(&spread, (36.0, 5_000_000), 26.0).is_some());
+		assert_eq!(
+			retry_bytes(&spread, (36.0, 5_000_000), 25.75),
+			None,
+			"more than 2 below the lowest probe"
+		);
+		assert_eq!(
+			retry_bytes(&close, (36.75, 5_000_000), 34.75),
+			None,
+			"the two lowest probes are 0.75 CRF apart"
+		);
+		assert_eq!(
+			retry_bytes(&close, (36.0, 5_000_000), 38.0),
+			None,
+			"the two highest are 0.25 apart"
+		);
+		assert!(
+			retry_bytes(&close, (36.75, 5_000_000), 36.5).is_some(),
+			"between the probes"
+		);
 	}
 
 	#[test]

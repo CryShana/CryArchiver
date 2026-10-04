@@ -2185,15 +2185,17 @@ async fn a_searched_near_miss_teaches_its_offset_but_no_setting() {
 	assert!(offset.mean < 0.0, "{offset:?}");
 }
 
-/// A test pattern whose search samples all skip 1.8 s of heavy noise, under a twentieth of its frames, so that its
-/// full check misses the samples' prediction on the mean by a point or two but keeps their floor.
+/// A test pattern whose search samples skip every noisy stretch: 1.8 s of heavy noise, under a twentieth of its frames,
+/// and four stretches of light noise. Its full check lands about 1.9 below the samples' prediction on the mean (91.8
+/// against 93.7 at CRF 52 on SVT-AV1 4.2), and about 3.7 below on the floor.
 fn noisy_stretch(dir: &Path) -> PathBuf {
 	let clip = dir.join("pattern.mkv");
 	support::ffmpeg(&[
 		"-f",
 		"lavfi",
 		"-i",
-		"testsrc2=s=320x240:r=25:d=40,noise=alls=60:allf=t:enable='between(t,6.3,8.1)'",
+		"testsrc2=s=320x240:r=25:d=40,noise=alls=8:allf=t:enable='between(t,12.7,15.1)+between(t,19.3,21.7)+\
+		 between(t,25.9,28.3)+between(t,32.5,34.9)',noise=alls=60:allf=t:enable='between(t,6.3,8.1)'",
 		"-pix_fmt",
 		"yuv420p",
 		"-c:v",
@@ -2201,6 +2203,20 @@ fn noisy_stretch(dir: &Path) -> PathBuf {
 		clip.to_str().unwrap(),
 	]);
 	clip
+}
+
+/// A `strict` job whose first full check misses its mean target by about 1.2 whatever the build scores, with a floor of
+/// 86 that the check keeps, and the CRF of that check: the mean is measured by a search against 93 / 89. The noise pulls
+/// the check far enough below the samples that a search against the measured mean plus 1.2 still ends at that CRF.
+async fn missing_by_a_point(clip: &Path, dir: &Path) -> (Job, f64) {
+	let engine = Engine::new(support::toolchain().await);
+	let (_, events) = run_recording(&engine, &strict(clip, 93.0, 89.0), &out_dir(dir, "calibration")).await;
+	let first = last_decision(&events).video.as_ref().unwrap().checks[0];
+
+	(
+		strict(clip, ((first.mean + 1.2) * 10.0).round() / 10.0, 86.0),
+		first.crf,
+	)
 }
 
 fn last_decision(events: &[JobEvent]) -> &Decision {
@@ -2218,9 +2234,10 @@ fn last_decision(events: &[JobEvent]) -> &Decision {
 async fn a_searched_video_that_misses_its_check_is_encoded_again_at_the_crf_its_probe_curve_points_to() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = noisy_stretch(dir.path());
+	let (job, first_crf) = missing_by_a_point(&clip, dir.path()).await;
 	let engine = Engine::new(support::toolchain().await);
 
-	let (outcome, events) = run_recording(&engine, &strict(&clip, 93.0, 89.0), dir.path()).await;
+	let (outcome, events) = run_recording(&engine, &job, dir.path()).await;
 
 	let decision = last_decision(&events);
 	let video = decision.video.as_ref().unwrap();
@@ -2228,6 +2245,12 @@ async fn a_searched_video_that_misses_its_check_is_encoded_again_at_the_crf_its_
 		.reencode
 		.as_ref()
 		.unwrap_or_else(|| panic!("the noisy stretch the samples skip misses the check: {decision:?}"));
+	let missed_by = video.target.unwrap().mean - video.checks[0].mean;
+	assert!(
+		(again.from_crf - first_crf).abs() < 1e-9 && (1.0..1.4).contains(&missed_by),
+		"{missed_by} at CRF {} after {first_crf}",
+		again.from_crf
+	);
 	let curve: Vec<Probe> = video
 		.probes
 		.iter()
@@ -2291,18 +2314,10 @@ async fn a_retry_predicted_to_come_out_too_large_keeps_the_original_without_enco
 	let dir = tempfile::tempdir().unwrap();
 	let clip = noisy_stretch(dir.path());
 	let source_bytes = fs::metadata(&clip).unwrap().len();
+	let (job, first_crf) = missing_by_a_point(&clip, dir.path()).await;
 	let engine = Engine::new(support::toolchain().await);
-	let (_, events) = run_recording(&engine, &strict(&clip, 93.0, 89.0), &out_dir(dir.path(), "measured")).await;
-	let first_crf = last_decision(&events)
-		.video
-		.as_ref()
-		.unwrap()
-		.reencode
-		.as_ref()
-		.unwrap()
-		.from_crf;
 	let fixed = advanced(
-		strict(&clip, 93.0, 89.0),
+		job.clone(),
 		Advanced {
 			crf: Some(first_crf),
 			..Advanced::default()
@@ -2312,7 +2327,7 @@ async fn a_retry_predicted_to_come_out_too_large_keeps_the_original_without_enco
 	#[allow(clippy::cast_precision_loss)]
 	let just_above_the_first = Job {
 		min_savings: 1.0 - first_bytes as f64 * 1.03 / source_bytes as f64,
-		..strict(&clip, 93.0, 89.0)
+		..job
 	};
 
 	let fresh = Engine::new(support::toolchain().await);
