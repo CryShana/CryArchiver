@@ -224,15 +224,12 @@ mod tests {
 	fn job(threads: Option<usize>) -> Job {
 		Job {
 			source: "a.flac".into(),
-			speed: cryarchiver_engine::preset::Speed::default(),
-			keep_metadata: false,
-			drop_aux: false,
 			min_savings: 0.1,
-			overrides: cryarchiver_engine::preset::Overrides::default(),
 			options: cryarchiver_engine::options::JobOptions {
 				threads,
 				..Default::default()
 			},
+			..Job::default()
 		}
 	}
 

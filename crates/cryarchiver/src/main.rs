@@ -1,6 +1,7 @@
 mod headless;
 mod inputs;
 mod memory;
+mod progress;
 mod projects;
 mod report;
 mod retry;
@@ -486,7 +487,13 @@ impl QueueSeat {
 				}
 			}
 			JobEvent::Stage(_) => self.leave(),
-			_ => {}
+			JobEvent::Progress(_)
+			| JobEvent::Warning(_)
+			| JobEvent::Parts { .. }
+			| JobEvent::Probe { .. }
+			| JobEvent::Probed { .. }
+			| JobEvent::EncodeAgain(_)
+			| JobEvent::Decision(_) => {}
 		}
 	}
 
@@ -1093,7 +1100,10 @@ fn pause_if_launched_from_explorer() {}
 
 #[cfg(test)]
 mod tests {
+	use std::collections::BTreeSet;
 	use std::time::Duration;
+
+	use cryarchiver_engine::toolchain::{FfmpegBuild, Version};
 
 	use super::*;
 
@@ -1535,12 +1545,30 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
-	async fn an_aom_choice_without_libaom_refuses_the_run_before_any_file() {
-		let mut tools = Toolchain::detect(&ToolConfig::default(), &CancellationToken::new())
-			.await
-			.unwrap();
-		tools.encoders.remove(cryarchiver_engine::toolchain::LIBAOM);
+	fn toolchain_without_libaom() -> Toolchain {
+		Toolchain {
+			ffmpeg: PathBuf::from("ffmpeg"),
+			ffprobe: PathBuf::from("ffprobe"),
+			build: FfmpegBuild::Release(Version { major: 9, minor: 0 }),
+			build_id: String::new(),
+			encoders: BTreeSet::from(["libsvtav1".to_owned()]),
+			decoders: BTreeSet::new(),
+			filters: BTreeSet::new(),
+			svt_av1: None,
+			svt_av1_release: None,
+			libvpx_release: None,
+			svt_settings: false,
+			colour_tags: false,
+			vp9_alpha: false,
+			soxr: false,
+			opus_surround: false,
+			vmaf: false,
+		}
+	}
+
+	#[test]
+	fn an_aom_choice_without_libaom_refuses_the_run_before_any_file() {
+		let tools = toolchain_without_libaom();
 		let Launch::Compress(aom) = launch_from(args(&["a.mp4", "--video-encoder", "aom"])) else {
 			panic!("not a compress run");
 		};

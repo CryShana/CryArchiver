@@ -351,6 +351,49 @@ mod tests {
 	}
 
 	#[test]
+	fn headers_that_only_look_like_pnm_or_tga_are_not_trusted() {
+		let probed = |format: &str, codec: &str| {
+			info(&format!(
+				r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"{codec}"}}],"format":{{"format_name":"{format}"}}}}"#
+			))
+		};
+		let tga = |colour_map: u8, kind: u8, width: u16, height: u16, depth: u8| {
+			let mut header = vec![0, colour_map, kind, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+			header.extend(width.to_le_bytes());
+			header.extend(height.to_le_bytes());
+			header.extend([depth, 8]);
+			header.extend([0; 16]);
+			header
+		};
+		let trusted =
+			|header: &[u8], codec: &str| matches!(classify(header, probed("image2", codec)), MediaClass::StillImage(_));
+
+		assert!(trusted(&tga(0, 2, 256, 192, 32), "targa"));
+		assert!(trusted(&tga(1, 1, 256, 192, 8), "targa"));
+		assert!(!trusted(&tga(0, 2, 0, 192, 32), "targa"), "zero width");
+		assert!(!trusted(&tga(0, 2, 256, 0, 32), "targa"), "zero height");
+		assert!(!trusted(&tga(0, 2, 256, 192, 12), "targa"), "depth");
+		assert!(!trusted(&tga(0, 4, 256, 192, 32), "targa"), "image type");
+		assert!(!trusted(&tga(2, 2, 256, 192, 32), "targa"), "colour map type");
+		assert!(trusted(&tga(1, 9, 256, 192, 8), "targa"));
+		assert!(
+			!trusted(&tga(0, 9, 256, 192, 8), "targa"),
+			"a mapped image needs its map"
+		);
+		assert!(!trusted(&tga(0, 2, 256, 192, 32)[..17], "targa"), "a header cut short");
+		assert!(!trusted(&tga(0, 2, 256, 192, 32), "mjpeg"), "ffprobe must agree");
+
+		let pnm = |header: &[u8]| matches!(classify(header, probed("image2", "pam")), MediaClass::StillImage(_));
+		assert!(pnm(b"P7\nWIDTH 4\nHEIGHT 4\n"));
+		assert!(pnm(b"P1 4 4\n"));
+		assert!(!pnm(b"P6x256 192\n"), "no whitespace after the magic");
+		assert!(!pnm(b"P7WIDTH 4\n"), "no whitespace after P7");
+		assert!(!pnm(b"P8\n4 4\n"), "not a PNM magic");
+		assert!(!pnm(b"P0 4 4\n"), "not a PNM magic");
+		assert!(!pnm(b"P6"), "the magic alone");
+	}
+
+	#[test]
 	fn apng_and_animated_webp_are_animated_without_a_duration() {
 		let apng = info(
 			r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"apng"}],"format":{"format_name":"apng"}}"#,

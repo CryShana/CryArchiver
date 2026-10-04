@@ -279,6 +279,7 @@ async fn a_real_clip_gets_its_expected_grain() {
 
 	let analysis = measured(&clip, window).await;
 	eprintln!("noise {:?}, sigma {:?}", analysis.noise, analysis.noise_sigma);
+
 	if let Some(expected) = std::env::var("CRY_GRAIN_LEVEL")
 		.ok()
 		.map(|level| level.parse::<u8>().unwrap())

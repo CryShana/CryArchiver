@@ -249,7 +249,7 @@ async fn broken_pixel_data_fails_but_broken_checksums_scans_and_profiles_do_not(
 }
 
 #[tokio::test]
-async fn bmp_tga_ppm_qoi_and_a_jpeg_without_an_extension_are_converted_or_kept() {
+async fn bmp_tga_ppm_and_qoi_are_encoded_and_a_jpeg_without_an_extension_is_converted_or_kept() {
 	let dir = tempfile::tempdir().unwrap();
 	let out = dir.path().join("out");
 	let mut sources = Vec::new();
@@ -286,19 +286,24 @@ async fn bmp_tga_ppm_qoi_and_a_jpeg_without_an_extension_are_converted_or_kept()
 	]);
 	let bare = dir.path().join("scan");
 	fs::rename(&jpeg, &bare).unwrap();
-	sources.push(bare);
 
 	for source in &sources {
 		let outcome = run(source, Speed::Fast, &out).await;
-		assert!(converted_or_kept(&outcome), "{}: {outcome:?}", source.display());
+		assert!(
+			matches!(outcome, JobOutcome::Encoded { .. }),
+			"{}: {outcome:?}",
+			source.display()
+		);
 	}
+
+	let outcome = run(&bare, Speed::Fast, &out).await;
+	assert!(converted_or_kept(&outcome), "{outcome:?}");
 }
 
 #[tokio::test]
-async fn two_angles_odd_4_4_4_frames_and_frames_wider_than_svt_are_encoded() {
+async fn two_angles_are_both_encoded_and_an_odd_4_4_4_frame_is_converted_or_kept() {
 	let dir = tempfile::tempdir().unwrap();
 	let out = dir.path().join("out");
-	let tools = support::toolchain().await;
 	let angles = dir.path().join("angles.mkv");
 	support::ffmpeg(&[
 		"-f",
@@ -329,6 +334,20 @@ async fn two_angles_odd_4_4_4_frames_and_frames_wider_than_svt_are_encoded() {
 		"yuv444p",
 		odd.to_str().unwrap(),
 	]);
+
+	let two = run(&angles, Speed::Fast, &out).await;
+	let info = encoded_info(&two).await;
+	assert_eq!(info.streams.iter().filter(|stream| stream.is_real_video()).count(), 2);
+
+	let odd = run(&odd, Speed::Fast, &out).await;
+	assert!(converted_or_kept(&odd), "{odd:?}");
+}
+
+#[tokio::test]
+async fn a_frame_wider_than_svt_is_encoded_with_libaom_and_fails_for_the_toolchain_without() {
+	let dir = tempfile::tempdir().unwrap();
+	let out = dir.path().join("out");
+	let tools = support::toolchain().await;
 	let wide = dir.path().join("wide.avi");
 	support::ffmpeg(&[
 		"-f",
@@ -341,13 +360,6 @@ async fn two_angles_odd_4_4_4_frames_and_frames_wider_than_svt_are_encoded() {
 		"3",
 		wide.to_str().unwrap(),
 	]);
-
-	let two = run(&angles, Speed::Fast, &out).await;
-	let info = encoded_info(&two).await;
-	assert_eq!(info.streams.iter().filter(|stream| stream.is_real_video()).count(), 2);
-
-	let odd = run(&odd, Speed::Fast, &out).await;
-	assert!(converted_or_kept(&odd), "{odd:?}");
 
 	let wide = run(&wide, Speed::Fast, &out).await;
 	if tools.has_libaom() {

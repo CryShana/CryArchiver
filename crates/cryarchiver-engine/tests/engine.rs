@@ -2213,6 +2213,19 @@ async fn the_outcome_records_the_encode_again_with_both_checks_and_both_crfs() {
 	assert!(video.checks[0].mean < 95.0 || video.checks[0].p5 < 91.0, "{decision:?}");
 	assert_eq!(decision.attempts, 2);
 
+	let announced_again = events
+		.iter()
+		.find_map(|event| match event {
+			JobEvent::EncodeAgain(again) => Some(*again),
+			_ => None,
+		})
+		.expect("the repeat is announced");
+	assert_eq!(
+		(announced_again.from_crf, announced_again.crf),
+		(again.from_crf, again.to_crf)
+	);
+	assert!(warnings.contains(&announced_again.warning()), "{warnings:?}");
+
 	assert_eq!(video.scan, Some(Scan::Progressive));
 	assert!(!video.deinterlaced);
 	assert!(video.encoder.starts_with("SVT-AV1 preset "), "{decision:?}");

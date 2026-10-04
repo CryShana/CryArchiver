@@ -41,6 +41,23 @@ pub struct Measurements {
 	pub videos: usize,
 }
 
+impl Measurements {
+	fn absorb(&mut self, other: Self) {
+		for (cell, values) in other.crf {
+			self.crf.entry(cell).or_default().extend(values);
+		}
+		for (all, values) in self.bpp.iter_mut().zip(other.bpp) {
+			all.extend(values);
+		}
+
+		self.grain_mean.extend(other.grain_mean);
+		self.grain_floor.extend(other.grain_floor);
+		self.preset4_ratio.extend(other.preset4_ratio);
+		self.slope.extend(other.slope);
+		self.videos += other.videos;
+	}
+}
+
 pub fn median(values: &[f64]) -> Option<f64> {
 	if values.is_empty() {
 		return None;
@@ -102,7 +119,6 @@ fn thousandths(value: f64) -> f64 {
 	((value * 1000.0).round() / 1000.0).max(0.001)
 }
 
-/// Refuses an `--out` that exists or whose folder can't be written, before any measuring.
 pub fn check_out(out: &Path) -> Result<(), String> {
 	if fs::symlink_metadata(out).is_ok() {
 		return Err(format!(
@@ -162,7 +178,6 @@ pub async fn run(corpus: &Path, out: &Path) -> Result<(), String> {
 	write_tables(out, &updated(tables().clone(), &measured))
 }
 
-/// Writes `tables` to the new file `out`. When that fails, the tables go to stdout, so a finished run is not lost.
 fn write_tables(out: &Path, tables: &Tables) -> Result<(), String> {
 	let text = toml::to_string_pretty(tables).map_err(|err| err.to_string())?;
 
@@ -226,6 +241,7 @@ async fn measure_video(
 	let workspace = Workspace::create(scratch, source).map_err(|err| err.to_string())?;
 	let threads = std::thread::available_parallelism().map_or(1, usize::from);
 	let mut by_segments: BTreeMap<usize, Analysis> = BTreeMap::new();
+	let mut video = Measurements::default();
 
 	let mut any = false;
 	let mut unmeasured = "no search samples: the duration is unknown";
@@ -272,10 +288,10 @@ async fn measure_video(
 		};
 		any = true;
 		let bucket = Resolution::of(plan.width, plan.height).index();
-		measured.crf.entry((row, bucket)).or_default().push(found.crf);
+		video.crf.entry((row, bucket)).or_default().push(found.crf);
 		if row == MODERATE {
 			let fps = main.fps().unwrap_or(25.0);
-			Box::pin(measure_at_moderate(scorer, &samples, found, (goal, fps), measured)).await?;
+			Box::pin(measure_at_moderate(scorer, &samples, found, (goal, fps), &mut video)).await?;
 		}
 	}
 
@@ -283,7 +299,8 @@ async fn measure_video(
 		return Err(unmeasured.into());
 	}
 
-	measured.videos += 1;
+	video.videos = 1;
+	measured.absorb(video);
 	Ok(true)
 }
 
@@ -396,6 +413,39 @@ mod tests {
 		assert_eq!(after.report.get("videos-measured"), Some(&3.0));
 		assert_eq!(after.report.get("moderate-preset4-bytes-ratio"), Some(&0.96));
 		assert_eq!(parse(&toml::to_string_pretty(&after).unwrap()).as_ref(), Ok(&after));
+	}
+
+	#[test]
+	fn a_video_adds_all_its_measurements_to_the_run() {
+		let mut run = Measurements::default();
+		run.crf.entry((MODERATE, 1)).or_default().push(30.0);
+		run.bpp[1].push(0.04);
+		run.videos = 1;
+		let mut video = Measurements::default();
+		video.crf.entry((MODERATE, 1)).or_default().push(32.0);
+		video.crf.entry((SLOW, 3)).or_default().push(28.0);
+		video.bpp[1].push(0.06);
+		video.slope.push(0.5);
+		video.grain_mean.push(1.0);
+		video.grain_floor.push(2.0);
+		video.preset4_ratio.push(0.9);
+		video.videos = 1;
+
+		run.absorb(video);
+
+		assert_eq!(run.crf[&(MODERATE, 1)], [30.0, 32.0]);
+		assert_eq!(run.crf[&(SLOW, 3)], [28.0]);
+		assert_eq!(run.bpp[1], [0.04, 0.06]);
+		assert_eq!(
+			(
+				run.slope,
+				run.grain_mean,
+				run.grain_floor,
+				run.preset4_ratio,
+				run.videos
+			),
+			(vec![0.5], vec![1.0], vec![2.0], vec![0.9], 2)
+		);
 	}
 
 	#[test]

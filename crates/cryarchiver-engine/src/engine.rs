@@ -74,7 +74,7 @@ const SUBTITLES_DROPPED: &str =
 const FRAMES_SPACE_HINT: &str = "an animated AVIF is made from lossless frames stored in the work folder: use \
                                  --ss/--to for a shorter clip or --resize for smaller frames";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Job {
 	pub source: PathBuf,
 	pub speed: Speed,
@@ -106,7 +106,8 @@ pub enum JobEvent {
 	Stage(Stage),
 	Progress(f64),
 	Warning(String),
-	/// `done` of the current step's `total` parts are finished: the analysis's segments, or a probe's samples.
+	/// `done` of the current step's `total` parts are finished: the analysis's segments, a probe's samples, or the
+	/// predicted-size gate's samples.
 	Parts {
 		done: usize,
 		total: usize,
@@ -134,7 +135,19 @@ pub struct EncodeAgain {
 	pub attempts: u32,
 	pub measured: Score,
 	pub target: Target,
+	pub from_crf: f64,
 	pub crf: f64,
+}
+
+impl EncodeAgain {
+	/// The warning filed with the outcome for this repeat.
+	#[must_use]
+	pub fn warning(&self) -> String {
+		format!(
+			"the quality check measured VMAF {:.1} / {:.1} at CRF {}; the video was encoded again at CRF {}",
+			self.measured.mean, self.measured.p5, self.from_crf, self.crf
+		)
+	}
 }
 
 /// The engine's job call as an object, so the project layer can run without ffmpeg in its tests.
@@ -1718,12 +1731,17 @@ impl Engine {
 				)));
 			};
 
-			temps.warnings.push(format!(
-				"the quality check measured VMAF {:.1} / {:.1} at CRF {crf}; the video was encoded again at CRF {lower}",
-				score.mean, score.p5
-			));
 			video.encoder = video.encoder.with_crf(lower);
 			attempt += 1;
+			let repeat = EncodeAgain {
+				attempt,
+				attempts: MAX_RETRIES + 1,
+				measured: score,
+				target: quality.target,
+				from_crf: crf,
+				crf: lower,
+			};
+			temps.warnings.push(repeat.warning());
 			let (target, again) = (quality.target, video.encoder.crf());
 			cx.record.video(|record| {
 				record.reencode = Some(Reencode {
@@ -1738,13 +1756,7 @@ impl Engine {
 			});
 			cx.record.update(|decision| decision.attempts = attempt);
 
-			(cx.on_event)(JobEvent::EncodeAgain(EncodeAgain {
-				attempt,
-				attempts: MAX_RETRIES + 1,
-				measured: score,
-				target: quality.target,
-				crf: lower,
-			}));
+			(cx.on_event)(JobEvent::EncodeAgain(repeat));
 			(cx.on_event)(JobEvent::Stage(Stage::Encode));
 			Box::pin(self.reencode_video(cx, workspace, inputs.declared_s, video, temps, attempt)).await?;
 		}

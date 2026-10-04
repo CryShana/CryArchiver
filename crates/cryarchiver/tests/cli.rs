@@ -1075,6 +1075,7 @@ fn a_verbose_run_with_a_failure_writes_nothing_but_the_outputs() {
 	] {
 		command.env(variable, home.path());
 	}
+
 	let out = command
 		.current_dir(dir.path())
 		.args(["-v", "good.flac", "cut.flac", "-o", "out"])
@@ -1091,12 +1092,14 @@ fn a_verbose_run_with_a_failure_writes_nothing_but_the_outputs() {
 		fs::read_dir(home.path()).unwrap().next().is_none(),
 		"the home folder gained files"
 	);
+
 	let mut names: Vec<String> = fs::read_dir(dir.path())
 		.unwrap()
 		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
 		.collect();
 	names.sort();
 	assert_eq!(names, ["cut.flac", "good.flac", "out"]);
+
 	let produced: Vec<String> = fs::read_dir(dir.path().join("out"))
 		.unwrap()
 		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())

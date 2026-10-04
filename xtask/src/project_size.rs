@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use cryarchiver_engine::decision::{Decision, ImageDecision, StageTime};
 use cryarchiver_project::keys::RelPath;
 use cryarchiver_project::record::{
 	FailureLog, FileRecord, FileState, FolderRecord, Hash, How, Identity, IssueKind, MediaClass, Output,
@@ -22,6 +23,8 @@ pub fn run(files: usize) -> Result<(), String> {
 		store.set_file(&key, &record(index, &key)).map_err(text)?;
 		if index.is_multiple_of(FAILING_EVERY) {
 			store.set_log(&key, 1, &failure(index)).map_err(text)?;
+		} else {
+			store.set_decision(&key, 1, &decision(index)).map_err(text)?;
 		}
 
 		if index.is_multiple_of(FILES_PER_FOLDER) {
@@ -91,6 +94,32 @@ fn record(index: usize, key: &RelPath) -> FileRecord {
 		full_hash: Some(hash(seed ^ 0xAA)),
 		replaces: None,
 		state,
+	}
+}
+
+fn decision(index: usize) -> Decision {
+	let seed = u64::try_from(index).unwrap_or(u64::MAX);
+	let tenths = u32::try_from(seed % 60).unwrap_or(0);
+
+	Decision {
+		image: Some(ImageDecision {
+			route: "AVIF".into(),
+			setting: Some(format!("quality {}", 55 + seed % 20)),
+			score: Some(80.0 + f64::from(tenths) / 10.0),
+			target: Some(80.0),
+		}),
+		source_bytes: Some(3_000_000 + seed % 2_000_000),
+		output_bytes: Some(1_200_000 + seed % 400_000),
+		stages: ["detect", "plan", "encode", "verify", "commit"]
+			.into_iter()
+			.zip(0_u32..)
+			.map(|(stage, step)| StageTime {
+				stage: stage.into(),
+				seconds: f64::from(tenths + step) / 7.0,
+			})
+			.collect(),
+		attempts: 1,
+		..Decision::default()
 	}
 }
 

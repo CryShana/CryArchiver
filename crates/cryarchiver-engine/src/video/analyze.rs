@@ -926,10 +926,18 @@ mod tests {
 		}];
 
 		for order in ["tt", "bb", "tb", "bt"] {
-			assert_eq!(classify(&down, Some(25.0), Some(order)).scan, ScanType::Progressive);
-			assert_eq!(classify(&up, Some(25.0), Some(order)).scan, ScanType::Progressive);
-			assert_eq!(classify(&tied, Some(25.0), Some(order)).scan, ScanType::Progressive);
-			assert_eq!(classify(&short, Some(25.0), Some(order)).scan, ScanType::Progressive);
+			for (name, votes) in [
+				("down", &down[..]),
+				("up", &up[..]),
+				("tied", &tied[..]),
+				("short", &short[..]),
+			] {
+				assert_eq!(
+					classify(votes, Some(25.0), Some(order)).scan,
+					ScanType::Progressive,
+					"{name} under {order}"
+				);
+			}
 		}
 
 		assert_eq!(
