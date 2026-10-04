@@ -1,10 +1,12 @@
 use std::fs;
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::{Lanes, in_lanes};
 use crate::calibration::tables;
 use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError, KeepReason};
@@ -15,7 +17,7 @@ use crate::quality::vmaf::{self, Reference, Score, Scoring};
 use crate::toolchain::Toolchain;
 use crate::video::analyze::{Analysis, DEFAULT_SEGMENTS, Detail};
 use crate::video::encode::{Sample, encode_sample, median_rate};
-use crate::video::plan::{Encoder, VideoPlan};
+use crate::video::plan::{Encoder, VideoPlan, lane_threads};
 use crate::workspace::Workspace;
 
 pub const MAX_RETRIES: u32 = 1;
@@ -34,6 +36,8 @@ const FLAT_SI: f64 = 2.0;
 const MAX_ANALYSIS_SEGMENTS: usize = 48;
 const LONG_SPAN_S: f64 = 600.0;
 const NEAR_MISS: f64 = 0.5;
+/// A sample gets a lane of its own only with at least this many threads: one-thread lanes encode slower in all.
+const SAMPLE_LANE_THREADS: usize = 2;
 const NO_MARGIN: Target = Target { mean: 0.0, floor: 0.0 };
 
 const TARGETS: [Target; 3] = [
@@ -109,7 +113,8 @@ pub enum Searched {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Search {
 	pub searched: Searched,
-	/// Encoding seconds per second of samples, from the first probe.
+	/// Encoding seconds per second of samples, from the first probe unless the aim brought one; `NaN` when that probe's
+	/// samples ran side by side.
 	pub rate: f64,
 	/// Every probe, in the order it was run: the samples' quality curve.
 	pub probes: Vec<Probe>,
@@ -138,7 +143,8 @@ pub struct Probed {
 	pub bytes: u64,
 	/// The time the sample encodes took.
 	pub encode_s: f64,
-	/// The median sample's encoding seconds per second of source, so that one slow start-up doesn't set it.
+	/// The median sample's encoding seconds per second of source, so that one slow start-up doesn't set it; `NaN` when
+	/// the samples ran side by side.
 	pub rate: f64,
 }
 
@@ -180,6 +186,8 @@ pub struct Scorer<'a> {
 	pub workspace: &'a Workspace,
 	pub plan: &'a VideoPlan,
 	pub threads: usize,
+	/// How many of a probe's samples may be encoded and scored at once.
+	pub lanes: Lanes<'a>,
 	pub cancel: &'a CancellationToken,
 }
 
@@ -258,6 +266,11 @@ impl Aim {
 			length_s: None,
 			rate: None,
 		}
+	}
+
+	/// Whether the search's first probe measures the encoding rate the margin comes from.
+	pub fn times_its_samples(self) -> bool {
+		self.length_s.is_some() && self.rate.is_none()
 	}
 
 	/// The search target with the margin for the full encode, at the rate given earlier or else `measured_rate`
@@ -596,7 +609,9 @@ pub fn dropped_grain_text(
 }
 
 impl Scorer<'_> {
-	/// Encodes and scores `samples` at `crf`, telling `on_samples` how many are done, from none to all.
+	/// Encodes and scores `samples` at `crf`, telling `on_samples` how many are done, from none to all. Samples run
+	/// side by side when the lanes allow it, each on its share of the threads; their times then don't show how fast
+	/// one sample encodes alone, so the rate is `NaN`.
 	pub async fn probe(
 		&self,
 		crf: f64,
@@ -604,28 +619,25 @@ impl Scorer<'_> {
 		round: usize,
 		mut on_samples: impl FnMut(usize),
 	) -> Result<Probed, JobError> {
+		let granted = self.lanes.grant(samples.len(), SAMPLE_LANE_THREADS);
+		let lane = granted.lane_threads();
 		let plan = VideoPlan {
 			encoder: self.plan.encoder.with_crf(crf),
+			threads: lane.map_or(self.plan.threads, |threads| Some(lane_threads(threads))),
 			..self.plan.clone()
 		};
-		let mut scores = Vec::new();
-		let mut bytes = 0;
-		let mut encode_s = 0.0;
-		let mut rates = Vec::new();
 		on_samples(0);
 
-		for (index, sample) in samples.iter().enumerate() {
+		let (plan, done) = (&plan, &Mutex::new((0, on_samples)));
+		let measured = in_lanes(samples.len(), granted.lanes, move |index| async move {
+			let sample = &samples[index];
 			let output = self.workspace.file(&format!("probe{round}-{index}.mkv"));
 			let started = Instant::now();
-			bytes += encode_sample(&self.tools.ffmpeg, self.source, &output, &plan, sample, self.cancel).await?;
+			let bytes = encode_sample(&self.tools.ffmpeg, self.source, &output, plan, sample, self.cancel).await?;
 			let elapsed_s = started.elapsed().as_secs_f64();
-			encode_s += elapsed_s;
-			if sample.length_s > 0.0 {
-				rates.push(elapsed_s / sample.length_s);
-			}
 
 			let log = format!("vmaf-probe{round}-{index}.json");
-			let scoring = self.scoring(&log);
+			let scoring = self.lane_scoring(&log, lane);
 			let cmd = vmaf::sample_command(
 				&self.tools.ffmpeg,
 				&output,
@@ -634,15 +646,30 @@ impl Scorer<'_> {
 				sample.length_s,
 				&scoring,
 			);
-			scores.extend(vmaf::frames(&cmd, &scoring, |_| {}, self.cancel).await?);
+			let scores = vmaf::frames(&cmd, &scoring, |_| {}, self.cancel).await?;
 			let _ = fs::remove_file(&output);
-			on_samples(index + 1);
-		}
 
+			let (count, on_samples) = &mut *done.lock().unwrap_or_else(PoisonError::into_inner);
+			*count += 1;
+			on_samples(*count);
+			Ok::<_, JobError>((bytes, elapsed_s, scores))
+		})
+		.await?;
+
+		let rates = samples
+			.iter()
+			.zip(&measured)
+			.filter(|(sample, _)| sample.length_s > 0.0 && lane.is_none())
+			.map(|(sample, (_, elapsed_s, _))| elapsed_s / sample.length_s)
+			.collect();
+		let scores: Vec<f64> = measured
+			.iter()
+			.flat_map(|(_, _, scores)| scores.iter().copied())
+			.collect();
 		Ok(Probed {
 			score: pooled(&scores)?,
-			bytes,
-			encode_s,
+			bytes: measured.iter().map(|(bytes, _, _)| bytes).sum(),
+			encode_s: measured.iter().map(|(_, elapsed_s, _)| elapsed_s).sum(),
 			rate: median_rate(rates),
 		})
 	}
@@ -703,10 +730,15 @@ impl Scorer<'_> {
 	}
 
 	fn scoring<'b>(&'b self, log: &'b str) -> Scoring<'b> {
+		self.lane_scoring(log, None)
+	}
+
+	/// Scoring on a lane's threads, or else on the job's.
+	fn lane_scoring<'b>(&'b self, log: &'b str, lane: Option<usize>) -> Scoring<'b> {
 		Scoring {
 			model: vmaf::model_for(self.plan.width, self.plan.height),
-			threads: self.threads,
-			budget: self.plan.threads.map(|threads| threads.tool),
+			threads: lane.unwrap_or(self.threads),
+			budget: lane.or(self.plan.threads.map(|threads| threads.tool)),
 			dir: self.workspace.dir(),
 			log,
 		}
@@ -726,7 +758,8 @@ pub async fn search(
 
 /// `search`, given up as unreachable once a probe misses the target at `bytes` or more: every CRF that would pass is
 /// lower and larger still, so nothing smaller than `bytes` can be found. The target takes its margin from how long the
-/// first probe's encodes took, unless the aim brings a rate.
+/// first probe's encodes took, unless the aim brings a rate; that probe's samples then run one at a time on the job's
+/// caps, so that each one's time is what it takes alone.
 pub async fn search_below(
 	scorer: &Scorer<'_>,
 	samples: &[Sample],
@@ -754,7 +787,15 @@ pub async fn search_below(
 				total: samples.len(),
 			});
 		};
-		let measured = scorer.probe(crf, samples, probes.len(), on_samples).await?;
+		let timing = if probes.is_empty() && aim.times_its_samples() {
+			Scorer {
+				lanes: Lanes::SERIAL,
+				..*scorer
+			}
+		} else {
+			*scorer
+		};
+		let measured = timing.probe(crf, samples, probes.len(), on_samples).await?;
 		on_step(SearchStep::Probed {
 			crf,
 			score: measured.score,

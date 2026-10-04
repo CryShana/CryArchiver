@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod budget;
 pub mod calibration;
 pub mod commit;
 pub mod container;

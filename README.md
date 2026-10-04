@@ -62,6 +62,7 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, the aspect rat
   - Photos with HDR gain maps or depth maps keep the original; `--drop-aux` converts them without the extra images.
   - RAW camera files, layered files (PSD, XCF), CMYK JPEGs and multi-page TIFFs are never converted.
 - One video is encoded at a time while audio and images run in parallel; `-j N` allows N videos at once.
+  - A video's analysis and quality search measure several parts at once on cores the other files leave idle, never beyond `--threads` when it is given. The CRF and the scores are the same as measured one part at a time.
 - Damaged or truncated videos fail with "source damaged" instead of producing a broken copy.
 - An existing output is skipped, so running the same command again is safe.
 - Files that would share an output name (song.flac and song.wav) are not merged: the first in name order is compressed, the second is skipped with a note.

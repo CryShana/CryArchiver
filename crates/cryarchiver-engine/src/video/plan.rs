@@ -46,6 +46,17 @@ pub fn svt_lp(threads: usize, cores: usize) -> u8 {
 		.clamp(1, SVT_MAX_LP) as u8
 }
 
+/// The threads of one of several tools that share a budget, `threads` each: SVT-AV1 starts about twice as many
+/// threads at each level of parallelism, one at level 1.
+#[allow(clippy::cast_possible_truncation)]
+pub fn lane_threads(threads: usize) -> Threads {
+	let threads = threads.max(1);
+	Threads {
+		tool: threads,
+		svt_lp: (threads.ilog2() as usize + 1).min(SVT_MAX_LP) as u8,
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoCaps {
 	pub vp9_alpha: bool,
@@ -1019,6 +1030,15 @@ mod tests {
 			"tune=0:keyint=5s:crf=38:film-grain=12:film-grain-denoise=1:mbr=12500"
 		);
 		assert_eq!(svt_params(30.0, None, Some(2), None), "tune=0:keyint=5s:crf=30:lp=2");
+	}
+
+	#[test]
+	fn a_lane_starts_about_as_many_svt_threads_as_it_has() {
+		let levels = [1, 2, 3, 4, 7, 8, 15, 16, 32, 64, 0].map(|threads| lane_threads(threads).svt_lp);
+
+		assert_eq!(levels, [1, 2, 2, 3, 3, 4, 4, 5, 6, 6, 1]);
+		assert_eq!(lane_threads(8), Threads { tool: 8, svt_lp: 4 });
+		assert_eq!(lane_threads(0).tool, 1);
 	}
 
 	#[test]

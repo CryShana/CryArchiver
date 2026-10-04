@@ -37,6 +37,7 @@ impl Backend for EngineBackend {
 		Arc::new(
 			Engine::new(self.tools.clone())
 				.with_image_threads(image_threads)
+				.with_thread_budget(image_threads)
 				.with_memory_gate(memory)
 				.with_quality_memory(quality),
 		)

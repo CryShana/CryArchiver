@@ -2775,6 +2775,30 @@ async fn a_learned_crf_whose_full_encode_is_expected_to_take_long_is_searched_ag
 	);
 }
 
+#[tokio::test]
+async fn measuring_side_by_side_chooses_the_same_crf_from_the_same_scores() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 20);
+	let tools = support::toolchain().await;
+	let run = async |threads: usize, out: &str| {
+		let engine = Engine::new(tools.clone()).with_thread_budget(threads);
+		let (outcome, _) = run_recording(&engine, &job(&clip), &out_dir(dir.path(), out)).await;
+		let JobOutcome::Encoded { decision, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		decision.video.unwrap()
+	};
+
+	let one_at_a_time = run(1, "serial").await;
+	let side_by_side = run(8, "side").await;
+
+	assert!(one_at_a_time.probes.len() >= 2, "{one_at_a_time:?}");
+	assert_eq!(side_by_side.crf, one_at_a_time.crf);
+	assert_eq!(side_by_side.probes, one_at_a_time.probes);
+	assert_eq!(side_by_side.checks, one_at_a_time.checks);
+	assert_eq!(side_by_side.scan, one_at_a_time.scan);
+}
+
 async fn learned_group(dir: &Path, setting: f64) -> SharedMemory {
 	let first = support::mpeg4(dir, "first.mp4", 3);
 	let learned = Arc::new(SharedMemory::default());

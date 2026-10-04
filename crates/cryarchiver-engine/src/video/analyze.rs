@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::{Granted, Lanes, in_lanes};
 use crate::calibration::tables;
 use crate::options::TrimWindow;
-use crate::outcome::JobError;
+use crate::outcome::{ErrorKind, JobError};
 use crate::probe::Stream;
 use crate::process::{self, RunError, STALL_TIMEOUT, ToolCommand};
 use crate::toolchain::Toolchain;
@@ -34,7 +35,12 @@ const FILTERS: &str = "idet=intl_thres=1.2,blackdetect=d=1,freezedetect=n=-60dB:
 
 pub const DEFAULT_SEGMENTS: usize = 4;
 
+/// Segments analysed at once by serial lanes.
 const PARALLEL_SEGMENTS: usize = 4;
+/// The frame statistics and the noise measure.
+const SEGMENT_TOOLS: usize = 2;
+/// A segment's two tools need about this many times less memory than a job reserves for its encode.
+const SEGMENT_MEMORY_SHARE: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanType {
@@ -129,17 +135,6 @@ pub fn window_segments(duration_s: Option<f64>, count: usize, window: Option<Tri
 			length_s: Some(segment.length_s.unwrap_or(window.length_s)),
 		})
 		.collect()
-}
-
-/// How many segments are analysed at once, and the threads of each of their two tools: the whole budget between
-/// them, at least one thread each.
-fn segment_threads(threads: Option<usize>) -> (usize, Option<usize>) {
-	let Some(threads) = threads else {
-		return (PARALLEL_SEGMENTS, None);
-	};
-
-	let parallel = (threads / 2).clamp(1, PARALLEL_SEGMENTS);
-	(parallel, Some((threads / (2 * parallel)).max(1)))
 }
 
 pub fn segment_command(
@@ -346,35 +341,40 @@ pub async fn analyze(
 		source,
 		main,
 		(duration_s, window),
-		(count, None),
+		(count, Lanes::SERIAL),
 		&|_, _| {},
 		cancel,
 	))
 	.await
 }
 
-/// `analyze` of `count` segments within a thread budget, if any, telling `on_segments` how many of the segments are
-/// done, from none to all.
+/// `analyze` of `count` segments in `lanes`, telling `on_segments` how many of the segments are done, from none to
+/// all. Each lane takes the next segment as it finishes one and runs its two tools together. Lanes with threads of
+/// their own get two threads each, one per tool (more when there are fewer segments than that); serial lanes run
+/// `PARALLEL_SEGMENTS` segments at once on ffmpeg's own threads.
 pub async fn analyze_reporting(
 	tools: &Toolchain,
 	source: &Path,
 	main: &Stream,
 	(duration_s, window): (Option<f64>, Option<TrimWindow>),
-	(count, threads): (usize, Option<usize>),
+	(count, lanes): (usize, Lanes<'_>),
 	on_segments: &(dyn Fn(usize, usize) + Sync),
 	cancel: &CancellationToken,
 ) -> Result<Analysis, JobError> {
 	let end_s = window.map_or(duration_s, |window| Some(window.start_s + window.length_s));
 	let segments = window_segments(duration_s, count, window);
 	let (done, total) = (&AtomicUsize::new(0), segments.len());
-	let (parallel, threads) = segment_threads(threads);
+	let granted = Lanes {
+		lane_bytes: lanes.lane_bytes / SEGMENT_MEMORY_SHARE,
+		..lanes
+	}
+	.grant(total, SEGMENT_TOOLS);
+	let (parallel, threads) = segment_lanes(&granted);
 	on_segments(0, total);
 
-	let run = |segment: Option<Segment>| async move {
-		let Some(segment) = segment else {
-			return Ok(None);
-		};
-
+	let segments = &segments;
+	let run = move |index: usize| async move {
+		let segment = segments[index];
 		let cmd = segment_command(
 			&tools.ffmpeg,
 			source,
@@ -401,22 +401,14 @@ pub async fn analyze_reporting(
 			}),
 		)
 	};
-
-	let mut stats = Vec::new();
-	for chunk in segments.chunks(parallel) {
-		let (first, second, third, fourth) = tokio::join!(
-			run(chunk.first().copied()),
-			run(chunk.get(1).copied()),
-			run(chunk.get(2).copied()),
-			run(chunk.get(3).copied())
-		);
-		stats.extend([first?, second?, third?, fourth?].into_iter().flatten());
-	}
+	let stats: Vec<SegmentStats> = in_lanes(total, parallel, run).await?.into_iter().flatten().collect();
 
 	Ok(classify(&stats, main.fps(), main.field_order.as_deref()))
 }
 
-/// A source whose luma can't be decoded to raw frames (an RGB stream, say) is left unmeasured rather than failed.
+/// A source whose luma can't be decoded to raw frames (an RGB stream, say) is left unmeasured rather than failed. The
+/// frames are read in a task of their own: measuring them blocks the task it runs on, which would hold up the other
+/// segments analysed beside this one.
 async fn segment_pixels(
 	tools: &Toolchain,
 	source: &Path,
@@ -426,9 +418,21 @@ async fn segment_pixels(
 	cancel: &CancellationToken,
 ) -> Result<Measured, JobError> {
 	let cmd = noise::command(&tools.ffmpeg, source, main, segment, threads);
-	let mut reader = noise::Reader::default();
+	let cancel = cancel.clone();
+	let mut reading = AbortOnDrop(tokio::spawn(async move {
+		let mut reader = noise::Reader::default();
+		let out = process::run_streamed(&cmd, |chunk| reader.push(chunk), &cancel).await;
+		(out, reader)
+	}));
 
-	let out = match process::run_streamed(&cmd, |chunk| reader.push(chunk), cancel).await {
+	let (out, reader) = match (&mut reading.0).await {
+		Ok(read) => read,
+		Err(err) => match err.try_into_panic() {
+			Ok(panic) => std::panic::resume_unwind(panic),
+			Err(_) => return Err(ErrorKind::Cancelled.into()),
+		},
+	};
+	let out = match out {
 		Ok(out) => out,
 		Err(RunError::CaptureLimit(_) | RunError::Crashed { .. }) => return Ok(Measured::default()),
 		Err(err) => return Err(err.into()),
@@ -438,6 +442,23 @@ async fn segment_pixels(
 	} else {
 		Measured::default()
 	})
+}
+
+/// How many segments are analysed at once, and the threads of each of their tools.
+fn segment_lanes(granted: &Granted<'_>) -> (usize, Option<usize>) {
+	match granted.threads() {
+		Some(lane) => (granted.lanes, Some((lane / SEGMENT_TOOLS).max(1))),
+		None => (PARALLEL_SEGMENTS, None),
+	}
+}
+
+/// Ends the task, and the tool it runs, when the analysis is dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+	fn drop(&mut self) {
+		self.0.abort();
+	}
 }
 
 pub fn forced_decoder(stream: &Stream) -> Option<&'static str> {
@@ -571,19 +592,29 @@ mod tests {
 
 	#[test]
 	fn the_segments_analysed_at_once_share_the_thread_budget() {
-		assert_eq!(segment_threads(None), (4, None));
-		assert_eq!(segment_threads(Some(2)), (1, Some(1)));
-		assert_eq!(segment_threads(Some(6)), (3, Some(1)));
-		assert_eq!(segment_threads(Some(8)), (4, Some(1)));
-		assert_eq!(segment_threads(Some(32)), (4, Some(4)));
+		let lanes = |threads: usize, segments: usize| {
+			segment_lanes(
+				&Lanes {
+					width: crate::budget::Width::Fixed(threads),
+					..Lanes::SERIAL
+				}
+				.grant(segments, SEGMENT_TOOLS),
+			)
+		};
+
+		assert_eq!(lanes(8, 8), (4, Some(1)));
+		assert_eq!(lanes(32, 24), (16, Some(1)));
+		assert_eq!(lanes(32, 8), (8, Some(2)));
+		assert_eq!(lanes(3, 8), (1, Some(1)));
+		assert_eq!(lanes(1, 8), (1, Some(1)));
+		assert_eq!(lanes(6, 1), (1, Some(3)));
+		assert_eq!(segment_lanes(&Lanes::SERIAL.grant(8, SEGMENT_TOOLS)), (4, None));
 
 		for threads in 1..=64 {
-			let (parallel, each) = segment_threads(Some(threads));
-			let each = each.unwrap();
-			assert!((1..=4).contains(&parallel), "{threads}");
+			let (parallel, each) = lanes(threads, 48);
 			assert!(
-				2 * parallel * each <= threads.max(2),
-				"{threads}: {parallel} × 2 × {each}"
+				SEGMENT_TOOLS * parallel * each.unwrap() <= threads.max(SEGMENT_TOOLS),
+				"{threads}: {parallel} × {SEGMENT_TOOLS} × {each:?}"
 			);
 		}
 	}

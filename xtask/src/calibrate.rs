@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use cryarchiver_engine::budget::Lanes;
 use cryarchiver_engine::calibration::{Tables, parse, tables};
 use cryarchiver_engine::detect::{self, Detection, MediaClass};
 use cryarchiver_engine::options::TrimWindow;
@@ -284,6 +285,7 @@ async fn measure_video(
 			workspace: &workspace,
 			plan: &plan,
 			threads,
+			lanes: Lanes::SERIAL,
 			cancel,
 		};
 		let start = plan.encoder.crf();

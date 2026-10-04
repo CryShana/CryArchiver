@@ -13,6 +13,7 @@ use crate::audio::plan::{
 	mixed_languages_warning, plan_file_with, retarget, unusable,
 };
 use crate::audio::{cover, encode, tags, verify};
+use crate::budget::{Hold, Lanes, ThreadBudget, Width, cores};
 use crate::calibration::tables;
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
@@ -186,6 +187,8 @@ impl Drop for MemoryReservation<'_> {
 pub struct Engine {
 	tools: Toolchain,
 	video_slots: Semaphore,
+	video_jobs: usize,
+	budget: ThreadBudget,
 	image_threads: usize,
 	metric_threads: usize,
 	video_threads: Option<usize>,
@@ -255,7 +258,16 @@ struct EncodedTemps {
 	warnings: Vec<String>,
 }
 
+struct VideoResources<'a> {
+	_slot: SemaphorePermit<'a>,
+	_memory: Option<MemoryReservation<'a>>,
+	hold: Hold<'a>,
+	/// The memory the job reserved, which each tool run beside its own needs too.
+	lane_bytes: u64,
+}
+
 struct VideoInputs<'a> {
+	lanes: Lanes<'a>,
 	info: &'a MediaInfo,
 	streams: &'a StreamPlan,
 	declared_s: Option<f64>,
@@ -357,10 +369,12 @@ enum Lesson {
 
 impl Engine {
 	pub fn new(tools: Toolchain) -> Self {
-		let cores = std::thread::available_parallelism().map_or(1, usize::from);
+		let cores = cores();
 		Self {
 			tools,
 			video_slots: Semaphore::new(1),
+			video_jobs: 1,
+			budget: ThreadBudget::new(cores),
 			image_threads: cores,
 			metric_threads: cores,
 			video_threads: None,
@@ -394,8 +408,17 @@ impl Engine {
 	pub fn with_video_jobs(self, jobs: usize) -> Self {
 		Self {
 			video_slots: Semaphore::new(jobs.max(1)),
+			video_jobs: jobs.max(1),
 			..self
 		}
+	}
+
+	/// The threads all of the engine's jobs share (the whole machine by default). A video job's measuring widens
+	/// only into the part of it that the other jobs leave free.
+	#[must_use]
+	pub fn with_thread_budget(self, threads: usize) -> Self {
+		self.budget.resize(threads);
+		self
 	}
 
 	#[must_use]
@@ -709,6 +732,9 @@ impl Engine {
 		input: &ImageInput,
 		workspace: &Workspace,
 	) -> Result<Produced, JobError> {
+		let threads = self.job_threads(cx.job, self.image_threads);
+		let _hold = self.budget.hold(threads.min(self.budget.total()));
+
 		let image = ImageContext {
 			tools: &self.tools,
 			source: &cx.job.source,
@@ -718,7 +744,7 @@ impl Engine {
 			overrides: cx.job.overrides,
 			min_savings: cx.job.min_savings,
 			mode: metadata_mode(cx.job),
-			threads: self.job_threads(cx.job, self.image_threads),
+			threads,
 			caps: self.image_caps(),
 			on_event: cx.on_event,
 			cancel: cx.cancel,
@@ -786,13 +812,14 @@ impl Engine {
 		}
 	}
 
-	/// A video slot, then the memory for decoding at the source's size and at the output's.
+	/// A video slot, then the memory for decoding at the source's size and at the output's, and the job's share of the
+	/// thread budget.
 	async fn video_resources(
 		&self,
 		cx: &Context<'_>,
 		main: &Stream,
 		size: Option<(u32, u32)>,
-	) -> Result<(SemaphorePermit<'_>, Option<MemoryReservation<'_>>), JobError> {
+	) -> Result<VideoResources<'_>, JobError> {
 		(cx.on_event)(JobEvent::Stage(Stage::Queued));
 		let slot = tokio::select! {
 			slot = self.video_slots.acquire() => slot.expect("the semaphore is never closed"),
@@ -804,10 +831,36 @@ impl Engine {
 			decoded.max(video_plan::memory_estimate(width, height))
 		});
 		let memory = self.reserve_memory(estimate, cx.on_event, cx.cancel).await?;
-		Ok((slot, memory))
+		let share = self
+			.tool_threads(cx.job)
+			.unwrap_or_else(|| self.budget.total() / self.video_jobs);
+		Ok(VideoResources {
+			_slot: slot,
+			_memory: memory,
+			hold: self.budget.hold(share.max(1)),
+			lane_bytes: estimate,
+		})
 	}
 
-	async fn analyze_main(&self, cx: &Context<'_>, main: &Stream, span: Span) -> Result<Analysis, JobError> {
+	/// Measuring within the job's own thread budget when it has one, and otherwise within its share of the engine's,
+	/// widened into what the other jobs leave free.
+	fn lanes<'a>(&'a self, job: &Job, resources: &'a VideoResources<'a>) -> Lanes<'a> {
+		Lanes {
+			width: self
+				.tool_threads(job)
+				.map_or(Width::Shared(&resources.hold), Width::Fixed),
+			memory: self.memory_gate.as_deref(),
+			lane_bytes: resources.lane_bytes,
+		}
+	}
+
+	async fn analyze_main(
+		&self,
+		cx: &Context<'_>,
+		main: &Stream,
+		span: Span,
+		lanes: Lanes<'_>,
+	) -> Result<Analysis, JobError> {
 		(cx.on_event)(JobEvent::Stage(Stage::Analyze));
 		let segments = video_quality::analysis_segments(cx.job.speed, span.length_s);
 		let on_segments = |done, total| (cx.on_event)(JobEvent::Parts { done, total });
@@ -816,7 +869,7 @@ impl Engine {
 			&cx.job.source,
 			main,
 			(span.declared_s, span.window),
-			(segments, self.tool_threads(cx.job)),
+			(segments, lanes),
 			&on_segments,
 			cx.cancel,
 		))
@@ -825,13 +878,11 @@ impl Engine {
 
 	/// The thread budget of the tools a video job starts, when the engine or the job sets one.
 	fn tool_threads(&self, job: &Job) -> Option<usize> {
-		let cores = std::thread::available_parallelism().map_or(1, usize::from);
-		(self.video_threads.is_some() || job.options.threads.is_some()).then(|| self.job_threads(job, cores))
+		(self.video_threads.is_some() || job.options.threads.is_some()).then(|| self.job_threads(job, cores()))
 	}
 
 	fn budget_threads(&self, job: &Job, video: &mut VideoPlan) {
-		let cores = std::thread::available_parallelism().map_or(1, usize::from);
-		video.threads = self.tool_threads(job).map(|threads| threads_for(threads, cores));
+		video.threads = self.tool_threads(job).map(|threads| threads_for(threads, cores()));
 	}
 
 	/// Sets the trim window and the frame count the encode must give: none under a trim, and otherwise the
@@ -862,6 +913,8 @@ impl Engine {
 		(from_video, skipped): (bool, &[String]),
 		workspace: &Workspace,
 	) -> Result<Produced, JobError> {
+		// An audio encode keeps about one core busy.
+		let _hold = self.budget.hold(1);
 		let output = workspace.file(&format!("out.{}", plan.container.extension));
 		let mut plan = with_clipped_chapters(plan, info, workspace)?;
 		plan.options.titles = encoded_titles(info, &plan.tracks);
@@ -1004,8 +1057,9 @@ impl Engine {
 			.await
 			.map_err(video_probe_error)?;
 
-		let _resources = self.video_resources(cx, main, size).await?;
-		let analysis = Box::pin(self.analyze_main(cx, main, span)).await?;
+		let resources = self.video_resources(cx, main, size).await?;
+		let lanes = self.lanes(cx.job, &resources);
+		let analysis = Box::pin(self.analyze_main(cx, main, span, lanes)).await?;
 		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed, size);
 		video.warnings.extend(size.and_then(|size| upscaled(shown, size)));
 		self.budget_threads(cx.job, &mut video);
@@ -1057,6 +1111,7 @@ impl Engine {
 		}
 
 		let inputs = VideoInputs {
+			lanes,
 			info: &info,
 			streams: &streams,
 			declared_s: span_s,
@@ -1205,8 +1260,8 @@ impl Engine {
 			.await
 			.map_err(video_probe_error)?;
 
-		let _resources = self.video_resources(cx, main, size).await?;
-		let analysis = Box::pin(self.analyze_main(cx, main, span)).await?;
+		let resources = self.video_resources(cx, main, size).await?;
+		let analysis = Box::pin(self.analyze_main(cx, main, span, self.lanes(cx.job, &resources))).await?;
 		let frame_count = estimated_frames(span, main.fps(), analysis.scan);
 		check_frame_count(frame_count)?;
 
@@ -1517,13 +1572,20 @@ impl Engine {
 		})
 	}
 
-	fn scorer<'a>(&'a self, cx: &'a Context<'_>, workspace: &'a Workspace, video: &'a VideoPlan) -> Scorer<'a> {
+	fn scorer<'a>(
+		&'a self,
+		cx: &'a Context<'_>,
+		workspace: &'a Workspace,
+		video: &'a VideoPlan,
+		lanes: Lanes<'a>,
+	) -> Scorer<'a> {
 		Scorer {
 			tools: &self.tools,
 			source: &cx.job.source,
 			workspace,
 			plan: video,
 			threads: self.job_threads(cx.job, self.metric_threads),
+			lanes,
 			cancel: cx.cancel,
 		}
 	}
@@ -1593,7 +1655,7 @@ impl Engine {
 		let probes_run = &AtomicUsize::new(0);
 		let progress = |pass: usize| search_events(cx.on_event, (pass, passes), probes_run);
 		let first = {
-			let scorer = self.scorer(cx, workspace, video);
+			let scorer = self.scorer(cx, workspace, video, inputs.lanes);
 			let aim = quality.aim(quality.target, inputs.declared_s, None);
 			Box::pin(video_quality::search(
 				&scorer,
@@ -1621,7 +1683,7 @@ impl Engine {
 			let grain_probes = cx.record.probe_count();
 
 			let plain = {
-				let scorer = self.scorer(cx, workspace, &plain_video);
+				let scorer = self.scorer(cx, workspace, &plain_video, inputs.lanes);
 				Box::pin(video_quality::search_below(
 					&scorer,
 					samples,
@@ -1718,7 +1780,7 @@ impl Engine {
 		loop {
 			(cx.on_event)(JobEvent::Stage(Stage::Verify));
 			let score = {
-				let scorer = self.scorer(cx, workspace, video);
+				let scorer = self.scorer(cx, workspace, video, inputs.lanes);
 				let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
 				Box::pin(scorer.verify(
 					&temps.video.path,
