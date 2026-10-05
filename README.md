@@ -103,6 +103,8 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, the aspect rat
 | `-q, --quiet` | Only print failures and the summary | off |
 | `-v, --verbose` | Show warnings as they happen and 20 lines of a failed tool's output | off |
 
+`--threads` bounds sustained CPU use; only `--cpu-limit` or a project's performance limit, where the system can apply it live, also caps momentary peaks.
+
 Hidden advanced options (`--help` lists them): `--crf N` encodes video at a fixed CRF without the quality search (the quality isn't measured, and it can't be combined with `--video-vmaf`), `--video-encoder svt-av1|aom`, `--image-encoder avif|jxl|jxl-lossless`.
 
 A plain run writes nothing but its outputs: no settings file, no cache and no log files. Errors are printed to the console; redirect the output to keep it. Locked files, files still being written, crashed or stalled tools and a full disk are retried automatically, up to three attempts; a crashed or out-of-memory tool is retried with half the threads it ran on, in plain runs and projects alike. A quality miss is not an error and is never retried.

@@ -654,7 +654,7 @@ impl Scorer<'_> {
 			let elapsed_s = started.elapsed().as_secs_f64();
 
 			let log = format!("vmaf-probe{round}-{index}.json");
-			let scoring = self.lane_scoring(&log, lane);
+			let scoring = self.scoring(&log, Scored::Samples(lane));
 			let cmd = vmaf::sample_command(
 				&self.tools.ffmpeg,
 				&output,
@@ -722,7 +722,7 @@ impl Scorer<'_> {
 		total_frames: u64,
 		mut on_fraction: impl FnMut(f64),
 	) -> Result<Vec<f64>, JobError> {
-		let scoring = self.scoring(VERIFY_LOG);
+		let scoring = self.scoring(VERIFY_LOG, Scored::Whole);
 		let cmd = vmaf::whole_command(&self.tools.ffmpeg, temp, &self.reference(), every, &scoring);
 
 		vmaf::frames(
@@ -752,16 +752,8 @@ impl Scorer<'_> {
 		}
 	}
 
-	fn scoring<'b>(&'b self, log: &'b str) -> Scoring<'b> {
-		self.lane_scoring(log, None)
-	}
-
-	/// Scoring on a lane's threads, or else on the job's.
-	fn lane_scoring<'b>(&'b self, log: &'b str, lane: Option<usize>) -> Scoring<'b> {
-		let (threads, budget) = match lane.map(lane_vmaf_threads) {
-			Some((vmaf, decoders)) => (vmaf, Some(decoders)),
-			None => (self.threads, self.plan.threads.map(|threads| threads.tool)),
-		};
+	fn scoring<'b>(&'b self, log: &'b str, scored: Scored) -> Scoring<'b> {
+		let (threads, budget) = scoring_threads(scored, self.plan.threads.map(|threads| threads.tool), self.threads);
 
 		Scoring {
 			model: vmaf::model_for(self.plan.width, self.plan.height),
@@ -778,6 +770,32 @@ impl Scorer<'_> {
 /// gets all but one and the decoders a quarter (3.4–3.9 of 4, 7.5–7.8 of 8).
 fn lane_vmaf_threads(lane: usize) -> (usize, usize) {
 	(lane.saturating_sub(1).max(1), (lane / 4).max(1))
+}
+
+/// libvmaf's threads and each decoder's in a whole-video check of `budget` threads. It scores only every few frames but
+/// decodes every frame of both files, so the decoders weigh far more than in a sample: half each fits 8 threads
+/// (6.8–7.0 and 7.6–7.7 cores at 1080p60, from a light source and a heavy one).
+fn whole_vmaf_threads(budget: usize) -> (usize, usize) {
+	((budget / 2).max(1), (budget / 2).max(1))
+}
+
+/// What a scoring run measures.
+#[derive(Debug, Clone, Copy)]
+enum Scored {
+	/// Samples, on a lane of this many threads, or else on the job's.
+	Samples(Option<usize>),
+	Whole,
+}
+
+/// libvmaf's threads and each decoder's cap: a lane's split of its threads, a split of the job's thread budget when
+/// there is no lane but a budget, and otherwise libvmaf on the job's threads beside uncapped decoders.
+fn scoring_threads(scored: Scored, budget: Option<usize>, job: usize) -> (usize, Option<usize>) {
+	let split = match scored {
+		Scored::Samples(lane) => lane.or(budget).map(lane_vmaf_threads),
+		Scored::Whole => budget.map(whole_vmaf_threads),
+	};
+
+	split.map_or((job, None), |(vmaf, decoders)| (vmaf, Some(decoders)))
 }
 
 pub async fn search(
@@ -1586,6 +1604,28 @@ mod tests {
 			[1, 2, 4, 8, 16].map(lane_vmaf_threads),
 			[(1, 1), (1, 1), (3, 1), (7, 2), (15, 4)]
 		);
+	}
+
+	#[test]
+	fn under_a_thread_budget_the_whole_check_splits_it_in_half_and_samples_like_a_lane() {
+		assert_eq!(
+			[1, 2, 3, 8, 16].map(whole_vmaf_threads),
+			[(1, 1), (1, 1), (1, 1), (4, 4), (8, 8)]
+		);
+
+		assert_eq!(scoring_threads(Scored::Whole, Some(8), 32), (4, Some(4)));
+		assert_eq!(scoring_threads(Scored::Whole, Some(1), 32), (1, Some(1)));
+		assert_eq!(scoring_threads(Scored::Samples(None), Some(8), 32), (7, Some(2)));
+		assert_eq!(scoring_threads(Scored::Samples(None), Some(4), 32), (3, Some(1)));
+		assert_eq!(
+			scoring_threads(Scored::Samples(Some(4)), Some(8), 32),
+			(3, Some(1)),
+			"a lane's own width"
+		);
+		assert_eq!(scoring_threads(Scored::Samples(Some(8)), None, 32), (7, Some(2)));
+
+		assert_eq!(scoring_threads(Scored::Whole, None, 32), (32, None));
+		assert_eq!(scoring_threads(Scored::Samples(None), None, 32), (32, None));
 	}
 
 	#[test]

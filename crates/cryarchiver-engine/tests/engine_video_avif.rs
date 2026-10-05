@@ -162,6 +162,48 @@ async fn a_60p_video_becomes_an_animated_avif_with_every_frame_at_its_rate() {
 }
 
 #[tokio::test]
+async fn an_animation_without_a_thread_budget_holds_the_whole_pool_while_it_encodes() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = clip(
+		dir.path(),
+		"clip.mp4",
+		"testsrc2=s=320x240:r=10:d=1",
+		&["-c:v", "mpeg4", "-q:v", "2"],
+	);
+	let engine = Engine::new(support::toolchain().await)
+		.with_video_jobs(2)
+		.with_thread_budget(8);
+	let sink = CliSink {
+		output_dir: Some(dir.path().to_path_buf()),
+		output_file: None,
+		overwrite: false,
+	};
+	let held = Mutex::new(Vec::new());
+
+	let outcome = engine
+		.run(
+			&as_avif(&source, JobOptions::default()),
+			&sink,
+			&|event| {
+				if let JobEvent::Stage(stage @ (Stage::Encode | Stage::Verify)) = event {
+					held.lock().unwrap().push((stage, engine.thread_budget().in_use()));
+				}
+			},
+			&CancellationToken::new(),
+		)
+		.await;
+
+	written(&outcome);
+	let held = held.into_inner().unwrap();
+	assert!(held.iter().any(|(stage, _)| *stage == Stage::Encode), "{held:?}");
+	assert!(
+		held.iter().all(|(_, in_use)| *in_use == 8),
+		"its share of 4 raised to the whole 8: {held:?}"
+	);
+	assert_eq!(engine.thread_budget().in_use(), 0, "all of it given back after the job");
+}
+
+#[tokio::test]
 async fn audio_and_subtitles_are_dropped_with_one_folded_warning_each() {
 	let dir = tempfile::tempdir().unwrap();
 	let cues = dir.path().join("cues.srt");

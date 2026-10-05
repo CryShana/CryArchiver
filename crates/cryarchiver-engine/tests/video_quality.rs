@@ -18,7 +18,7 @@ use cryarchiver_engine::video::analyze::{
 };
 use cryarchiver_engine::video::burn;
 use cryarchiver_engine::video::encode::{Sample, encode_sample, encode_video, video_command};
-use cryarchiver_engine::video::plan::{VideoCaps, VideoPlan, plan_video, precheck};
+use cryarchiver_engine::video::plan::{VideoCaps, VideoPlan, plan_video, precheck, threads_for};
 use cryarchiver_engine::video::quality::{
 	Aim, Scorer, SearchStep, Searched, search, search_below, search_samples, subsample, target,
 };
@@ -433,6 +433,52 @@ async fn the_sampled_check_of_a_24_fps_encode_scores_like_every_frame() {
 		(sampled.p5 - all.p5).abs() < 0.3 && (sampled.mean - all.mean).abs() < 0.2,
 		"every third frame {sampled:?} against every frame {all:?}"
 	);
+}
+
+#[tokio::test]
+async fn a_check_split_to_fit_a_thread_budget_scores_every_frame_as_one_without() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let clip = dir.path().join("noisy.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=1280x720:r=30:d=4,noise=alls=10:allf=t",
+		"-c:v",
+		"libx264",
+		"-crf",
+		"16",
+		clip.to_str().unwrap(),
+	]);
+	let cancel = CancellationToken::new();
+	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
+	let free = plan_for(&tools, &clip).await;
+	let budgeted = VideoPlan {
+		threads: Some(threads_for(8)),
+		..free.clone()
+	};
+	let temp = workspace.file("video.a1.mkv");
+	let cmd = video_command(&tools.ffmpeg, &clip, &temp, &free);
+	let encoded = encode_video(&cmd, &free, Some(4.0), |_| {}, &cancel).await.unwrap();
+	let scores = async |plan: &VideoPlan| {
+		let scorer = Scorer {
+			tools: &tools,
+			source: &clip,
+			workspace: &workspace,
+			plan,
+			threads: 8,
+			lanes: Lanes::SERIAL,
+			cancel: &cancel,
+		};
+		scorer.whole_scores(&temp, 1, encoded.frames, |_| {}).await.unwrap()
+	};
+
+	let unsplit = scores(&free).await;
+	let split = scores(&budgeted).await;
+
+	assert_eq!(unsplit.len(), 120);
+	assert_eq!(split, unsplit);
 }
 
 #[tokio::test]

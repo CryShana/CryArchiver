@@ -441,6 +441,11 @@ impl Engine {
 		}
 	}
 
+	/// The threads the engine's jobs share, and what they hold of them.
+	pub fn thread_budget(&self) -> &ThreadBudget {
+		&self.budget
+	}
+
 	fn job_threads(&self, job: &Job, fallback: usize) -> usize {
 		thread_budget(self.video_threads, job.options.threads, fallback)
 	}
@@ -1263,7 +1268,8 @@ impl Engine {
 			.map_err(video_probe_error)?;
 
 		let resources = self.video_resources(cx, main, size).await?;
-		let analysis = Box::pin(self.analyze_main(cx, main, span, self.lanes(cx.job, &resources))).await?;
+		let lanes = self.lanes(cx.job, &resources);
+		let analysis = Box::pin(self.analyze_main(cx, main, span, lanes)).await?;
 		let frame_count = estimated_frames(span, main.fps(), analysis.scan);
 		check_frame_count(frame_count)?;
 
@@ -1296,6 +1302,7 @@ impl Engine {
 		let compared = share.unwrap_or(cx.source_bytes);
 		cx.record.update(|decision| decision.source_bytes = Some(compared));
 
+		let _uncapped = lanes.uncapped_stage();
 		let frames_need = match frame_count {
 			Some(frames) => {
 				let raw = frames_bytes(frames, &video, format);

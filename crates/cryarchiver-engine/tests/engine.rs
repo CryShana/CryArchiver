@@ -2866,6 +2866,43 @@ async fn a_thread_limit_changes_how_svt_runs_but_not_one_bit_of_the_video() {
 	}
 }
 
+#[tokio::test]
+async fn a_video_without_a_thread_budget_holds_the_whole_pool_from_its_encode_through_its_checks() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let engine = Engine::new(support::toolchain().await)
+		.with_video_jobs(2)
+		.with_thread_budget(8);
+	let held = Mutex::new(Vec::new());
+
+	let outcome = engine
+		.run(
+			&fast_keeping_any_saving(&clip),
+			&sink(dir.path()),
+			&|event| {
+				if let JobEvent::Stage(stage @ (Stage::Encode | Stage::Verify)) = event {
+					held.lock().unwrap().push((stage, engine.thread_budget().in_use()));
+				}
+			},
+			&CancellationToken::new(),
+		)
+		.await;
+
+	assert!(matches!(outcome, JobOutcome::Encoded { .. }), "{outcome:?}");
+	let held = held.into_inner().unwrap();
+	assert!(
+		[Stage::Encode, Stage::Verify]
+			.iter()
+			.all(|wanted| held.iter().any(|(stage, _)| stage == wanted)),
+		"{held:?}"
+	);
+	assert!(
+		held.iter().all(|(_, in_use)| *in_use == 8),
+		"its share of 4 raised to the whole 8: {held:?}"
+	);
+	assert_eq!(engine.thread_budget().in_use(), 0, "all of it given back after the job");
+}
+
 async fn learned_group(dir: &Path, setting: f64) -> SharedMemory {
 	let first = support::mpeg4(dir, "first.mp4", 3);
 	let learned = Arc::new(SharedMemory::default());
