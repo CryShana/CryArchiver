@@ -29,6 +29,7 @@ lofty.workspace = true
 moxcms.workspace = true
 process-wrap.workspace = true
 quick-xml.workspace = true
+rav1e.workspace = true
 ravif.workspace = true
 rayon.workspace = true
 rgb.workspace = true

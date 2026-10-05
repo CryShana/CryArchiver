@@ -9,10 +9,11 @@ use cryarchiver_engine::container::avif::{
 };
 use cryarchiver_engine::container::isobmff::{EntityGroup, Meta, Nclx, Property, brands, parse_meta};
 use cryarchiver_engine::images::avif::encode;
+use cryarchiver_engine::images::gain_map;
 use cryarchiver_engine::images::plan::RavifSettings;
 use cryarchiver_engine::metadata::gain_map::GainMapMetadata;
 use cryarchiver_engine::metadata::icc::Cicp;
-use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
+use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgb, Rgba};
 use moxcms::ColorProfile;
 use support::replaced;
 use support::ultra_hdr::UltraHdrOptions;
@@ -293,11 +294,18 @@ fn without_a_gain_map_the_output_bytes_stay_as_before() {
 	assert_eq!(fingerprint(&with_alpha), (560, 213_443_570));
 }
 
+fn gain_map_levels(width: u32, height: u32) -> GrayImage {
+	GrayImage::from_fn(width, height, |x, y| {
+		Luma([u8::try_from((x * 7 + y * 11) % 256).unwrap()])
+	})
+}
+
 fn grey_gain_map(width: u32, height: u32) -> Vec<u8> {
-	let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(width, height, |x, y| {
-		let level = u8::try_from((x * 7 + y * 11) % 256).unwrap();
-		Rgb([level, level, level])
-	}));
+	gain_map::encode(&gain_map_levels(width, height), 60.0, 10, 1).unwrap()
+}
+
+fn ravif_gain_map(width: u32, height: u32) -> Vec<u8> {
+	let image = DynamicImage::ImageLuma8(gain_map_levels(width, height));
 	encode(&image, false, QUICK, 1).unwrap()
 }
 
@@ -313,12 +321,19 @@ fn expectations<'a>(metadata: AvifMetadata<'a>, gain_map: Option<&'a GainMapMeta
 		cicp: Cicp::SRGB,
 		metadata,
 		gain_map,
-		gain_map_coded_cicp: false,
+		gain_map_coded_cicp: true,
 	}
 }
 
 fn with_gain_map(metadata: &AvifMetadata<'_>, gain_map: &GainMapMetadata) -> (Vec<u8>, Vec<u8>) {
-	let gain_map_avif = grey_gain_map(6, 4);
+	with_encoded_gain_map(metadata, gain_map, grey_gain_map(6, 4))
+}
+
+fn with_encoded_gain_map(
+	metadata: &AvifMetadata<'_>,
+	gain_map: &GainMapMetadata,
+	gain_map_avif: Vec<u8>,
+) -> (Vec<u8>, Vec<u8>) {
 	let input = GainMapInput {
 		encoded: &gain_map_avif,
 		metadata: gain_map,
@@ -530,17 +545,22 @@ fn check_refuses_tone_map_and_gain_map_items_that_break_libavifs_rules() {
 #[test]
 fn the_coded_gain_map_cicp_check_refuses_ravifs_described_header() {
 	let metadata = gain_map_metadata();
-	let (avif, _) = with_gain_map(&AvifMetadata::default(), &metadata);
+	let (avif, _) = with_encoded_gain_map(&AvifMetadata::default(), &metadata, ravif_gain_map(6, 4));
+	let (ours, _) = with_gain_map(&AvifMetadata::default(), &metadata);
 	let header = read_sequence_header(&gain_map_av1(&avif).unwrap()).unwrap();
+	let our_header = read_sequence_header(&gain_map_av1(&ours).unwrap()).unwrap();
 
-	let strict = AvifExpectations {
-		gain_map_coded_cicp: true,
-		..expectations(AvifMetadata::default(), Some(&metadata))
+	let strict = expectations(AvifMetadata::default(), Some(&metadata));
+	let lenient = AvifExpectations {
+		gain_map_coded_cicp: false,
+		..strict
 	};
 
 	assert_eq!((header.primaries, header.transfer), (Some(1), Some(13)));
 	assert!(check(&avif, &strict).unwrap_err().contains("sequence header"));
-	check(&avif, &expectations(AvifMetadata::default(), Some(&metadata))).unwrap();
+	check(&avif, &lenient).unwrap();
+	assert_eq!((our_header.primaries, our_header.transfer), (Some(2), Some(2)));
+	check(&ours, &strict).unwrap();
 }
 
 #[test]

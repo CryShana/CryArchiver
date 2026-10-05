@@ -703,6 +703,7 @@ dependencies = [
  "moxcms",
  "process-wrap",
  "quick-xml",
+ "rav1e",
  "ravif",
  "rayon",
  "rgb",

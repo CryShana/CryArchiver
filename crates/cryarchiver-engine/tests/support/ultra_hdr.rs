@@ -70,7 +70,10 @@ impl Default for UltraHdrOptions {
 	}
 }
 
-pub fn ultra_hdr_jpeg(base: &image::RgbImage, gain: &image::GrayImage, opts: &UltraHdrOptions) -> Vec<u8> {
+pub fn ultra_hdr_jpeg<G: GenericImageView>(base: &image::RgbImage, gain: &G, opts: &UltraHdrOptions) -> Vec<u8>
+where
+	G::Pixel: PixelWithColorType,
+{
 	let gain_map = gain_map_jpeg(gain, opts);
 	let base_jpeg = encode(base);
 
@@ -107,7 +110,10 @@ pub fn ultra_hdr_jpeg(base: &image::RgbImage, gain: &image::GrayImage, opts: &Ul
 	.concat()
 }
 
-fn gain_map_jpeg(gain: &image::GrayImage, opts: &UltraHdrOptions) -> Vec<u8> {
+fn gain_map_jpeg<G: GenericImageView>(gain: &G, opts: &UltraHdrOptions) -> Vec<u8>
+where
+	G::Pixel: PixelWithColorType,
+{
 	let encoded = encode(gain);
 
 	let mut out = vec![0xFF, 0xD8];

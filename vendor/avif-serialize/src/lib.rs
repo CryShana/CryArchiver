@@ -314,14 +314,14 @@ impl Aviffy {
         })).ok_or(io::ErrorKind::InvalidInput)?;
 
         // Useless bloat
-        let pixi_3 = ipco.push(IpcoProp::Pixi(PixiBox {
-            channels: 3,
+        let pixi_color = ipco.push(IpcoProp::Pixi(PixiBox {
+            channels: if self.monochrome { 1 } else { 3 },
             depth: color_depth_bits,
         })).ok_or(io::ErrorKind::InvalidInput)?;
 
         let mut ipma = IpmaEntry {
             item_id: color_image_id,
-            prop_ids: from_array([ispe_prop, av1c_color_prop | ESSENTIAL_BIT, pixi_3]),
+            prop_ids: from_array([ispe_prop, av1c_color_prop | ESSENTIAL_BIT, pixi_color]),
         };
 
         if let Some(icc) = &self.icc {

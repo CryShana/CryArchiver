@@ -1,6 +1,7 @@
 pub mod animated;
 pub mod avif;
 pub mod decode;
+pub mod gain_map;
 pub mod job;
 pub mod jxl;
 pub mod plan;
