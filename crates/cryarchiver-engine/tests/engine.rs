@@ -1323,12 +1323,37 @@ async fn garbage_in_the_middle_of_an_mp4_is_carried_over_with_a_warning() {
 async fn a_video_whose_container_lists_frames_that_dont_decode_keeps_the_frames_that_do() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::undecodable_packets_clip(dir.path(), "paused.mp4");
+	let events = Mutex::new(Vec::new());
 
-	let outcome = run(&fast_keeping_any_saving(&clip), dir.path()).await;
+	let outcome = Engine::new(support::toolchain().await)
+		.run(
+			&fast_keeping_any_saving(&clip),
+			&sink(dir.path()),
+			&|event| events.lock().unwrap().push(event),
+			&CancellationToken::new(),
+		)
+		.await;
 
 	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
 		panic!("{outcome:?}")
 	};
+	let events = events.into_inner().unwrap();
+	let first_encode = events
+		.iter()
+		.position(|event| *event == JobEvent::Stage(Stage::Encode))
+		.unwrap();
+	let counting = &events[first_encode..];
+	let shown = counting
+		.iter()
+		.position(|event| *event == JobEvent::Stage(Stage::Verify))
+		.unwrap();
+	let back = shown
+		+ 1 + counting[shown + 1..]
+		.iter()
+		.position(|event| matches!(event, JobEvent::Stage(_)))
+		.unwrap();
+	assert_eq!(counting[back], JobEvent::Stage(Stage::Encode), "{counting:?}");
+	assert_eq!(counting[back - 1], JobEvent::Progress(0.92), "{counting:?}");
 	assert!(
 		warnings.contains(&"the source has 8 video frames that don't decode; the 92 that do were kept".to_owned()),
 		"{warnings:?}"

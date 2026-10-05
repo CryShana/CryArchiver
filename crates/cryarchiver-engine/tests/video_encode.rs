@@ -13,8 +13,7 @@ use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, ScanType,
 use cryarchiver_engine::video::burn::{self, FONT_DIR, SUBTITLE_FILE};
 use cryarchiver_engine::video::colour::{ColourTags, Range, alpha_conversion, output_tags};
 use cryarchiver_engine::video::encode::{
-	TempCheck, check_video_temp, decoded_frames, encode_video, extract, inspect_video_temp, undecodable_frames,
-	video_command,
+	EncodedVideo, TempCheck, check_video_temp, decoded_frames, encode_video, extract, undecodable_frames, video_command,
 };
 use cryarchiver_engine::video::plan::{
 	Encoder, VideoCaps, VideoPlan, grain_level, plan_video, precheck, synthesized_grain, usable_main,
@@ -80,7 +79,10 @@ async fn encodes_the_video_temp_and_reports_frames_and_duration() {
 	assert_eq!(encoded.frames, 50);
 	assert!((encoded.decoded_s - 2.0).abs() < 0.1, "{encoded:?}");
 	assert_eq!(encoded.decode_errors, 0);
-	assert_eq!(check_video_temp(&video, &encoded, Some(2.0), 0.0, None).unwrap(), None);
+	assert_eq!(
+		check_video_temp(&video, &encoded, Some(2.0), 0.0, None).unwrap(),
+		TempCheck::Passed(None)
+	);
 	assert!(fractions.last().is_some_and(|last| *last > 0.9), "{fractions:?}");
 	let info = probe(&tools, &output, &CancellationToken::new()).await.unwrap();
 	assert_eq!(info.streams.len(), 1);
@@ -235,35 +237,49 @@ async fn a_short_encode_is_kept_only_when_the_source_decodes_to_as_few_frames() 
 		shape: "select=lt(n\\,80)".into(),
 		..plan(Some(100))
 	};
+	let undecodable = VideoPlan {
+		decoder: Some("no-such-decoder"),
+		..plan(Some(100))
+	};
 
-	let decoded = decoded_frames(&tools.ffmpeg, &clip, &whole, &cancel).await.unwrap();
-	let mut decisions = Vec::new();
+	let mut counted = Vec::new();
+	let decoded = decoded_frames(&tools.ffmpeg, &clip, &whole, |frames| counted.push(frames), &cancel)
+		.await
+		.unwrap();
+	let uncounted = decoded_frames(&tools.ffmpeg, &clip, &undecodable, |_| {}, &cancel)
+		.await
+		.unwrap();
+	let mut shortfalls = Vec::new();
 	for (name, video) in [("whole.mkv", &whole), ("losing.mkv", &losing)] {
 		let cmd = video_command(&tools.ffmpeg, &clip, &dir.path().join(name), video);
 		let encoded = encode_video(&cmd, video, Some(4.0), |_| {}, &cancel).await.unwrap();
-		let checked = inspect_video_temp(video, &encoded, Some(4.0), 0.0, Some(25.0)).unwrap();
+		let checked = check_video_temp(video, &encoded, Some(4.0), 0.0, Some(25.0)).unwrap();
 		let TempCheck::FewerFrames { expected } = checked else {
 			panic!("{name}: {checked:?}")
 		};
-		decisions.push(undecodable_frames(
-			video,
-			&encoded,
-			expected,
-			decoded,
-			ScanType::Progressive,
-		));
+		shortfalls.push((video, encoded, expected));
 	}
+	let decide = |(video, encoded, expected): &(&VideoPlan, EncodedVideo, u64), count| {
+		undecodable_frames(video, encoded, *expected, count, ScanType::Progressive)
+	};
 
-	assert_eq!(decoded, 92);
+	assert_eq!(decoded, Some(92));
+	assert_eq!(counted.last(), Some(&92));
+	assert_eq!(uncounted, None);
 	assert_eq!(
-		decisions[0].as_deref().unwrap(),
+		decide(&shortfalls[0], decoded).unwrap(),
 		"the source has 8 video frames that don't decode; the 92 that do were kept"
 	);
-	assert!(
-		matches!(&decisions[1], Err(err) if matches!(&err.kind, ErrorKind::EncodeFailed(reason) if reason == "the video has 80 frames, 100 expected")),
-		"{:?}",
-		decisions[1]
-	);
+	for (shortfall, count, reason) in [
+		(&shortfalls[0], uncounted, "the video has 92 frames, 100 expected"),
+		(&shortfalls[1], decoded, "the video has 80 frames, 100 expected"),
+	] {
+		let decision = decide(shortfall, count);
+		assert!(
+			matches!(&decision, Err(err) if err.kind == ErrorKind::EncodeFailed(reason.to_owned())),
+			"{decision:?}"
+		);
+	}
 }
 
 #[tokio::test]

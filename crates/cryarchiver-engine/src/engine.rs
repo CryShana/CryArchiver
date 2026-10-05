@@ -300,7 +300,8 @@ struct VideoInputs<'a> {
 /// fewer frames than the plan expects.
 struct SourceFrames {
 	scan: ScanType,
-	decoded: OnceLock<u64>,
+	/// `None` when the decode failed.
+	decoded: OnceLock<Option<u64>>,
 }
 
 impl SourceFrames {
@@ -1972,10 +1973,10 @@ impl Engine {
 		let start_s = earliest_video_start(&info).unwrap_or(0.0);
 		let fps = info.real_video_streams().next().and_then(Stream::fps);
 
-		let warning = match video_encode::inspect_video_temp(video, encoded, declared_s, start_s, fps)? {
+		let warning = match video_encode::check_video_temp(video, encoded, declared_s, start_s, fps)? {
 			TempCheck::Passed(warning) => warning,
 			TempCheck::FewerFrames { expected } => {
-				let decoded = self.decoded_source_frames(cx, video, source_frames).await?;
+				let decoded = self.decoded_source_frames(cx, video, expected, source_frames).await?;
 				Some(video_encode::undecodable_frames(
 					video,
 					encoded,
@@ -1988,17 +1989,28 @@ impl Engine {
 		Ok((Temp { path, info }, warning))
 	}
 
+	/// Shown as a check, with its progress towards the `expected` frames, before the stage goes back to encoding.
+	#[allow(clippy::cast_precision_loss)]
 	async fn decoded_source_frames(
 		&self,
 		cx: &Context<'_>,
 		video: &VideoPlan,
+		expected: u64,
 		source_frames: &SourceFrames,
-	) -> Result<u64, JobError> {
+	) -> Result<Option<u64>, JobError> {
 		if let Some(&decoded) = source_frames.decoded.get() {
 			return Ok(decoded);
 		}
 
-		let decoded = video_encode::decoded_frames(&self.tools.ffmpeg, &cx.job.source, video, cx.cancel).await?;
+		(cx.on_event)(JobEvent::Stage(Stage::Verify));
+		let on_frames = |frames| {
+			let fraction = video_plan::scanned_frames(frames, source_frames.scan) as f64 / expected as f64;
+			(cx.on_event)(JobEvent::Progress(fraction.clamp(0.0, 1.0)));
+		};
+		let decoded =
+			video_encode::decoded_frames(&self.tools.ffmpeg, &cx.job.source, video, on_frames, cx.cancel).await?;
+		(cx.on_event)(JobEvent::Stage(Stage::Encode));
+
 		Ok(*source_frames.decoded.get_or_init(|| decoded))
 	}
 

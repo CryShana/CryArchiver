@@ -464,22 +464,8 @@ pub enum TempCheck {
 	},
 }
 
-/// `inspect_video_temp`, with fewer frames than expected as a failure.
-pub fn check_video_temp(
-	plan: &VideoPlan,
-	encoded: &EncodedVideo,
-	declared_s: Option<f64>,
-	start_s: f64,
-	fps: Option<f64>,
-) -> Result<Option<String>, JobError> {
-	match inspect_video_temp(plan, encoded, declared_s, start_s, fps)? {
-		TempCheck::Passed(warning) => Ok(warning),
-		TempCheck::FewerFrames { expected } => Err(frame_count_error(encoded, expected)),
-	}
-}
-
 /// `fps` is the video temp's declared rate.
-pub fn inspect_video_temp(
+pub fn check_video_temp(
 	plan: &VideoPlan,
 	encoded: &EncodedVideo,
 	declared_s: Option<f64>,
@@ -526,23 +512,32 @@ pub fn inspect_video_temp(
 }
 
 /// An encode with fewer frames than the `expected` is kept when the source's main video itself decodes to about as
-/// many: `decoded` frames, counted by decoding only, which the plan's shape turns into frames as `scan` says.
+/// many: `decoded` frames, counted by decoding only, which the plan's shape turns into frames as `scan` says. Without
+/// a count, the shortfall stands.
 pub fn undecodable_frames(
 	plan: &VideoPlan,
 	encoded: &EncodedVideo,
 	expected: u64,
-	decoded: u64,
+	decoded: Option<u64>,
 	scan: ScanType,
 ) -> Result<String, JobError> {
-	let decoded = scanned_frames(decoded, scan);
+	let Some(decoded) = decoded.map(|decoded| scanned_frames(decoded, scan)) else {
+		return Err(frame_count_error(encoded, expected));
+	};
+
 	if encoded.frames.abs_diff(decoded) > plan.frame_tolerance {
 		return Err(frame_count_error(encoded, expected));
 	}
 
+	// Deinterlacing makes a frame of each field; the note counts the source's frames.
+	let per_source_frame = match scan {
+		ScanType::Interlaced { .. } => 2,
+		ScanType::Progressive | ScanType::Telecined => 1,
+	};
 	Ok(format!(
 		"the source has {} video frames that don't decode; the {} that do were kept",
-		expected.saturating_sub(decoded),
-		encoded.frames
+		expected.saturating_sub(decoded) / per_source_frame,
+		encoded.frames.div_ceil(per_source_frame)
 	))
 }
 
@@ -561,15 +556,25 @@ pub fn decode_command(ffmpeg: &Path, source: &Path, plan: &VideoPlan) -> ToolCom
 	cmd
 }
 
-/// The frames the main video of `plan` decodes to from `source`.
+/// The frames the main video of `plan` decodes to from `source`, reported to `on_frames` as they decode; `None` when
+/// the decode fails. Only cancellation is an error.
 pub async fn decoded_frames(
 	ffmpeg: &Path,
 	source: &Path,
 	plan: &VideoPlan,
+	mut on_frames: impl FnMut(u64),
 	cancel: &CancellationToken,
-) -> Result<u64, JobError> {
-	let out = run_ffmpeg(&decode_command(ffmpeg, source, plan), |_| {}, cancel).await?;
-	Ok(out.last_progress.and_then(|progress| progress.frame).unwrap_or(0))
+) -> Result<Option<u64>, JobError> {
+	let on_progress = |progress: &process::Progress| {
+		if let Some(frame) = progress.frame {
+			on_frames(frame);
+		}
+	};
+	match run_ffmpeg(&decode_command(ffmpeg, source, plan), on_progress, cancel).await {
+		Ok(out) => Ok(Some(out.last_progress.and_then(|progress| progress.frame).unwrap_or(0))),
+		Err(err) if err.kind == ErrorKind::Cancelled => Err(err),
+		Err(_) => Ok(None),
+	}
 }
 
 // A declared duration is a length in MP4 but the end timestamp in Matroska's DURATION tag, and the video temp keeps
@@ -1423,7 +1428,7 @@ mod tests {
 		);
 		assert_eq!(
 			check_video_temp(&video, &encoded(505, 16.7, 0), Some(16.834), 0.0, None).unwrap(),
-			None
+			TempCheck::Passed(None)
 		);
 	}
 
@@ -1431,20 +1436,19 @@ mod tests {
 	fn frame_counts_are_checked_only_without_decoder_errors() {
 		let video = plan(svt(), Some(505));
 
-		assert!(matches!(
-			check_video_temp(&video, &encoded(496, 16.83, 0), Some(16.834), 0.0, None)
-				.unwrap_err()
-				.kind,
-			ErrorKind::EncodeFailed(_)
-		));
+		assert_eq!(
+			check_video_temp(&video, &encoded(496, 16.83, 0), Some(16.834), 0.0, None).unwrap(),
+			TempCheck::FewerFrames { expected: 505 }
+		);
 		assert_eq!(
 			check_video_temp(&video, &encoded(503, 16.83, 0), Some(16.834), 0.0, None).unwrap(),
-			None
+			TempCheck::Passed(None)
 		);
-		let warning = check_video_temp(&video, &encoded(496, 16.83, 41), Some(16.834), 0.0, None)
-			.unwrap()
-			.unwrap();
-		assert!(warning.contains("41 decoding errors"), "{warning}");
+		let checked = check_video_temp(&video, &encoded(496, 16.83, 41), Some(16.834), 0.0, None).unwrap();
+		assert!(
+			matches!(&checked, TempCheck::Passed(Some(warning)) if warning.contains("41 decoding errors")),
+			"{checked:?}"
+		);
 	}
 
 	#[test]
@@ -1462,7 +1466,7 @@ mod tests {
 
 		assert_eq!(
 			check_video_temp(&moved, &encoded(152, 6.571, 0), Some(6.24), 0.491, None).unwrap(),
-			None
+			TempCheck::Passed(None)
 		);
 		assert!(check_video_temp(&plan(svt(), None), &encoded(152, 6.571, 0), Some(6.24), 0.491, None).is_err());
 		assert!(check_video_temp(&moved, &encoded(140, 6.1, 0), Some(6.24), 0.491, None).is_err());
@@ -1474,30 +1478,28 @@ mod tests {
 
 		assert_eq!(
 			check_video_temp(&video, &encoded(117, 4.66, 0), Some(4.7), 0.0, None).unwrap(),
-			None
+			TempCheck::Passed(None)
 		);
 		assert_eq!(
 			check_video_temp(&video, &encoded(117, 5.98, 0), Some(4.7), 1.32, None).unwrap(),
-			None
+			TempCheck::Passed(None)
 		);
 		assert_eq!(
 			check_video_temp(&video, &encoded(75, 3.5, 0), Some(3.5), 0.5, None).unwrap(),
-			None
+			TempCheck::Passed(None)
 		);
 		let err = check_video_temp(&video, &encoded(100, 4.4, 0), Some(4.7), 0.0, None).unwrap_err();
 		assert!(
 			matches!(err.kind, ErrorKind::EncodeFailed(ref reason) if reason == "the video lasts 4.40 s, 4.70 s expected"),
 			"{err:?}"
 		);
-		assert_eq!(
-			check_video_temp(&video, &encoded(100, 4.4, 3), Some(4.7), 0.0, None)
-				.unwrap()
-				.map(|warning| warning.contains("3 decoding errors")),
-			Some(true)
-		);
+		assert!(matches!(
+			check_video_temp(&video, &encoded(100, 4.4, 3), Some(4.7), 0.0, None).unwrap(),
+			TempCheck::Passed(Some(warning)) if warning.contains("3 decoding errors")
+		));
 		assert_eq!(
 			check_video_temp(&video, &encoded(100, 4.4, 0), None, 0.0, None).unwrap(),
-			None
+			TempCheck::Passed(None)
 		);
 	}
 
@@ -1508,12 +1510,12 @@ mod tests {
 			check_video_temp(&video, &encoded(20, decoded_s, 0), Some(declared_s), 0.0, fps)
 		};
 
-		assert_eq!(check(1.4, 1.5, Some(10.0)).unwrap(), None);
-		assert_eq!(check(1.4, 1.5, None).unwrap(), None);
-		assert_eq!(check(3.8, 4.0, Some(5.0)).unwrap(), None);
+		assert_eq!(check(1.4, 1.5, Some(10.0)).unwrap(), TempCheck::Passed(None));
+		assert_eq!(check(1.4, 1.5, None).unwrap(), TempCheck::Passed(None));
+		assert_eq!(check(3.8, 4.0, Some(5.0)).unwrap(), TempCheck::Passed(None));
 		assert!(check(3.8, 4.0, None).is_err());
 		assert!(check(3.6, 4.0, Some(5.0)).is_err());
-		assert_eq!(check(7.5, 8.0, Some(2.0)).unwrap(), None);
+		assert_eq!(check(7.5, 8.0, Some(2.0)).unwrap(), TempCheck::Passed(None));
 	}
 
 	#[test]
@@ -1523,7 +1525,7 @@ mod tests {
 			check_video_temp(&video, &encoded(frames, decoded_s, 0), Some(20.0), 0.0, fps)
 		};
 
-		assert_eq!(check(10, 18.0, Some(0.5)).unwrap(), None);
+		assert_eq!(check(10, 18.0, Some(0.5)).unwrap(), TempCheck::Passed(None));
 		assert!(matches!(
 			check(9, 16.0, Some(0.5)).unwrap_err().kind,
 			ErrorKind::SourceDamaged(_)
@@ -1549,56 +1551,52 @@ mod tests {
 	#[test]
 	fn only_an_encode_short_of_the_expected_frames_asks_for_the_source_count() {
 		let video = plan(svt(), Some(674));
-		let inspect = |encoded: EncodedVideo| inspect_video_temp(&video, &encoded, Some(11.23), 0.0, Some(60.0));
+		let check = |encoded: EncodedVideo| check_video_temp(&video, &encoded, Some(11.23), 0.0, Some(60.0));
 
 		assert_eq!(
-			inspect(encoded(668, 11.1, 0)).unwrap(),
+			check(encoded(668, 11.1, 0)).unwrap(),
 			TempCheck::FewerFrames { expected: 674 }
 		);
-		assert_eq!(inspect(encoded(672, 11.2, 0)).unwrap(), TempCheck::Passed(None));
+		assert_eq!(check(encoded(672, 11.2, 0)).unwrap(), TempCheck::Passed(None));
 		assert!(matches!(
-			inspect(encoded(680, 11.3, 0)).unwrap_err().kind,
+			check(encoded(680, 11.3, 0)).unwrap_err().kind,
 			ErrorKind::EncodeFailed(ref reason) if reason == "the video has 680 frames, 674 expected"
 		));
 		assert!(matches!(
-			inspect(encoded(668, 11.1, 3)).unwrap(),
+			check(encoded(668, 11.1, 3)).unwrap(),
 			TempCheck::Passed(Some(_))
 		));
 		assert!(matches!(
-			inspect(encoded(300, 5.0, 0)).unwrap_err().kind,
+			check(encoded(300, 5.0, 0)).unwrap_err().kind,
 			ErrorKind::SourceDamaged(_)
-		));
-		assert!(matches!(
-			check_video_temp(&video, &encoded(668, 11.1, 0), Some(11.23), 0.0, Some(60.0))
-				.unwrap_err()
-				.kind,
-			ErrorKind::EncodeFailed(ref reason) if reason == "the video has 668 frames, 674 expected"
 		));
 	}
 
 	#[test]
 	fn a_short_encode_is_kept_when_the_source_decodes_to_as_few_frames() {
 		let video = plan(svt(), Some(674));
-		let decide =
-			|decoded: u64| undecodable_frames(&video, &encoded(668, 11.1, 0), 674, decoded, ScanType::Progressive);
+		let decide = |decoded: Option<u64>| {
+			undecodable_frames(&video, &encoded(668, 11.1, 0), 674, decoded, ScanType::Progressive)
+		};
 
 		assert_eq!(
-			decide(668).unwrap(),
+			decide(Some(668)).unwrap(),
 			"the source has 6 video frames that don't decode; the 668 that do were kept"
 		);
 		assert_eq!(
-			decide(670).unwrap(),
+			decide(Some(670)).unwrap(),
 			"the source has 4 video frames that don't decode; the 668 that do were kept"
 		);
-		assert!(matches!(
-			decide(671).unwrap_err().kind,
-			ErrorKind::EncodeFailed(ref reason) if reason == "the video has 668 frames, 674 expected"
-		));
-		assert!(decide(674).is_err());
+		for refused in [Some(671), Some(674), None] {
+			assert!(matches!(
+				decide(refused).unwrap_err().kind,
+				ErrorKind::EncodeFailed(ref reason) if reason == "the video has 668 frames, 674 expected"
+			));
+		}
 	}
 
 	#[test]
-	fn the_source_count_is_scanned_like_the_expected_frames() {
+	fn the_source_count_is_scanned_like_the_expected_frames_and_the_note_counts_source_frames() {
 		let deinterlaced = VideoPlan {
 			frame_tolerance: 4,
 			..plan(svt(), Some(1348))
@@ -1610,15 +1608,24 @@ mod tests {
 				&deinterlaced,
 				&encoded(1336, 11.1, 0),
 				1348,
-				668,
+				Some(668),
 				ScanType::Interlaced { top_first: true }
 			)
 			.unwrap(),
-			"the source has 12 video frames that don't decode; the 1336 that do were kept"
+			"the source has 6 video frames that don't decode; the 668 that do were kept"
 		);
-		assert!(undecodable_frames(&deinterlaced, &encoded(1336, 11.1, 0), 1348, 668, ScanType::Progressive).is_err());
+		assert!(
+			undecodable_frames(
+				&deinterlaced,
+				&encoded(1336, 11.1, 0),
+				1348,
+				Some(668),
+				ScanType::Progressive
+			)
+			.is_err()
+		);
 		assert_eq!(
-			undecodable_frames(&telecined, &encoded(668, 11.1, 0), 674, 835, ScanType::Telecined).unwrap(),
+			undecodable_frames(&telecined, &encoded(668, 11.1, 0), 674, Some(835), ScanType::Telecined).unwrap(),
 			"the source has 6 video frames that don't decode; the 668 that do were kept"
 		);
 	}
