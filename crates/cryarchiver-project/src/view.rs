@@ -306,6 +306,10 @@ pub const WARNING_LABEL: &str = "Warning";
 pub fn decision_lines(decision: &Decision) -> Vec<DecisionLine> {
 	let mut lines = Vec::new();
 
+	if let Some(reason) = &decision.kept {
+		lines.push(plain("Kept", reason.clone()));
+	}
+
 	if let Some(video) = &decision.video {
 		video_lines(video, &mut lines);
 	}
@@ -755,6 +759,31 @@ mod tests {
 	}
 
 	#[test]
+	fn a_kept_file_says_why_it_was_kept_first() {
+		let decision = Decision {
+			image: Some(ImageDecision {
+				route: "AVIF".into(),
+				setting: Some("quality 70".into()),
+				..ImageDecision::default()
+			}),
+			kept: Some("the encode came out larger than the source (129.19 kB → 154.21 kB)".into()),
+			..Decision::default()
+		};
+
+		assert_eq!(
+			labelled(&decision_lines(&decision)),
+			[
+				line(
+					"Kept",
+					"the encode came out larger than the source (129.19 kB → 154.21 kB)",
+					false
+				),
+				line("Encoder", "AVIF, quality 70", false),
+			]
+		);
+	}
+
+	#[test]
 	fn every_decision_label_fits_the_details_label_column() {
 		// The TUI's details pane gives labels 9 cells, the last one for the gap before the value.
 		const DETAILS_LABEL_CELLS: usize = 8;
@@ -787,6 +816,7 @@ mod tests {
 				seconds: 5.0,
 			}],
 			warnings: vec!["a note".into()],
+			kept: Some("a reason".into()),
 			..Decision::default()
 		};
 		let skipped = Decision {

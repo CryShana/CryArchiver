@@ -246,9 +246,14 @@ impl JobContext {
 				self.commit(staged, Made::Encoded { extension }, Some(decision)).await
 			}
 			JobOutcome::KeptOriginal { reason } => {
-				let decision = announced.into_inner().unwrap_or_else(PoisonError::into_inner);
+				let mut decision = announced
+					.into_inner()
+					.unwrap_or_else(PoisonError::into_inner)
+					.unwrap_or_default();
+				decision.kept = Some(reason.description());
+
 				self.send(JobMessage::Kept(reason.description()));
-				self.copy(CopyReason::KeptOriginal, decision).await
+				self.copy(CopyReason::KeptOriginal, Some(decision)).await
 			}
 			JobOutcome::Skipped { .. } => self.copy(CopyReason::NotMedia, None).await,
 			JobOutcome::Failed(err) => Err(err),

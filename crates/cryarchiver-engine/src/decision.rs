@@ -27,6 +27,8 @@ pub struct Decision {
 	pub stages: Vec<StageTime>,
 	/// The full encodes made: more than one when the quality check sent the video back.
 	pub attempts: u32,
+	/// Why the original was archived as it is instead of the encode.
+	pub kept: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

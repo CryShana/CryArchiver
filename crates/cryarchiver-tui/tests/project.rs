@@ -433,6 +433,7 @@ fn file_details_show_what_the_engine_decided() {
 	assert_eq!(
 		lines,
 		[
+			("Kept", "encoding saved too little (10 B → 10 B)", false),
 			("Encoder", "SVT-AV1 preset 5", false),
 			("CRF", "30 (learned)", false),
 			("Target", "near miss: written slightly below the target", true),

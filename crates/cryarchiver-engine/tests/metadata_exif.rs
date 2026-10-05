@@ -6,7 +6,7 @@ use std::process::Command;
 use cryarchiver_engine::metadata::exif::{
 	ExifError, adobe_rgb_only, from_tiff_file, ifd0_value, orientation, patch, problem, tiff_pages,
 };
-use support::tiff::{ascii, ifd, long, short, tiff, undefined};
+use support::tiff::{Entry, ascii, bytes16, bytes32, ifd, long, short, tiff, undefined};
 
 fn camera_block(big: bool) -> Vec<u8> {
 	tiff(
@@ -51,6 +51,95 @@ fn patch_resets_orientation_and_rewrites_dimensions_in_place() {
 		assert!(changed <= 10, "{changed} bytes changed");
 		let maker_note = original.windows(16).position(|w| w == b"maker note bytes").unwrap();
 		assert_eq!(&block[maker_note..maker_note + 16], b"maker note bytes");
+	}
+}
+
+/// Where the value of the only entry of an IFD0 written by `tiff` starts.
+const VALUE_AT: usize = 8 + 2 + 8;
+
+fn orientation_entry(kind: u16, value: Vec<u8>) -> Entry {
+	Entry {
+		tag: 0x0112,
+		kind,
+		count: 1,
+		value,
+	}
+}
+
+#[test]
+fn orientation_of_any_integer_type_is_read_and_set_upright_in_its_own_type() {
+	for big in [true, false] {
+		let cases = [
+			(1, vec![6], 6, vec![1]),
+			(3, bytes16(big, 6).to_vec(), 6, bytes16(big, 1).to_vec()),
+			(4, bytes32(big, 6).to_vec(), 6, bytes32(big, 1).to_vec()),
+			(8, bytes16(big, 8).to_vec(), 8, bytes16(big, 1).to_vec()),
+			(9, bytes32(big, 3).to_vec(), 3, bytes32(big, 1).to_vec()),
+		];
+
+		for (kind, value, read, upright) in cases {
+			let original = tiff(big, &[orientation_entry(kind, value)], &[], &[]);
+			let mut block = original.clone();
+			assert_eq!(orientation(&block), Some(read), "type {kind}");
+
+			let result = patch(&mut block, 10, 10).unwrap();
+
+			assert_eq!(result.orientation, Some(read), "type {kind}");
+			assert!(result.skipped.is_empty(), "type {kind}: {:?}", result.skipped);
+			assert_eq!(orientation(&block), Some(1), "type {kind}");
+			assert_eq!(block.len(), original.len());
+			assert_eq!(&block[..VALUE_AT], &original[..VALUE_AT], "type {kind} keeps its type");
+			assert_eq!(&block[VALUE_AT..VALUE_AT + upright.len()], upright, "type {kind}");
+			assert_eq!(
+				&block[VALUE_AT + upright.len()..],
+				&original[VALUE_AT + upright.len()..],
+				"type {kind}"
+			);
+		}
+	}
+}
+
+#[test]
+fn an_orientation_outside_one_to_eight_reads_as_upright_without_a_warning() {
+	for big in [true, false] {
+		let values = [
+			orientation_entry(4, bytes32(big, 0).to_vec()),
+			orientation_entry(3, bytes16(big, 9).to_vec()),
+			orientation_entry(1, vec![200]),
+			orientation_entry(8, bytes16(big, (-3i16).cast_unsigned()).to_vec()),
+			orientation_entry(9, bytes32(big, (-1i32).cast_unsigned()).to_vec()),
+			orientation_entry(4, bytes32(big, 65_542).to_vec()),
+		];
+
+		for entry in values {
+			let mut block = tiff(big, std::slice::from_ref(&entry), &[], &[]);
+			assert_eq!(orientation(&block), Some(1), "type {}", entry.kind);
+
+			let result = patch(&mut block, 10, 10).unwrap();
+
+			assert_eq!(result.orientation, Some(1), "type {}", entry.kind);
+			assert!(result.skipped.is_empty(), "type {}: {:?}", entry.kind, result.skipped);
+			assert_eq!(orientation(&block), Some(1), "type {}", entry.kind);
+		}
+	}
+}
+
+#[test]
+fn an_orientation_that_is_not_a_single_number_is_left_with_a_warning() {
+	let two_shorts = Entry {
+		count: 2,
+		..orientation_entry(3, [bytes16(true, 6), bytes16(true, 6)].concat())
+	};
+	for entry in [two_shorts, ascii(0x0112, "6")] {
+		let original = tiff(true, &[entry], &[], &[]);
+		let mut block = original.clone();
+		assert_eq!(orientation(&block), None);
+
+		let result = patch(&mut block, 10, 10).unwrap();
+
+		assert_eq!(result.orientation, None);
+		assert_eq!(result.skipped, ["Orientation is not a single number"]);
+		assert_eq!(block, original);
 	}
 }
 

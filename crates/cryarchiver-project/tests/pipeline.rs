@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::decision::{CrfChoice, Decision, Measured, VideoDecision, Vmaf};
-use cryarchiver_engine::outcome::ErrorKind;
+use cryarchiver_engine::outcome::{ErrorKind, KeepReason};
 use cryarchiver_project::issues::{Problem, Verb};
 use cryarchiver_project::keys::RelPath;
 use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How, Output};
@@ -217,14 +217,52 @@ fn what_the_engine_decided_is_kept_with_the_file_and_shown_after_a_reopen() {
 	assert_eq!(stored("clip.jpg"), Some(searched(36.75)));
 	assert_eq!(
 		stored("kept.jpg"),
-		Some(searched(20.0)),
-		"a kept original keeps its record too"
+		Some(Decision {
+			kept: Some(fake_keep_reason()),
+			..searched(20.0)
+		}),
+		"a kept original keeps its record too, with why it was kept"
 	);
 	drop(store);
 
 	let project = support::open(&setup, &FakeEncoder::new());
 	let mut snapshot = Snapshot::default();
 	assert_eq!(decision_shown(&project, &mut snapshot, "clip.jpg"), expected);
+}
+
+fn fake_keep_reason() -> String {
+	KeepReason::NotSmaller {
+		src_bytes: 10,
+		out_bytes: 10,
+	}
+	.description()
+}
+
+#[test]
+fn a_kept_file_without_a_record_gets_one_with_why_it_was_kept() {
+	let setup = setup(|_| {});
+	write(&setup.source, "kept.jpg", &jpeg(1, 100));
+	let encoder = FakeEncoder::new();
+	encoder.rule("kept.jpg", Rule::Keep);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+	let shown = decision_shown(&project, &mut snapshot, "kept.jpg");
+	drop(project);
+
+	assert_eq!(shown, [("Kept".to_owned(), fake_keep_reason())]);
+	let (store, _, _) = Store::open(&setup.project).unwrap();
+	assert_eq!(
+		store
+			.latest_decision(&RelPath::from_bytes(b"kept.jpg".to_vec()))
+			.unwrap(),
+		Some(Decision {
+			kept: Some(fake_keep_reason()),
+			..Decision::default()
+		})
+	);
 }
 
 #[test]

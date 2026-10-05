@@ -12,8 +12,11 @@ const TAG_COLOR_SPACE: u16 = 0xA001;
 const TAG_PIXEL_X: u16 = 0xA002;
 const TAG_PIXEL_Y: u16 = 0xA003;
 const TAG_INTEROP_INDEX: u16 = 0x0001;
+const TYPE_BYTE: u16 = 1;
 const TYPE_SHORT: u16 = 3;
 const TYPE_LONG: u16 = 4;
+const TYPE_SSHORT: u16 = 8;
+const TYPE_SLONG: u16 = 9;
 const TYPE_SIZES: [usize; 14] = [0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 4];
 const UNCALIBRATED: u16 = 0xFFFF;
 const MAX_IFDS: usize = 16;
@@ -46,6 +49,7 @@ pub struct ExifPatch {
 
 #[derive(Debug, Clone, Copy)]
 enum Value {
+	Byte(u8),
 	Short(u16),
 	Long(u32),
 }
@@ -122,6 +126,22 @@ impl<'a> Tiff<'a> {
 			.flatten()
 	}
 
+	fn integer(self, entry: usize) -> Option<i64> {
+		if self.count(entry) != 1 {
+			return None;
+		}
+
+		let at = entry + 8;
+		match self.kind(entry) {
+			TYPE_BYTE => self.data.get(at).copied().map(i64::from),
+			TYPE_SHORT => self.u16_at(at).map(i64::from),
+			TYPE_LONG => self.u32_at(at).map(i64::from),
+			TYPE_SSHORT => self.u16_at(at).map(|value| i64::from(value.cast_signed())),
+			TYPE_SLONG => self.u32_at(at).map(|value| i64::from(value.cast_signed())),
+			_ => None,
+		}
+	}
+
 	fn pointer(self, range: Range<usize>, tag: u16) -> Option<u32> {
 		self.find(range, tag).and_then(|entry| self.u32_at(entry + 8))
 	}
@@ -138,7 +158,25 @@ pub fn endian(tiff: &[u8]) -> Option<Endian> {
 pub fn orientation(tiff: &[u8]) -> Option<u16> {
 	let reader = Tiff::new(tiff)?;
 	let ifd0 = reader.entries("IFD0", reader.first_ifd()).ok()?;
-	reader.find(ifd0, TAG_ORIENTATION).and_then(|entry| reader.short(entry))
+	reader
+		.find(ifd0, TAG_ORIENTATION)
+		.and_then(|entry| reader.integer(entry))
+		.map(known_orientation)
+}
+
+fn known_orientation(value: i64) -> u16 {
+	u16::try_from(value)
+		.ok()
+		.filter(|orientation| (1..=8).contains(orientation))
+		.unwrap_or(1)
+}
+
+fn upright(kind: u16) -> Value {
+	match kind {
+		TYPE_BYTE => Value::Byte(1),
+		TYPE_LONG | TYPE_SLONG => Value::Long(1),
+		_ => Value::Short(1),
+	}
 }
 
 pub fn problem(tiff: &[u8]) -> Option<String> {
@@ -203,12 +241,12 @@ pub fn patch(tiff: &mut [u8], width: u32, height: u32) -> Result<ExifPatch, Exif
 	let mut result = ExifPatch::default();
 	let mut writes = Vec::new();
 	if let Some(entry) = reader.find(ifd0, TAG_ORIENTATION) {
-		match reader.short(entry) {
+		match reader.integer(entry) {
 			Some(value) => {
-				result.orientation = Some(value);
-				writes.push((entry + 8, Value::Short(1)));
+				result.orientation = Some(known_orientation(value));
+				writes.push((entry + 8, upright(reader.kind(entry))));
 			}
-			None => result.skipped.push("Orientation is not a single SHORT".to_owned()),
+			None => result.skipped.push("Orientation is not a single number".to_owned()),
 		}
 	}
 	for (entry, value) in dimensions {
@@ -256,6 +294,7 @@ fn dimension_write(reader: Tiff<'_>, entry: usize, value: u32, result: &mut Exif
 
 fn write(tiff: &mut [u8], endian: Endian, at: usize, value: Value) {
 	match (value, endian) {
+		(Value::Byte(byte), _) => tiff[at] = byte,
 		(Value::Short(short), Endian::Little) => tiff[at..at + 2].copy_from_slice(&short.to_le_bytes()),
 		(Value::Short(short), Endian::Big) => tiff[at..at + 2].copy_from_slice(&short.to_be_bytes()),
 		(Value::Long(long), Endian::Little) => tiff[at..at + 4].copy_from_slice(&long.to_le_bytes()),
