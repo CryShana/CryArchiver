@@ -15,7 +15,8 @@ pub const MAX_WAITING_VIDEOS: usize = 2;
 
 const IDLE_SHARE: f32 = 0.20;
 const VIDEO_EXTENSIONS: &[&str] = &[
-	"mp4", "mov", "m4v", "mkv", "webm", "avi", "mts", "m2ts", "3gp", "wmv", "flv", "mpg", "mpeg", "ts", "vob",
+	"mp4", "mov", "m4v", "mkv", "webm", "avi", "mts", "m2ts", "3gp", "wmv", "flv", "mpg", "mpeg", "ts", "vob", "ogv",
+	"asf",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,6 +68,11 @@ impl Governor {
 
 	pub fn set_limit(&mut self, limit: bool) {
 		self.limit = limit;
+	}
+
+	/// Limit mode: one job of any kind at a time.
+	pub fn limited(&self) -> bool {
+		self.limit
 	}
 
 	/// `busy` is the share of the whole machine's CPU in use, from 0 to 1.
@@ -129,6 +135,10 @@ impl Governor {
 
 	pub fn total(&self) -> usize {
 		self.running.values().sum()
+	}
+
+	pub fn videos_waiting(&self) -> usize {
+		self.videos_waiting
 	}
 
 	/// How many running jobs the current limit wouldn't allow.
@@ -489,7 +499,15 @@ mod tests {
 
 	#[test]
 	fn videos_are_guessed_from_the_extension_alone() {
-		for name in ["clip.mp4", "CLIP.MKV", "show.m2ts", "home.vob", "a.b.webm"] {
+		for name in [
+			"clip.mp4",
+			"CLIP.MKV",
+			"show.m2ts",
+			"home.vob",
+			"a.b.webm",
+			"film.ogv",
+			"old.ASF",
+		] {
 			assert!(looks_like_video(OsStr::new(name)), "{name}");
 		}
 		for name in ["photo.jpg", "song.flac", "mp4", "notes.txt", "song.m4a"] {

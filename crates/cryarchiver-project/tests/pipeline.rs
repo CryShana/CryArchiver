@@ -1,6 +1,7 @@
 mod support;
 
 use std::fs;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How, Output
 use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
 use cryarchiver_project::view::RowState;
-use cryarchiver_project::{Command, Fault, Tuning};
+use cryarchiver_project::{Command, Fault, Project, Tuning};
 use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
 
 fn records(setup: &support::Setup) -> Vec<(String, FileRecord)> {
@@ -379,31 +380,71 @@ fn copy_original_and_exclude_resolve_a_failure() {
 	assert!(!setup.destination.join("skip-me.jpg").exists());
 }
 
-/// Videos that hold the encoder until cancelled, in an engine with `slots` video slots.
-fn videos_held(names: &[&str], slots: usize) -> (support::Setup, std::sync::Arc<FakeEncoder>) {
+/// Files that hold the encoder until cancelled, in an engine with `slots` video slots.
+fn held(names: &[&str], slots: usize) -> (support::Setup, Arc<FakeEncoder>) {
 	let setup = setup(|_| {});
 	for (seed, name) in (1..).zip(names) {
 		write(&setup.source, name, &jpeg(seed, 100));
 	}
 	let encoder = FakeEncoder::new();
 	encoder.video_slots(slots);
-	encoder.rule(".mp4", Rule::Hold);
+	for suffix in [".jpg", ".mp4"] {
+		encoder.rule(suffix, Rule::Hold);
+	}
 	(setup, encoder)
+}
+
+/// Starts one encode at a time, `ramp` apart, from a queue that holds every file in discovery order: an earlier
+/// session left them all queued, and opening queues them again in that order before the run starts.
+fn start_spaced(setup: &support::Setup, encoder: &Arc<FakeEncoder>, count: usize, ramp: Duration) -> Project {
+	let deadline = Instant::now() + support::WAIT;
+	loop {
+		let project = support::open(setup, encoder);
+		settle(&project, &mut Snapshot::default(), Duration::from_millis(100));
+		drop(project);
+
+		let records = records(setup);
+		if records.len() == count && records.iter().all(|(_, record)| record.state == FileState::Queued) {
+			break;
+		}
+		assert!(Instant::now() < deadline, "not every file was queued: {records:?}");
+	}
+	assert!(encoder.calls().is_empty());
+
+	let tuning = Tuning {
+		ramp,
+		..support::tuning()
+	};
+	let project = support::open_tuned(setup, encoder, tuning, None);
+	start(&project);
+	project
 }
 
 fn workers_in(snapshot: &Snapshot, state: RowState) -> usize {
 	snapshot.workers.iter().filter(|worker| worker.state == state).count()
 }
 
+/// Folds updates for `window`, so anything that would start in it has.
+fn settle(project: &Project, snapshot: &mut Snapshot, window: Duration) {
+	let until = Instant::now() + window;
+	while Instant::now() < until {
+		if let Some(update) = project.wait_update(Duration::from_millis(20)) {
+			snapshot.apply(update);
+		}
+	}
+}
+
 #[test]
-fn two_queued_videos_encode_at_once_when_the_engine_has_two_video_slots() {
-	let (setup, encoder) = videos_held(&["a.mp4", "b.mp4"], 2);
-	let project = support::open(&setup, &encoder);
+fn with_two_video_slots_both_videos_start_before_the_photos_queued_ahead_of_them() {
+	let names = ["a.jpg", "b.jpg", "c.mp4", "d.mp4"];
+	let (setup, encoder) = held(&names, 2);
+	let project = start_spaced(&setup, &encoder, names.len(), Duration::from_millis(100));
 	let mut snapshot = Snapshot::default();
 
-	start(&project);
+	wait_for(&project, &mut snapshot, "two encodes", |_| encoder.calls().len() >= 2);
+	assert_eq!(encoder.calls()[..2], ["c.mp4", "d.mp4"]);
 	wait_for(&project, &mut snapshot, "both videos encoding", |s| {
-		workers_in(s, RowState::Encoding) == 2
+		workers_in(s, RowState::Encoding) >= 2 && workers_in(s, RowState::Waiting) == 0
 	});
 
 	project.send(Command::StopNow);
@@ -412,24 +453,16 @@ fn two_queued_videos_encode_at_once_when_the_engine_has_two_video_slots() {
 
 #[test]
 fn no_more_videos_start_once_two_wait_for_the_video_slot() {
-	let (setup, encoder) = videos_held(&["a.mp4", "b.mp4", "c.mp4", "d.mp4"], 1);
-	let tuning = Tuning {
-		ramp: Duration::from_millis(50),
-		..support::tuning()
-	};
-	let project = support::open_tuned(&setup, &encoder, tuning, None);
+	const RAMP: Duration = Duration::from_millis(250);
+	let names = ["a.mp4", "b.mp4", "c.mp4", "d.mp4"];
+	let (setup, encoder) = held(&names, 1);
+	let project = start_spaced(&setup, &encoder, names.len(), RAMP);
 	let mut snapshot = Snapshot::default();
 
-	start(&project);
 	wait_for(&project, &mut snapshot, "one video encoding and two waiting", |s| {
 		workers_in(s, RowState::Encoding) == 1 && workers_in(s, RowState::Waiting) == 2
 	});
-	let settle = Instant::now() + Duration::from_millis(300);
-	while Instant::now() < settle {
-		if let Some(update) = project.wait_update(Duration::from_millis(20)) {
-			snapshot.apply(update);
-		}
-	}
+	settle(&project, &mut snapshot, RAMP * 2);
 
 	assert_eq!(snapshot.workers.len(), 3);
 	assert_eq!(encoder.calls().len(), 3, "the fourth video stays queued");

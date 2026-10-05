@@ -360,11 +360,17 @@ impl Owner {
 	}
 
 	/// A video while the encoder has a slot no running video holds, and otherwise anything but a video, so photos and
-	/// videos run side by side; the front of the queue when none of that kind is queued.
+	/// videos run side by side; the front of the queue when none of that kind is queued, or while the limit runs one
+	/// job at a time.
 	pub(super) fn next_encode(&mut self) -> Option<FileId> {
 		let want_video = self.running_videos() < self.pipeline.video_slots;
+		let limited = self.pipeline.governor.limited();
 		let tree = &self.tree;
 		let queue = self.pipeline.queues.get_mut(&Work::Encode)?;
+
+		if limited {
+			return queue.pop_front();
+		}
 
 		let search = (want_video, queue.pushed());
 		if self.pipeline.fruitless_search != Some(search) {
@@ -546,6 +552,7 @@ impl Owner {
 	fn on_job_event(&mut self, file: FileId, event: JobEvent) {
 		let queued = event == JobEvent::Stage(Stage::Queued);
 		let waits_for_slot = queued && self.video_slots_held(file) >= self.pipeline.video_slots;
+
 		let Some(job) = self.pipeline.jobs.get_mut(&file) else {
 			return;
 		};
@@ -559,7 +566,7 @@ impl Owner {
 			JobEvent::Stage(stage) => {
 				let was_waiting = job.video_waiting();
 				job.video = match job.video {
-					_ if queued && waits_for_slot => VideoSlot::Waiting,
+					_ if waits_for_slot => VideoSlot::Waiting,
 					_ if queued => VideoSlot::Held,
 					VideoSlot::None => VideoSlot::None,
 					VideoSlot::Waiting | VideoSlot::Held => VideoSlot::Held,
@@ -1924,6 +1931,7 @@ pub(super) mod tests {
 
 			owner.pipeline.governor.started(Work::Encode, now);
 			owner.pipeline.jobs.insert(file, running_job(Work::Encode));
+			owner.set_state(file, FileState::InProgress { attempt: 1 });
 			started.push(owner.tree.file(file).name.to_string_lossy().into_owned());
 		}
 		started
@@ -1962,6 +1970,41 @@ pub(super) mod tests {
 		let finished = file(&owner, "a.mp4");
 		owner.pipeline.jobs.remove(&finished);
 		assert!(!stage(&mut owner, "c.mp4", Stage::Analyze));
+	}
+
+	#[test]
+	fn the_waiting_count_returns_to_zero_however_waiting_videos_end() {
+		let (_dir, mut owner, _updates) = encodes(&["a.mp4", "b.mp4", "c.mp4", "d.mp4"], 2);
+		let file = |owner: &Owner, name: &str| owner.tree.file_id(&key(name)).unwrap();
+		let send = |owner: &mut Owner, name: &str, message: JobMessage| {
+			let file = file(owner, name);
+			owner.on_job(file, message);
+		};
+		let stage = |stage| JobMessage::Event(JobEvent::Stage(stage));
+
+		assert_eq!(start_encodes(&mut owner), ["a.mp4", "b.mp4", "c.mp4", "d.mp4"]);
+		for name in ["a.mp4", "b.mp4", "c.mp4", "d.mp4"] {
+			send(&mut owner, name, stage(Stage::Queued));
+		}
+		assert_eq!(owner.pipeline.governor.videos_waiting(), 2);
+
+		send(&mut owner, "c.mp4", cancelled());
+		assert_eq!(owner.pipeline.governor.videos_waiting(), 1, "a cancelled wait");
+
+		send(&mut owner, "a.mp4", JobMessage::Finished(Ok(())));
+		send(&mut owner, "d.mp4", stage(Stage::Analyze));
+		assert_eq!(owner.pipeline.governor.videos_waiting(), 0, "a wait that got its slot");
+		send(&mut owner, "d.mp4", JobMessage::Finished(Ok(())));
+		assert_eq!(owner.pipeline.governor.videos_waiting(), 0);
+		assert!(owner.pipeline.governor.may_start(Work::Encode, Instant::now()));
+	}
+
+	#[test]
+	fn under_the_limit_encodes_start_in_plain_queue_order() {
+		let (_dir, mut owner, _updates) = encodes(&["a.jpg", "d.mp4"], 2);
+		owner.pipeline.governor.set_limit(true);
+
+		assert_eq!(start_encodes(&mut owner), ["a.jpg"]);
 	}
 
 	#[test]
