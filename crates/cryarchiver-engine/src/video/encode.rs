@@ -53,11 +53,7 @@ pub struct EncodedVideo {
 	pub decode_errors: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Sample {
-	pub start_s: f64,
-	pub length_s: f64,
-}
+pub type Sample = TrimWindow;
 
 /// What encoding a set of samples gave.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -83,18 +79,26 @@ enum Run<'a> {
 }
 
 pub fn video_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan) -> ToolCommand {
-	encode_command(ffmpeg, source, output, plan, Run::Whole)
+	encode_command(ffmpeg, source, output, plan, plan.threads, Run::Whole)
 }
 
 pub fn sample_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan, sample: &Sample) -> ToolCommand {
-	encode_command(ffmpeg, source, output, plan, Run::Sample(sample))
+	encode_command(ffmpeg, source, output, plan, plan.threads, Run::Sample(sample))
 }
 
 pub fn frames_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan) -> ToolCommand {
-	encode_command(ffmpeg, source, output, plan, Run::Frames)
+	encode_command(ffmpeg, source, output, plan, plan.threads, Run::Frames)
 }
 
-fn encode_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan, run: Run<'_>) -> ToolCommand {
+/// `plan` encoded on `threads` in place of its own.
+fn encode_command(
+	ffmpeg: &Path,
+	source: &Path,
+	output: &Path,
+	plan: &VideoPlan,
+	threads: Option<Threads>,
+	run: Run<'_>,
+) -> ToolCommand {
 	let sample = match run {
 		Run::Sample(sample) => Some(sample),
 		Run::Whole | Run::Frames => None,
@@ -108,7 +112,7 @@ fn encode_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan,
 	cmd.count_lines_containing(DECODE_ERRORS);
 	cmd.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "repeat+info"]);
 
-	cmd.threads(plan.threads.map(|threads| threads.tool));
+	cmd.threads(threads.map(|threads| threads.tool));
 
 	let start = if main_only { plan.starts.main } else { plan.starts.every };
 	let cut = sample
@@ -125,10 +129,7 @@ fn encode_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan,
 	let trim = cut.and_then(Seek::trim_filter).unwrap_or_default();
 	let shaped = burn::chained(&[&trim, &plan.shape]);
 
-	if let Some(decoder) = plan.decoder {
-		cmd.arg("-c:v").arg(decoder);
-	}
-	cmd.arg("-i").arg(process::tool_path(source));
+	cmd.input(plan.decoder, None, source);
 	if let Some(overlay) = plan.overlay {
 		cmd.args(overlay.input_args())
 			.arg("-i")
@@ -167,7 +168,7 @@ fn encode_command(ffmpeg: &Path, source: &Path, output: &Path, plan: &VideoPlan,
 	if matches!(run, Run::Frames) {
 		cmd.args(["-c:v", "ffv1", "-level", "3"]);
 	} else {
-		encoder_args(&mut cmd, &plan.encoder, plan.threads, plan.max_bitrate_kbps);
+		encoder_args(&mut cmd, &plan.encoder, threads, plan.max_bitrate_kbps);
 	}
 
 	// On Matroska's millisecond clock: the encoder's default, one tick per frame at the declared rate, would put the
@@ -247,15 +248,17 @@ pub fn samples(declared_s: Option<f64>) -> Vec<Sample> {
 		.unwrap_or_default()
 }
 
+/// Encodes `sample` of `plan` on `threads` in place of the plan's own.
 pub async fn encode_sample(
 	ffmpeg: &Path,
 	source: &Path,
 	output: &Path,
 	plan: &VideoPlan,
+	threads: Option<Threads>,
 	sample: &Sample,
 	cancel: &CancellationToken,
 ) -> Result<u64, JobError> {
-	let cmd = sample_command(ffmpeg, source, output, plan, sample);
+	let cmd = encode_command(ffmpeg, source, output, plan, threads, Run::Sample(sample));
 	let out = process::run(&cmd, StdoutMode::Progress, |_| {}, cancel).await?;
 	if !out.completed() {
 		return Err(failed_encode(out));
@@ -282,7 +285,7 @@ pub async fn encode_samples(
 	for (index, sample) in samples.iter().enumerate() {
 		let output = workspace.file(&format!("sample-{index}.mkv"));
 		let started = Instant::now();
-		bytes += encode_sample(ffmpeg, source, &output, plan, sample, cancel).await?;
+		bytes += encode_sample(ffmpeg, source, &output, plan, plan.threads, sample, cancel).await?;
 		if sample.length_s > 0.0 {
 			rates.push(started.elapsed().as_secs_f64() / sample.length_s);
 		}
@@ -513,7 +516,7 @@ fn lasts(plan: &VideoPlan, encoded: &EncodedVideo, (start_s, declared_s): (f64, 
 	.any(|decoded| (decoded - declared_s).abs() <= tolerance_s)
 }
 
-fn frame_s(fps: Option<f64>) -> f64 {
+pub fn frame_s(fps: Option<f64>) -> f64 {
 	fps.filter(|fps| *fps > 0.0).map_or(0.0, |fps| 1.0 / fps)
 }
 

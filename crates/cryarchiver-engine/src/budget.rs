@@ -38,13 +38,6 @@ pub struct Lease<'a> {
 	pub threads: usize,
 }
 
-/// The part of the budget beyond a holder's own tokens, held while its uncapped stage runs.
-#[derive(Debug)]
-pub struct Raised<'a> {
-	budget: &'a ThreadBudget,
-	extra: usize,
-}
-
 /// How many threads a job's measuring tools may use at once.
 #[derive(Debug, Clone, Copy)]
 pub enum Width<'a> {
@@ -114,16 +107,27 @@ impl ThreadBudget {
 	}
 }
 
-impl Hold<'_> {
+impl<'a> Hold<'a> {
 	/// The holder's fair share of the budget, never more than its own tokens, or all the tokens the other holders
 	/// leave free when that is more. The part beyond its own tokens is held until the lease is dropped, so a lease
 	/// never puts the budget over its size.
-	pub fn lease(&self) -> Lease<'_> {
+	pub fn lease(&self) -> Lease<'a> {
 		let total = self.budget.total();
 		let mut state = self.budget.state();
 		let others = state.held.saturating_sub(self.tokens);
 		let fair = (total / state.holders.max(1)).min(self.tokens);
 		let threads = fair.max(total.saturating_sub(others)).max(1);
+		self.leased(&mut state, threads)
+	}
+
+	/// Holds the whole budget until the lease is dropped, for a stage whose tools run without caps of their own and
+	/// may use the whole machine: no other job's measuring then counts those threads as free.
+	pub fn raise_to_total(&self) -> Lease<'a> {
+		let mut state = self.budget.state();
+		self.leased(&mut state, self.budget.total())
+	}
+
+	fn leased(&self, state: &mut State, threads: usize) -> Lease<'a> {
 		let extra = threads.saturating_sub(self.tokens);
 		state.held += extra;
 
@@ -132,27 +136,6 @@ impl Hold<'_> {
 			extra: AtomicUsize::new(extra),
 			threads,
 		}
-	}
-}
-
-impl<'a> Hold<'a> {
-	/// Holds the whole budget until the guard is dropped, for a stage whose tools run without caps of their own and
-	/// may use the whole machine: no other job's measuring then counts those threads as free.
-	pub fn raise_to_total(&self) -> Raised<'a> {
-		let mut state = self.budget.state();
-		let extra = self.budget.total().saturating_sub(self.tokens);
-		state.held += extra;
-		Raised {
-			budget: self.budget,
-			extra,
-		}
-	}
-}
-
-impl Drop for Raised<'_> {
-	fn drop(&mut self) {
-		let mut state = self.budget.state();
-		state.held = state.held.saturating_sub(self.extra);
 	}
 }
 
@@ -180,7 +163,7 @@ impl<'a> Lanes<'a> {
 
 	/// Holds the whole budget for a stage on the plan's caps when they are none: a job without a thread budget of its
 	/// own. A job with one stays within it.
-	pub fn uncapped_stage(&self) -> Option<Raised<'a>> {
+	pub fn uncapped_stage(&self) -> Option<Lease<'a>> {
 		match self.width {
 			Width::Shared(hold) => Some(hold.raise_to_total()),
 			Width::Serial | Width::Fixed(_) => None,
@@ -205,18 +188,16 @@ impl<'a> Lanes<'a> {
 		} else {
 			1
 		};
-		let mut memory = None;
-		while lanes > 1 {
-			let bytes = self.lane_bytes * (lanes as u64 - 1);
-			match self.memory {
-				None => break,
-				Some(gate) if gate.try_reserve(bytes) => {
-					memory = Some((gate, bytes));
-					break;
+		let memory = self.memory.and_then(|gate| {
+			while lanes > 1 {
+				let bytes = self.lane_bytes * (lanes as u64 - 1);
+				if gate.try_reserve(bytes) {
+					return Some((gate, bytes));
 				}
-				Some(_) => lanes -= 1,
+				lanes -= 1;
 			}
-		}
+			None
+		});
 
 		Granted {
 			lanes,

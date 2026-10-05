@@ -92,6 +92,10 @@ impl JobError {
 		}
 	}
 
+	pub fn verification(reason: impl std::fmt::Display) -> Self {
+		ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into()
+	}
+
 	/// The thread cap of the attempt after this one, from `job_threads`, the cap this attempt was given: after a crash,
 	/// which fewer threads may avoid, half the budget it ran on (the cap, or the whole machine, when the engine didn't
 	/// say), at least one; otherwise the same cap.

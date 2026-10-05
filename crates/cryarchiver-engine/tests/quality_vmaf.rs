@@ -72,10 +72,10 @@ async fn a_sample_cut_like_the_reference_scores_near_the_top() {
 
 	let aligned_scoring = scoring(dir.path(), "aligned.json");
 	let aligned_cmd = sample_command(&ffmpeg, &aligned, &reference(&source), 1.0, 2.0, &aligned_scoring);
-	let aligned = pool(&frames(&aligned_cmd, &aligned_scoring, |_| {}, &cancel).await.unwrap()).unwrap();
+	let aligned = pool(&mut frames(&aligned_cmd, &aligned_scoring, |_| {}, &cancel).await.unwrap()).unwrap();
 	let late_scoring = scoring(dir.path(), "late.json");
 	let late_cmd = sample_command(&ffmpeg, &late, &reference(&source), 1.0, 2.0, &late_scoring);
-	let late = pool(&frames(&late_cmd, &late_scoring, |_| {}, &cancel).await.unwrap()).unwrap();
+	let late = pool(&mut frames(&late_cmd, &late_scoring, |_| {}, &cancel).await.unwrap()).unwrap();
 
 	assert!(aligned.mean > 99.0, "{aligned:?}");
 	assert_eq!(aligned.frames, 50);
@@ -100,7 +100,7 @@ async fn the_whole_check_pairs_frames_by_position_scores_every_nth_and_reports_e
 	let mut paced = 0;
 	let copy_scoring = scoring(dir.path(), "copy.json");
 	let copy_cmd = whole_command(&ffmpeg, &copy, &reference(&source), 3, &copy_scoring);
-	let copy_frames = frames(
+	let mut copy_frames = frames(
 		&copy_cmd,
 		&copy_scoring,
 		|progress| paced = paced.max(progress.frame.unwrap_or(0)),
@@ -108,10 +108,10 @@ async fn the_whole_check_pairs_frames_by_position_scores_every_nth_and_reports_e
 	)
 	.await
 	.unwrap();
-	let same = pool(&copy_frames).unwrap();
+	let same = pool(&mut copy_frames).unwrap();
 	let shifted_scoring = scoring(dir.path(), "shifted.json");
 	let shifted_cmd = whole_command(&ffmpeg, &shifted, &reference(&source), 3, &shifted_scoring);
-	let off_by_one = pool(&frames(&shifted_cmd, &shifted_scoring, |_| {}, &cancel).await.unwrap()).unwrap();
+	let off_by_one = pool(&mut frames(&shifted_cmd, &shifted_scoring, |_| {}, &cancel).await.unwrap()).unwrap();
 
 	assert!(same.mean > 99.0, "{same:?}");
 	assert_eq!(same.frames, 34, "frames 0, 3, 6 … 99");

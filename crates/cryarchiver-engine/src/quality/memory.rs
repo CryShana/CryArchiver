@@ -80,38 +80,20 @@ impl GroupStats {
 	#[must_use]
 	pub fn updated(self, observation: Observation) -> Self {
 		if observation.without_grain != self.without_grain || !self.learned() {
-			let offset = match (self.offset, observation.offset) {
-				(Some(old), Some(new)) => Some(Offset {
-					mean: f64::midpoint(old.mean, new.mean),
-					p5: f64::midpoint(old.p5, new.p5),
-				}),
-				(old, new) => new.or(old),
-			};
 			return Self {
-				offset,
+				offset: combine_offsets(self.offset, observation.offset, f64::midpoint),
 				..Self::first(observation)
 			};
 		}
 
 		let weight = f64::from(self.observations.min(HISTORY - 1));
 		let blend = |old: f64, new: f64| (old * weight + new) / (weight + 1.0);
-		let merge = |old: Option<f64>, new: Option<f64>| match (old, new) {
-			(Some(old), Some(new)) => Some(blend(old, new)),
-			(old, new) => new.or(old),
-		};
-		let offset = match (self.offset, observation.offset) {
-			(Some(old), Some(new)) => Some(Offset {
-				mean: blend(old.mean, new.mean),
-				p5: blend(old.p5, new.p5),
-			}),
-			(old, new) => new.or(old),
-		};
 
 		Self {
 			setting: blend(self.setting, observation.setting),
-			slope: merge(self.slope, observation.slope),
-			bpp: merge(self.bpp, observation.bpp),
-			offset,
+			slope: combine(self.slope, observation.slope, blend),
+			bpp: combine(self.bpp, observation.bpp, blend),
+			offset: combine_offsets(self.offset, observation.offset, blend),
 			observations: self.observations.saturating_add(1),
 			without_grain: self.without_grain,
 		}
@@ -159,6 +141,21 @@ impl GroupStats {
 		}
 		None
 	}
+}
+
+/// `both` of the two values when there are two, else the one there is.
+fn combine<T>(old: Option<T>, new: Option<T>, both: impl FnOnce(T, T) -> T) -> Option<T> {
+	match (old, new) {
+		(Some(old), Some(new)) => Some(both(old, new)),
+		(old, new) => new.or(old),
+	}
+}
+
+fn combine_offsets(old: Option<Offset>, new: Option<Offset>, both: impl Fn(f64, f64) -> f64) -> Option<Offset> {
+	combine(old, new, |old, new| Offset {
+		mean: both(old.mean, new.mean),
+		p5: both(old.p5, new.p5),
+	})
 }
 
 fn setting_range(encoder: &str) -> Option<RangeInclusive<f64>> {
@@ -239,6 +236,28 @@ impl SharedMemory {
 	fn lock(&self) -> MutexGuard<'_, Entries> {
 		self.entries.lock().unwrap_or_else(PoisonError::into_inner)
 	}
+
+	/// Replaces `key`'s stats with what `change` makes of them, `None` dropping them, and marks the group changed
+	/// unless it had none and still has none.
+	fn apply(&self, key: &CacheKey, change: impl FnOnce(Option<GroupStats>) -> Option<GroupStats>) {
+		let key = key.to_string();
+		let mut entries = self.lock();
+		let old = entries.stats.get(&key).copied();
+		let new = change(old);
+		if old.is_none() && new.is_none() {
+			return;
+		}
+
+		match new {
+			Some(stats) => entries.stats.insert(key.clone(), stats),
+			None => entries.stats.remove(&key),
+		};
+		entries.changed.insert(key);
+	}
+}
+
+fn observed(stats: Option<GroupStats>, observation: Observation) -> GroupStats {
+	stats.map_or_else(|| GroupStats::first(observation), |stats| stats.updated(observation))
 }
 
 impl QualityMemory for SharedMemory {
@@ -255,44 +274,15 @@ impl QualityMemory for SharedMemory {
 	}
 
 	fn record(&self, key: &CacheKey, observation: Observation) {
-		let key = key.to_string();
-		let mut entries = self.lock();
-		let stats = match entries.stats.get(&key) {
-			Some(stats) => stats.updated(observation),
-			None => GroupStats::first(observation),
-		};
-
-		entries.stats.insert(key.clone(), stats);
-		entries.changed.insert(key);
+		self.apply(key, |stats| Some(observed(stats, observation)));
 	}
 
 	fn record_offset(&self, key: &CacheKey, observation: Observation) {
-		let key = key.to_string();
-		let mut entries = self.lock();
-		let stats = match entries.stats.get(&key) {
-			Some(stats) => stats.updated(observation),
-			None if observation.offset.is_none() => return,
-			None => GroupStats::first(observation),
-		};
-
-		match stats.forgotten() {
-			Some(kept) => entries.stats.insert(key.clone(), kept),
-			None => entries.stats.remove(&key),
-		};
-		entries.changed.insert(key);
+		self.apply(key, |stats| observed(stats, observation).forgotten());
 	}
 
 	fn forget(&self, key: &CacheKey) {
-		let key = key.to_string();
-		let mut entries = self.lock();
-		let Some(stats) = entries.stats.remove(&key) else {
-			return;
-		};
-
-		if let Some(kept) = stats.forgotten() {
-			entries.stats.insert(key.clone(), kept);
-		}
-		entries.changed.insert(key);
+		self.apply(key, |stats| stats.and_then(GroupStats::forgotten));
 	}
 }
 

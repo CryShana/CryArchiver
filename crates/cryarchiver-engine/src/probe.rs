@@ -7,12 +7,22 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::process::{self, RunError, StdoutMode, ToolCommand};
+use crate::process::{self, RunError, StdoutMode, ToolCommand, ToolOutput};
 use crate::toolchain::Toolchain;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const AV1_GRAIN_TRACE: &[&str] = &[" apply_grain "];
 const ESTIMATED_DURATION: &str = "Estimating duration from bitrate";
+const JSON_ARGS: [&str; 8] = [
+	"-v",
+	"warning",
+	"-hide_banner",
+	"-print_format",
+	"json",
+	"-show_format",
+	"-show_streams",
+	"-show_chapters",
+];
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MediaInfo {
@@ -137,6 +147,10 @@ impl Stream {
 		self.codec_type == "video"
 	}
 
+	pub fn is_subtitle(&self) -> bool {
+		self.codec_type == "subtitle"
+	}
+
 	pub fn is_attached_pic(&self) -> bool {
 		self.disposition.get("attached_pic") == Some(&1)
 	}
@@ -150,6 +164,11 @@ impl Stream {
 			.iter()
 			.find(|(name, _)| name.eq_ignore_ascii_case(key))
 			.map(|(_, value)| value.as_str())
+	}
+
+	/// Matroska's `alpha_mode`: the stream carries an alpha channel.
+	pub fn alpha_signalled(&self) -> bool {
+		self.tag("alpha_mode") == Some("1")
 	}
 
 	pub fn side_data(&self, kind: &str) -> Option<&SideData> {
@@ -227,6 +246,10 @@ impl MediaInfo {
 		self.streams.iter().filter(|stream| stream.is_audio())
 	}
 
+	pub fn real_video_streams(&self) -> impl Iterator<Item = &Stream> {
+		self.streams.iter().filter(|stream| stream.is_real_video())
+	}
+
 	pub fn duration_shortfall(&self, decoded_s: f64) -> Option<String> {
 		let declared = self.format.duration.filter(|_| !self.format.duration_estimated)?;
 
@@ -247,24 +270,9 @@ pub enum ProbeError {
 
 pub async fn probe(tools: &Toolchain, path: &Path, cancel: &CancellationToken) -> Result<MediaInfo, ProbeError> {
 	let mut cmd = ToolCommand::new(&tools.ffprobe, PROBE_TIMEOUT);
-	cmd.args([
-		"-v",
-		"warning",
-		"-hide_banner",
-		"-print_format",
-		"json",
-		"-show_format",
-		"-show_streams",
-		"-show_chapters",
-		"-i",
-	])
-	.arg(process::tool_path(path));
+	cmd.args(JSON_ARGS).arg("-i").arg(process::tool_path(path));
 
-	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
-	if !out.status.success() {
-		return Err(ProbeError::Failed(out.stderr_tail));
-	}
-
+	let out = run_ffprobe(&cmd, cancel).await?;
 	let mut info = MediaInfo::parse(&out.stdout)?;
 	info.format.duration_estimated = out.stderr_tail.iter().any(|line| line.contains(ESTIMATED_DURATION));
 	Ok(info)
@@ -280,27 +288,13 @@ pub async fn probe_video(
 	cancel: &CancellationToken,
 ) -> Result<(MediaInfo, Vec<u8>), ProbeError> {
 	let mut cmd = ToolCommand::new(&tools.ffprobe, process::scaled_timeout(source_bytes));
-	cmd.args([
-		"-v",
-		"warning",
-		"-hide_banner",
-		"-print_format",
-		"json",
-		"-show_format",
-		"-show_streams",
-		"-show_chapters",
-		"-show_programs",
-	]);
+	cmd.args(JSON_ARGS).arg("-show_programs");
 	if count_packets {
 		cmd.arg("-count_packets");
 	}
 	cmd.arg("-i").arg(process::tool_path(path));
 
-	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
-	if !out.status.success() {
-		return Err(ProbeError::Failed(out.stderr_tail));
-	}
-
+	let out = run_ffprobe(&cmd, cancel).await?;
 	let info = MediaInfo::parse(&out.stdout)?;
 	Ok((info, out.stdout))
 }
@@ -335,13 +329,19 @@ pub async fn first_frames(
 	])
 	.arg(process::tool_path(path));
 
-	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
+	let out = run_ffprobe(&cmd, cancel).await?;
+	let frames: Frames = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))?;
+	Ok(frames.frames)
+}
+
+/// Runs a probe to its output, failing when the tool does.
+pub async fn run_ffprobe(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<ToolOutput, ProbeError> {
+	let out = process::run(cmd, StdoutMode::Capture, |_| {}, cancel).await?;
 	if !out.status.success() {
 		return Err(ProbeError::Failed(out.stderr_tail));
 	}
 
-	let frames: Frames = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))?;
-	Ok(frames.frames)
+	Ok(out)
 }
 
 /// Whether an AV1 stream's first frame header carries film grain parameters, read from the bitstream rather than from

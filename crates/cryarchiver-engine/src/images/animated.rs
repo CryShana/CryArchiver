@@ -357,14 +357,14 @@ pub async fn verify_animation(
 ) -> Result<f64, JobError> {
 	let info = probe::probe(tools, output, cancel)
 		.await
-		.map_err(|err| failed(format!("ffprobe could not read the output: {err}")))?;
+		.map_err(|err| JobError::verification(format!("ffprobe could not read the output: {err}")))?;
 	let tracks = sequence_tracks(&info, animation)?;
 	check_delays(tools, source, output, tracks[0], &animation.timeline, cancel).await?;
 
-	let bytes = std::fs::read(output).map_err(|err| failed(err.to_string()))?;
+	let bytes = std::fs::read(output).map_err(|err| JobError::verification(err.to_string()))?;
 	let timeline = &animation.timeline;
 	if plays(&bytes) != Some(timeline.plays.map(u64::from)) {
-		return Err(failed(format!(
+		return Err(JobError::verification(format!(
 			"the loop count is {:?}, not {:?}",
 			plays(&bytes),
 			timeline.plays
@@ -389,7 +389,7 @@ pub async fn verify_animation(
 	)
 	.await?;
 	if reference.len() != frames.len() || decoded.len() != frames.len() {
-		return Err(failed("fewer frames decoded than sampled"));
+		return Err(JobError::verification("fewer frames decoded than sampled"));
 	}
 
 	blocking(cancel, move || {
@@ -400,7 +400,7 @@ pub async fn verify_animation(
 			.try_fold(f64::INFINITY, |worst, score| score.map(|score| worst.min(score)))
 	})
 	.await?
-	.map_err(failed)
+	.map_err(JobError::verification)
 }
 
 fn sequence_tracks(info: &MediaInfo, animation: &Animation) -> Result<Vec<u32>, JobError> {
@@ -412,7 +412,7 @@ fn sequence_tracks(info: &MediaInfo, animation: &Animation) -> Result<Vec<u32>, 
 		.collect();
 	let expected = if animation.alpha { 2 } else { 1 };
 	if tracks.len() != expected {
-		return Err(failed(format!(
+		return Err(JobError::verification(format!(
 			"expected {expected} animated tracks, found {}",
 			tracks.len()
 		)));
@@ -425,14 +425,16 @@ fn sequence_tracks(info: &MediaInfo, animation: &Animation) -> Result<Vec<u32>, 
 		.find(|stream| stream.index == tracks[0])
 		.expect("listed above");
 	if color.nb_frames != Some(u64::from(timeline.frames)) {
-		return Err(failed(format!(
+		return Err(JobError::verification(format!(
 			"the output has {:?} frames, not {}",
 			color.nb_frames, timeline.frames
 		)));
 	}
 	let (width, height) = animation.size.unwrap_or((timeline.width, timeline.height));
 	if (color.width, color.height) != (Some(width), Some(height)) {
-		return Err(failed(format!("the output frames are not {width}×{height}")));
+		return Err(JobError::verification(format!(
+			"the output frames are not {width}×{height}"
+		)));
 	}
 	Ok(tracks)
 }
@@ -468,7 +470,7 @@ async fn check_delays(
 	if matches {
 		Ok(())
 	} else {
-		Err(failed("the frame timing differs from the source"))
+		Err(JobError::verification("the frame timing differs from the source"))
 	}
 }
 
@@ -489,12 +491,14 @@ enum Sampled<'a> {
 async fn decode_frames(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<Vec<DynamicImage>, JobError> {
 	let out = process::run(cmd, StdoutMode::Capture, |_| {}, cancel).await?;
 	if !out.status.success() {
-		return Err(failed(format!(
+		return Err(JobError::verification(format!(
 			"ffmpeg could not decode sampled frames: {}",
 			process::failure_reason(&out.stderr_tail)
 		)));
 	}
-	blocking(cancel, move || split_pams(&out.stdout)).await?.map_err(failed)
+	blocking(cancel, move || split_pams(&out.stdout))
+		.await?
+		.map_err(JobError::verification)
 }
 
 /// Decodes `frames` of `input` as PAM images on stdout. The select still decodes every frame up to the last one.
@@ -573,10 +577,6 @@ fn milliseconds(seconds: f64) -> u32 {
 #[allow(clippy::cast_possible_truncation)]
 fn whole_ms(seconds: f64) -> i64 {
 	(seconds * 1000.0).round() as i64
-}
-
-fn failed(reason: impl std::fmt::Display) -> JobError {
-	ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into()
 }
 
 #[cfg(test)]

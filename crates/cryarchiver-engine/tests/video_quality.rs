@@ -359,8 +359,8 @@ async fn both_checks(tools: &Toolchain, clip: &Path, workspace: &Workspace, plan
 		clip.display()
 	);
 	assert!(progress > 0.9, "{}: {progress}", clip.display());
-	let picked: Vec<f64> = all.into_iter().step_by(usize::try_from(every).unwrap()).collect();
-	(checked, pool(&picked).unwrap(), every)
+	let mut picked: Vec<f64> = all.into_iter().step_by(usize::try_from(every).unwrap()).collect();
+	(checked, pool(&mut picked).unwrap(), every)
 }
 
 fn same_frames(checked: Score, through: Score) -> bool {
@@ -426,7 +426,7 @@ async fn the_sampled_check_of_a_24_fps_encode_scores_like_every_frame() {
 		.verify(&temp, encoded.frames, encoded.decoded_s, |_| {})
 		.await
 		.unwrap();
-	let all = pool(&scorer.whole_scores(&temp, 1, encoded.frames, |_| {}).await.unwrap()).unwrap();
+	let all = pool(&mut scorer.whole_scores(&temp, 1, encoded.frames, |_| {}).await.unwrap()).unwrap();
 
 	assert_eq!(subsample(encoded.frames, encoded.decoded_s), 3);
 	assert!(
@@ -771,9 +771,17 @@ async fn a_search_sample_and_its_reference_draw_the_subtitles_on_screen_at_its_o
 	let during = black_work.file("during.mkv");
 	let before = black_work.file("before.mkv");
 	for (sample, output) in [(&on_screen, &during), (&off_screen, &before)] {
-		encode_sample(&tools.ffmpeg, &black, output, &black_plan, sample, &cancel)
-			.await
-			.unwrap();
+		encode_sample(
+			&tools.ffmpeg,
+			&black,
+			output,
+			&black_plan,
+			black_plan.threads,
+			sample,
+			&cancel,
+		)
+		.await
+		.unwrap();
 	}
 
 	let colour_work = Workspace::create(&dir.path().join("work"), &colour).unwrap();
@@ -789,7 +797,7 @@ async fn a_search_sample_and_its_reference_draw_the_subtitles_on_screen_at_its_o
 	};
 	let probed = scorer.probe(20.0, &[on_screen], 0, |_| {}).await.unwrap();
 	let score = probed.score;
-	assert!(probed.encode_s > 0.0 && probed.bytes > 0, "{probed:?}");
+	assert!(probed.rate > 0.0 && probed.bytes > 0, "{probed:?}");
 
 	let lit = support::lit_span(&during, 0).unwrap();
 	assert!(lit.0.abs() < 0.02 && (lit.1 - 0.96).abs() < 0.02, "{lit:?}");

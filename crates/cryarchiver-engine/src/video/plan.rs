@@ -190,7 +190,7 @@ pub fn memory_estimate(width: u32, height: u32) -> u64 {
 
 pub fn main_stream(info: &MediaInfo) -> Option<&Stream> {
 	let mut first_real = None;
-	for stream in info.streams.iter().filter(|stream| stream.is_real_video()) {
+	for stream in info.real_video_streams() {
 		if stream.disposition.get("default") == Some(&1) {
 			return Some(stream);
 		}
@@ -476,7 +476,7 @@ fn too_large_for_svt(width: u32, height: u32) -> bool {
 }
 
 pub fn has_alpha(stream: &Stream) -> bool {
-	stream.tag("alpha_mode") == Some("1")
+	stream.alpha_signalled()
 		|| stream
 			.pix_fmt
 			.as_deref()
@@ -501,7 +501,7 @@ fn has_side_data(frames: &[Frame], kind: &str) -> bool {
 #[allow(clippy::cast_precision_loss)]
 pub fn source_bpp(info: &MediaInfo, main: &Stream) -> Option<f64> {
 	let bits_per_second = main.bit_rate.or_else(|| {
-		let single_video = info.streams.iter().filter(|stream| stream.is_real_video()).count() == 1;
+		let single_video = info.real_video_streams().count() == 1;
 		let audio: u64 = info.audio_streams().filter_map(|stream| stream.bit_rate).sum();
 		info.format
 			.bit_rate

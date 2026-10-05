@@ -83,19 +83,19 @@ pub fn model_for(width: u32, height: u32) -> &'static str {
 	clippy::cast_possible_truncation,
 	clippy::cast_sign_loss
 )]
-pub fn pool(frames: &[f64]) -> Option<Score> {
+/// Sorts `frames` in place; the mean is summed in that order.
+pub fn pool(frames: &mut [f64]) -> Option<Score> {
 	if frames.is_empty() {
 		return None;
 	}
 
-	let mut sorted = frames.to_vec();
-	sorted.sort_by(f64::total_cmp);
-	let low = sorted[(sorted.len() as f64 * LOW_PERCENTILE).floor() as usize];
+	frames.sort_by(f64::total_cmp);
+	let low = frames[(frames.len() as f64 * LOW_PERCENTILE).floor() as usize];
 
 	Some(Score {
-		mean: sorted.iter().sum::<f64>() / sorted.len() as f64,
+		mean: frames.iter().sum::<f64>() / frames.len() as f64,
 		p5: low,
-		frames: sorted.len(),
+		frames: frames.len(),
 	})
 }
 
@@ -112,22 +112,8 @@ pub fn sample_command(
 	length_s: f64,
 	scoring: &Scoring<'_>,
 ) -> ToolCommand {
-	let mut cmd = base(ffmpeg, distorted, scoring);
-	let cut = reference.start.seek(start_s, length_s);
-	cmd.seek(cut.input_s, cut.input_length_s);
-	push_reference(&mut cmd, reference, scoring, Some(cut));
-
-	let distorted_chain = chain(&[SCORED_FORMAT, BY_POSITION]);
-	let reference_chain = chain(&[reference.filters, SCORED_FORMAT, BY_POSITION]);
-	// A mapped label, not an unlabeled output: with an unlabeled one, ffmpeg 9 doesn't start a TS or PS reference at
-	// the streams it reads (as `InputStart` has it), but at the file's start.
-	cmd.arg("-filter_complex").arg(format!(
-		"[0:v:0]{distorted_chain}[d];{};[d][r]{}[scored]",
-		reference_branch(reference, &reference_chain, Some(cut)),
-		libvmaf(scoring)
-	));
-	cmd.args(["-map", "[scored]", "-f", "null", "-"]);
-	cmd
+	let span = TrimWindow { start_s, length_s };
+	scored_command(ffmpeg, distorted, reference, Some(span), 1, scoring)
 }
 
 /// Scores the whole of `distorted` against the same span of the source, both decoded through, on every `every`th
@@ -140,22 +126,33 @@ pub fn whole_command(
 	every: u64,
 	scoring: &Scoring<'_>,
 ) -> ToolCommand {
+	scored_command(ffmpeg, distorted, reference, reference.window, every, scoring)
+}
+
+fn scored_command(
+	ffmpeg: &Path,
+	distorted: &Path,
+	reference: &Reference<'_>,
+	span: Option<TrimWindow>,
+	every: u64,
+	scoring: &Scoring<'_>,
+) -> ToolCommand {
 	let mut cmd = base(ffmpeg, distorted, scoring);
-	let cut = reference
-		.window
-		.map(|window| reference.start.seek(window.start_s, window.length_s));
+	let cut = span.map(|span| reference.start.seek(span.start_s, span.length_s));
 	if let Some(cut) = cut {
 		cmd.seek(cut.input_s, cut.input_length_s);
 	}
 	push_reference(&mut cmd, reference, scoring, cut);
 
-	let distorted_chain = chain(&[SCORED_FORMAT, BY_POSITION]);
-	let reference_chain = chain(&[reference.filters, SCORED_FORMAT, BY_POSITION]);
+	let distorted_chain = burn::chained(&[SCORED_FORMAT, BY_POSITION]);
+	let reference_chain = burn::chained(&[reference.filters, SCORED_FORMAT, BY_POSITION]);
 	let subsample = if every > 1 {
 		format!(":n_subsample={every}")
 	} else {
 		String::new()
 	};
+	// A mapped label, not an unlabeled output: with an unlabeled one, ffmpeg 9 doesn't start a TS or PS reference at
+	// the streams it reads (as `InputStart` has it), but at the file's start.
 	cmd.arg("-filter_complex").arg(format!(
 		"[0:v:0]{distorted_chain}[d];{};[d][r]{}{subsample}[scored]",
 		reference_branch(reference, &reference_chain, cut),
@@ -189,9 +186,7 @@ fn base(ffmpeg: &Path, distorted: &Path, scoring: &Scoring<'_>) -> ToolCommand {
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
 	cmd.in_dir(scoring.dir);
 	cmd.args(["-hide_banner", "-nostdin"])
-		.threads(scoring.budget)
-		.arg("-i")
-		.arg(process::tool_path(distorted));
+		.input(None, scoring.budget, distorted);
 	cmd
 }
 
@@ -199,12 +194,7 @@ fn push_reference(cmd: &mut ToolCommand, reference: &Reference<'_>, scoring: &Sc
 	if let Some(offset) = reference.start.offset_arg(cut.map(|cut| cut.input_s)) {
 		cmd.arg("-itsoffset").arg(offset);
 	}
-	if let Some(decoder) = reference.decoder {
-		cmd.arg("-c:v").arg(decoder);
-	}
-	cmd.threads(scoring.budget)
-		.arg("-i")
-		.arg(process::tool_path(reference.source));
+	cmd.input(reference.decoder, scoring.budget, reference.source);
 
 	if let Some(overlay) = reference.overlay {
 		cmd.args(overlay.input_args())
@@ -227,15 +217,6 @@ fn reference_branch(reference: &Reference<'_>, chain: &str, cut: Option<Seek>) -
 			burn::main_chain(&shaped, reference.subtitles, chain, seek_s)
 		),
 	}
-}
-
-fn chain(parts: &[&str]) -> String {
-	parts
-		.iter()
-		.filter(|part| !part.is_empty())
-		.copied()
-		.collect::<Vec<_>>()
-		.join(",")
 }
 
 fn libvmaf(scoring: &Scoring<'_>) -> String {
@@ -306,14 +287,14 @@ mod tests {
 
 	#[test]
 	fn pooling_takes_the_mean_and_the_fifth_percentile() {
-		let frames: Vec<f64> = (0..100).map(f64::from).collect();
+		let mut frames: Vec<f64> = (0..100).map(f64::from).collect();
 
-		let score = pool(&frames).unwrap();
+		let score = pool(&mut frames).unwrap();
 
 		assert!((score.mean - 49.5).abs() < 1e-9, "{score:?}");
 		assert!((score.p5 - 5.0).abs() < 1e-9, "{score:?}");
 		assert_eq!(score.frames, 100);
-		assert_eq!(pool(&[]), None);
+		assert_eq!(pool(&mut []), None);
 	}
 
 	#[test]

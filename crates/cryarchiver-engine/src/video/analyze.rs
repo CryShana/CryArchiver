@@ -152,13 +152,7 @@ pub fn segment_command(
 		cmd.seek(segment.start_s, length);
 	}
 
-	if let Some(decoder) = decoder {
-		cmd.arg("-c:v").arg(decoder);
-	}
-
-	cmd.threads(threads)
-		.arg("-i")
-		.arg(process::tool_path(source))
+	cmd.input(decoder, threads, source)
 		.arg("-filter_complex")
 		.arg(format!("[0:{stream_index}]{FILTERS}"))
 		.args(["-map", "[out]", "-f", "null", "-"]);
@@ -213,7 +207,7 @@ pub fn parse_segment(stderr: &[String], start_s: f64, length_s: f64) -> Option<S
 
 #[allow(clippy::cast_precision_loss)]
 pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&str>) -> Analysis {
-	let voting: Vec<&SegmentStats> = stats.iter().filter(|segment| !blank(segment)).collect();
+	let voting: Vec<&SegmentStats> = stats.iter().filter(|segment| !segment.blank()).collect();
 	let voting = if voting.is_empty() {
 		stats.iter().collect()
 	} else {
@@ -239,17 +233,9 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 		_ if frames < 1.0 => ScanType::Progressive,
 		Some(fps) if fps > MAX_INTERLACED_FPS && !flagged_interlaced => ScanType::Progressive,
 		Some(fps) if (fps - NTSC_FPS).abs() < 0.01 && repeated / frames >= TELECINE_REPEATS => ScanType::Telecined,
-		_ if (tff + bff) / frames >= INTERLACED_SHARE => {
-			let top_share = tff / (tff + bff);
-			let top_first = if top_share >= FIELD_ORDER_SHARE {
-				true
-			} else if top_share <= 1.0 - FIELD_ORDER_SHARE {
-				false
-			} else {
-				!matches!(field_order, Some("bb" | "bt"))
-			};
-			ScanType::Interlaced { top_first }
-		}
+		_ if (tff + bff) / frames >= INTERLACED_SHARE => ScanType::Interlaced {
+			top_first: top_first(tff / (tff + bff)).unwrap_or(!matches!(field_order, Some("bb" | "bt"))),
+		},
 		// A mostly still picture leaves most interlaced frames undetermined, so an interlaced container needs only a
 		// few frames that agree on one field order. They must outnumber the progressive frames: a slow vertical pan
 		// of progressive video draws a steady share of one-sided votes too.
@@ -258,14 +244,7 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 			&& tff + bff >= FLAGGED_INTERLACED_VOTES
 			&& tff + bff > progressive =>
 		{
-			let top_share = tff / (tff + bff);
-			if top_share >= FIELD_ORDER_SHARE {
-				ScanType::Interlaced { top_first: true }
-			} else if top_share <= 1.0 - FIELD_ORDER_SHARE {
-				ScanType::Interlaced { top_first: false }
-			} else {
-				ScanType::Progressive
-			}
+			interlaced_or_progressive(tff / (tff + bff))
 		}
 		// Faint interlacing that nothing flags: idet weighs whole frames, where a small moving area drowns in the still
 		// rest, while the comb measure counts only the moving blocks.
@@ -274,14 +253,7 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 			&& (combed.top_first + combed.bottom_first) as f64
 				>= COMBED_SHARE * (combed.top_first + combed.bottom_first + combed.progressive) as f64 =>
 		{
-			let top_share = combed.top_first as f64 / (combed.top_first + combed.bottom_first) as f64;
-			if top_share >= FIELD_ORDER_SHARE {
-				ScanType::Interlaced { top_first: true }
-			} else if top_share <= 1.0 - FIELD_ORDER_SHARE {
-				ScanType::Interlaced { top_first: false }
-			} else {
-				ScanType::Progressive
-			}
+			interlaced_or_progressive(combed.top_first as f64 / (combed.top_first + combed.bottom_first) as f64)
 		}
 		_ => ScanType::Progressive,
 	};
@@ -292,8 +264,11 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 		.iter()
 		.filter(|segment| segment.black_s < REJECT_SHARE * segment.length_s)
 		.flat_map(|segment| {
-			let held = segment.frozen_s >= REJECT_SHARE * segment.length_s;
-			segment.noise.iter().copied().take(if held { 1 } else { usize::MAX })
+			segment
+				.noise
+				.iter()
+				.copied()
+				.take(if segment.held() { 1 } else { usize::MAX })
 		})
 		.collect();
 	let noise_sigma = noise::level(&triplets);
@@ -312,8 +287,8 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 			ti: segment.ti,
 			luma: segment.luma,
 			noise: noise::level(&segment.noise),
-			usable: !blank(segment) && segment.si.is_none_or(|si| si >= tables().video.low_detail_si),
-			still: segment.frozen_s >= REJECT_SHARE * segment.length_s,
+			usable: !segment.blank() && segment.si.is_none_or(|si| si >= tables().video.low_detail_si),
+			still: segment.held(),
 		})
 		.collect();
 	Analysis {
@@ -324,8 +299,31 @@ pub fn classify(stats: &[SegmentStats], fps: Option<f64>, field_order: Option<&s
 	}
 }
 
-fn blank(segment: &SegmentStats) -> bool {
-	segment.black_s >= REJECT_SHARE * segment.length_s || segment.frozen_s >= REJECT_SHARE * segment.length_s
+impl SegmentStats {
+	/// Held for most of the segment: its frames repeat.
+	fn held(&self) -> bool {
+		self.frozen_s >= REJECT_SHARE * self.length_s
+	}
+
+	fn blank(&self) -> bool {
+		self.black_s >= REJECT_SHARE * self.length_s || self.held()
+	}
+}
+
+/// Whether most fields come top first (`Some(true)`) or bottom first (`Some(false)`) at a top-first share of
+/// `top_share`; `None` when neither order holds most of them.
+fn top_first(top_share: f64) -> Option<bool> {
+	if top_share >= FIELD_ORDER_SHARE {
+		Some(true)
+	} else if top_share <= 1.0 - FIELD_ORDER_SHARE {
+		Some(false)
+	} else {
+		None
+	}
+}
+
+fn interlaced_or_progressive(top_share: f64) -> ScanType {
+	top_first(top_share).map_or(ScanType::Progressive, |top_first| ScanType::Interlaced { top_first })
 }
 
 pub async fn analyze(
@@ -471,7 +469,7 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 pub fn forced_decoder(stream: &Stream) -> Option<&'static str> {
-	if stream.tag("alpha_mode") != Some("1") {
+	if !stream.alpha_signalled() {
 		return None;
 	}
 

@@ -1,4 +1,3 @@
-use std::fmt::Display;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,7 +13,7 @@ use crate::images::jxl::libjxl_cicp;
 use crate::images::ssim;
 use crate::metadata::OutputMetadata;
 use crate::metadata::icc::Cicp;
-use crate::outcome::{ErrorKind, JobError};
+use crate::outcome::JobError;
 use crate::toolchain::Toolchain;
 
 #[derive(Debug, Clone, Copy)]
@@ -46,7 +45,7 @@ pub async fn verify_avif(
 			xmp: expected.metadata.xmp.as_deref(),
 		},
 	};
-	avif::check(bytes, &expectations).map_err(failed)?;
+	avif::check(bytes, &expectations).map_err(JobError::verification)?;
 
 	let request = PamRequest {
 		alpha_item: expected.alpha,
@@ -55,14 +54,16 @@ pub async fn verify_avif(
 	};
 	let (decoded, errors) = run_pam(&pam_command(&tools.ffmpeg, output, request), cancel)
 		.await
-		.map_err(|err| failed(err.kind))?;
+		.map_err(|err| JobError::verification(err.kind))?;
 	if errors > 0 {
-		return Err(failed(format!("the output decodes with {errors} errors")));
+		return Err(JobError::verification(format!(
+			"the output decodes with {errors} errors"
+		)));
 	}
 
 	blocking(cancel, move || ssim::score(&reference, &decoded))
 		.await?
-		.map_err(failed)
+		.map_err(JobError::verification)
 }
 
 pub async fn verify_jxl(
@@ -72,7 +73,7 @@ pub async fn verify_jxl(
 	lossless: bool,
 	cancel: &CancellationToken,
 ) -> Result<f64, JobError> {
-	check_jxl(&bytes, expected, lossless).map_err(failed)?;
+	check_jxl(&bytes, expected, lossless).map_err(JobError::verification)?;
 
 	let source_icc = expected.icc.map(<[u8]>::to_vec);
 	blocking(cancel, move || {
@@ -84,7 +85,7 @@ pub async fn verify_jxl(
 		ssim::score(&reference, &rendered)
 	})
 	.await?
-	.map_err(failed)
+	.map_err(JobError::verification)
 }
 
 pub fn check_jxl(bytes: &[u8], expected: &Expected<'_>, lossless: bool) -> Result<(), String> {
@@ -137,8 +138,4 @@ pub fn check_jxl(bytes: &[u8], expected: &Expected<'_>, lossless: bool) -> Resul
 		}
 	}
 	Ok(())
-}
-
-fn failed(reason: impl Display) -> JobError {
-	ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into()
 }

@@ -88,6 +88,14 @@ impl ToolCommand {
 		self
 	}
 
+	/// The next input: `path`, decoded by `decoder` when one is forced, on `threads`.
+	pub fn input(&mut self, decoder: Option<&str>, threads: Option<usize>, path: &Path) -> &mut Self {
+		if let Some(decoder) = decoder {
+			self.arg("-c:v").arg(decoder);
+		}
+		self.threads(threads).arg("-i").arg(tool_path(path))
+	}
+
 	pub fn count_lines_containing(&mut self, patterns: &'static [&'static str]) -> &mut Self {
 		self.counted = patterns;
 		self

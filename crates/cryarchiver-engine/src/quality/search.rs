@@ -1,14 +1,14 @@
 use crate::quality::vmaf::Score;
 
 pub const MAX_PROBES: usize = 4;
+/// Half a VMAF point: a search stops once it passes by no more, a retry aims this far above the target, and a full
+/// check that misses by no more is written as it is.
+pub const TOLERANCE: f64 = 0.5;
 
 const MAX_STEP: f64 = 8.0;
-const CLOSE_ENOUGH: f64 = 0.5;
 const DOWN_MARGIN: f64 = 0.5;
 const MIN_SLOPE: f64 = 0.05;
 const MAX_SLOPE: f64 = 5.0;
-/// How far above the target a retry aims: half a point, as far as a check may miss and still be written.
-const RETRY_MARGIN: f64 = 0.5;
 const RETRY_SLOPE_TRUST: f64 = 0.75;
 const MIN_RETRY_DROP: f64 = 2.0;
 /// How far below its lowest probe a retry may follow the samples' curve, with no probe there to show its shape.
@@ -27,6 +27,11 @@ impl Target {
 
 	pub fn met(self, score: Score) -> bool {
 		self.margin(score) >= 0.0
+	}
+
+	/// Whether `score` misses the mean and the floor alike by no more than `slack`.
+	pub fn within(self, score: Score, slack: f64) -> bool {
+		score.mean >= self.mean - slack && score.p5 >= self.floor - slack
 	}
 }
 
@@ -67,9 +72,7 @@ pub fn next(probes: &[Probe], target: Target, bounds: Bounds, prior_slope: f64) 
 	let passing = highest_pass(probes, target);
 	let failing = lowest_miss(probes, target, passing);
 
-	let slope = slope(probes, target, bounds, passing, failing)
-		.unwrap_or(prior_slope)
-		.clamp(MIN_SLOPE, MAX_SLOPE);
+	let slope = clamped(slope(probes, target, bounds, passing, failing).unwrap_or(prior_slope));
 	let done = Next::Done(match passing {
 		Some(index) => Choice::Chosen { index, slope },
 		None => Choice::Unreachable {
@@ -77,7 +80,7 @@ pub fn next(probes: &[Probe], target: Target, bounds: Bounds, prior_slope: f64) 
 		},
 	});
 
-	if passing.is_some_and(|index| margin(index) <= CLOSE_ENOUGH) || probes.len() >= MAX_PROBES {
+	if passing.is_some_and(|index| margin(index) <= TOLERANCE) || probes.len() >= MAX_PROBES {
 		return done;
 	}
 
@@ -104,7 +107,7 @@ pub fn next(probes: &[Probe], target: Target, bounds: Bounds, prior_slope: f64) 
 	Next::Probe(candidate)
 }
 
-/// The CRF a missed full check is encoded again at. The retry is the last full encode, so it aims `RETRY_MARGIN` above
+/// The CRF a missed full check is encoded again at. The retry is the last full encode, so it aims `TOLERANCE` above
 /// the target on a slope it trusts only so far, and drops at least `MIN_RETRY_DROP`: the full check already landed
 /// away from the samples once, and a CRF next to the one that missed would miss again.
 pub fn retry_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bounds) -> Option<f64> {
@@ -114,15 +117,14 @@ pub fn retry_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bou
 		return None;
 	}
 
-	let trusted = slope.clamp(MIN_SLOPE, MAX_SLOPE) * RETRY_SLOPE_TRUST;
-	let drop = ((deficit + RETRY_MARGIN) / trusted).clamp(MIN_RETRY_DROP, MAX_STEP);
-	let lowered = bounds.quantize(crf - drop);
-	(lowered < crf).then_some(lowered)
+	let trusted = clamped(slope) * RETRY_SLOPE_TRUST;
+	let drop = ((deficit + TOLERANCE) / trusted).clamp(MIN_RETRY_DROP, MAX_STEP);
+	lowered(crf, crf - drop, bounds)
 }
 
 /// The CRF a missed full check is encoded again at, aimed on the search's own probe curve: the probes below the CRF
 /// that missed, each moved by how far the full check landed from its samples (`full` against `predicted`), with the
-/// check itself on top. It is where that curve reaches the target plus `RETRY_MARGIN`, between the two points around
+/// check itself on top. It is where that curve reaches the target plus `TOLERANCE`, between the two points around
 /// it, or, when no point reaches it, on the line through the lowest two, but never more than `MAX_EXTRAPOLATION` below
 /// the lowest probe. It drops at least `MIN_RETRY_DROP` and at most `MAX_STEP`, like `retry_crf`. `None` for a check
 /// that didn't miss or with no probe below the CRF that missed, where `retry_crf` aims on the slope instead.
@@ -140,8 +142,8 @@ pub fn curve_retry_crf(
 	}
 
 	let aim = Target {
-		mean: target.mean + RETRY_MARGIN,
-		floor: target.floor + RETRY_MARGIN,
+		mean: target.mean + TOLERANCE,
+		floor: target.floor + TOLERANCE,
 	};
 	let shifted = |score: Score| Score {
 		mean: score.mean + full.mean - predicted.mean,
@@ -172,21 +174,29 @@ pub fn curve_retry_crf(
 		}
 	});
 
-	let lowered = bounds.quantize(
-		aimed
-			.max(lowest - MAX_EXTRAPOLATION)
-			.max(crf - MAX_STEP)
-			.min(crf - MIN_RETRY_DROP),
-	);
+	let to = aimed
+		.max(lowest - MAX_EXTRAPOLATION)
+		.max(crf - MAX_STEP)
+		.min(crf - MIN_RETRY_DROP);
+	lowered(crf, to, bounds)
+}
+
+/// `to` on the CRF grid, when that is below `crf`.
+fn lowered(crf: f64, to: f64, bounds: Bounds) -> Option<f64> {
+	let lowered = bounds.quantize(to);
 	(lowered < crf).then_some(lowered)
+}
+
+fn clamped(slope: f64) -> f64 {
+	slope.clamp(MIN_SLOPE, MAX_SLOPE)
 }
 
 /// The CRF a passing score points to: the one used, raised by the margin beyond the search's own tolerance over the
 /// slope, by one full step at most. Aiming at the tolerance rather than at the target itself keeps the next file of
 /// the group from landing on the edge, where half of them would miss: written below the target, or encoded again.
 pub fn implied_crf(crf: f64, score: Score, target: Target, slope: f64, bounds: Bounds) -> f64 {
-	let spare = (target.margin(score) - CLOSE_ENOUGH).max(0.0);
-	let step = (spare / slope.clamp(MIN_SLOPE, MAX_SLOPE)).min(MAX_STEP);
+	let spare = (target.margin(score) - TOLERANCE).max(0.0);
+	let step = (spare / clamped(slope)).min(MAX_STEP);
 	(crf + step).clamp(bounds.min, bounds.max)
 }
 

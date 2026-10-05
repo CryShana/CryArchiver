@@ -5,9 +5,10 @@ use tokio_util::sync::CancellationToken;
 use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
-use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
+use crate::process::{self, STALL_TIMEOUT, ToolCommand};
 use crate::toolchain::Toolchain;
 use crate::video::analyze::ScanType;
+use crate::video::encode::frame_s;
 use crate::video::mux::{MuxInput, OutputStream};
 use crate::video::plan::{Encoder, VideoPlan};
 use crate::video::streams::StreamPlan;
@@ -50,7 +51,7 @@ pub struct Timelines<'a> {
 
 pub fn check_output(output: &MediaInfo, first_frame: Option<&Frame>, expected: &Expected<'_>) -> Result<(), String> {
 	let count = |kind: &str| output.streams.iter().filter(|stream| stream.codec_type == kind).count();
-	let videos: Vec<&Stream> = output.streams.iter().filter(|stream| stream.is_real_video()).collect();
+	let videos: Vec<&Stream> = output.real_video_streams().collect();
 	let attachments = count("attachment") + output.streams.iter().filter(|stream| stream.is_attached_pic()).count();
 
 	expect_count("video streams", videos.len(), expected.video.streams.len())?;
@@ -102,7 +103,7 @@ pub fn check_output(output: &MediaInfo, first_frame: Option<&Frame>, expected: &
 		)?;
 	}
 
-	if plan.alpha && main.tag("alpha_mode") != Some("1") {
+	if plan.alpha && !main.alpha_signalled() {
 		return Err("the alpha channel is not signalled".into());
 	}
 
@@ -135,8 +136,7 @@ pub async fn verify_output(
 	)
 	.map_err(unreadable)?;
 
-	check_output(&info, frames.first(), expected)
-		.map_err(|reason| ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into())
+	check_output(&info, frames.first(), expected).map_err(JobError::verification)
 }
 
 pub async fn probe_temp(tools: &Toolchain, temp: &Path, cancel: &CancellationToken) -> Result<MediaInfo, JobError> {
@@ -144,9 +144,7 @@ pub async fn probe_temp(tools: &Toolchain, temp: &Path, cancel: &CancellationTok
 }
 
 pub fn earliest_video_start(info: &MediaInfo) -> Option<f64> {
-	info.streams
-		.iter()
-		.filter(|stream| stream.is_real_video())
+	info.real_video_streams()
 		.filter_map(|stream| stream.start_time)
 		.reduce(f64::min)
 }
@@ -186,7 +184,7 @@ pub fn synced_streams(outputs: &[OutputStream], source: &MediaInfo, merge_from: 
 		.zip(0..)
 		.filter_map(|(output, position)| {
 			let stream = source.streams.iter().find(|stream| stream.index == output.origin)?;
-			let audio = stream.codec_type == "audio";
+			let audio = stream.is_audio();
 			let origin = if merge_from.first() == Some(&output.origin) {
 				earliest_source(source, merge_from)?
 			} else {
@@ -217,8 +215,7 @@ fn earliest_source(source: &MediaInfo, merge_from: &[u32]) -> Option<u32> {
 }
 
 pub fn sync_tolerance_s(fps: Option<f64>) -> f64 {
-	fps.filter(|fps| *fps > 0.0)
-		.map_or(MIN_SYNC_TOLERANCE_S, |fps| (1.0 / fps).max(MIN_SYNC_TOLERANCE_S))
+	frame_s(fps).max(MIN_SYNC_TOLERANCE_S)
 }
 
 /// `starts` follow `synced_streams`. The output's timestamps count from `zero_s` on the source's.
@@ -279,10 +276,11 @@ pub async fn first_decoded_s(
 		.args([frames, "1", filter, info, "-f", "null", "-"]);
 
 	let out = run_ffmpeg(&cmd, |_| {}, cancel).await?;
+	let parsed = format!("Parsed_{info}");
 	Ok(out
 		.stderr_tail
 		.iter()
-		.filter(|line| line.contains(&format!("Parsed_{info}")))
+		.filter(|line| line.contains(&parsed))
 		.find_map(|line| {
 			line.split_whitespace()
 				.find_map(|field| field.strip_prefix("pts_time:"))?
@@ -299,19 +297,22 @@ pub async fn undecoded_lead(
 	stream: u32,
 	cancel: &CancellationToken,
 ) -> Result<u64, JobError> {
-	let Some(first_s) = first_decoded_s(tools, path, stream, false, cancel).await? else {
+	let index = stream.to_string();
+	let (first_s, packets) = tokio::join!(
+		Box::pin(first_decoded_s(tools, path, stream, false, cancel)),
+		Box::pin(packet_times(
+			tools,
+			(path, &index),
+			("packet=pts_time", Some(LEAD_PACKETS)),
+			"the source's first video packets can't be listed",
+			cancel,
+		))
+	);
+	let Some(first_s) = first_s? else {
 		return Ok(0);
 	};
 
-	let packets = packet_times(
-		tools,
-		(path, &stream.to_string()),
-		("packet=pts_time", Some(LEAD_PACKETS)),
-		"the source's first video packets can't be listed",
-		cancel,
-	)
-	.await?;
-	Ok(undecoded_count(&packets, first_s))
+	Ok(undecoded_count(&packets?, first_s))
 }
 
 /// `packets` is ffprobe's `pts_time` list, one per line.
@@ -364,17 +365,13 @@ pub struct FrameTiming {
 /// (a packet has no time, the frames are retimed, or a TS or PS source jumps where ffmpeg closes its timestamps up), no
 /// two output frames may share a time.
 pub fn frame_times_error(source: &str, output: &str, timing: FrameTiming) -> Option<String> {
-	let Some(mut output) = parsed(output)
-		.iter()
-		.map(|packet| packet.pts)
-		.collect::<Option<Vec<f64>>>()
-	else {
+	let Some(mut output) = parsed(output).map(|packet| packet.pts).collect::<Option<Vec<f64>>>() else {
 		return Some("a video frame has no time".into());
 	};
 	output.sort_by(f64::total_cmp);
 
 	let compared = (timing.retiming != Retiming::New)
-		.then(|| comparable(&parsed(source), timing.discontinuous))
+		.then(|| comparable(source, timing.discontinuous))
 		.flatten();
 	let Some(mut expected) = compared else {
 		return output
@@ -385,10 +382,7 @@ pub fn frame_times_error(source: &str, output: &str, timing: FrameTiming) -> Opt
 
 	expected.sort_by(f64::total_cmp);
 	if let Some(window) = timing.window {
-		let (from, to) = (
-			window.start_s - WINDOW_MARGIN_S,
-			window.start_s + window.length_s + WINDOW_MARGIN_S,
-		);
+		let (from, to) = padded(window);
 		expected.retain(|time| (from..=to).contains(time));
 	}
 	if timing.retiming == Retiming::Doubled {
@@ -411,11 +405,8 @@ pub async fn check_frame_times(
 	cancel: &CancellationToken,
 ) -> Result<(), JobError> {
 	let interval = timing.window.map(|window| {
-		format!(
-			"{:.3}%{:.3}",
-			(window.start_s - WINDOW_MARGIN_S).max(0.0),
-			window.start_s + window.length_s + WINDOW_MARGIN_S
-		)
+		let (from, to) = padded(window);
+		format!("{:.3}%{to:.3}", from.max(0.0))
 	});
 	let stream = stream.to_string();
 	let (source_times, output_times) = tokio::try_join!(
@@ -435,10 +426,7 @@ pub async fn check_frame_times(
 		)),
 	)?;
 
-	match frame_times_error(&source_times, &output_times, timing) {
-		Some(reason) => Err(ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into()),
-		None => Ok(()),
-	}
+	frame_times_error(&source_times, &output_times, timing).map_or(Ok(()), |reason| Err(JobError::verification(reason)))
 }
 
 /// ffprobe's list of `entries` for `stream`'s packets in `path`, one packet per line.
@@ -456,14 +444,11 @@ async fn packet_times(
 	}
 	cmd.args(["-of", "csv=p=0", "-i"]).arg(process::tool_path(path));
 
-	let out = process::run(&cmd, StdoutMode::Capture, |_| {}, cancel).await?;
-	if !out.status.success() {
-		return Err(JobError::with_log(
-			ErrorKind::EncodeFailed(failure.to_owned()),
-			out.stderr_tail,
-		));
-	}
-	Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+	let out = probe::run_ffprobe(&cmd, cancel).await.map_err(|err| match err {
+		ProbeError::Failed(log) => JobError::with_log(ErrorKind::EncodeFailed(failure.to_owned()), log),
+		err => unreadable(err),
+	})?;
+	Ok(String::from_utf8(out.stdout).unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned()))
 }
 
 struct Packet {
@@ -472,7 +457,7 @@ struct Packet {
 }
 
 /// ffprobe's `pts_time[,dts_time]` lines, in file order.
-fn parsed(packets: &str) -> Vec<Packet> {
+fn parsed(packets: &str) -> impl Iterator<Item = Packet> {
 	packets
 		.lines()
 		.map(|line| line.trim().trim_end_matches(','))
@@ -484,26 +469,38 @@ fn parsed(packets: &str) -> Vec<Packet> {
 				dts: fields.next().flatten(),
 			}
 		})
-		.collect()
 }
 
 /// The source's frame times, when every packet has one and, in a TS or PS source, ffmpeg keeps them as they are.
-fn comparable(packets: &[Packet], discontinuous: bool) -> Option<Vec<f64>> {
-	if packets.is_empty() || (discontinuous && jumps(packets)) {
-		return None;
-	}
+fn comparable(packets: &str, discontinuous: bool) -> Option<Vec<f64>> {
+	let mut times = Vec::new();
+	let mut last_dts: Option<f64> = None;
 
-	packets.iter().map(|packet| packet.pts).collect()
+	for packet in parsed(packets) {
+		times.push(packet.pts?);
+
+		if let Some(dts) = packet.dts {
+			if discontinuous && last_dts.is_some_and(|last| jumps(dts - last)) {
+				return None;
+			}
+			last_dts = Some(dts);
+		}
+	}
+	(!times.is_empty()).then_some(times)
 }
 
 /// Where ffmpeg finds a TS or PS discontinuity: the decode time jumps by more than `DTS_DELTA_THRESHOLD_S`, or steps
 /// back by more than `DTS_BACK_THRESHOLD_S`.
-fn jumps(packets: &[Packet]) -> bool {
-	let times: Vec<f64> = packets.iter().filter_map(|packet| packet.dts).collect();
-	times.windows(2).any(|pair| {
-		let delta = pair[1] - pair[0];
-		delta.abs() > DTS_DELTA_THRESHOLD_S || delta < -DTS_BACK_THRESHOLD_S
-	})
+fn jumps(delta: f64) -> bool {
+	delta.abs() > DTS_DELTA_THRESHOLD_S || delta < -DTS_BACK_THRESHOLD_S
+}
+
+/// The span of the source's times read around `window`.
+fn padded(window: TrimWindow) -> (f64, f64) {
+	(
+		window.start_s - WINDOW_MARGIN_S,
+		window.start_s + window.length_s + WINDOW_MARGIN_S,
+	)
 }
 
 /// The times of `frames` and of the fields between them, the last one as far after it as the one before.
@@ -577,10 +574,7 @@ pub async fn check_sync(
 		});
 	}
 
-	match sync_error(&starts, zero_s, trimmed, tolerance_s) {
-		Some(reason) => Err(ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into()),
-		None => Ok(()),
-	}
+	sync_error(&starts, zero_s, trimmed, tolerance_s).map_or(Ok(()), |reason| Err(JobError::verification(reason)))
 }
 
 pub fn parse_ssim(stderr: &[String]) -> Option<f64> {
@@ -613,19 +607,12 @@ fn alpha_ssim_command(ffmpeg: &Path, output: &Path, source: &Path, video: &Video
 	let threads = video.threads.map(|threads| threads.tool);
 
 	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
-	cmd.args(["-hide_banner", "-nostdin", "-c:v", "libvpx-vp9"])
-		.threads(threads)
-		.arg("-i")
-		.arg(process::tool_path(output));
+	cmd.args(["-hide_banner", "-nostdin"])
+		.input(Some("libvpx-vp9"), threads, output);
 	if let Some(window) = video.window {
 		cmd.seek(window.start_s, window.length_s);
 	}
-	if let Some(decoder) = video.decoder {
-		cmd.arg("-c:v").arg(decoder);
-	}
-	cmd.threads(threads)
-		.arg("-i")
-		.arg(process::tool_path(source))
+	cmd.input(video.decoder, threads, source)
 		.arg("-filter_complex")
 		.arg(format!(
 			"[0:v:0]alphaextract,format=gray[o];[1:{}]{},alphaextract,format=gray[s];[o][s]ssim",
@@ -648,14 +635,7 @@ pub fn check_alpha(ssim: f64) -> Result<(), JobError> {
 
 fn landing(output: &OutputStream, timelines: &Timelines<'_>) -> Option<f64> {
 	match output.input {
-		MuxInput::VideoTemp(ordinal) => {
-			let mut videos = timelines
-				.video_temp
-				.streams
-				.iter()
-				.filter(|stream| stream.is_real_video());
-			videos.nth(ordinal)?.start_time
-		}
+		MuxInput::VideoTemp(ordinal) => timelines.video_temp.real_video_streams().nth(ordinal)?.start_time,
 		MuxInput::AudioTemp(ordinal) => timelines.audio_temp?.audio_streams().nth(ordinal)?.start_time,
 		MuxInput::Source => {
 			let stream = timelines
@@ -672,9 +652,7 @@ fn check_start_offsets(output: &MediaInfo, expected: &Expected<'_>) -> Result<()
 	let Some(video_start) = earliest_video_start(output) else {
 		return Ok(());
 	};
-	let tolerance = expected
-		.source_fps
-		.map_or(MIN_START_TOLERANCE_S, |fps| (1.0 / fps).max(MIN_START_TOLERANCE_S));
+	let tolerance = frame_s(expected.source_fps).max(MIN_START_TOLERANCE_S);
 
 	for (stream, wanted) in output.streams.iter().zip(&expected.start_offsets) {
 		let (Some(start), Some(wanted)) = (stream.start_time, wanted) else {
@@ -683,7 +661,7 @@ fn check_start_offsets(output: &MediaInfo, expected: &Expected<'_>) -> Result<()
 
 		// ffprobe reports a Matroska subtitle stream as starting at 0 whenever other streams do, whatever its first
 		// cue.
-		if stream.codec_type == "subtitle" {
+		if stream.is_subtitle() {
 			continue;
 		}
 

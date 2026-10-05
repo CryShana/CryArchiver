@@ -12,7 +12,7 @@ use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, JobError, KeepReason};
 use crate::preset::{Overrides, Speed};
 use crate::quality::memory::{GroupStats, Offset};
-use crate::quality::search::{self as crf_search, Bounds, Choice, Next, Probe, Target};
+use crate::quality::search::{self as crf_search, Bounds, Choice, Next, Probe, TOLERANCE, Target};
 use crate::quality::vmaf::{self, Reference, Score, Scoring};
 use crate::toolchain::Toolchain;
 use crate::video::analyze::{Analysis, DEFAULT_SEGMENTS, Detail};
@@ -22,9 +22,6 @@ use crate::workspace::Workspace;
 
 pub const MAX_RETRIES: u32 = 1;
 pub const MAX_SEARCH_RAISE: f64 = 3.0;
-/// The samples lean on the hardest scenes, so the full check usually lands above them: a group's offset only ever
-/// raises the search target.
-pub const MAX_SEARCH_LOWER: f64 = 0.0;
 
 const MAX_SEARCH_MEAN: f64 = 99.0;
 const MOTION_SHARE: usize = 3;
@@ -35,7 +32,6 @@ const SHORT_COVERAGE: f64 = 0.25;
 const FLAT_SI: f64 = 2.0;
 const MAX_ANALYSIS_SEGMENTS: usize = 48;
 const LONG_SPAN_S: f64 = 600.0;
-const NEAR_MISS: f64 = 0.5;
 /// A sample lane's threads: the fewest on which SVT-AV1 runs above its first level of parallelism, as level 2 uses
 /// about 3.8 cores.
 const SAMPLE_LANE_THREADS: usize = 4;
@@ -145,8 +141,6 @@ pub struct Aim {
 pub struct Probed {
 	pub score: Score,
 	pub bytes: u64,
-	/// The samples' encoding times summed, overlapping ones included.
-	pub encode_s: f64,
 	/// The median sample's encoding seconds per second of source, so that one slow start-up doesn't set it; `NaN` when
 	/// the samples ran side by side.
 	pub rate: f64,
@@ -154,9 +148,9 @@ pub struct Probed {
 
 struct SampleRun {
 	bytes: u64,
-	elapsed_s: f64,
-	/// Encoded with no other sample beside it, on the plan's caps.
-	alone: bool,
+	/// Encoding seconds per second of the sample, when it was encoded with no other sample beside it, on the plan's
+	/// caps.
+	rate: Option<f64>,
 	scores: Vec<f64>,
 }
 
@@ -226,13 +220,14 @@ pub fn target(speed: Speed, film_grain: bool, overrides: &Overrides) -> Target {
 }
 
 /// The target the samples must reach so that the full check, which lands `offset` from them, reaches `target`. It
-/// moves at most `MAX_SEARCH_RAISE` up and `MAX_SEARCH_LOWER` down.
+/// moves at most `MAX_SEARCH_RAISE` up and never down: the samples lean on the hardest scenes, so the full check
+/// usually lands above them.
 pub fn search_target(target: Target, offset: Option<Offset>) -> Target {
 	let Some(offset) = offset else {
 		return target;
 	};
 
-	let shift = |gap: f64| (-gap).clamp(-MAX_SEARCH_LOWER, MAX_SEARCH_RAISE);
+	let shift = |gap: f64| (-gap).clamp(0.0, MAX_SEARCH_RAISE);
 	let mean = (target.mean + shift(offset.mean)).min(MAX_SEARCH_MEAN);
 	Target {
 		mean,
@@ -397,10 +392,7 @@ pub fn search_samples(analysis: &Analysis, span: Option<TrimWindow>, speed: Spee
 		return Vec::new();
 	};
 
-	let whole = vec![Sample {
-		start_s: span.start_s,
-		length_s: span.length_s,
-	}];
+	let whole = vec![span];
 	if SEARCH_SEGMENT_S * wanted as f64 >= span.length_s {
 		return whole;
 	}
@@ -424,8 +416,9 @@ pub fn search_samples(analysis: &Analysis, span: Option<TrimWindow>, speed: Spee
 
 /// At least `wanted` segments, more when the hardest ones alone are more.
 fn hardest_first(details: &[Detail], wanted: usize) -> Vec<&Detail> {
-	let mut chosen = hardest_segments(details, wanted);
-	for detail in ranked(details) {
+	let ranked = ranked(details);
+	let mut chosen = hardest_segments(details, ranked.first().copied(), wanted);
+	for detail in ranked {
 		if chosen.len() >= wanted {
 			break;
 		}
@@ -458,11 +451,11 @@ fn moving_picture(detail: &Detail) -> bool {
 	!detail.still && detail.si.is_none_or(|si| si >= FLAT_SI)
 }
 
-/// The hardest segments of `wanted` samples: the most detailed, the `wanted / MOTION_SHARE` busiest, the darkest and
+/// The hardest segments of `wanted` samples: the `most_detailed`, the `wanted / MOTION_SHARE` busiest, the darkest and
 /// the noisiest. The busiest, darkest and noisiest may be segments that are not usable for detail (low detail, or
 /// mostly black to blackdetect): near-black scenes with content are exactly what blackdetect calls black, and only
 /// flat and held segments are left out.
-pub fn hardest_segments(details: &[Detail], wanted: usize) -> Vec<&Detail> {
+fn hardest_segments<'a>(details: &'a [Detail], most_detailed: Option<&'a Detail>, wanted: usize) -> Vec<&'a Detail> {
 	let candidates: Vec<&Detail> = details.iter().filter(|detail| moving_picture(detail)).collect();
 	let mut busiest: Vec<&Detail> = candidates
 		.iter()
@@ -482,9 +475,7 @@ pub fn hardest_segments(details: &[Detail], wanted: usize) -> Vec<&Detail> {
 		.max_by(|a, b| a.noise.unwrap_or(0.0).total_cmp(&b.noise.unwrap_or(0.0)));
 
 	let mut chosen: Vec<&Detail> = Vec::new();
-	let hardest = ranked(details)
-		.first()
-		.copied()
+	let hardest = most_detailed
 		.into_iter()
 		.chain(busiest.into_iter().take(wanted.div_ceil(MOTION_SHARE)))
 		.chain(darkest)
@@ -538,14 +529,14 @@ pub fn short_text(crf: f64, score: Score, target: Target) -> String {
 /// A full check, the first or the last, that missed by so little, on the mean and on the p5 alike, that the output is
 /// written as it is instead of being encoded again.
 pub fn near_miss(score: Score, target: Target) -> bool {
-	score.mean >= target.mean - NEAR_MISS && score.p5 >= target.floor - NEAR_MISS
+	target.within(score, TOLERANCE)
 }
 
 /// Under a bitrate cap the cap is named instead: a capped encode is never encoded again, whatever it misses by.
 pub fn near_miss_text(crf: f64, score: Score, target: Target, cap_kbps: Option<u32>) -> String {
 	let written = format!(
 		"written slightly below the quality target: VMAF {:.1} / {:.1} at CRF {crf}, target {:.1} / {:.1} (within \
-		 {NEAR_MISS:.1}",
+		 {TOLERANCE:.1}",
 		score.mean, score.p5, target.mean, target.floor
 	);
 	match cap_kbps {
@@ -642,15 +633,21 @@ impl Scorer<'_> {
 		let next = || granted.next();
 		let measured = in_lanes(samples.len(), granted.lanes, next, move |index, threads| async move {
 			let lane = (!granted.plan_caps()).then_some(threads);
-			let plan = VideoPlan {
-				threads: lane.map_or(plan.threads, |threads| Some(threads_for(threads))),
-				..plan.clone()
-			};
+			let lane_threads = lane.map_or(plan.threads, |threads| Some(threads_for(threads)));
 
 			let sample = &samples[index];
 			let output = self.workspace.file(&format!("probe{round}-{index}.mkv"));
 			let started = Instant::now();
-			let bytes = encode_sample(&self.tools.ffmpeg, self.source, &output, &plan, sample, self.cancel).await?;
+			let bytes = encode_sample(
+				&self.tools.ffmpeg,
+				self.source,
+				&output,
+				plan,
+				lane_threads,
+				sample,
+				self.cancel,
+			)
+			.await?;
 			let elapsed_s = started.elapsed().as_secs_f64();
 
 			let log = format!("vmaf-probe{round}-{index}.json");
@@ -671,29 +668,21 @@ impl Scorer<'_> {
 			on_samples(*count);
 			Ok::<_, JobError>(SampleRun {
 				bytes,
-				elapsed_s,
-				alone: lane.is_none(),
+				rate: (lane.is_none() && sample.length_s > 0.0).then(|| elapsed_s / sample.length_s),
 				scores,
 			})
 		})
 		.await?;
 
-		let rates = samples
-			.iter()
-			.zip(&measured)
-			.filter(|(sample, measured)| sample.length_s > 0.0 && measured.alone)
-			.map(|(sample, measured)| measured.elapsed_s / sample.length_s)
-			.collect();
-		let scores: Vec<f64> = measured
-			.iter()
-			.flat_map(|measured| measured.scores.iter().copied())
-			.collect();
+		let mut scores = Vec::with_capacity(measured.iter().map(|measured| measured.scores.len()).sum());
+		for run in &measured {
+			scores.extend_from_slice(&run.scores);
+		}
 
 		Ok(Probed {
-			score: pooled(&scores)?,
+			score: pooled(&mut scores)?,
 			bytes: measured.iter().map(|measured| measured.bytes).sum(),
-			encode_s: measured.iter().map(|measured| measured.elapsed_s).sum(),
-			rate: median_rate(rates),
+			rate: median_rate(measured.iter().filter_map(|measured| measured.rate).collect()),
 		})
 	}
 
@@ -707,10 +696,10 @@ impl Scorer<'_> {
 		decoded_s: f64,
 		on_fraction: impl FnMut(f64),
 	) -> Result<Score, JobError> {
-		let scores = self
+		let mut scores = self
 			.whole_scores(temp, subsample(total_frames, decoded_s), total_frames, on_fraction)
 			.await?;
-		pooled(&scores)
+		pooled(&mut scores)
 	}
 
 	/// The VMAF of every `every`th frame of `temp`, `total_frames` long, in order.
@@ -829,7 +818,7 @@ pub async fn search_below(
 	let mut sample_bytes: Vec<u64> = Vec::new();
 	let mut crf = bounds.quantize(start);
 
-	let searched = loop {
+	let (index, slope) = loop {
 		on_step(SearchStep::Probe {
 			round: probes.len(),
 			crf,
@@ -867,31 +856,29 @@ pub async fn search_below(
 		});
 		sample_bytes.push(measured.bytes);
 		if !target.met(measured.score) && bytes.is_some_and(|bytes| measured.bytes >= bytes) {
-			break Searched::Unreachable {
-				crf,
-				score: measured.score,
-				sample_bytes: measured.bytes,
-			};
+			break (probes.len() - 1, None);
 		}
 
 		match crf_search::next(&probes, target, bounds, prior_slope) {
 			Next::Probe(next) => crf = next,
-			Next::Done(Choice::Chosen { index, slope }) => {
-				break Searched::Found(Found {
-					crf: probes[index].crf,
-					score: probes[index].score,
-					sample_bytes: sample_bytes[index],
-					slope,
-				});
-			}
-			Next::Done(Choice::Unreachable { index }) => {
-				break Searched::Unreachable {
-					crf: probes[index].crf,
-					score: probes[index].score,
-					sample_bytes: sample_bytes[index],
-				};
-			}
+			Next::Done(Choice::Chosen { index, slope }) => break (index, Some(slope)),
+			Next::Done(Choice::Unreachable { index }) => break (index, None),
 		}
+	};
+
+	let Probe { crf, score } = probes[index];
+	let searched = match slope {
+		Some(slope) => Searched::Found(Found {
+			crf,
+			score,
+			sample_bytes: sample_bytes[index],
+			slope,
+		}),
+		None => Searched::Unreachable {
+			crf,
+			score,
+			sample_bytes: sample_bytes[index],
+		},
 	};
 	Ok(Search {
 		searched,
@@ -901,7 +888,7 @@ pub async fn search_below(
 	})
 }
 
-fn pooled(scores: &[f64]) -> Result<Score, JobError> {
+fn pooled(scores: &mut [f64]) -> Result<Score, JobError> {
 	vmaf::pool(scores).ok_or_else(|| ErrorKind::EncodeFailed("the quality check scored no frames".into()).into())
 }
 

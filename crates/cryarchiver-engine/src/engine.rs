@@ -998,8 +998,7 @@ impl Engine {
 
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
 		let output_levels = verify::measure_output(&self.tools, &output, plan, cx.cancel).await?;
-		verify::check_tracks(plan, &source_levels, &output_levels)
-			.map_err(|reason| ErrorKind::EncodeFailed(format!("verification failed: {reason}")))?;
+		verify::check_tracks(plan, &source_levels, &output_levels).map_err(JobError::verification)?;
 
 		Ok(Produced::Output(Staged {
 			path: output,
@@ -1921,11 +1920,7 @@ impl Engine {
 	) -> Result<(Temp, Option<String>), JobError> {
 		let info = probe_temp(&self.tools, &path, cancel).await?;
 		let start_s = earliest_video_start(&info).unwrap_or(0.0);
-		let fps = info
-			.streams
-			.iter()
-			.find(|stream| stream.is_real_video())
-			.and_then(Stream::fps);
+		let fps = info.real_video_streams().next().and_then(Stream::fps);
 		let warning = video_encode::check_video_temp(video, encoded, declared_s, start_s, fps)?;
 		Ok((Temp { path, info }, warning))
 	}
@@ -2220,8 +2215,7 @@ impl Engine {
 		cancel: &CancellationToken,
 	) -> Result<(), JobError> {
 		let output_levels = verify::measure_output(&self.tools, audio_temp, plan, cancel).await?;
-		verify::check_tracks(plan, source_levels, &output_levels)
-			.map_err(|reason| ErrorKind::EncodeFailed(format!("verification failed: {reason}")).into())
+		verify::check_tracks(plan, source_levels, &output_levels).map_err(JobError::verification)
 	}
 }
 
@@ -2997,11 +2991,7 @@ fn thread_budget(engine: Option<usize>, job_cap: Option<usize>, fallback: usize)
 /// The thread budget an attempt ran on: an image's encoder threads, or else what the video tools got, the whole
 /// machine without a budget.
 fn attempt_threads(image: bool, engine: Option<usize>, image_threads: usize, job_cap: Option<usize>) -> usize {
-	let fallback = if image {
-		image_threads
-	} else {
-		std::thread::available_parallelism().map_or(1, usize::from)
-	};
+	let fallback = if image { image_threads } else { cores() };
 	thread_budget(engine, job_cap, fallback)
 }
 
@@ -3021,7 +3011,7 @@ mod tests {
 
 	#[test]
 	fn an_attempt_ran_on_the_image_share_or_the_video_tools_budget() {
-		let cores = std::thread::available_parallelism().map_or(1, usize::from);
+		let cores = cores();
 
 		assert_eq!(attempt_threads(true, None, 4, None), 4);
 		assert_eq!(attempt_threads(true, None, 4, Some(2)), 2);

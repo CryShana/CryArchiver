@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::images::decode::deep_pix_fmt;
 use crate::probe::Stream;
-use crate::process::{self, STALL_TIMEOUT, ToolCommand};
+use crate::process::{STALL_TIMEOUT, ToolCommand};
 use crate::video::analyze::{Segment, forced_decoder};
 
 pub const TRIPLETS: usize = 3;
@@ -110,25 +110,14 @@ pub struct Frame<'a> {
 	pub width: usize,
 	pub height: usize,
 	max: f32,
-	wide: bool,
 	data: &'a [u8],
 }
 
-impl<'a> Frame<'a> {
-	pub fn gray16(width: usize, height: usize, data: &'a [u8]) -> Option<Self> {
-		(data.len() == width * height * 2).then_some(Self {
-			width,
-			height,
-			max: 65_535.0,
-			wide: true,
-			data,
-		})
-	}
-
+impl Frame<'_> {
 	/// The luma at `(x, y)` on the 8-bit scale.
 	pub fn sample(&self, x: usize, y: usize) -> f32 {
 		let index = y * self.width + x;
-		let value = if self.wide {
+		let value = if self.max > 255.0 {
 			u16::from_be_bytes([self.data[2 * index], self.data[2 * index + 1]])
 		} else {
 			u16::from(self.data[index])
@@ -159,7 +148,6 @@ impl Held {
 			width: self.header.width,
 			height: self.header.height,
 			max: f32::from(self.header.max),
-			wide: self.header.max > 255,
 			data: &self.bytes[self.header.offset..self.header.offset + self.header.size],
 		}
 	}
@@ -170,9 +158,13 @@ impl Held {
 pub struct Reader {
 	pending: Vec<u8>,
 	held: Vec<Held>,
+	/// The buffers of a measured triplet, for the frames after it.
+	spare: Vec<Vec<u8>>,
 	triplets: Vec<Triplet>,
-	luma: Vec<f64>,
+	luma_sum: f64,
+	luma_frames: usize,
 	combing: Combing,
+	#[cfg(test)]
 	peak_bytes: usize,
 	/// The stream stopped being PGM; nothing after it is read.
 	broken: bool,
@@ -182,6 +174,12 @@ impl Reader {
 	/// A frame's bytes go into a buffer reserved to its exact size and never past its end, which would double it.
 	pub fn push(&mut self, mut chunk: &[u8]) {
 		while !chunk.is_empty() && !self.broken {
+			if self.pending.is_empty()
+				&& let Some(spare) = self.spare.pop()
+			{
+				self.pending = spare;
+			}
+
 			let header = header(&self.pending);
 			if header.is_none() && self.pending.len() >= PGM_HEADER_BYTES {
 				self.broken = true;
@@ -195,6 +193,7 @@ impl Reader {
 			let (taken, rest) = chunk.split_at(wanted.min(chunk.len()));
 			self.pending.extend_from_slice(taken);
 			chunk = rest;
+			#[cfg(test)]
 			self.note_peak();
 
 			if let Some(header) = header
@@ -202,7 +201,6 @@ impl Reader {
 			{
 				let bytes = std::mem::take(&mut self.pending);
 				self.held.push(Held { header, bytes });
-				self.note_peak();
 			}
 
 			if let [a, b, c] = self.held.as_slice() {
@@ -214,16 +212,24 @@ impl Reader {
 						combing(&a, &b, &c),
 					)
 				});
-				self.held.clear();
+				self.spare.extend(self.held.drain(..).map(|held| {
+					let mut bytes = held.bytes;
+					bytes.clear();
+					bytes
+				}));
 
 				self.triplets.extend(triplet);
-				self.luma.extend(luma.into_iter().flatten());
+				for luma in luma.into_iter().flatten() {
+					self.luma_sum += luma;
+					self.luma_frames += 1;
+				}
 				self.combing.add(combing);
 			}
 		}
 	}
 
 	/// The most bytes held at once, frames and the one being read together.
+	#[cfg(test)]
 	pub fn peak_bytes(&self) -> usize {
 		self.peak_bytes
 	}
@@ -231,14 +237,16 @@ impl Reader {
 	#[allow(clippy::cast_precision_loss)]
 	pub fn finish(self) -> Measured {
 		Measured {
-			luma: (!self.luma.is_empty()).then(|| self.luma.iter().sum::<f64>() / self.luma.len() as f64),
+			luma: (self.luma_frames > 0).then(|| self.luma_sum / self.luma_frames as f64),
 			triplets: self.triplets,
 			combing: self.combing,
 		}
 	}
 
+	#[cfg(test)]
 	fn note_peak(&mut self) {
-		let held = self.pending.capacity() + self.held.iter().map(|held| held.bytes.capacity()).sum::<usize>();
+		let buffers = self.held.iter().map(|held| &held.bytes).chain(&self.spare);
+		let held = self.pending.capacity() + buffers.map(Vec::capacity).sum::<usize>();
 		self.peak_bytes = self.peak_bytes.max(held);
 	}
 }
@@ -265,13 +273,7 @@ pub fn command(ffmpeg: &Path, source: &Path, main: &Stream, segment: &Segment, t
 		cmd.seek(segment.start_s, length);
 	}
 
-	if let Some(decoder) = forced_decoder(main) {
-		cmd.arg("-c:v").arg(decoder);
-	}
-
-	cmd.threads(threads)
-		.arg("-i")
-		.arg(process::tool_path(source))
+	cmd.input(forced_decoder(main), threads, source)
 		.arg("-map")
 		.arg(format!("0:{}", main.index))
 		.arg("-vf")
@@ -362,13 +364,6 @@ pub fn triplet(a: &Frame<'_>, b: &Frame<'_>, c: &Frame<'_>) -> Option<Triplet> {
 		(sigmas.len() >= MIN_BLOCKS).then(|| median(&mut sigmas))
 	});
 	Some(Triplet { bands })
-}
-
-/// Every PGM triplet in `bytes`, measured.
-pub fn measure(bytes: &[u8]) -> Measured {
-	let mut reader = Reader::default();
-	reader.push(bytes);
-	reader.finish()
 }
 
 /// Pixel work done inside an async task: on a multi-threaded runtime, its worker hands its other tasks on first.
@@ -667,6 +662,22 @@ mod tests {
 	const W: usize = 320;
 	const H: usize = 240;
 
+	fn gray16(width: usize, height: usize, data: &[u8]) -> Option<Frame<'_>> {
+		(data.len() == width * height * 2).then_some(Frame {
+			width,
+			height,
+			max: 65_535.0,
+			data,
+		})
+	}
+
+	/// Every PGM triplet in `bytes`, measured.
+	fn measure(bytes: &[u8]) -> Measured {
+		let mut reader = Reader::default();
+		reader.push(bytes);
+		reader.finish()
+	}
+
 	#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 	fn encode(width: usize, height: usize, mut pixel: impl FnMut(usize, usize) -> f64) -> Vec<u8> {
 		let mut bytes = Vec::with_capacity(width * height * 2);
@@ -690,7 +701,7 @@ mod tests {
 	}
 
 	fn measured(frames: &[Vec<u8>; 3]) -> Option<Triplet> {
-		let [a, b, c] = frames.each_ref().map(|bytes| Frame::gray16(W, H, bytes).unwrap());
+		let [a, b, c] = frames.each_ref().map(|bytes| gray16(W, H, bytes).unwrap());
 		triplet(&a, &b, &c)
 	}
 
@@ -848,7 +859,7 @@ mod tests {
 	}
 
 	fn fields_of(frames: &[Vec<u8>; 3]) -> Combing {
-		let [a, b, c] = frames.each_ref().map(|bytes| Frame::gray16(W, H, bytes).unwrap());
+		let [a, b, c] = frames.each_ref().map(|bytes| gray16(W, H, bytes).unwrap());
 		combing(&a, &b, &c)
 	}
 
@@ -977,7 +988,7 @@ mod tests {
 		let expected: Vec<Triplet> = frames
 			.chunks(3)
 			.map(|three| {
-				let [a, b, c] = [0, 1, 2].map(|index| Frame::gray16(W, H, &three[index][17..]).unwrap());
+				let [a, b, c] = [0, 1, 2].map(|index| gray16(W, H, &three[index][17..]).unwrap());
 				triplet(&a, &b, &c).unwrap()
 			})
 			.collect();
@@ -1049,7 +1060,6 @@ mod tests {
 			width: 4,
 			height: 2,
 			max: 255.0,
-			wide: false,
 			data: &pixels,
 		};
 		assert!((frame.sample(3, 1) - 7.0).abs() < 1e-3);
