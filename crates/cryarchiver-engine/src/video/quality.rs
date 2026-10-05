@@ -758,14 +758,26 @@ impl Scorer<'_> {
 
 	/// Scoring on a lane's threads, or else on the job's.
 	fn lane_scoring<'b>(&'b self, log: &'b str, lane: Option<usize>) -> Scoring<'b> {
+		let (threads, budget) = match lane.map(lane_vmaf_threads) {
+			Some((vmaf, decoders)) => (vmaf, Some(decoders)),
+			None => (self.threads, self.plan.threads.map(|threads| threads.tool)),
+		};
+
 		Scoring {
 			model: vmaf::model_for(self.plan.width, self.plan.height),
-			threads: lane.unwrap_or(self.threads),
-			budget: lane.or(self.plan.threads.map(|threads| threads.tool)),
+			threads,
+			budget,
 			dir: self.workspace.dir(),
 			log,
 		}
 	}
+}
+
+/// libvmaf's threads and each decoder's in a lane of `lane` threads. Given the lane's threads each, libvmaf and the two
+/// decoders together use about a third more cores than that (5.2 of 4, 10.3 of 8, at 1080p and 4K alike), so libvmaf
+/// gets all but one and the decoders a quarter (3.4–3.9 of 4, 7.5–7.8 of 8).
+fn lane_vmaf_threads(lane: usize) -> (usize, usize) {
+	(lane.saturating_sub(1).max(1), (lane / 4).max(1))
 }
 
 pub async fn search(
@@ -810,15 +822,17 @@ pub async fn search_below(
 				total: samples.len(),
 			});
 		};
-		let timing = if probes.is_empty() && aim.times_its_samples() {
-			Scorer {
+		let (timing, uncapped) = if probes.is_empty() && aim.times_its_samples() {
+			let serial = Scorer {
 				lanes: Lanes::SERIAL,
 				..*scorer
-			}
+			};
+			(serial, scorer.lanes.uncapped_stage())
 		} else {
-			*scorer
+			(*scorer, None)
 		};
 		let measured = timing.probe(crf, samples, probes.len(), on_samples).await?;
+		drop(uncapped);
 		on_step(SearchStep::Probed {
 			crf,
 			score: measured.score,
@@ -1563,6 +1577,14 @@ mod tests {
 			near_miss_text(28.5, scored(92.04, 86.21), target, Some(12_500)),
 			"written slightly below the quality target: VMAF 92.0 / 86.2 at CRF 28.5, target 91.0 / 86.5 (within 0.5) \
 			 under the 12.5 Mbit/s cap"
+		);
+	}
+
+	#[test]
+	fn a_lane_scores_with_libvmaf_on_all_but_one_thread_and_the_decoders_on_a_quarter() {
+		assert_eq!(
+			[1, 2, 4, 8, 16].map(lane_vmaf_threads),
+			[(1, 1), (1, 1), (3, 1), (7, 2), (15, 4)]
 		);
 	}
 

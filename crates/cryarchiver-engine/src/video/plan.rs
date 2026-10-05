@@ -24,11 +24,11 @@ const MIN_PACKET_SLACK: f64 = 2.0;
 const SOURCE_FRAME_TOLERANCE: u64 = 2;
 const VIDEO_BASE_BYTES: u64 = 512 << 20;
 const VIDEO_BYTES_PER_PIXEL: u64 = 540;
-/// The fewest threads each SVT-AV1 level of parallelism needs. A 4 s sample at presets 3 and 5, 1080p and 4K, uses
-/// at most 1.1 cores at level 1, 3.8 at level 2, 6.8 at level 3 and 11 at level 4, decoding included. Samples that
-/// short can't show what levels 5 and 6 would use, so level 5 asks for twice level 4's threads and level 6 is left
-/// out.
-const SVT_LEVELS: [(usize, u8); 4] = [(24, 5), (12, 4), (7, 3), (4, 2)];
+/// The fewest threads each SVT-AV1 level of parallelism needs, a twentieth above the most cores it was measured on,
+/// decoding included: 3.8 at level 2, 6.8 at level 3 and 11.8 at level 4 (4 s samples and 60 s encodes, presets 3 and
+/// 5, 1080p and 4K). Level 5 couldn't be measured unsaturated, so it asks for twice level 4's threads, and level 6 is
+/// left out.
+const SVT_LEVELS: [(usize, u8); 4] = [(26, 5), (13, 4), (8, 3), (4, 2)];
 
 /// A tool's thread caps under a thread budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1024,9 +1024,9 @@ mod tests {
 
 	#[test]
 	fn a_budget_gets_the_highest_svt_level_whose_cpu_use_fits_it() {
-		let levels = [0, 1, 2, 3, 4, 6, 7, 11, 12, 23, 24, 64].map(|threads| threads_for(threads).svt_lp);
+		let levels = [0, 1, 3, 4, 7, 8, 12, 13, 25, 26, 64].map(|threads| threads_for(threads).svt_lp);
 
-		assert_eq!(levels, [1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
+		assert_eq!(levels, [1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
 		assert_eq!(threads_for(8), Threads { tool: 8, svt_lp: 3 });
 		assert_eq!(threads_for(0).tool, 1);
 	}

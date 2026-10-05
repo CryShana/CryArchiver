@@ -2,7 +2,8 @@
 //! holding never waits, so a job always gets its own tokens. A job's measuring leases threads for a phase: its fair
 //! share of the budget, capped at its own tokens, widened into the tokens no job holds. Whenever a job that starts
 //! later puts the budget over its size, the measuring gives the widened part back lane by lane, before each lane's
-//! next sample or segment, and all of it when the phase ends.
+//! next sample or segment, and all of it when the phase ends. A job without a thread budget of its own holds the
+//! whole budget while it runs a stage on uncapped tools, since they may use the whole machine.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -35,6 +36,13 @@ pub struct Lease<'a> {
 	budget: &'a ThreadBudget,
 	extra: AtomicUsize,
 	pub threads: usize,
+}
+
+/// The part of the budget beyond a holder's own tokens, held while its uncapped stage runs.
+#[derive(Debug)]
+pub struct Raised<'a> {
+	budget: &'a ThreadBudget,
+	extra: usize,
 }
 
 /// How many threads a job's measuring tools may use at once.
@@ -127,6 +135,27 @@ impl Hold<'_> {
 	}
 }
 
+impl<'a> Hold<'a> {
+	/// Holds the whole budget until the guard is dropped, for a stage whose tools run without caps of their own and
+	/// may use the whole machine: no other job's measuring then counts those threads as free.
+	pub fn raise_to_total(&self) -> Raised<'a> {
+		let mut state = self.budget.state();
+		let extra = self.budget.total().saturating_sub(self.tokens);
+		state.held += extra;
+		Raised {
+			budget: self.budget,
+			extra,
+		}
+	}
+}
+
+impl Drop for Raised<'_> {
+	fn drop(&mut self) {
+		let mut state = self.budget.state();
+		state.held = state.held.saturating_sub(self.extra);
+	}
+}
+
 impl Drop for Hold<'_> {
 	fn drop(&mut self) {
 		let mut state = self.budget.state();
@@ -148,6 +177,15 @@ impl<'a> Lanes<'a> {
 		memory: None,
 		lane_bytes: 0,
 	};
+
+	/// Holds the whole budget for a stage on the plan's caps when they are none: a job without a thread budget of its
+	/// own. A job with one stays within it.
+	pub fn uncapped_stage(&self) -> Option<Raised<'a>> {
+		match self.width {
+			Width::Shared(hold) => Some(hold.raise_to_total()),
+			Width::Serial | Width::Fixed(_) => None,
+		}
+	}
 
 	/// Lanes for `count` tool runs: one for every `per_lane` threads of the width once it reaches `from` threads, at
 	/// most `count`, and no more than the memory gate admits beside the first.
@@ -368,6 +406,67 @@ mod tests {
 		assert_eq!((leased.threads, other.threads), (24, 8));
 		drop((leased, other));
 		assert_eq!(budget.in_use(), 16);
+	}
+
+	#[test]
+	fn lanes_never_borrow_on_top_of_another_jobs_uncapped_stage() {
+		let budget = ThreadBudget::new(32);
+		let encoding = budget.hold(16);
+		let measuring = budget.hold(16);
+
+		let raised = shared(&encoding).uncapped_stage();
+		let during = shared(&measuring).grant(4, 4, 16);
+		let lanes = during.lanes;
+		let threads = (0..lanes).map(|_| during.next().unwrap()).sum::<usize>();
+		drop(during);
+
+		assert_eq!(
+			threads, 16,
+			"two jobs of -j 2 measure within their share of 16 during the other's encode"
+		);
+		assert_eq!(lanes, 4);
+		drop(raised);
+		assert_eq!(budget.in_use(), 32);
+		drop(encoding);
+
+		let alone = shared(&measuring).grant(4, 4, 16);
+		let threads = (0..alone.lanes).map(|_| alone.next().unwrap()).sum::<usize>();
+		assert_eq!(threads, 32, "the other half is borrowed once the other job ends");
+		drop(alone);
+
+		let fixed = Lanes {
+			width: Width::Fixed(8),
+			..Lanes::SERIAL
+		};
+		assert!(
+			fixed.uncapped_stage().is_none(),
+			"a budgeted job's stages stay within its budget"
+		);
+		assert_eq!(budget.in_use(), 16);
+	}
+
+	#[test]
+	fn with_two_of_four_jobs_left_measuring_borrows_only_after_the_other_encode() {
+		let budget = ThreadBudget::new(32);
+		let encoding = budget.hold(8);
+		let measuring = budget.hold(8);
+
+		let raised = shared(&encoding).uncapped_stage();
+		let during = shared(&measuring).grant(4, 4, 16);
+
+		assert_eq!(
+			(during.lanes, during.next()),
+			(1, Some(8)),
+			"-j 4 with two videos left: no borrowing on top of the other's encode"
+		);
+		drop((during, raised));
+
+		let after = shared(&measuring).grant(4, 4, 16);
+		assert_eq!(
+			(after.lanes, after.next()),
+			(4, Some(6)),
+			"24 free once the encode ends"
+		);
 	}
 
 	#[test]

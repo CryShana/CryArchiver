@@ -2814,13 +2814,20 @@ async fn measuring_side_by_side_chooses_the_same_crf_from_the_same_scores() {
 #[tokio::test]
 async fn a_thread_limit_changes_how_svt_runs_but_not_one_bit_of_the_video() {
 	let dir = tempfile::tempdir().unwrap();
-	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
-	let engine = Engine::new(support::toolchain().await);
+	let small = support::mpeg4(dir.path(), "small.mp4", 3);
+	let hd = support::video(
+		dir.path(),
+		"hd.mkv",
+		2,
+		&["-map", "0:v", "-vf", "scale=1280:720", "-c:v", "libx264", "-crf", "18"],
+	);
+	let tools = support::toolchain().await;
+	let engine = Engine::new(tools.clone());
 	let video_md5 = |outcome: &JobOutcome| {
 		let JobOutcome::Encoded { output, .. } = outcome else {
 			panic!("{outcome:?}")
 		};
-		let out = std::process::Command::new("ffmpeg")
+		let out = std::process::Command::new(&tools.ffmpeg)
 			.args(["-v", "error", "-i"])
 			.arg(output)
 			.args(["-map", "0:v", "-c", "copy", "-f", "md5", "-"])
@@ -2828,19 +2835,35 @@ async fn a_thread_limit_changes_how_svt_runs_but_not_one_bit_of_the_video() {
 			.unwrap();
 		String::from_utf8(out.stdout).unwrap()
 	};
-	let limited = Job {
+	let moderate_at_a_fixed_crf = Job {
+		speed: Speed::Moderate,
 		options: JobOptions {
-			threads: Some(6),
+			advanced: Advanced {
+				crf: Some(32.0),
+				..Advanced::default()
+			},
 			..JobOptions::default()
 		},
-		..fast_keeping_any_saving(&clip)
+		..fast_keeping_any_saving(&hd)
+	};
+	let limited = |job: &Job| Job {
+		options: JobOptions {
+			threads: Some(6),
+			..job.options.clone()
+		},
+		..job.clone()
 	};
 
-	let (free, _) = run_recording(&engine, &fast_keeping_any_saving(&clip), &out_dir(dir.path(), "free")).await;
-	let (six, _) = run_recording(&engine, &limited, &out_dir(dir.path(), "six")).await;
+	for (name, job) in [
+		("fast", fast_keeping_any_saving(&small)),
+		("moderate", moderate_at_a_fixed_crf),
+	] {
+		let (free, _) = run_recording(&engine, &job, &out_dir(dir.path(), &format!("{name}-free"))).await;
+		let (six, _) = run_recording(&engine, &limited(&job), &out_dir(dir.path(), &format!("{name}-six"))).await;
 
-	assert!(video_md5(&free).starts_with("MD5="), "{free:?}");
-	assert_eq!(video_md5(&six), video_md5(&free));
+		assert!(video_md5(&free).starts_with("MD5="), "{name}: {free:?}");
+		assert_eq!(video_md5(&six), video_md5(&free), "{name}");
+	}
 }
 
 async fn learned_group(dir: &Path, setting: f64) -> SharedMemory {

@@ -1126,6 +1126,7 @@ impl Engine {
 			Tuning::Encode { verify } => verify,
 		};
 
+		let _uncapped = lanes.uncapped_stage();
 		cx.record.update(|decision| decision.attempts = 1);
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let mut temps = Box::pin(self.encode_stage(cx, workspace, source, &video, &inputs)).await?;
@@ -1944,6 +1945,7 @@ impl Engine {
 				total: samples.len(),
 			});
 		};
+		let uncapped = inputs.lanes.uncapped_stage();
 		let encoded = Box::pin(video_encode::encode_samples(
 			&self.tools.ffmpeg,
 			&cx.job.source,
@@ -1954,6 +1956,7 @@ impl Engine {
 			cx.cancel,
 		))
 		.await?;
+		drop(uncapped);
 
 		let other_bits_per_s = video_encode::other_bitrate(inputs.info, inputs.streams);
 		let predicted = video_encode::predicted_bytes(encoded.bytes, &samples, duration_s, other_bits_per_s);
