@@ -171,7 +171,7 @@ impl MemoryGate for CountingGate {
 		self.requested.store(bytes, Ordering::SeqCst);
 		if self
 			.refusals
-			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+			.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
 			.is_ok()
 		{
 			return false;
