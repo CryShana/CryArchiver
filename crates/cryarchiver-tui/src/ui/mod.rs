@@ -24,7 +24,8 @@ use crate::view::{ArchiveView, FileDetails, Notification};
 
 pub const MIN_WIDTH: u16 = 100;
 pub const MIN_HEIGHT: u16 = 30;
-const TOP_HEIGHT: u16 = 9;
+const TOP_HEIGHT: u16 = 7;
+const MAX_TOP_HEIGHT: u16 = 9;
 const LOG_HEIGHT: u16 = 6;
 
 struct Areas {
@@ -36,7 +37,7 @@ struct Areas {
 }
 
 impl Areas {
-	fn new(area: Rect, layout: Layout) -> Self {
+	fn new(area: Rect, layout: Layout, top_height: u16) -> Self {
 		let header = Rect { height: 1, ..area };
 		let footer = Rect {
 			y: area.bottom() - 1,
@@ -71,7 +72,7 @@ impl Areas {
 
 		let log_height = if layout.log_open { LOG_HEIGHT } else { 1 };
 		let top = Rect {
-			height: TOP_HEIGHT,
+			height: top_height,
 			..between
 		};
 		let log = Rect {
@@ -81,7 +82,7 @@ impl Areas {
 		};
 		let main = Rect {
 			y: top.bottom(),
-			height: between.height - TOP_HEIGHT - log_height,
+			height: between.height - top_height - log_height,
 			..between
 		};
 
@@ -117,7 +118,8 @@ pub fn draw(frame: &mut Frame, source: &dyn ArchiveSource, fetched: &Fetched, ui
 		return;
 	}
 
-	let areas = Areas::new(area, ui.layout);
+	let top_height = panels::height(area.width, view, &ui.theme, &ui.spinner).clamp(TOP_HEIGHT, MAX_TOP_HEIGHT);
+	let areas = Areas::new(area, ui.layout, top_height);
 	header::render(buf, areas.header, view, &ui.theme);
 
 	if let Some(top) = areas.top {

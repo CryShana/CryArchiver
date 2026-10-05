@@ -179,8 +179,14 @@ fn low_disk_pause_at_100x30() {
 		source.step();
 	}
 	let mut app = App::new(source, ColorDepth::TrueColor);
+	let terminal = draw(&mut app, 100, 30);
+	let header = support::row_text(&terminal, 0);
 
-	assert_snapshot!(draw(&mut app, 100, 30).backend());
+	assert!(
+		header.trim_end().ends_with(" free · ‖ paused: low disk space"),
+		"the free space stays beside the paused state: {header}"
+	);
+	assert_snapshot!(terminal.backend());
 }
 
 #[test]

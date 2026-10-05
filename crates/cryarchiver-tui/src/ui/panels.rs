@@ -8,7 +8,7 @@ use ratatui::widgets::{Sparkline, Widget};
 use throbber_widgets_tui::{Set, Throbber, ThrobberState};
 
 use super::widgets::{Chrome, Parts, block_gauge, bold, fg, gauge, pad_left, panel, put, put_line, to_u16, wrap};
-use crate::format::{bytes, duration, fit, fit_middle, fps, fraction, percent, round_to_u32, speed, thousands, width};
+use crate::format::{bytes, fit, fit_middle, fps, fraction, percent, round_to_u32, speed, thousands, width};
 use crate::theme::{Theme, label};
 use crate::view::{ArchiveView, JobActivity, Overall, Parity, RunState, SystemStats, WorkKind, WorkerJob};
 
@@ -24,9 +24,20 @@ const MAX_CODEC: usize = 4;
 const MIN_STATUS: usize = 7;
 const MAX_STATUS: usize = 18;
 
+/// The Overall panel's lines and border at this terminal width. Workers and System are drawn into whatever height the
+/// caller settles on.
+pub fn height(width: u16, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) -> u16 {
+	let cells = usize::from(overall_width(width)).saturating_sub(4);
+	to_u16(overall_lines(&view.overall, cells, theme, spinner).lines.len()) + 2
+}
+
+fn overall_width(width: u16) -> u16 {
+	to_u16(usize::from(width) * 30 / 100)
+}
+
 /// Returns whether the scanning spinner made it onto the screen.
 pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) -> bool {
-	let overall_width = to_u16(usize::from(area.width) * 30 / 100);
+	let overall_width = overall_width(area.width);
 	let workers_width = to_u16((usize::from(area.width) * 43 + 50) / 100);
 	let [overall, workers, system] = Layout::horizontal([
 		Constraint::Length(overall_width),
@@ -60,7 +71,37 @@ fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 	};
 	let body = content(panel(buf, area, theme, &chrome));
 	let overall = &view.overall;
-	let cells = usize::from(body.width);
+	let OverallLines {
+		lines,
+		saved_row,
+		spinning,
+	} = overall_lines(overall, usize::from(body.width), theme, spinner);
+
+	for (row, line) in (body.y..body.bottom()).zip(&lines) {
+		put_line(buf, body.x, row, line, body.right());
+	}
+
+	let spark_x = body.x + to_u16(lines[saved_row].width()) + 2;
+	let saved_row = body.y + to_u16(saved_row);
+	if saved_row < body.bottom() && spark_x + 4 < body.right() {
+		let spark_width = (body.right() - spark_x).min(30);
+		sparkline(
+			buf,
+			Rect::new(spark_x, saved_row, spark_width, 1),
+			&overall.savings_history,
+			theme.done,
+		);
+	}
+	spinning
+}
+
+struct OverallLines<'a> {
+	lines: Vec<Line<'a>>,
+	saved_row: usize,
+	spinning: bool,
+}
+
+fn overall_lines<'a>(overall: &Overall, cells: usize, theme: &Theme, spinner: &ThrobberState) -> OverallLines<'a> {
 	let gauge_color = if overall.parity.is_some() {
 		theme.done
 	} else {
@@ -84,26 +125,21 @@ fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 		lines.push(deleted_line(overall, cells, theme));
 	}
 
-	let saved = saved_line(overall, cells, theme);
-	let spark_x = body.x + to_u16(saved.width()) + 2;
-	let saved_row = body.y + to_u16(lines.len());
-	lines.push(saved);
-	lines.extend(closing_lines(overall, cells, theme));
-
-	for (row, line) in (body.y..body.bottom()).zip(&lines) {
-		put_line(buf, body.x, row, line, body.right());
-	}
-
-	if saved_row < body.bottom() && spark_x + 4 < body.right() {
-		let spark_width = (body.right() - spark_x).min(30);
-		sparkline(
-			buf,
-			Rect::new(spark_x, saved_row, spark_width, 1),
-			&overall.savings_history,
-			theme.done,
+	let saved_row = lines.len();
+	lines.push(saved_line(overall, cells, theme));
+	if let Some(parity) = overall.parity {
+		lines.extend(
+			wrap(&parity_text(parity), cells)
+				.into_iter()
+				.map(|line| Line::styled(line, fg(theme.done))),
 		);
 	}
-	spinning
+
+	OverallLines {
+		lines,
+		saved_row,
+		spinning,
+	}
 }
 
 fn headline<'a>(overall: &Overall, cells: usize, theme: &Theme, spinner: &ThrobberState) -> Line<'a> {
@@ -204,26 +240,6 @@ fn parity_text(parity: Parity) -> String {
 	)
 }
 
-fn closing_lines<'a>(overall: &Overall, cells: usize, theme: &Theme) -> Vec<Line<'a>> {
-	if let Some(parity) = overall.parity {
-		return wrap(&parity_text(parity), cells)
-			.into_iter()
-			.map(|line| Line::styled(line, fg(theme.done)))
-			.collect();
-	}
-
-	let Some(eta) = overall.eta else {
-		return Vec::new();
-	};
-
-	let mut line = Parts::new(cells);
-	line.push(format!("ETA {}", duration(eta)), fg(theme.dim));
-	if !overall.scan_complete {
-		line.push(" · grows while scanning", fg(theme.dim));
-	}
-	vec![line.line()]
-}
-
 fn render_workers(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	let workers = &view.workers;
 	let right = if workers.slots.is_empty() {
@@ -251,8 +267,16 @@ fn render_workers(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 		return;
 	}
 
-	let columns = columns(&workers.jobs, body.width);
-	for ((index, job), row) in workers.jobs.iter().enumerate().zip(body.y..body.bottom()) {
+	let rows = usize::from(body.height);
+	let shown = if workers.jobs.len() > rows {
+		rows.saturating_sub(1)
+	} else {
+		workers.jobs.len()
+	};
+	let jobs = &workers.jobs[..shown];
+
+	let columns = columns(jobs, body.width);
+	for ((index, job), row) in jobs.iter().enumerate().zip(body.y..body.bottom()) {
 		worker_line(
 			buf,
 			Rect::new(body.x, row, body.width, 1),
@@ -260,6 +284,19 @@ fn render_workers(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 			job,
 			columns,
 			theme,
+		);
+	}
+
+	let hidden = workers.jobs.len() - shown;
+	if hidden > 0 {
+		let row = body.y + to_u16(shown);
+		put(
+			buf,
+			body.x,
+			row,
+			&format!("+{hidden} more"),
+			fg(theme.dim),
+			body.right(),
 		);
 	}
 }
@@ -436,10 +473,6 @@ fn render_system(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme
 	}
 
 	let text_lines = [
-		(
-			format!("Disk {} · {} free", system.disk_label, bytes(system.disk_free)),
-			fg(theme.text),
-		),
 		limit_line(limit, system, theme),
 		(system.toolchain.clone(), fg(theme.dim)),
 	];
@@ -497,6 +530,8 @@ fn sparkline(buf: &mut Buffer, area: Rect, history: &[u64], color: Color) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::mock::MockSource;
+	use crate::source::ArchiveSource;
 	use crate::theme::ColorDepth;
 	use crate::view::{FileId, FileState, Library};
 
@@ -535,6 +570,79 @@ mod tests {
 		(0..buf.area.height)
 			.map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
 			.collect()
+	}
+
+	fn view() -> ArchiveView {
+		let mut view = MockSource::new(7).view().clone();
+		view.overall.eta = Some(std::time::Duration::from_hours(3));
+		view.overall.originals_deleted = 0;
+		view.overall.parity = None;
+		view
+	}
+
+	fn panels(view: &ArchiveView, width: u16) -> Vec<String> {
+		let theme = Theme::dark(ColorDepth::TrueColor);
+		let spinner = ThrobberState::default();
+		let area = Rect::new(0, 0, width, height(width, view, &theme, &spinner));
+		let mut buf = Buffer::empty(area);
+		render(&mut buf, area, view, &theme, &spinner);
+		(0..area.height)
+			.map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+			.collect()
+	}
+
+	#[test]
+	fn the_panels_leave_the_eta_and_the_disk_to_the_header() {
+		let rows = panels(&view(), 100);
+
+		assert_eq!(rows.len(), 7, "{rows:#?}");
+		assert!(
+			rows.iter().all(|row| !row.contains("ETA") && !row.contains("free")),
+			"{rows:#?}"
+		);
+		assert!(
+			rows[5].contains("Saved"),
+			"the last row inside the border is used: {rows:#?}"
+		);
+		assert!(rows[5].contains("ffmpeg"), "{rows:#?}");
+	}
+
+	#[test]
+	fn the_top_grows_only_for_lines_that_would_not_fit() {
+		let theme = Theme::dark(ColorDepth::TrueColor);
+		let spinner = ThrobberState::default();
+		let mut view = view();
+		assert_eq!(height(100, &view, &theme, &spinner), 7);
+
+		view.overall.originals_deleted = 12;
+		assert_eq!(height(100, &view, &theme, &spinner), 8);
+		assert!(panels(&view, 100)[6].contains("Saved"));
+
+		view.overall.originals_deleted = 0;
+		view.overall.parity = Some(Parity {
+			source_files: 44_463,
+			archive_files: 44_461,
+			excluded: 2,
+		});
+		assert_eq!(height(100, &view, &theme, &spinner), 9);
+		assert_eq!(height(160, &view, &theme, &spinner), 8);
+		assert!(panels(&view, 100)[7].contains("excluded"));
+	}
+
+	#[test]
+	fn hidden_workers_are_counted_on_the_last_row() {
+		let mut view = view();
+		view.workers.jobs = (0..8).map(|_| job("AVIF", "encoding")).collect();
+
+		let rows = panels(&view, 120);
+		assert!(rows[4].contains("#4 AVIF"), "{rows:#?}");
+		assert!(rows[5].contains("+4 more"), "{rows:#?}");
+		assert!(!rows.iter().any(|row| row.contains("#5 ")), "{rows:#?}");
+
+		view.workers.jobs.truncate(5);
+		let rows = panels(&view, 120);
+		assert!(rows[5].contains("#5 AVIF"), "{rows:#?}");
+		assert!(!rows.iter().any(|row| row.contains("more")), "{rows:#?}");
 	}
 
 	#[test]

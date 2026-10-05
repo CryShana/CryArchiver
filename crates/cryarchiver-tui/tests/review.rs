@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEve
 
 use support::{app, draw, find_row, mouse, press, row_text, type_text};
 
-const FIRST_BODY_ROW: u16 = 12;
+const FIRST_BODY_ROW: u16 = 10;
 
 fn keys_at(start: Instant, text: &str, gap: Duration) -> Vec<(Event, Instant)> {
 	(0u32..)

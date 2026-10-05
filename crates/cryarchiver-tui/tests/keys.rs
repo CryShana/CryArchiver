@@ -2,9 +2,12 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use cryarchiver_tui::view::{IssueKind, Limit, RunState};
-use cryarchiver_tui::{App, ArchiveSource, ColorDepth, MockSource, OverlayKind, Selection, ViewMode};
-use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use cryarchiver_tui::view::{
+	ArchiveView, FileDetails, FileId, FileRow, FileState, FilterResult, Issue, IssueId, IssueKind, IssueVerbs, Limit,
+	NodeId, Notification, RunState,
+};
+use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, MockSource, OverlayKind, Selection, ViewMode};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use support::{app, click, draw, find_on_row, find_row, mouse, press, press_with, release, type_text};
 
@@ -380,13 +383,13 @@ fn footer_chips_are_clickable() {
 fn wheel_scrolls_the_library_without_moving_the_selection() {
 	let mut app = app();
 	let before = draw(&mut app, 120, 36);
-	let first_row = support::row_text(&before, 12);
+	let first_row = support::row_text(&before, 10);
 	let selected = app.selected();
 
 	mouse(&mut app, MouseEventKind::ScrollDown, 40, 20, Instant::now());
 	let after = draw(&mut app, 120, 36);
 
-	assert_ne!(support::row_text(&after, 12), first_row);
+	assert_ne!(support::row_text(&after, 10), first_row);
 	assert_eq!(app.selected(), selected);
 }
 
@@ -445,13 +448,13 @@ fn wheel_over_the_log_scrolls_the_log_not_the_library() {
 	let mut app = app();
 	let before = draw(&mut app, 120, 36);
 	let title_row = log_title_row(&before);
-	let library_row = support::row_text(&before, 12);
+	let library_row = support::row_text(&before, 10);
 	let second_line = support::row_text(&before, title_row + 2);
 
 	mouse(&mut app, MouseEventKind::ScrollDown, 40, title_row + 2, Instant::now());
 	let after = draw(&mut app, 120, 36);
 
-	assert_eq!(support::row_text(&after, 12), library_row);
+	assert_eq!(support::row_text(&after, 10), library_row);
 	assert!(support::row_text(&after, title_row).contains("↑ 3 newer"));
 	assert_ne!(support::row_text(&after, title_row + 2), second_line);
 
@@ -582,7 +585,7 @@ fn right_click_on_the_normal_log_outside_its_lines_does_nothing() {
 #[test]
 fn wheel_outside_the_maximized_log_leaves_the_hidden_library_alone() {
 	let mut app = app();
-	let before = support::row_text(&draw(&mut app, 120, 36), 12);
+	let before = support::row_text(&draw(&mut app, 120, 36), 10);
 	press(&mut app, KeyCode::Char('L'));
 	draw(&mut app, 120, 36);
 
@@ -590,7 +593,7 @@ fn wheel_outside_the_maximized_log_leaves_the_hidden_library_alone() {
 	mouse(&mut app, MouseEventKind::ScrollDown, 40, 35, Instant::now());
 	press(&mut app, KeyCode::Char('L'));
 
-	assert_eq!(support::row_text(&draw(&mut app, 120, 36), 12), before);
+	assert_eq!(support::row_text(&draw(&mut app, 120, 36), 10), before);
 }
 
 #[test]
@@ -663,6 +666,50 @@ fn q_asks_from_the_menu_and_the_settings_too() {
 		assert_eq!(app.overlay(), Some(OverlayKind::ConfirmQuit));
 		assert!(!app.should_quit());
 	}
+}
+
+#[test]
+fn staying_returns_to_the_overlay_q_was_pressed_in() {
+	for (open, kind) in [
+		('m', OverlayKind::Menu),
+		('s', OverlayKind::Settings),
+		('?', OverlayKind::Help),
+	] {
+		let mut app = app();
+		press(&mut app, KeyCode::Char(open));
+		press(&mut app, KeyCode::Char('q'));
+
+		press(&mut app, KeyCode::Esc);
+
+		assert_eq!(app.overlay(), Some(kind));
+	}
+}
+
+#[test]
+fn q_asks_from_every_view() {
+	for keys in [&[KeyCode::Enter][..], &[KeyCode::Char('i')], &[KeyCode::Char('L')]] {
+		let mut app = app();
+		for &key in keys {
+			press(&mut app, key);
+		}
+
+		press(&mut app, KeyCode::Char('q'));
+
+		assert_eq!(app.overlay(), Some(OverlayKind::ConfirmQuit), "after {keys:?}");
+		assert!(!app.should_quit());
+	}
+}
+
+#[test]
+fn the_footer_quit_chip_asks_first() {
+	let mut app = app();
+	let terminal = draw(&mut app, 160, 45);
+	let chip = find_on_row(&terminal, 44, " q ").unwrap();
+
+	click(&mut app, chip + 1, 44, Instant::now());
+
+	assert_eq!(app.overlay(), Some(OverlayKind::ConfirmQuit));
+	assert!(!app.should_quit());
 }
 
 #[test]
@@ -744,20 +791,211 @@ fn clicking_progress_cycles_the_sort_and_off_restores_the_order() {
 	assert_eq!(library_names(&terminal, header), original);
 }
 
+/// The Library body's screen rows, between the column header and the panel's bottom border.
+fn library_body(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, header: u16) -> Vec<u16> {
+	let height = terminal.backend().buffer().area.height;
+	(header + 1..height)
+		.take_while(|&row| !support::row_text(terminal, row).starts_with('╰'))
+		.collect()
+}
+
+fn library_row_of(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, header: u16, name: &str) -> Option<u16> {
+	library_body(terminal, header)
+		.into_iter()
+		.find(|&row| support::row_text(terminal, row).contains(name))
+}
+
 #[test]
 fn the_selection_follows_its_row_when_the_sort_changes() {
 	let mut app = app();
 	let selected = app.selected();
+	let name = app.selected_name().unwrap();
 	let terminal = draw(&mut app, 120, 36);
 	let header = find_row(&terminal, "Status").unwrap();
 	let progress = find_on_row(&terminal, header, "Progress").unwrap();
+	let unsorted = library_row_of(&terminal, header, &name).unwrap();
 	let now = Instant::now();
 
-	for step in 0..3 {
+	click(&mut app, progress + 2, header, now);
+	let terminal = draw(&mut app, 120, 36);
+	assert_eq!(app.selected(), selected);
+	let sorted = library_row_of(&terminal, header, &name).expect("the selected row stays on screen");
+	assert_ne!(
+		sorted, unsorted,
+		"the selected row moved, and the selection went with it"
+	);
+
+	for step in 1..3 {
 		click(&mut app, progress + 2, header, now + Duration::from_secs(step));
-		draw(&mut app, 120, 36);
+		let terminal = draw(&mut app, 120, 36);
 		assert_eq!(app.selected(), selected);
+		assert!(library_row_of(&terminal, header, &name).is_some());
 	}
+}
+
+/// The demo with its view frozen for editing, and files finished on demand, patched into their folder's rows the way
+/// a source patches statuses.
+struct Patched {
+	inner: MockSource,
+	view: ArchiveView,
+	rows: std::collections::HashMap<NodeId, Vec<FileRow>>,
+	changed: bool,
+}
+
+impl Patched {
+	fn new() -> Self {
+		let inner = support::source();
+		Self {
+			view: inner.view().clone(),
+			inner,
+			rows: std::collections::HashMap::new(),
+			changed: false,
+		}
+	}
+
+	fn finish(&mut self, file: FileId, folder: NodeId) {
+		let mut rows = self.inner.files(folder).unwrap().to_vec();
+		let row = rows.iter_mut().find(|row| row.id == file).unwrap();
+		row.status.state = FileState::Done;
+		row.status.progress = None;
+		self.rows.insert(folder, rows);
+		self.changed = true;
+	}
+}
+
+impl ArchiveSource for Patched {
+	fn refresh(&mut self) -> bool {
+		std::mem::take(&mut self.changed)
+	}
+
+	fn view(&self) -> &ArchiveView {
+		&self.view
+	}
+
+	fn files(&self, folder: NodeId) -> Option<&[FileRow]> {
+		self.rows
+			.get(&folder)
+			.map(Vec::as_slice)
+			.or_else(|| self.inner.files(folder))
+	}
+
+	fn rows_version(&self) -> u64 {
+		self.inner.rows_version()
+	}
+
+	fn filter(&self) -> Option<&FilterResult> {
+		self.inner.filter()
+	}
+
+	fn details(&self, file: FileId) -> Option<FileDetails> {
+		self.inner.details(file)
+	}
+
+	fn issue_log(&self, issue: IssueId, attempt: u32) -> Option<Vec<String>> {
+		self.inner.issue_log(issue, attempt)
+	}
+
+	fn take_notifications(&mut self) -> Vec<Notification> {
+		self.inner.take_notifications()
+	}
+
+	fn perform(&mut self, action: Action) {
+		self.inner.perform(action);
+	}
+
+	fn shutdown(&mut self) {
+		self.inner.shutdown();
+	}
+}
+
+fn key_to(app: &mut App<Patched>, code: KeyCode, times: usize) {
+	for _ in 0..times {
+		app.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), Instant::now());
+	}
+}
+
+fn draw_patched(app: &mut App<Patched>) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+	let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+	terminal.draw(|frame| app.draw(frame)).unwrap();
+	terminal
+}
+
+#[test]
+fn a_live_re_sort_keeps_the_selected_row_where_it_is_on_screen() {
+	let mut app = App::new(Patched::new(), ColorDepth::TrueColor);
+	let terminal = draw_patched(&mut app);
+	let header = find_row(&terminal, "Status").unwrap();
+	let progress = find_on_row(&terminal, header, "Progress").unwrap();
+	let down = MouseEvent {
+		kind: MouseEventKind::Down(MouseButton::Left),
+		column: progress + 2,
+		row: header,
+		modifiers: KeyModifiers::NONE,
+	};
+	app.handle_event(&Event::Mouse(down), Instant::now());
+
+	draw_patched(&mut app);
+	key_to(&mut app, KeyCode::End, 1);
+	let terminal = draw_patched(&mut app);
+	let page = library_body(&terminal, header).len();
+	key_to(&mut app, KeyCode::Up, page - 1);
+	let terminal = draw_patched(&mut app);
+	let top = app.selected_name().unwrap();
+	assert_eq!(
+		library_row_of(&terminal, header, &top),
+		Some(header + 1),
+		"the top row is selected"
+	);
+	let Some(Selection::File { file, folder }) = app.selected() else {
+		panic!("the last page starts with a file without a gauge");
+	};
+
+	key_to(&mut app, KeyCode::Down, 5);
+	let terminal = draw_patched(&mut app);
+	let name = app.selected_name().unwrap();
+	let row = library_row_of(&terminal, header, &name).unwrap();
+
+	app.source_mut().finish(file, folder);
+	assert!(app.refresh());
+	let terminal = draw_patched(&mut app);
+
+	assert_ne!(
+		library_row_of(&terminal, header, &top),
+		Some(header + 1),
+		"the finished file moved up"
+	);
+	assert_eq!(app.selected_name().as_deref(), Some(name.as_str()));
+	assert_eq!(library_row_of(&terminal, header, &name), Some(row));
+}
+
+#[test]
+fn an_issue_without_a_file_offers_no_folder_retry() {
+	let mut source = Patched::new();
+	let root = source.view.library.root();
+	source.view.issues = vec![Issue {
+		id: IssueId(1),
+		kind: IssueKind::SourceUnreadable,
+		file: None,
+		folder: Some(root),
+		name: "Locked".to_owned(),
+		location: "Locked".to_owned(),
+		reason: "Permission denied".to_owned(),
+		resolution: String::new(),
+		verbs: IssueVerbs {
+			retry: Some("Retry".to_owned()),
+			accept: None,
+			exclude: true,
+		},
+		attempts: 0,
+	}];
+	let mut app = App::new(source, ColorDepth::TrueColor);
+	key_to(&mut app, KeyCode::Home, 1);
+
+	key_to(&mut app, KeyCode::Char('m'), 1);
+
+	let items = app.menu_items();
+	assert!(items.iter().any(|item| item == "Copy path"));
+	assert!(!items.iter().any(|item| item == "Retry failed in folder"));
 }
 
 fn has(app: &App<MockSource>, item: &str) -> bool {
@@ -794,6 +1032,21 @@ fn the_file_menu_fits_the_view_it_opened_in() {
 	press(&mut app, KeyCode::Char('m'));
 	assert!(has(&app, "Show ffmpeg log"));
 	assert!(has(&app, "Show details"));
+}
+
+#[test]
+fn the_details_menu_of_an_original_leaves_out_its_duplicates() {
+	let mut app = app();
+	open_battle_theme_original(&mut app);
+	assert_eq!(app.mode(), ViewMode::Details);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(!has(&app, "Show duplicates"), "the details already list them");
+	press(&mut app, KeyCode::Esc);
+
+	press(&mut app, KeyCode::Esc);
+	assert_eq!(app.mode(), ViewMode::Library);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(has(&app, "Show duplicates"));
 }
 
 #[test]
