@@ -27,7 +27,7 @@ use crate::memory::MemoryBudget;
 use crate::record::{CopyReason, FailureLog, FileRecord, FileState, How, IssueKind, MediaClass, Output};
 use crate::references::{self, RefKind};
 use crate::run::{ArchiveFolders, Staged};
-use crate::schedule::{DiskGuard, Governor, GovernorConfig, Queue, Waits, Work, retry_delay};
+use crate::schedule::{DiskGuard, Governor, GovernorConfig, Queue, Waits, Work, looks_like_video, retry_delay};
 use crate::tree::{FileId, FolderId};
 use crate::view::{LogKind, NoticeLevel, size_text};
 use crate::watch::{ReadyCheck, check_ready, is_stable};
@@ -41,13 +41,22 @@ const IDENTITY_UNSTABLE: &str = "its identity changes every time it is read";
 const START_ORDER: [Work; 5] = [Work::Placeholder, Work::Hash, Work::Delete, Work::Copy, Work::Encode];
 const DELETES_FIRST: [Work; 5] = [Work::Placeholder, Work::Delete, Work::Hash, Work::Copy, Work::Encode];
 
+/// Where a job stands with the encoder's video slots, as its events tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VideoSlot {
+	/// Not a video, or not yet known to be one.
+	None,
+	Waiting,
+	Held,
+}
+
 pub(crate) struct RunningJob {
 	pub(super) work: Work,
 	pub(super) attempt: u32,
 	pub(super) cancel: CancellationToken,
 	pub(super) fraction: f64,
 	pub(super) stage: Option<Stage>,
-	pub(super) video_waiting: bool,
+	pub(super) video: VideoSlot,
 	pub(super) requeue: bool,
 	/// The job found that the duplicate it was writing a placeholder for is no longer the same file.
 	pub(super) not_same_file: bool,
@@ -74,6 +83,11 @@ pub(crate) struct Pipeline {
 	/// Files ready to start again while their earlier job still winds down; they start once it has finished.
 	pub(super) deferred: HashSet<FileId>,
 	pub(super) governor: Governor,
+	/// How many videos the encoder runs at once.
+	pub(super) video_slots: usize,
+	/// The last search of the encode queue for a video, or for anything but one, that found none, with the queue's
+	/// push count then: it can't find one before a file is queued again.
+	fruitless_search: Option<(bool, u64)>,
 	/// A hash started while deletes waited: the next free disk slot goes to a delete, so an endless stream of
 	/// hashes in watch mode can't hold deletes back for good.
 	deletes_first: bool,
@@ -97,6 +111,10 @@ pub(crate) struct Pipeline {
 }
 
 impl RunningJob {
+	pub(super) fn video_waiting(&self) -> bool {
+		self.video == VideoSlot::Waiting
+	}
+
 	/// The output named in the job's commit intent, until it is placed or taken.
 	pub(super) fn pending_output(&self) -> Option<&Output> {
 		self.pending.as_ref()
@@ -136,6 +154,8 @@ impl Pipeline {
 			jobs: HashMap::new(),
 			deferred: HashSet::new(),
 			governor: Governor::new(config),
+			video_slots: 1,
+			fruitless_search: None,
 			deletes_first: false,
 			encoder,
 			image_threads,
@@ -311,7 +331,11 @@ impl Owner {
 		};
 		for work in order {
 			while self.pipeline.governor.may_start(work, now) {
-				let next = self.pipeline.queues.get_mut(&work).and_then(Queue::pop_front);
+				let next = if work == Work::Encode {
+					self.next_encode()
+				} else {
+					self.pipeline.queues.get_mut(&work).and_then(Queue::pop_front)
+				};
 				let Some(file) = next else {
 					break;
 				};
@@ -333,6 +357,47 @@ impl Owner {
 				}
 			}
 		}
+	}
+
+	/// A video while the encoder has a slot no running video holds, and otherwise anything but a video, so photos and
+	/// videos run side by side; the front of the queue when none of that kind is queued.
+	pub(super) fn next_encode(&mut self) -> Option<FileId> {
+		let want_video = self.running_videos() < self.pipeline.video_slots;
+		let tree = &self.tree;
+		let queue = self.pipeline.queues.get_mut(&Work::Encode)?;
+
+		let search = (want_video, queue.pushed());
+		if self.pipeline.fruitless_search != Some(search) {
+			let found = queue.take_first(|file| looks_like_video(&tree.file(file).name) == want_video);
+			if found.is_some() {
+				return found;
+			}
+			self.pipeline.fruitless_search = Some(search);
+		}
+
+		queue.pop_front()
+	}
+
+	/// Encodes of videos, and of files named like videos.
+	fn running_videos(&self) -> usize {
+		self.pipeline
+			.jobs
+			.iter()
+			.filter(|(file, job)| {
+				job.work == Work::Encode
+					&& (job.video != VideoSlot::None || looks_like_video(&self.tree.file(**file).name))
+			})
+			.count()
+	}
+
+	/// The video slots the other jobs hold, as far as their events tell. The engine frees a slot before the job's
+	/// result arrives, so this is never fewer than the engine's count.
+	fn video_slots_held(&self, except: FileId) -> usize {
+		self.pipeline
+			.jobs
+			.iter()
+			.filter(|(file, job)| **file != except && job.video == VideoSlot::Held)
+			.count()
 	}
 
 	fn start_job(&mut self, file: FileId, work: Work, now: Instant) {
@@ -380,7 +445,7 @@ impl Owner {
 				cancel,
 				fraction: 0.0,
 				stage: None,
-				video_waiting: false,
+				video: VideoSlot::None,
 				requeue: false,
 				not_same_file: false,
 				pending: None,
@@ -477,7 +542,10 @@ impl Owner {
 		self.source_changed(file, size, mtime_ns);
 	}
 
+	/// Every video reports `Queued` before it takes a slot; only one that finds every slot held waits.
 	fn on_job_event(&mut self, file: FileId, event: JobEvent) {
+		let queued = event == JobEvent::Stage(Stage::Queued);
+		let waits_for_slot = queued && self.video_slots_held(file) >= self.pipeline.video_slots;
 		let Some(job) = self.pipeline.jobs.get_mut(&file) else {
 			return;
 		};
@@ -489,10 +557,15 @@ impl Owner {
 				self.touch_file(file);
 			}
 			JobEvent::Stage(stage) => {
-				let waiting = stage == Stage::Queued;
-				if waiting != job.video_waiting {
-					job.video_waiting = waiting;
-					self.pipeline.governor.set_video_waiting(waiting);
+				let was_waiting = job.video_waiting();
+				job.video = match job.video {
+					_ if queued && waits_for_slot => VideoSlot::Waiting,
+					_ if queued => VideoSlot::Held,
+					VideoSlot::None => VideoSlot::None,
+					VideoSlot::Waiting | VideoSlot::Held => VideoSlot::Held,
+				};
+				if job.video_waiting() != was_waiting {
+					self.pipeline.governor.set_video_waiting(job.video_waiting());
 				}
 				job.stage = Some(stage);
 				self.touch_file(file);
@@ -755,7 +828,7 @@ impl Owner {
 		};
 
 		self.pipeline.governor.finished(job.work);
-		if job.video_waiting {
+		if job.video_waiting() {
 			self.pipeline.governor.set_video_waiting(false);
 		}
 		self.pipeline.workers_dirty = true;
@@ -1253,7 +1326,7 @@ pub(super) mod tests {
 			cancel: CancellationToken::new(),
 			fraction: 0.0,
 			stage: None,
-			video_waiting: false,
+			video: VideoSlot::None,
 			requeue: false,
 			not_same_file: false,
 			pending: None,
@@ -1798,5 +1871,122 @@ pub(super) mod tests {
 		};
 		assert_eq!(output.path, key("notes.txt"));
 		assert_eq!(fixture.claims(), 1);
+	}
+
+	/// An owner whose source holds `names`, small enough to skip dedup, each queued for an encode in this order, with
+	/// room for four encodes at once.
+	fn encodes(names: &[&str], video_slots: usize) -> (tempfile::TempDir, Owner, Receiver<Update>) {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		for name in names {
+			fs::write(source.join(name), name.as_bytes()).unwrap();
+		}
+
+		let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		for name in names {
+			ready_media(&mut owner, name);
+		}
+
+		owner.pipeline.video_slots = video_slots;
+		owner.pipeline.governor = Governor::new(GovernorConfig {
+			ramp: Duration::ZERO,
+			max_encodes: 4,
+		});
+		owner.pipeline.governor.observe_cpu(Instant::now(), 0.1);
+		(dir, owner, updates)
+	}
+
+	fn ready_media(owner: &mut Owner, name: &str) {
+		let file = owner.tree.file_id(&key(name)).unwrap();
+		owner.on_ready_checked(
+			file,
+			ReadyCheck::Ready {
+				class: MediaClass::Media,
+				content: None,
+			},
+		);
+		assert!(
+			owner.pipeline.queues[&Work::Encode].contains(file),
+			"{name} is queued to encode"
+		);
+	}
+
+	/// The encodes `start_jobs` starts while the governor lets it, recorded as running without spawning them.
+	fn start_encodes(owner: &mut Owner) -> Vec<String> {
+		let now = Instant::now();
+		let mut started = Vec::new();
+		while owner.pipeline.governor.may_start(Work::Encode, now) {
+			let Some(file) = owner.next_encode() else {
+				break;
+			};
+
+			owner.pipeline.governor.started(Work::Encode, now);
+			owner.pipeline.jobs.insert(file, running_job(Work::Encode));
+			started.push(owner.tree.file(file).name.to_string_lossy().into_owned());
+		}
+		started
+	}
+
+	#[test]
+	fn videos_start_beside_photos_while_the_engine_has_a_free_video_slot() {
+		let names = ["a.jpg", "b.jpg", "c.jpg", "d.mp4", "e.jpg", "f.mp4"];
+
+		let (_dir, mut two_slots, _updates) = encodes(&names, 2);
+		assert_eq!(start_encodes(&mut two_slots), ["d.mp4", "f.mp4", "a.jpg", "b.jpg"]);
+
+		let (_dir, mut one_slot, _updates) = encodes(&names, 1);
+		assert_eq!(start_encodes(&mut one_slot), ["d.mp4", "a.jpg", "b.jpg", "c.jpg"]);
+	}
+
+	#[test]
+	fn a_video_waits_for_a_slot_only_when_every_slot_is_held() {
+		let (_dir, mut owner, _updates) = encodes(&["a.mp4", "b.mp4", "c.mp4"], 2);
+		let file = |owner: &Owner, name: &str| owner.tree.file_id(&key(name)).unwrap();
+		let stage = |owner: &mut Owner, name: &str, stage: Stage| {
+			let file = file(owner, name);
+			owner.on_job(file, JobMessage::Event(JobEvent::Stage(stage)));
+			owner.pipeline.jobs[&file].video_waiting()
+		};
+		assert_eq!(start_encodes(&mut owner), ["a.mp4", "b.mp4", "c.mp4"]);
+
+		assert!(
+			!stage(&mut owner, "a.mp4", Stage::Queued),
+			"a free slot is taken at once"
+		);
+		assert!(!stage(&mut owner, "b.mp4", Stage::Queued));
+		assert!(stage(&mut owner, "c.mp4", Stage::Queued), "both slots are held");
+		assert!(owner.pipeline.jobs.values().all(|job| job.video != VideoSlot::None));
+
+		let finished = file(&owner, "a.mp4");
+		owner.pipeline.jobs.remove(&finished);
+		assert!(!stage(&mut owner, "c.mp4", Stage::Analyze));
+	}
+
+	#[test]
+	fn photos_alone_start_in_discovery_order_and_requeued_ones_first() {
+		let (_dir, mut owner, _updates) = encodes(&["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"], 2);
+		let queue = owner.pipeline.queues.get_mut(&Work::Encode).unwrap();
+		let requeued = owner.tree.file_id(&key("d.jpg")).unwrap();
+		queue.remove(requeued);
+		queue.push_front(requeued);
+
+		assert_eq!(start_encodes(&mut owner), ["d.jpg", "a.jpg", "b.jpg", "c.jpg"]);
+	}
+
+	#[test]
+	fn a_video_queued_after_a_search_found_none_still_starts_next() {
+		let (dir, mut owner, _updates) = encodes(&["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"], 2);
+		assert_eq!(start_encodes(&mut owner), ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+
+		fs::write(dir.path().join("source").join("z.mp4"), b"video").unwrap();
+		list(&mut owner, &RelPath::root(), false);
+		ready_media(&mut owner, "z.mp4");
+		let finished = owner.tree.file_id(&key("a.jpg")).unwrap();
+		owner.pipeline.jobs.remove(&finished);
+		owner.pipeline.governor.finished(Work::Encode);
+
+		assert_eq!(start_encodes(&mut owner), ["z.mp4"]);
 	}
 }

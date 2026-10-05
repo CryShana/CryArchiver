@@ -10,7 +10,7 @@ use cryarchiver_engine::engine::Stage;
 use cryarchiver_engine::text::{display_name, display_path};
 
 use super::owner::Owner;
-use super::pipeline::kept_note;
+use super::pipeline::{RunningJob, kept_note};
 use crate::issues::{IssueId, IssueKey, Problem, UNREADABLE_FOLDER_VERBS, UNREADABLE_SOURCE_VERBS, Verbs};
 use crate::record::{CopyReason, FileState, How, IssueKind, MediaClass};
 use crate::tree::{FileId, FolderId};
@@ -280,7 +280,7 @@ impl Owner {
 			FileState::Queued if self.waiting(file) => RowState::Waiting,
 			FileState::Ready if self.hashing(file) || self.is_duplicate(file) => RowState::Waiting,
 			FileState::Discovered | FileState::Ready | FileState::Queued => RowState::Queued,
-			FileState::InProgress { .. } if job.is_some_and(|job| job.video_waiting) => RowState::Waiting,
+			FileState::InProgress { .. } if job.is_some_and(RunningJob::video_waiting) => RowState::Waiting,
 			FileState::InProgress { .. } if job.is_some_and(|job| job.stage == Some(Stage::Verify)) => {
 				RowState::Verifying
 			}

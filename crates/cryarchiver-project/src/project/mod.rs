@@ -95,6 +95,11 @@ pub trait Backend: Send + Sync {
 		quality: Arc<dyn QualityMemory>,
 	) -> Arc<dyn Encode>;
 
+	/// How many videos the encoder runs at once; the others wait for a slot.
+	fn video_jobs(&self) -> usize {
+		1
+	}
+
 	fn toolchain(&self) -> String;
 
 	fn sample(&self) -> SystemSample;

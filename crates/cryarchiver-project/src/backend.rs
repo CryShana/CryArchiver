@@ -10,6 +10,8 @@ use sysinfo::System;
 
 use crate::project::{Backend, SystemSample};
 
+const TWO_VIDEOS_FROM_CORES: usize = 16;
+
 pub struct EngineBackend {
 	tools: Toolchain,
 	system: Mutex<System>,
@@ -34,6 +36,10 @@ fn video_threads(image_threads: usize, cores: usize) -> Option<usize> {
 	(image_threads < cores).then_some(image_threads)
 }
 
+fn video_jobs(cores: usize) -> usize {
+	if cores >= TWO_VIDEOS_FROM_CORES { 2 } else { 1 }
+}
+
 impl Backend for EngineBackend {
 	fn encoder(
 		&self,
@@ -45,11 +51,16 @@ impl Backend for EngineBackend {
 			.with_image_threads(image_threads)
 			.with_thread_budget(image_threads)
 			.with_memory_gate(memory)
-			.with_quality_memory(quality);
+			.with_quality_memory(quality)
+			.with_video_jobs(self.video_jobs());
 		if let Some(threads) = video_threads(image_threads, cores()) {
 			engine = engine.with_threads(threads);
 		}
 		Arc::new(engine)
+	}
+
+	fn video_jobs(&self) -> usize {
+		video_jobs(cores())
 	}
 
 	fn toolchain(&self) -> String {
@@ -82,6 +93,15 @@ mod tests {
 	use cryarchiver_engine::video::plan::threads_for;
 
 	use super::*;
+
+	#[test]
+	fn machines_with_sixteen_threads_or_more_encode_two_videos_at_once() {
+		assert_eq!(video_jobs(1), 1);
+		assert_eq!(video_jobs(8), 1);
+		assert_eq!(video_jobs(15), 1);
+		assert_eq!(video_jobs(16), 2);
+		assert_eq!(video_jobs(32), 2);
+	}
 
 	#[test]
 	fn a_limit_that_leaves_fewer_image_threads_than_cores_caps_the_video_encoder_too() {

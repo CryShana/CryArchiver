@@ -379,6 +379,65 @@ fn copy_original_and_exclude_resolve_a_failure() {
 	assert!(!setup.destination.join("skip-me.jpg").exists());
 }
 
+/// Videos that hold the encoder until cancelled, in an engine with `slots` video slots.
+fn videos_held(names: &[&str], slots: usize) -> (support::Setup, std::sync::Arc<FakeEncoder>) {
+	let setup = setup(|_| {});
+	for (seed, name) in (1..).zip(names) {
+		write(&setup.source, name, &jpeg(seed, 100));
+	}
+	let encoder = FakeEncoder::new();
+	encoder.video_slots(slots);
+	encoder.rule(".mp4", Rule::Hold);
+	(setup, encoder)
+}
+
+fn workers_in(snapshot: &Snapshot, state: RowState) -> usize {
+	snapshot.workers.iter().filter(|worker| worker.state == state).count()
+}
+
+#[test]
+fn two_queued_videos_encode_at_once_when_the_engine_has_two_video_slots() {
+	let (setup, encoder) = videos_held(&["a.mp4", "b.mp4"], 2);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "both videos encoding", |s| {
+		workers_in(s, RowState::Encoding) == 2
+	});
+
+	project.send(Command::StopNow);
+	wait_for(&project, &mut snapshot, "the requeue", |s| s.workers.is_empty());
+}
+
+#[test]
+fn no_more_videos_start_once_two_wait_for_the_video_slot() {
+	let (setup, encoder) = videos_held(&["a.mp4", "b.mp4", "c.mp4", "d.mp4"], 1);
+	let tuning = Tuning {
+		ramp: Duration::from_millis(50),
+		..support::tuning()
+	};
+	let project = support::open_tuned(&setup, &encoder, tuning, None);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "one video encoding and two waiting", |s| {
+		workers_in(s, RowState::Encoding) == 1 && workers_in(s, RowState::Waiting) == 2
+	});
+	let settle = Instant::now() + Duration::from_millis(300);
+	while Instant::now() < settle {
+		if let Some(update) = project.wait_update(Duration::from_millis(20)) {
+			snapshot.apply(update);
+		}
+	}
+
+	assert_eq!(snapshot.workers.len(), 3);
+	assert_eq!(encoder.calls().len(), 3, "the fourth video stays queued");
+
+	project.send(Command::StopNow);
+	wait_for(&project, &mut snapshot, "the requeue", |s| s.workers.is_empty());
+}
+
 #[test]
 fn stop_now_requeues_running_jobs_without_output() {
 	let setup = setup(|_| {});

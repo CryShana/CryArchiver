@@ -135,6 +135,7 @@ impl Owner {
 			quality,
 		);
 		pipeline.governor.set_limit(settings.performance_limit.is_some());
+		pipeline.video_slots = options.backend.video_jobs();
 
 		let mut owner = Self {
 			project_file: project_file.to_path_buf(),

@@ -18,12 +18,14 @@ use cryarchiver_engine::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepR
 use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::workspace::Workspace;
 use cryarchiver_project::issues::IssueId;
+use cryarchiver_project::schedule::looks_like_video;
 use cryarchiver_project::settings::Settings;
 use cryarchiver_project::tree::{FileId, FolderId, FolderStats};
 use cryarchiver_project::view::{
 	Details, FileRow, FilterView, IssueView, LogEntry, Notice, Overall, RunState, Status, SystemView, Update, Worker,
 };
 use cryarchiver_project::{Backend, Fault, Project, ProjectOptions, SystemSample, Tuning};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 pub const WAIT: Duration = Duration::from_secs(20);
@@ -62,6 +64,7 @@ pub struct FakeEncoder {
 	running: AtomicUsize,
 	pub peak: AtomicUsize,
 	pub quality: Mutex<Option<Arc<dyn QualityMemory>>>,
+	video_slots: Mutex<Option<(usize, Arc<Semaphore>)>>,
 }
 
 impl FakeEncoder {
@@ -73,6 +76,16 @@ impl FakeEncoder {
 	/// are encoded (to AVIF) and anything else comes back as not media.
 	pub fn rule(&self, suffix: &str, rule: Rule) {
 		self.rules.lock().unwrap().push((suffix.to_owned(), rule));
+	}
+
+	/// Files named like videos wait for one of `slots` before they run, as the engine's videos do, and the backend
+	/// reports that many video jobs.
+	pub fn video_slots(&self, slots: usize) {
+		*self.video_slots.lock().unwrap() = Some((slots, Arc::new(Semaphore::new(slots))));
+	}
+
+	fn video_jobs(&self) -> usize {
+		self.video_slots.lock().unwrap().as_ref().map_or(1, |(slots, _)| *slots)
 	}
 
 	pub fn calls(&self) -> Vec<String> {
@@ -126,6 +139,23 @@ impl Encode for FakeEncoder {
 		Box::pin(async move {
 			let name = job.source.file_name().unwrap().to_string_lossy().into_owned();
 			self.calls.lock().unwrap().push(name.clone());
+			let slots = self
+				.video_slots
+				.lock()
+				.unwrap()
+				.as_ref()
+				.map(|(_, slots)| slots.clone());
+			let _slot = match slots {
+				Some(slots) if looks_like_video(OsStr::new(&name)) => {
+					on_event(JobEvent::Stage(Stage::Queued));
+					tokio::select! {
+						slot = slots.acquire_owned() => Some(slot.unwrap()),
+						() = cancel.cancelled() => return JobOutcome::Failed(ErrorKind::Cancelled.into()),
+					}
+				}
+				_ => None,
+			};
+
 			let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
 			self.peak.fetch_max(running, Ordering::SeqCst);
 
@@ -242,6 +272,10 @@ impl Backend for FakeBackend {
 	) -> Arc<dyn Encode> {
 		*self.encoder.quality.lock().unwrap() = Some(quality);
 		self.encoder.clone()
+	}
+
+	fn video_jobs(&self) -> usize {
+		self.encoder.video_jobs()
 	}
 
 	fn toolchain(&self) -> String {

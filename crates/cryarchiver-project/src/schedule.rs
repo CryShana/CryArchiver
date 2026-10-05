@@ -3,14 +3,20 @@
 //! project task feeds it the facts.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::tree::FileId;
 
 pub const MAX_DISK_JOBS: usize = 2;
 pub const AUTO_RETRIES: u32 = 2;
+pub const MAX_WAITING_VIDEOS: usize = 2;
 
 const IDLE_SHARE: f32 = 0.20;
+const VIDEO_EXTENSIONS: &[&str] = &[
+	"mp4", "mov", "m4v", "mkv", "webm", "avi", "mts", "m2ts", "3gp", "wmv", "flv", "mpg", "mpeg", "ts", "vob",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Work {
@@ -81,6 +87,10 @@ impl Governor {
 			Work::Copy | Work::Hash | Work::Delete => self.disk_jobs() < MAX_DISK_JOBS,
 			Work::Placeholder => true,
 			Work::Encode => {
+				if self.videos_waiting >= MAX_WAITING_VIDEOS {
+					return false;
+				}
+
 				let busy = self.busy_encodes();
 				if busy == 0 {
 					return true;
@@ -107,7 +117,8 @@ impl Governor {
 		}
 	}
 
-	/// A video that waits for the engine's video slot doesn't count against the parallel budget.
+	/// A video that waits for the engine's video slot doesn't count against the parallel budget, but no encode starts
+	/// while [`MAX_WAITING_VIDEOS`] wait.
 	pub fn set_video_waiting(&mut self, waiting: bool) {
 		if waiting {
 			self.videos_waiting += 1;
@@ -140,17 +151,27 @@ impl Governor {
 	}
 }
 
+/// A guess from the name alone, which only orders the encodes: the engine detects the content.
+pub fn looks_like_video(name: &OsStr) -> bool {
+	Path::new(name)
+		.extension()
+		.and_then(OsStr::to_str)
+		.is_some_and(|extension| VIDEO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
+}
+
 /// Files ready to run, in discovery order.
 #[derive(Debug, Default)]
 pub struct Queue {
 	order: VecDeque<FileId>,
 	members: HashSet<FileId>,
+	pushed: u64,
 }
 
 impl Queue {
 	pub fn push(&mut self, file: FileId) {
 		if self.members.insert(file) {
 			self.order.push_back(file);
+			self.pushed += 1;
 		}
 	}
 
@@ -158,7 +179,21 @@ impl Queue {
 	pub fn push_front(&mut self, file: FileId) {
 		if self.members.insert(file) {
 			self.order.push_front(file);
+			self.pushed += 1;
 		}
+	}
+
+	/// How many files were ever queued; it changes only when one is.
+	pub fn pushed(&self) -> u64 {
+		self.pushed
+	}
+
+	/// Takes the first queued file `wanted` accepts, leaving the others in their order.
+	pub fn take_first(&mut self, wanted: impl Fn(FileId) -> bool) -> Option<FileId> {
+		let index = self.order.iter().position(|file| wanted(*file))?;
+		let file = self.order.remove(index)?;
+		self.members.remove(&file);
+		Some(file)
 	}
 
 	pub fn pop_front(&mut self) -> Option<FileId> {
@@ -314,6 +349,8 @@ pub fn space_estimate(remaining_source: u64, bytes_in: u64, bytes_out: u64) -> u
 
 #[cfg(test)]
 mod tests {
+	use std::ffi::OsStr;
+
 	use super::*;
 
 	const CONFIG: GovernorConfig = GovernorConfig {
@@ -349,6 +386,39 @@ mod tests {
 		assert!(governor.may_start(Work::Encode, now));
 		governor.set_video_waiting(false);
 		assert!(!governor.may_start(Work::Encode, now));
+	}
+
+	#[test]
+	fn no_encode_starts_while_two_videos_wait_for_a_slot() {
+		let mut governor = Governor::new(CONFIG);
+		let start = Instant::now();
+		let later = start + Duration::from_secs(10);
+		governor.observe_cpu(start, 0.1);
+		for _ in 0..3 {
+			governor.started(Work::Encode, start);
+		}
+
+		governor.set_video_waiting(true);
+		governor.set_video_waiting(true);
+		assert!(!governor.may_start(Work::Encode, later));
+
+		governor.set_video_waiting(false);
+		assert!(governor.may_start(Work::Encode, later));
+		assert!(!governor.may_start(Work::Encode, start));
+	}
+
+	#[test]
+	fn two_waiting_videos_hold_back_even_the_first_running_encode() {
+		let mut governor = Governor::new(CONFIG);
+		let now = Instant::now();
+		governor.started(Work::Encode, now);
+		governor.started(Work::Encode, now);
+
+		governor.set_video_waiting(true);
+		governor.set_video_waiting(true);
+
+		assert!(!governor.may_start(Work::Encode, now));
+		assert!(governor.may_start(Work::Copy, now));
 	}
 
 	#[test]
@@ -396,6 +466,35 @@ mod tests {
 		assert_eq!(queue.len(), 2);
 		assert_eq!(queue.pop_front(), Some(FileId(3)));
 		assert!(!queue.contains(FileId(3)));
+	}
+
+	#[test]
+	fn the_first_wanted_file_is_taken_and_the_rest_keep_their_order() {
+		let mut queue = Queue::default();
+		for file in 1..=4 {
+			queue.push(FileId(file));
+		}
+		let pushed = queue.pushed();
+
+		assert_eq!(queue.take_first(|file| file.0 % 2 == 0), Some(FileId(2)));
+		assert_eq!(queue.take_first(|file| file.0 > 9), None);
+		assert!(!queue.contains(FileId(2)));
+		assert_eq!(queue.iter().collect::<Vec<_>>(), [FileId(1), FileId(3), FileId(4)]);
+		assert_eq!(queue.pushed(), pushed, "taking queues nothing");
+
+		queue.push_front(FileId(2));
+		queue.push(FileId(3));
+		assert_eq!(queue.pushed(), pushed + 1, "only a file not queued yet counts");
+	}
+
+	#[test]
+	fn videos_are_guessed_from_the_extension_alone() {
+		for name in ["clip.mp4", "CLIP.MKV", "show.m2ts", "home.vob", "a.b.webm"] {
+			assert!(looks_like_video(OsStr::new(name)), "{name}");
+		}
+		for name in ["photo.jpg", "song.flac", "mp4", "notes.txt", "song.m4a"] {
+			assert!(!looks_like_video(OsStr::new(name)), "{name}");
+		}
 	}
 
 	#[test]
