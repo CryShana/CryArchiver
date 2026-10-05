@@ -1324,6 +1324,30 @@ fn dragging_the_library_scrollbar_moves_the_view_and_leaves_the_selection() {
 }
 
 #[test]
+fn a_release_the_window_never_saw_leaves_no_scrollbar_held() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let (column, track) = library_track(&terminal);
+	let (top, bottom) = (track[0], *track.last().unwrap());
+	let now = Instant::now();
+
+	mouse(&mut app, left(MouseEventKind::Down), column, top, now);
+	assert!(app.scroll_dragging());
+	mouse(&mut app, MouseEventKind::Moved, 40, 10, now);
+	mouse(&mut app, left(MouseEventKind::Drag), column, bottom, now);
+	assert_eq!(app.library_scroll(), 0, "a plain move means the button is up");
+	assert!(!app.scroll_dragging());
+
+	let later = now + Duration::from_secs(1);
+	mouse(&mut app, left(MouseEventKind::Down), column, top, later);
+	assert!(app.scroll_dragging());
+	app.handle_event(&Event::FocusLost, later);
+	mouse(&mut app, left(MouseEventKind::Drag), column, bottom, later);
+	assert_eq!(app.library_scroll(), 0, "the release may happen in another window");
+	assert!(!app.scroll_dragging());
+}
+
+#[test]
 fn clicking_the_library_track_jumps_there() {
 	let mut app = app();
 	let terminal = draw(&mut app, 120, 36);

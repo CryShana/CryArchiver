@@ -2,6 +2,7 @@ mod app;
 mod clock;
 mod format;
 pub mod mock;
+mod priority;
 mod project;
 pub mod recent;
 pub mod source;

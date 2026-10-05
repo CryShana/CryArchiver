@@ -669,6 +669,8 @@ fn spawn_checks(generation: u64, paths: Vec<PathBuf>) -> Checks {
 	let worker = Arc::new(Mutex::new(Worker::default()));
 	let shared = worker.clone();
 	std::thread::spawn(move || {
+		crate::priority::restore_this_thread();
+
 		for (index, path) in paths.into_iter().enumerate() {
 			{
 				let mut state = lock(&shared);

@@ -106,7 +106,7 @@ impl Ui {
 				self.on_click(source, position, double)
 			}
 			MouseEventKind::Drag(MouseButton::Left) => self.on_drag(source, position),
-			MouseEventKind::Up(MouseButton::Left) => {
+			MouseEventKind::Up(MouseButton::Left) | MouseEventKind::Moved => {
 				self.scroll_drag = None;
 				Outcome::Ignored
 			}

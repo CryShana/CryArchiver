@@ -301,6 +301,7 @@ impl<S: ArchiveSource> App<S> {
 				self.ui.on_mouse(&self.source, *mouse, now);
 			}
 			Event::Paste(text) => self.ui.on_paste(&self.source, text),
+			Event::FocusLost => self.ui.scroll_drag = None,
 			_ => {}
 		}
 
@@ -435,6 +436,11 @@ impl<S: ArchiveSource> App<S> {
 
 	pub fn set_mouse_capture(&mut self, captured: bool) {
 		self.ui.mouse_capture = captured;
+	}
+
+	/// Whether the left button holds a scrollbar.
+	pub fn scroll_dragging(&self) -> bool {
+		self.ui.scroll_drag.is_some()
 	}
 
 	/// Whether the last frame showed the scanning spinner, so the runner only animates what is visible.

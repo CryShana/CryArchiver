@@ -96,13 +96,24 @@ pub async fn measure_output(
 }
 
 /// The warnings on success: a channel whose level doesn't match is excused with a warning when its source goes beyond
-/// full scale, which the output can't carry.
+/// full scale, which the output can't carry, and clipping can explain the drop.
 pub fn compare(
 	source: &Levels,
 	output: &Levels,
 	check_levels: bool,
 	lfe: Option<usize>,
 ) -> Result<Vec<String>, String> {
+	let clipped = clipped_channels(source, output, check_levels, lfe)?;
+	Ok(clipped_warning(&clipped, None).into_iter().collect())
+}
+
+/// The channels, counted from 1, whose level mismatch clipping explains.
+fn clipped_channels(
+	source: &Levels,
+	output: &Levels,
+	check_levels: bool,
+	lfe: Option<usize>,
+) -> Result<Vec<usize>, String> {
 	let drift = (source.duration_s - output.duration_s).abs();
 	if drift > DURATION_TOLERANCE_S {
 		return Err(format!(
@@ -123,30 +134,47 @@ pub fn compare(
 		return Ok(Vec::new());
 	}
 
-	let mut over_full_scale = Vec::new();
-	for (index, (src, out)) in source.rms_db.iter().zip(&output.rms_db).enumerate() {
+	let mut clipped = Vec::new();
+	for (index, (&src, &out)) in source.rms_db.iter().zip(&output.rms_db).enumerate() {
 		if Some(index) == lfe {
 			continue;
 		}
 
-		let Some(mismatch) = level_mismatch(*src, *out) else {
+		let Some(mismatch) = level_mismatch(src, out) else {
 			continue;
 		};
 
-		if source.peak_db.get(index).is_some_and(|&peak| peak > OVER_FULL_SCALE_DB) {
-			over_full_scale.push(index + 1);
+		if source
+			.peak_db
+			.get(index)
+			.is_some_and(|&peak| peak > OVER_FULL_SCALE_DB && clipping_explains(src, out, peak))
+		{
+			clipped.push(index + 1);
 			continue;
 		}
+
 		return Err(format!("channel {} {mismatch}", index + 1));
 	}
+	Ok(clipped)
+}
 
-	if over_full_scale.is_empty() {
-		return Ok(Vec::new());
+/// Clipping only lowers samples, those beyond full scale by at most `peak` dB, so it can only make a channel quieter,
+/// and by no more than that.
+fn clipping_explains(src: f64, out: f64, peak: f64) -> bool {
+	out.is_finite() && src > out && src - out <= peak + LEVEL_TOLERANCE_DB
+}
+
+fn clipped_warning(channels: &[usize], track: Option<usize>) -> Option<String> {
+	if channels.is_empty() {
+		return None;
 	}
-	Ok(vec![format!(
-		"the source audio goes beyond full scale on channel {}, likely damaged; it was clipped",
-		channel_list(&over_full_scale)
-	)])
+
+	let track = track.map_or_else(String::new, |track| format!("track {track}, "));
+	let noun = if channels.len() == 1 { "channel" } else { "channels" };
+	Some(format!(
+		"the source audio goes beyond full scale on {track}{noun} {}, likely damaged; it was clipped",
+		channel_list(channels)
+	))
 }
 
 fn level_mismatch(src: f64, out: f64) -> Option<String> {
@@ -175,18 +203,17 @@ pub fn lfe_index(layout: &str) -> Option<usize> {
 }
 
 pub fn check_tracks(plan: &FilePlan, source: &[Levels], output: &[Levels]) -> Result<Vec<String>, String> {
-	let mut warnings: Vec<String> = Vec::new();
-	for (track, (source, measured)) in plan.tracks.iter().zip(source.iter().zip(output)) {
+	let several = plan.tracks.len() > 1;
+	let mut warnings = Vec::new();
+
+	for (index, (track, (source, measured))) in plan.tracks.iter().zip(source.iter().zip(output)).enumerate() {
 		let TrackPlan::Encode(encoded) = &track.plan else {
 			continue;
 		};
 
 		let check_levels = !matches!(encoded.layout, LayoutFix::Remix(_));
-		for warning in compare(source, measured, check_levels, lfe_index(encoded.layout.target()))? {
-			if !warnings.contains(&warning) {
-				warnings.push(warning);
-			}
-		}
+		let clipped = clipped_channels(source, measured, check_levels, lfe_index(encoded.layout.target()))?;
+		warnings.extend(clipped_warning(&clipped, several.then_some(index + 1)));
 	}
 	Ok(warnings)
 }
@@ -194,6 +221,8 @@ pub fn check_tracks(plan: &FilePlan, source: &[Levels], output: &[Levels]) -> Re
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::audio::plan::{EncodePlan, FileOptions, TrackJob};
+	use crate::container::OGG_OPUS;
 
 	fn levels(duration_s: f64, rms_db: &[f64]) -> Levels {
 		Levels {
@@ -312,14 +341,63 @@ mod tests {
 				.unwrap_err()
 				.contains("channel 2 level differs")
 		);
-		assert_eq!(
+		assert!(
 			compare(
 				&peaking(levels(10.0, &[-3.0, -3.0]), &[0.5, 0.0]),
-				&levels(10.0, &[-3.0, -3.0]),
+				&levels(10.0, &[-4.3, -3.0]),
+				true,
+				None
+			)
+			.unwrap_err()
+			.contains("channel 1 level differs")
+		);
+		assert_eq!(
+			compare(
+				&peaking(levels(10.0, &[-3.0, -3.0]), &[0.6, 0.0]),
+				&levels(10.0, &[-4.3, -3.0]),
 				true,
 				None
 			),
-			Ok(Vec::new())
+			Ok(vec![
+				"the source audio goes beyond full scale on channel 1, likely damaged; it was clipped".to_owned()
+			])
+		);
+	}
+
+	#[test]
+	fn only_a_drop_clipping_can_cause_is_excused() {
+		let loud = peaking(levels(10.0, &[-0.4, -3.4]), &[1.9, -0.3]);
+		let output = |level: f64| levels(10.0, &[level, -3.3]);
+
+		assert_eq!(
+			compare(&loud, &output(-2.9), true, None),
+			Ok(vec![
+				"the source audio goes beyond full scale on channel 1, likely damaged; it was clipped".to_owned()
+			])
+		);
+
+		for (level, failure) in [
+			(f64::NEG_INFINITY, "channel 1 level differs"),
+			(f64::NAN, "channel 1 level could not be measured"),
+			(2.6, "channel 1 level differs"),
+			(-6.4, "channel 1 level differs"),
+		] {
+			let result = compare(&loud, &output(level), true, None);
+			assert!(
+				result.as_ref().is_err_and(|err| err.contains(failure)),
+				"{level}: {result:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn an_unmeasurable_source_level_is_never_excused() {
+		let damaged = peaking(levels(10.0, &[f64::NAN, -3.4]), &[83.8, -0.3]);
+
+		assert!(
+			compare(&damaged, &levels(10.0, &[-13.7, -3.3]), true, None)
+				.unwrap_err()
+				.contains("channel 1 level could not be measured")
 		);
 	}
 
@@ -334,7 +412,7 @@ mod tests {
 	fn channels_beyond_full_scale_are_listed_in_one_warning() {
 		let warning = |peak_db: &[f64]| {
 			let source_rms_db: Vec<f64> = peak_db.iter().map(|&peak| peak - 3.0).collect();
-			let output_rms_db: Vec<f64> = peak_db.iter().map(|&peak| peak.min(-6.0) - 3.0).collect();
+			let output_rms_db: Vec<f64> = peak_db.iter().map(|&peak| peak.min(0.0) - 3.0).collect();
 			compare(
 				&peaking(levels(10.0, &source_rms_db), peak_db),
 				&levels(10.0, &output_rms_db),
@@ -350,11 +428,57 @@ mod tests {
 		);
 		assert_eq!(
 			warning(&[20.0, 20.0]),
-			["the source audio goes beyond full scale on channel 1 and 2, likely damaged; it was clipped"]
+			["the source audio goes beyond full scale on channels 1 and 2, likely damaged; it was clipped"]
 		);
 		assert_eq!(
 			warning(&[20.0, 20.0, -6.0, 20.0]),
-			["the source audio goes beyond full scale on channel 1, 2 and 4, likely damaged; it was clipped"]
+			["the source audio goes beyond full scale on channels 1, 2 and 4, likely damaged; it was clipped"]
+		);
+	}
+
+	#[test]
+	fn the_warning_names_the_track_when_the_file_has_several() {
+		let track = |stream_index| TrackJob {
+			stream_index,
+			sample_rate: 48_000,
+			plan: TrackPlan::Encode(EncodePlan {
+				bitrate_kbps: 128,
+				channels: 2,
+				layout: LayoutFix::Keep("stereo"),
+			}),
+		};
+		let plan = |tracks| FilePlan {
+			container: OGG_OPUS,
+			tracks,
+			options: FileOptions::default(),
+		};
+		let clipped = peaking(levels(10.0, &[17.0, 17.0]), &[20.0, 20.0]);
+		let fine = peaking(levels(10.0, &[-3.0, -3.0]), &[-1.0, -1.0]);
+		let output = levels(10.0, &[-3.0, -3.0]);
+
+		assert_eq!(
+			check_tracks(
+				&plan(vec![track(0), track(1), track(2)]),
+				&[
+					peaking(levels(10.0, &[17.0, -3.0]), &[20.0, -1.0]),
+					fine,
+					clipped.clone()
+				],
+				&[output.clone(), output.clone(), output.clone()]
+			),
+			Ok(vec![
+				"the source audio goes beyond full scale on track 1, channel 1, likely damaged; it was clipped"
+					.to_owned(),
+				"the source audio goes beyond full scale on track 3, channels 1 and 2, likely damaged; it was clipped"
+					.to_owned(),
+			])
+		);
+		assert_eq!(
+			check_tracks(&plan(vec![track(0)]), &[clipped], &[output]),
+			Ok(vec![
+				"the source audio goes beyond full scale on channels 1 and 2, likely damaged; it was clipped"
+					.to_owned()
+			])
 		);
 	}
 

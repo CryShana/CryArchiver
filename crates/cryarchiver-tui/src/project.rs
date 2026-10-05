@@ -134,7 +134,10 @@ impl ProjectSource {
 	fn shutdown_on_own_thread(&mut self) {
 		let project = &mut self.project;
 		std::thread::scope(|scope| {
-			scope.spawn(|| project.shutdown());
+			scope.spawn(|| {
+				crate::priority::restore_this_thread();
+				project.shutdown();
+			});
 		});
 	}
 

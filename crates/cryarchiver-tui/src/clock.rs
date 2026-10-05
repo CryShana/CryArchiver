@@ -12,14 +12,23 @@ pub fn local_seconds(utc: u32, offset: i32) -> u32 {
 /// How many seconds the local zone is east of UTC right now, daylight saving included. 0 when the OS can't say.
 #[cfg(windows)]
 pub fn utc_offset() -> i32 {
-	use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION};
-
-	const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+	use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 
 	let mut zone = TIME_ZONE_INFORMATION::default();
 
 	// SAFETY: `zone` is a valid, writable TIME_ZONE_INFORMATION for the call.
-	let bias = match unsafe { GetTimeZoneInformation(&raw mut zone) } {
+	let id = unsafe { GetTimeZoneInformation(&raw mut zone) };
+	zone_offset(id, &zone)
+}
+
+/// `id` is what `GetTimeZoneInformation` returned for `zone`. Its biases are minutes west of UTC.
+#[cfg(windows)]
+fn zone_offset(id: u32, zone: &windows::Win32::System::Time::TIME_ZONE_INFORMATION) -> i32 {
+	use windows::Win32::System::Time::TIME_ZONE_ID_INVALID;
+
+	const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+
+	let bias = match id {
 		TIME_ZONE_ID_INVALID => return 0,
 		TIME_ZONE_ID_DAYLIGHT => zone.Bias + zone.DaylightBias,
 		_ => zone.Bias + zone.StandardBias,
@@ -83,8 +92,35 @@ mod tests {
 		assert_eq!(local_seconds(clock(24, 10), HOUR), clock(1, 10));
 	}
 
+	/// A smoke test: the zone's own offset is only known to the machine.
 	#[test]
 	fn the_machine_offset_is_a_real_zone_offset() {
 		assert!((-12 * HOUR..=14 * HOUR).contains(&utc_offset()));
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_zones_count_east_of_utc_with_daylight_saving_only_when_it_applies() {
+		use windows::Win32::System::Time::{TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION};
+
+		const UNKNOWN: u32 = 0;
+		const STANDARD: u32 = 1;
+		const DAYLIGHT: u32 = 2;
+
+		let zone = |bias, standard_bias, daylight_bias| TIME_ZONE_INFORMATION {
+			Bias: bias,
+			StandardBias: standard_bias,
+			DaylightBias: daylight_bias,
+			..TIME_ZONE_INFORMATION::default()
+		};
+		let central_european = zone(-60, 0, -60);
+
+		assert_eq!(zone_offset(DAYLIGHT, &central_european), 2 * HOUR);
+		assert_eq!(zone_offset(STANDARD, &central_european), HOUR);
+		assert_eq!(zone_offset(UNKNOWN, &central_european), HOUR);
+		assert_eq!(zone_offset(TIME_ZONE_ID_INVALID, &central_european), 0);
+		assert_eq!(zone_offset(TIME_ZONE_ID_INVALID, &zone(300, 15, -60)), 0);
+		assert_eq!(zone_offset(DAYLIGHT, &zone(300, 0, -60)), -4 * HOUR);
+		assert_eq!(zone_offset(STANDARD, &zone(300, 0, -60)), -5 * HOUR);
 	}
 }

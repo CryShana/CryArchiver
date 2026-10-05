@@ -19,6 +19,7 @@ use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::{Frame, Terminal};
 
 use crate::app::{App, BURST_GAP};
+use crate::priority;
 use crate::recent::RecentStore;
 use crate::source::ArchiveSource;
 use crate::start::StartMenu;
@@ -51,6 +52,7 @@ pub fn run<S: ArchiveSource>(source: S) -> Result<(), RunError> {
 	}
 
 	priority::raise_this_thread();
+
 	let mut app = App::new(source, ColorDepth::detect());
 	let mut screen = match start_terminal() {
 		Ok(screen) => screen,
@@ -80,6 +82,7 @@ where
 	}
 
 	priority::raise_this_thread();
+
 	let depth = ColorDepth::detect();
 	let mut menu = StartMenu::new(store, depth);
 	let mut screen = start_terminal()?;
@@ -186,6 +189,7 @@ impl<W: Write> Screen<W> {
 			}
 			None => self.shown = Some(rendered.clone()),
 		}
+
 		self.terminal.apply_buffer()?;
 		Ok(true)
 	}
@@ -219,14 +223,14 @@ enum Redraw {
 	Now,
 }
 
-/// Mouse moves, releases and the like change nothing on screen.
-fn redraw(event: &Event) -> Redraw {
+/// Mouse moves, releases and the like change nothing on screen, nor does a drag unless it holds a scrollbar.
+/// `dragging` is whether one was held before the batch: the press that takes one asks for a frame of its own.
+fn redraw(event: &Event, dragging: bool) -> Redraw {
 	match event {
 		Event::Key(key) if key.kind == KeyEventKind::Press => Redraw::Now,
 		Event::Mouse(mouse) => match mouse.kind {
-			MouseEventKind::ScrollDown | MouseEventKind::ScrollUp | MouseEventKind::Drag(MouseButton::Left) => {
-				Redraw::Paced
-			}
+			MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => Redraw::Paced,
+			MouseEventKind::Drag(MouseButton::Left) if dragging => Redraw::Paced,
 			MouseEventKind::Down(_) => Redraw::Now,
 			_ => Redraw::Never,
 		},
@@ -257,8 +261,8 @@ impl Pacer {
 	}
 
 	/// Returns whether the input can have changed the screen.
-	fn input(&mut self, batch: &[(Event, Instant)], now: Instant) -> bool {
-		match batch.iter().map(|(event, _)| redraw(event)).max() {
+	fn input(&mut self, batch: &[(Event, Instant)], dragging: bool, now: Instant) -> bool {
+		match batch.iter().map(|(event, _)| redraw(event, dragging)).max() {
 			Some(Redraw::Now) => self.next = now,
 			Some(Redraw::Paced) => self.next = self.next.min(self.last.map_or(now, |last| last + WHEEL_FRAME)),
 			Some(Redraw::Never) | None => return false,
@@ -291,7 +295,7 @@ where
 			Ok(first) => {
 				let batch = gather(first?, events)?;
 				menu.handle_batch(&batch);
-				dirty |= pacer.input(&batch, Instant::now());
+				dirty |= pacer.input(&batch, false, Instant::now());
 			}
 			Err(RecvTimeoutError::Timeout) => {}
 			Err(RecvTimeoutError::Disconnected) => return Err(RunError::InputClosed),
@@ -343,8 +347,9 @@ fn pump<W: Write, S: ArchiveSource>(screen: &mut Screen<W>, app: &mut App<S>, ev
 		match events.recv_timeout(pacer.wait(Instant::now())) {
 			Ok(first) => {
 				let batch = gather(first?, events)?;
+				let dragging = app.scroll_dragging();
 				app.handle_batch(&batch);
-				dirty |= pacer.input(&batch, Instant::now());
+				dirty |= pacer.input(&batch, dragging, Instant::now());
 			}
 			Err(RecvTimeoutError::Timeout) => {}
 			Err(RecvTimeoutError::Disconnected) => return Err(RunError::InputClosed),
@@ -417,6 +422,7 @@ fn gather(first: (Event, Instant), events: &Events) -> io::Result<Vec<(Event, In
 		if now >= until || now.duration_since(started) >= FRAME {
 			break;
 		}
+
 		thread::sleep(PASTE_POLL.min(until - now));
 	}
 	Ok(batch)
@@ -445,6 +451,7 @@ fn spawn_input(stop: Arc<AtomicBool>) -> (Events, JoinHandle<()>) {
 	let (sender, receiver) = mpsc::channel();
 	let reader = thread::spawn(move || {
 		priority::raise_this_thread();
+
 		while !stop.load(Ordering::Relaxed) {
 			let next = match event::poll(INPUT_POLL) {
 				Ok(false) => continue,
@@ -459,90 +466,6 @@ fn spawn_input(stop: Arc<AtomicBool>) -> (Events, JoinHandle<()>) {
 		}
 	});
 	(receiver, reader)
-}
-
-/// The TUI's own threads, the loop that draws and the input reader, run above normal priority, so a key press gets a
-/// core at once while encoders keep every core busy. Everything else keeps its priority.
-mod priority {
-	/// Opening a project starts the run's threads, which on Linux would inherit a raised nice value.
-	pub fn while_normal<T>(work: impl FnOnce() -> T) -> T {
-		native::restore_this_thread();
-		let result = work();
-		native::raise_this_thread();
-		result
-	}
-
-	pub fn raise_this_thread() {
-		native::raise_this_thread();
-	}
-
-	#[cfg(windows)]
-	pub mod native {
-		use windows::Win32::System::Threading::{
-			GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
-		};
-
-		pub fn raise_this_thread() {
-			// SAFETY: the pseudo handle of the current thread is always valid and needs no closing.
-			let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
-		}
-
-		pub fn restore_this_thread() {
-			// SAFETY: as above.
-			let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
-		}
-	}
-
-	/// A lower nice value needs privileges; without them the thread simply stays where it was.
-	#[cfg(target_os = "linux")]
-	pub mod native {
-		use std::sync::OnceLock;
-
-		const RAISE_BY: libc::c_int = 5;
-		const HIGHEST: libc::c_int = -20;
-
-		static ORIGINAL: OnceLock<libc::c_int> = OnceLock::new();
-
-		fn this_thread() -> libc::id_t {
-			// SAFETY: gettid has no preconditions.
-			libc::id_t::try_from(unsafe { libc::gettid() }).unwrap_or_default()
-		}
-
-		fn set(nice: libc::c_int) {
-			// SAFETY: setpriority only reads its integer arguments and affects this thread alone.
-			unsafe { libc::setpriority(libc::PRIO_PROCESS, this_thread(), nice) };
-		}
-
-		/// The nice value the TUI found, before raising anything.
-		fn original() -> libc::c_int {
-			// SAFETY: getpriority only reads this thread's own value. -1 is also a valid nice value, so errno tells an
-			// error apart; it is this thread's own.
-			*ORIGINAL.get_or_init(|| unsafe {
-				*libc::__errno_location() = 0;
-				let nice = libc::getpriority(libc::PRIO_PROCESS, this_thread());
-				if nice == -1 && *libc::__errno_location() != 0 {
-					0
-				} else {
-					nice
-				}
-			})
-		}
-
-		pub fn raise_this_thread() {
-			set((original() - RAISE_BY).max(HIGHEST));
-		}
-
-		pub fn restore_this_thread() {
-			set(original());
-		}
-	}
-
-	#[cfg(not(any(windows, target_os = "linux")))]
-	pub mod native {
-		pub fn raise_this_thread() {}
-
-		pub fn restore_this_thread() {}
-	}
 }
 
 #[cfg(test)]
@@ -622,19 +545,33 @@ mod tests {
 
 	#[test]
 	fn only_input_that_can_change_the_screen_asks_for_a_frame() {
-		assert_eq!(redraw(&key(KeyCode::Down)), Redraw::Now);
-		assert_eq!(redraw(&mouse(MouseEventKind::Down(MouseButton::Right))), Redraw::Now);
-		assert_eq!(redraw(&Event::Paste("text".into())), Redraw::Now);
-		assert_eq!(redraw(&Event::Resize(80, 24)), Redraw::Now);
-		assert_eq!(redraw(&mouse(MouseEventKind::ScrollDown)), Redraw::Paced);
-		assert_eq!(redraw(&mouse(MouseEventKind::ScrollUp)), Redraw::Paced);
-		assert_eq!(redraw(&mouse(MouseEventKind::Drag(MouseButton::Left))), Redraw::Paced);
+		for dragging in [false, true] {
+			assert_eq!(redraw(&key(KeyCode::Down), dragging), Redraw::Now);
+			assert_eq!(
+				redraw(&mouse(MouseEventKind::Down(MouseButton::Right)), dragging),
+				Redraw::Now
+			);
+			assert_eq!(redraw(&Event::Paste("text".into()), dragging), Redraw::Now);
+			assert_eq!(redraw(&Event::Resize(80, 24), dragging), Redraw::Now);
+			assert_eq!(redraw(&mouse(MouseEventKind::ScrollDown), dragging), Redraw::Paced);
+			assert_eq!(redraw(&mouse(MouseEventKind::ScrollUp), dragging), Redraw::Paced);
 
-		assert_eq!(redraw(&mouse(MouseEventKind::Moved)), Redraw::Never);
-		assert_eq!(redraw(&mouse(MouseEventKind::Up(MouseButton::Left))), Redraw::Never);
-		assert_eq!(redraw(&mouse(MouseEventKind::Drag(MouseButton::Right))), Redraw::Never);
-		assert_eq!(redraw(&released(KeyCode::Down)), Redraw::Never);
-		assert_eq!(redraw(&Event::FocusLost), Redraw::Never);
+			assert_eq!(redraw(&mouse(MouseEventKind::Moved), dragging), Redraw::Never);
+			assert_eq!(
+				redraw(&mouse(MouseEventKind::Up(MouseButton::Left)), dragging),
+				Redraw::Never
+			);
+			assert_eq!(
+				redraw(&mouse(MouseEventKind::Drag(MouseButton::Right)), dragging),
+				Redraw::Never
+			);
+			assert_eq!(redraw(&released(KeyCode::Down), dragging), Redraw::Never);
+			assert_eq!(redraw(&Event::FocusLost, dragging), Redraw::Never);
+		}
+
+		let left_drag = mouse(MouseEventKind::Drag(MouseButton::Left));
+		assert_eq!(redraw(&left_drag, true), Redraw::Paced, "a scrollbar drag");
+		assert_eq!(redraw(&left_drag, false), Redraw::Never, "a drag that holds nothing");
 	}
 
 	#[test]
@@ -644,7 +581,7 @@ mod tests {
 		pacer.framed(start);
 
 		let now = start + Duration::from_millis(1);
-		assert!(pacer.input(&[(key(KeyCode::Down), now)], now));
+		assert!(pacer.input(&[(key(KeyCode::Down), now)], false, now));
 		assert!(pacer.due(now));
 	}
 
@@ -655,14 +592,14 @@ mod tests {
 		pacer.framed(start);
 
 		let now = start + Duration::from_millis(1);
-		assert!(pacer.input(&[(mouse(MouseEventKind::ScrollDown), now)], now));
+		assert!(pacer.input(&[(mouse(MouseEventKind::ScrollDown), now)], false, now));
 		assert!(!pacer.due(now));
 		assert!(pacer.due(start + WHEEL_FRAME));
 
 		let mut pacer = Pacer::new(start);
 		pacer.framed(start);
 		let late = start + FRAME + WHEEL_FRAME;
-		assert!(pacer.input(&[(mouse(MouseEventKind::ScrollDown), late)], late));
+		assert!(pacer.input(&[(mouse(MouseEventKind::ScrollDown), late)], false, late));
 		assert!(pacer.due(start + FRAME), "the source's frame stays due");
 	}
 
@@ -676,7 +613,7 @@ mod tests {
 			.map(|_| (mouse(MouseEventKind::Moved), start))
 			.chain([(released(KeyCode::Down), start)])
 			.collect();
-		assert!(!pacer.input(&moves, start));
+		assert!(!pacer.input(&moves, false, start));
 		assert!(!pacer.due(start + FRAME.saturating_sub(Duration::from_millis(1))));
 		assert!(pacer.due(start + FRAME));
 	}
@@ -710,6 +647,32 @@ mod tests {
 
 		let batch = gather((key(KeyCode::Char('p')), typed), &events).unwrap();
 		assert_eq!(batch.len(), 6);
+	}
+
+	/// The first key's own time decides how long the batch waits for a second key that arrives about 10 ms later.
+	fn batch_with_a_late_key(first_read: Instant) -> usize {
+		let (sender, events) = mpsc::channel();
+		let typist = thread::spawn(move || {
+			thread::sleep(Duration::from_millis(10));
+			let _ = sender.send(Ok((key(KeyCode::Char('b')), Instant::now())));
+		});
+
+		let batch = gather((key(KeyCode::Char('a')), first_read), &events).unwrap();
+		typist.join().unwrap();
+		batch.len()
+	}
+
+	#[test]
+	fn a_key_read_while_the_paste_window_is_open_joins_the_batch() {
+		assert_eq!(batch_with_a_late_key(Instant::now() + Duration::from_millis(200)), 2);
+	}
+
+	#[test]
+	fn a_key_read_after_the_paste_window_closed_waits_for_the_next_batch() {
+		assert_eq!(
+			batch_with_a_late_key(Instant::now().checked_sub(Duration::from_millis(10)).unwrap()),
+			1
+		);
 	}
 
 	#[test]
@@ -854,55 +817,6 @@ mod tests {
 			one_at_a_time(EVENTS - 1),
 			"one wheel step fewer shows other rows"
 		);
-	}
-
-	#[cfg(windows)]
-	fn this_thread_priority() -> i32 {
-		use windows::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
-
-		// SAFETY: the pseudo handle of the current thread is always valid.
-		unsafe { GetThreadPriority(GetCurrentThread()) }
-	}
-
-	#[cfg(target_os = "linux")]
-	fn this_thread_priority() -> i32 {
-		// SAFETY: getpriority only reads this thread's own nice value.
-		-unsafe { libc::getpriority(libc::PRIO_PROCESS, libc::id_t::try_from(libc::gettid()).unwrap()) }
-	}
-
-	/// On Linux raising needs privileges, so it may leave the thread where it was, never below.
-	#[cfg(any(windows, target_os = "linux"))]
-	#[test]
-	fn the_ui_thread_is_raised_and_back_to_normal_only_while_a_project_opens() {
-		thread::spawn(|| {
-			let normal = this_thread_priority();
-
-			priority::raise_this_thread();
-			let raised = this_thread_priority();
-			let during_open = priority::while_normal(this_thread_priority);
-
-			#[cfg(windows)]
-			assert!(raised > normal, "{raised} vs {normal}");
-			assert!(raised >= normal, "{raised} vs {normal}");
-			assert_eq!(during_open, normal);
-			assert_eq!(this_thread_priority(), raised);
-		})
-		.join()
-		.unwrap();
-	}
-
-	#[cfg(windows)]
-	#[test]
-	fn threads_started_by_a_raised_thread_keep_normal_priority_on_windows() {
-		thread::spawn(|| {
-			let normal = this_thread_priority();
-			priority::raise_this_thread();
-
-			let started = thread::spawn(this_thread_priority).join().unwrap();
-			assert_eq!(started, normal);
-		})
-		.join()
-		.unwrap();
 	}
 
 	mod latency {
