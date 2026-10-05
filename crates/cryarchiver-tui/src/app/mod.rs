@@ -174,6 +174,8 @@ pub(crate) struct Ui {
 	pub log_scroll: LogScroll,
 	/// A log line the user copied, until the app moves it to the clipboard.
 	pub copied: Option<String>,
+	/// The overlay the quit question replaced, shown again when the user stays.
+	pub before_quit: Option<Overlay>,
 	last_click: Option<Click>,
 }
 
@@ -219,6 +221,7 @@ impl<S: ArchiveSource> App<S> {
 			actions: Vec::new(),
 			log_scroll: LogScroll::default(),
 			copied: None,
+			before_quit: None,
 			last_click: None,
 		};
 		Self {

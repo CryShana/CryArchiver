@@ -114,8 +114,10 @@ pub fn render(buf: &mut Buffer, area: Rect, source: &dyn ArchiveSource, ui: &mut
 	Widget::render(table, inner, buf);
 
 	let progress_x = inner.x + to_u16(columns.name + STATUS);
-	ui.hits
-		.push(Rect::new(progress_x, inner.y, to_u16(PROGRESS), 1), Hit::ProgressHeader);
+	ui.hits.push(
+		Rect::new(progress_x, inner.y, to_u16(PROGRESS), 1).intersection(inner),
+		Hit::ProgressHeader,
+	);
 
 	for (offset, index) in (start..end).enumerate() {
 		let row_area = Rect::new(body.x, body.y + to_u16(offset), body.width, 1);

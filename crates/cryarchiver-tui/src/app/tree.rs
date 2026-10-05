@@ -143,24 +143,26 @@ fn sort_levels(rows: &[Row], order: ProgressSort, progress: &impl Fn(Row) -> Opt
 		start = end;
 	}
 
-	let rank = |row: Row| match row.kind {
-		RowKind::Folder(..) => 0,
-		RowKind::File { .. } => 1,
-		RowKind::Loading(_) => 2,
+	let key = |row: Row| {
+		let rank = match row.kind {
+			RowKind::Folder(..) => 0,
+			RowKind::File { .. } => 1,
+			RowKind::Loading(_) => 2,
+		};
+		(rank, progress(row).unwrap_or(-1.0))
 	};
-	let compare = |a: Row, b: Row| {
-		let (a_value, b_value) = (progress(a).unwrap_or(-1.0), progress(b).unwrap_or(-1.0));
+	let mut keyed: Vec<_> = blocks.into_iter().map(|block| (key(block[0]), block)).collect();
+	keyed.sort_by(|((a_rank, a_value), _), ((b_rank, b_value), _)| {
 		let by_progress = match order {
 			ProgressSort::Off => Ordering::Equal,
-			ProgressSort::Descending => b_value.total_cmp(&a_value),
-			ProgressSort::Ascending => a_value.total_cmp(&b_value),
+			ProgressSort::Descending => b_value.total_cmp(a_value),
+			ProgressSort::Ascending => a_value.total_cmp(b_value),
 		};
-		rank(a).cmp(&rank(b)).then(by_progress)
-	};
-	blocks.sort_by(|a, b| compare(a[0], b[0]));
+		a_rank.cmp(b_rank).then(by_progress)
+	});
 
 	let mut sorted = Vec::with_capacity(rows.len());
-	for block in blocks {
+	for (_, block) in keyed {
 		sorted.push(block[0]);
 		sorted.extend(sort_levels(&block[1..], order, progress));
 	}
@@ -178,7 +180,8 @@ struct RowsKey {
 }
 
 /// The Library's visible rows. They are rebuilt only when the folder tree, the loaded file lists, the expansion or
-/// the filter change, never per frame; values inside the rows are read from the source when drawing.
+/// the filter change, and while a Progress sort is on also whenever the source changes; values inside the rows are
+/// read from the source when drawing.
 #[derive(Debug)]
 pub struct TreeState {
 	expanded: HashMap<NodeId, Expansion>,
@@ -286,16 +289,40 @@ impl TreeState {
 		}
 
 		let filter_changed = self.key.as_ref().is_some_and(|old| old.filter != key.filter);
+		let resorted = self
+			.key
+			.as_ref()
+			.is_some_and(|old| old.sort == key.sort && old.filter == key.filter && key.sort != ProgressSort::Off);
 		let anchors = self
 			.rows
 			.get(self.scroll)
 			.map(|&row| anchor_chain(library, row))
 			.unwrap_or_default();
+		let selected_offset = (self.scroll..self.scroll + self.page)
+			.contains(&self.selected_index)
+			.then(|| self.selected_index - self.scroll);
 
 		self.rebuild(source, filter);
 		self.key = Some(key);
 		let moved = self.reselect();
-		self.place_viewport(&anchors, moved || filter_changed);
+		if resorted {
+			self.keep_selected_offset(selected_offset, moved);
+		} else {
+			self.place_viewport(&anchors, moved || filter_changed);
+		}
+	}
+
+	/// In a sorted list any row can move, so the selected row keeps its place on screen instead of the top row.
+	fn keep_selected_offset(&mut self, offset: Option<usize>, moved: bool) {
+		if std::mem::take(&mut self.follow) || moved {
+			self.ensure_visible();
+			return;
+		}
+
+		if let Some(offset) = offset {
+			self.scroll = self.selected_index.saturating_sub(offset);
+		}
+		self.clamp_scroll();
 	}
 
 	/// Keeps the row that was at the top of the viewport at the top, so a rebuild never scrolls under the user. When

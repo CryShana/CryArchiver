@@ -128,9 +128,11 @@ impl Ui {
 			view.header.run_state,
 			RunState::Paused | RunState::Watching | RunState::Finished
 		);
+
 		if idle && view.workers.jobs.is_empty() {
 			self.lifecycle = Lifecycle::Quitting;
 		} else {
+			self.before_quit = self.overlay.take();
 			self.overlay = Some(Overlay::ConfirmQuit);
 		}
 	}
@@ -138,7 +140,7 @@ impl Ui {
 	fn on_confirm_quit_key(&mut self, key: KeyEvent) -> Outcome {
 		match key.code {
 			KeyCode::Enter | KeyCode::Char('y') => self.lifecycle = Lifecycle::Quitting,
-			KeyCode::Esc | KeyCode::Char('n' | 'q') => self.overlay = None,
+			KeyCode::Esc | KeyCode::Char('n' | 'q') => self.overlay = self.before_quit.take(),
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done

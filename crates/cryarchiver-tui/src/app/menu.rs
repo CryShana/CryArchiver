@@ -110,7 +110,9 @@ fn folder_items(source: &dyn ArchiveSource, ui: &Ui, folder: NodeId) -> Vec<(Men
 	}
 
 	let retryable = view.issues.iter().any(|issue| {
-		issue.verbs.retry.is_some() && issue.folder.is_some_and(|inside| is_inside(library, inside, folder))
+		issue.file.is_some()
+			&& issue.verbs.retry.is_some()
+			&& issue.folder.is_some_and(|inside| is_inside(library, inside, folder))
 	});
 	if retryable {
 		items.push(labelled(MenuItem::RetryFailedIn, "Retry failed in folder"));
