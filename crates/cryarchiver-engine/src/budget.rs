@@ -1,9 +1,10 @@
-//! The thread budget the jobs of one engine share. Every running job holds tokens for the threads its tools may use;
-//! holding never waits, so a job always gets its own tokens. A job's measuring leases threads for a phase: its fair
-//! share of the budget, capped at its own tokens, widened into the tokens no job holds. Whenever a job that starts
-//! later puts the budget over its size, the measuring gives the widened part back lane by lane, before each lane's
-//! next sample or segment, and all of it when the phase ends. A job without a thread budget of its own holds the
-//! whole budget while it runs a stage on uncapped tools, since they may use the whole machine.
+//! The thread budget the jobs of one engine share, or of every engine given the same budget. Every running job holds
+//! tokens for the threads its tools may use; holding never waits, so a job always gets its own tokens. A job's
+//! measuring leases threads for a phase: its fair share of the budget, capped at its own tokens, widened into the
+//! tokens no job holds. Whenever a job that starts later puts the budget over its size, the measuring gives the widened
+//! part back lane by lane, before each lane's next sample or segment, and all of it when the phase ends. A job without
+//! a thread budget of its own holds the whole budget while it runs a stage on uncapped tools, since they may use the
+//! whole machine.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};

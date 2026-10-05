@@ -329,7 +329,7 @@ impl<S: ArchiveSource> App<S> {
 
 		let notice = Notification {
 			level: NoticeLevel::Info,
-			text: "copied log line".to_owned(),
+			text: format!("copied {text}"),
 		};
 		self.toast = Some((notice, Instant::now()));
 		self.clipboard = Some(text);
@@ -345,16 +345,13 @@ impl<S: ArchiveSource> App<S> {
 		else {
 			return false;
 		};
-		self.show(worst)
-	}
 
-	fn show(&mut self, notice: Notification) -> bool {
 		let current = self.toast.as_ref().filter(|(_, at)| at.elapsed() < TOAST_LIFETIME);
-		if current.is_some_and(|(shown, _)| shown.level > notice.level) {
+		if current.is_some_and(|(shown, _)| shown.level > worst.level) {
 			return false;
 		}
 
-		self.toast = Some((notice, Instant::now()));
+		self.toast = Some((worst, Instant::now()));
 		true
 	}
 
@@ -594,6 +591,16 @@ impl Ui {
 			return Outcome::Ignored;
 		}
 		Outcome::Done
+	}
+
+	fn toggle_maximized(&mut self) {
+		self.layout.maximized = !self.layout.maximized;
+		self.layout.log_maximized = false;
+	}
+
+	fn toggle_log_maximized(&mut self) {
+		self.layout.log_maximized = !self.layout.log_maximized;
+		self.layout.maximized = false;
 	}
 
 	fn select_issue(&mut self, index: usize) {

@@ -2,8 +2,8 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use cryarchiver_engine::budget::cores;
-use cryarchiver_engine::engine::{Encode, Engine, MemoryGate};
+use cryarchiver_engine::budget::{ThreadBudget, cores};
+use cryarchiver_engine::engine::{Encode, Engine, MemoryGate, VideoSlots};
 use cryarchiver_engine::quality::memory::QualityMemory;
 use cryarchiver_engine::toolchain::{FfmpegBuild, Toolchain};
 use sysinfo::System;
@@ -15,6 +15,9 @@ const TWO_VIDEOS_FROM_CORES: usize = 16;
 pub struct EngineBackend {
 	tools: Toolchain,
 	system: Mutex<System>,
+	/// Shared by every engine built, so a video still running on an earlier one keeps counting.
+	video_slots: Arc<VideoSlots>,
+	budget: Arc<ThreadBudget>,
 }
 
 impl EngineBackend {
@@ -26,6 +29,8 @@ impl EngineBackend {
 		Self {
 			tools,
 			system: Mutex::new(system),
+			video_slots: Arc::new(VideoSlots::new(video_jobs(cores()))),
+			budget: Arc::new(ThreadBudget::new(cores())),
 		}
 	}
 }
@@ -49,10 +54,11 @@ impl Backend for EngineBackend {
 	) -> Arc<dyn Encode> {
 		let mut engine = Engine::new(self.tools.clone())
 			.with_image_threads(image_threads)
+			.with_shared_thread_budget(self.budget.clone())
 			.with_thread_budget(image_threads)
 			.with_memory_gate(memory)
 			.with_quality_memory(quality)
-			.with_video_jobs(self.video_jobs());
+			.with_video_slots(self.video_slots.clone());
 		if let Some(threads) = video_threads(image_threads, cores()) {
 			engine = engine.with_threads(threads);
 		}
@@ -60,7 +66,7 @@ impl Backend for EngineBackend {
 	}
 
 	fn video_jobs(&self) -> usize {
-		video_jobs(cores())
+		self.video_slots.jobs()
 	}
 
 	fn toolchain(&self) -> String {

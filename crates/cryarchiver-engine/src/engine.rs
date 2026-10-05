@@ -173,6 +173,26 @@ pub trait MemoryGate: Send + Sync {
 	fn release(&self, bytes: u64);
 }
 
+/// How many videos encode at once, across every engine given the same slots.
+#[derive(Debug)]
+pub struct VideoSlots {
+	semaphore: Semaphore,
+	jobs: usize,
+}
+
+impl VideoSlots {
+	pub fn new(jobs: usize) -> Self {
+		Self {
+			semaphore: Semaphore::new(jobs.max(1)),
+			jobs: jobs.max(1),
+		}
+	}
+
+	pub fn jobs(&self) -> usize {
+		self.jobs
+	}
+}
+
 struct MemoryReservation<'a> {
 	gate: &'a dyn MemoryGate,
 	bytes: u64,
@@ -186,9 +206,8 @@ impl Drop for MemoryReservation<'_> {
 
 pub struct Engine {
 	tools: Toolchain,
-	video_slots: Semaphore,
-	video_jobs: usize,
-	budget: ThreadBudget,
+	video_slots: Arc<VideoSlots>,
+	budget: Arc<ThreadBudget>,
 	image_threads: usize,
 	metric_threads: usize,
 	video_threads: Option<usize>,
@@ -372,9 +391,8 @@ impl Engine {
 		let cores = cores();
 		Self {
 			tools,
-			video_slots: Semaphore::new(1),
-			video_jobs: 1,
-			budget: ThreadBudget::new(cores),
+			video_slots: Arc::new(VideoSlots::new(1)),
+			budget: Arc::new(ThreadBudget::new(cores)),
 			image_threads: cores,
 			metric_threads: cores,
 			video_threads: None,
@@ -406,11 +424,18 @@ impl Engine {
 
 	#[must_use]
 	pub fn with_video_jobs(self, jobs: usize) -> Self {
-		Self {
-			video_slots: Semaphore::new(jobs.max(1)),
-			video_jobs: jobs.max(1),
-			..self
-		}
+		self.with_video_slots(Arc::new(VideoSlots::new(jobs)))
+	}
+
+	#[must_use]
+	pub fn with_video_slots(self, video_slots: Arc<VideoSlots>) -> Self {
+		Self { video_slots, ..self }
+	}
+
+	/// Shares `budget` with the other engines given it; `with_thread_budget` then resizes it for all of them.
+	#[must_use]
+	pub fn with_shared_thread_budget(self, budget: Arc<ThreadBudget>) -> Self {
+		Self { budget, ..self }
 	}
 
 	/// The threads all of the engine's jobs share (the whole machine by default). A video job's measuring widens
@@ -827,7 +852,7 @@ impl Engine {
 	) -> Result<VideoResources<'_>, JobError> {
 		(cx.on_event)(JobEvent::Stage(Stage::Queued));
 		let slot = tokio::select! {
-			slot = self.video_slots.acquire() => slot.expect("the semaphore is never closed"),
+			slot = self.video_slots.semaphore.acquire() => slot.expect("the semaphore is never closed"),
 			() = cx.cancel.cancelled() => return Err(ErrorKind::Cancelled.into()),
 		};
 
@@ -838,7 +863,7 @@ impl Engine {
 		let memory = self.reserve_memory(estimate, cx.on_event, cx.cancel).await?;
 		let share = self
 			.tool_threads(cx.job)
-			.unwrap_or_else(|| self.budget.total() / self.video_jobs);
+			.unwrap_or_else(|| self.budget.total() / self.video_slots.jobs);
 		Ok(VideoResources {
 			_slot: slot,
 			_memory: memory,

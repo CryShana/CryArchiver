@@ -633,7 +633,8 @@ fn the_copy_confirmation_shows_over_a_recent_warning() {
 		Instant::now(),
 	);
 
-	assert_eq!(app.toast().map(|toast| toast.text.as_str()), Some("copied log line"));
+	let copied = format!("copied {}", app.take_clipboard().unwrap());
+	assert_eq!(app.toast().map(|toast| toast.text.as_str()), Some(copied.as_str()));
 }
 
 #[test]

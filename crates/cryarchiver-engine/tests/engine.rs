@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use cryarchiver_engine::calibration::tables;
 use cryarchiver_engine::decision::{CrfChoice, Decision, Scan, Vmaf};
-use cryarchiver_engine::engine::{Encode, EncodeAgain, Engine, Job, JobEvent, MemoryGate, Stage};
+use cryarchiver_engine::engine::{Encode, EncodeAgain, Engine, Job, JobEvent, MemoryGate, Stage, VideoSlots};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::plan::worst_case_memory;
 use cryarchiver_engine::options::{Advanced, BurnSubs, JobOptions, Resize, SubtitlePick, Trim, VideoEncoderChoice};
@@ -1620,6 +1620,46 @@ async fn one_video_slot_queues_the_second_video() {
 	assert!(matches!(a, JobOutcome::Encoded { .. }), "{a:?}");
 	assert!(matches!(b, JobOutcome::Encoded { .. }), "{b:?}");
 	assert_eq!(queued.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn engines_sharing_one_video_slot_never_encode_two_videos_at_once() {
+	let dir = tempfile::tempdir().unwrap();
+	let first = support::mpeg4(dir.path(), "first.mp4", 3);
+	let second = support::mpeg4(dir.path(), "second.mp4", 3);
+	let tools = support::toolchain().await;
+	let slots = Arc::new(VideoSlots::new(1));
+	let (one, other) = (
+		Engine::new(tools.clone()).with_video_slots(slots.clone()),
+		Engine::new(tools).with_video_slots(slots),
+	);
+	let stages = Mutex::new(Vec::new());
+	let recorder = |name: &'static str| {
+		let stages = &stages;
+		move |event: JobEvent| {
+			if let JobEvent::Stage(stage @ (Stage::Encode | Stage::Verify)) = event {
+				stages.lock().unwrap().push((name, stage));
+			}
+		}
+	};
+	let (on_first, on_second) = (recorder("first"), recorder("second"));
+	let cancel = CancellationToken::new();
+	let out_sink = sink(dir.path());
+	let (first_job, second_job) = (fast(&first), fast(&second));
+
+	let (a, b) = tokio::join!(
+		one.run(&first_job, &out_sink, &on_first, &cancel),
+		other.run(&second_job, &out_sink, &on_second, &cancel),
+	);
+
+	assert!(matches!(a, JobOutcome::Encoded { .. }), "{a:?}");
+	assert!(matches!(b, JobOutcome::Encoded { .. }), "{b:?}");
+	let stages = stages.into_inner().unwrap();
+	let switches = stages.windows(2).filter(|pair| pair[0].0 != pair[1].0).count();
+	assert_eq!(
+		switches, 1,
+		"one video runs its encode and checks after the other's: {stages:?}"
+	);
 }
 
 #[tokio::test]

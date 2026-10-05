@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
@@ -149,6 +149,8 @@ struct Env<'a> {
 	reference: Option<Arc<DynamicImage>>,
 	/// A resized or retagged image written out losslessly for libjxl (`jxl::upright_png`).
 	upright: Option<PathBuf>,
+	/// Why lower encodes that couldn't be verified were dropped, for the warnings of an output.
+	discarded: Mutex<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -182,7 +184,7 @@ enum StepDown {
 	Passed(Pass),
 	/// It scored below the target.
 	Missed(Candidate),
-	/// It wasn't tried, wasn't smaller, or couldn't be verified.
+	/// It wasn't smaller, or couldn't be verified.
 	Skipped,
 }
 
@@ -195,7 +197,8 @@ enum Tried {
 		score: f64,
 		gain_map: Option<f64>,
 		short: bool,
-		/// A lower encode of `candidate` that scored below the target.
+		/// A lower encode of `candidate` that scored below the target, or that came out no smaller once its gain map
+		/// was encoded again.
 		missed: Option<Candidate>,
 	},
 	Rejected {
@@ -563,6 +566,7 @@ async fn encode_and_choose(
 		},
 		reference: eight_bit_reference(cx, &still).await?,
 		upright: upright_for_libjxl(cx, workspace, &still).await?,
+		discarded: Mutex::default(),
 	};
 	let mut choice = Choice::default();
 	let mut learned = Vec::new();
@@ -645,8 +649,8 @@ async fn encode_and_choose(
 
 	notes.extend(gain_map_short_note(picked.as_ref()));
 
-	let mut warnings = still.warnings;
-	warnings.extend(notes);
+	let discarded = env.discarded.into_inner().unwrap_or_else(PoisonError::into_inner);
+	let warnings = [still.warnings, notes, discarded].concat();
 	finish_choice(cx, workspace, choice, still.plan.target, warnings, learned, picked)
 }
 
@@ -730,14 +734,14 @@ async fn try_candidate(
 		let mut missed = None;
 		if !short {
 			match Box::pin(step_down(cx, input, workspace, still, env, slot, &pass)).await? {
-				StepDown::Passed(lowered) => {
+				Some(StepDown::Passed(lowered)) => {
 					match Box::pin(either_pass(cx, workspace, still, env, slot, pass, lowered)).await? {
 						Ok(tried) => return Ok(tried),
 						Err(earlier) => pass = earlier,
 					}
 				}
-				StepDown::Missed(lowered) => missed = Some(lowered),
-				StepDown::Skipped => {}
+				Some(StepDown::Missed(lowered)) => missed = Some(lowered),
+				Some(StepDown::Skipped) | None => {}
 			}
 		}
 
@@ -760,8 +764,9 @@ fn within_step_down_reach(cx: &ImageContext<'_>, size: u64) -> bool {
 }
 
 /// A first encode that saved too little, verified and stepped down once when it cleared the target well. Only the lower
-/// encode can be kept, when it passes and saves enough; anything else leaves the candidate too large, at the smallest
-/// passing size seen, and without its score: a score would turn the keep reason into a missed quality target.
+/// encode can be kept, when it saves enough and then passes; one that saves too little isn't verified. Anything else
+/// leaves the candidate too large, at the smallest size seen that didn't miss the target, and without its score: a
+/// score would turn the keep reason into a missed quality target.
 async fn reached_down(
 	cx: &ImageContext<'_>,
 	input: &ImageInput,
@@ -794,24 +799,41 @@ async fn reached_down(
 		rebuilt: false,
 	};
 
-	let StepDown::Passed(mut lowered) = Box::pin(step_down(cx, input, workspace, still, env, slot, &pass)).await?
-	else {
+	let Some(lowered) = Box::pin(encode_lower(cx, input, workspace, still, env, slot, &pass)).await? else {
 		return Ok(too_large_at(pass.size));
 	};
 
-	if !too_large(cx, lowered.size)
-		&& let Ok(gain_map) = Box::pin(gain_map_checked(cx, workspace, still, env, slot, &mut lowered)).await?
-	{
-		let _ = fs::remove_file(&pass.path);
-		return Ok(lowered.passed(gain_map, false, None));
+	let lowered_size = lowered.bytes.len() as u64;
+	if too_large(cx, lowered_size) {
+		let _ = fs::remove_file(&lowered.path);
+		return Ok(too_large_at(pass.size.min(lowered_size)));
+	}
+
+	let StepDown::Passed(mut lowered) = Box::pin(verify_lower(cx, still, env, slot, &pass, lowered)).await? else {
+		return Ok(too_large_at(pass.size));
+	};
+
+	let gain_map = Box::pin(gain_map_checked(cx, workspace, still, env, slot, &mut lowered)).await?;
+	Ok(reached_lower(&pass, lowered, &gain_map))
+}
+
+/// The lower encode `reached_down` keeps once its gain map passed; otherwise the candidate stays too large, at the
+/// smaller of the two sizes. The file not kept is removed.
+fn reached_lower(first: &Pass, lowered: Pass, gain_map: &Result<Option<f64>, Tried>) -> Tried {
+	if let Ok(gain_map) = gain_map {
+		let _ = fs::remove_file(&first.path);
+		return lowered.passed(*gain_map, false, None);
 	}
 
 	let _ = fs::remove_file(&lowered.path);
-	Ok(too_large_at(pass.size.min(lowered.size)))
+	Tried::TooLarge {
+		size: first.size.min(lowered.size),
+		score: None,
+	}
 }
 
-/// Encodes a pass well above the target once more, aimed just above it. A lower encode that isn't passed on is removed;
-/// the earlier pass is left to the caller.
+/// Encodes a pass well above the target once more, aimed just above it, and verifies it; `None` when the lower encode
+/// would hardly differ.
 async fn step_down(
 	cx: &ImageContext<'_>,
 	input: &ImageInput,
@@ -820,10 +842,26 @@ async fn step_down(
 	env: &Env<'_>,
 	slot: Slot,
 	pass: &Pass,
-) -> Result<StepDown, JobError> {
-	let target = still.plan.target;
-	let Some(lowered) = pass.candidate.stepped_down(pass.score, target, cx.speed) else {
-		return Ok(StepDown::Skipped);
+) -> Result<Option<StepDown>, JobError> {
+	let Some(lowered) = Box::pin(encode_lower(cx, input, workspace, still, env, slot, pass)).await? else {
+		return Ok(None);
+	};
+
+	Ok(Some(Box::pin(verify_lower(cx, still, env, slot, pass, lowered)).await?))
+}
+
+/// The pass well above the target encoded once more, aimed just above it; `None` when that would hardly differ.
+async fn encode_lower(
+	cx: &ImageContext<'_>,
+	input: &ImageInput,
+	workspace: &Workspace,
+	still: &Still,
+	env: &Env<'_>,
+	slot: Slot,
+	pass: &Pass,
+) -> Result<Option<Encoded>, JobError> {
+	let Some(lowered) = pass.candidate.stepped_down(pass.score, still.plan.target, cx.speed) else {
+		return Ok(None);
 	};
 
 	(cx.on_event)(JobEvent::Stage(Stage::Encode));
@@ -831,12 +869,44 @@ async fn step_down(
 	let (bytes, parts) = encode_candidate(cx, input, workspace, still, env, lowered).await?;
 	fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
 
+	Ok(Some(Encoded {
+		path,
+		candidate: lowered,
+		bytes,
+		parts,
+	}))
+}
+
+/// Verifies a lower encode that is smaller than `pass` and not beaten. A lower encode that isn't passed on is removed;
+/// the earlier pass is left to the caller.
+async fn verify_lower(
+	cx: &ImageContext<'_>,
+	still: &Still,
+	env: &Env<'_>,
+	slot: Slot,
+	pass: &Pass,
+	lowered: Encoded,
+) -> Result<StepDown, JobError> {
+	let Encoded {
+		path,
+		candidate,
+		bytes,
+		parts,
+	} = lowered;
 	let size = bytes.len() as u64;
+
 	let score = if size < pass.size && !slot.beaten(size) {
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
-		match verify_candidate(cx, still, env, lowered, &path, bytes).await {
+		match verify_candidate(cx, still, env, candidate, &path, bytes).await {
 			Ok(score) => Some(score),
-			Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => None,
+			Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => {
+				let warning = lower_discarded(candidate, &err);
+				env.discarded
+					.lock()
+					.unwrap_or_else(PoisonError::into_inner)
+					.push(warning);
+				None
+			}
 			Err(err) => return Err(err),
 		}
 	} else {
@@ -844,17 +914,17 @@ async fn step_down(
 	};
 
 	match score {
-		Some(score) if score >= target => Ok(StepDown::Passed(Pass {
+		Some(score) if score >= still.plan.target => Ok(StepDown::Passed(Pass {
 			path,
 			size,
-			candidate: lowered,
+			candidate,
 			score,
 			parts,
 			rebuilt: false,
 		})),
 		missed => {
 			let _ = fs::remove_file(&path);
-			Ok(missed.map_or(StepDown::Skipped, |_| StepDown::Missed(lowered)))
+			Ok(missed.map_or(StepDown::Skipped, |_| StepDown::Missed(candidate)))
 		}
 	}
 }
@@ -871,21 +941,43 @@ async fn either_pass(
 	mut earlier: Pass,
 	mut lowered: Pass,
 ) -> Result<Result<Tried, Pass>, JobError> {
-	let Ok(gain_map) = Box::pin(gain_map_checked(cx, workspace, still, env, slot, &mut lowered)).await? else {
-		let _ = fs::remove_file(&lowered.path);
-		return Ok(Err(earlier));
+	let lowered_gain_map = Box::pin(gain_map_checked(cx, workspace, still, env, slot, &mut lowered)).await?;
+	let earlier_gain_map = if lowered_gain_map.is_ok() && lowered.rebuilt {
+		Some(Box::pin(gain_map_checked(cx, workspace, still, env, slot, &mut earlier)).await?)
+	} else {
+		None
 	};
 
-	if lowered.rebuilt
-		&& let Ok(earlier_gain_map) = Box::pin(gain_map_checked(cx, workspace, still, env, slot, &mut earlier)).await?
+	Ok(kept_pass(
+		earlier,
+		lowered,
+		&lowered_gain_map,
+		earlier_gain_map.as_ref(),
+	))
+}
+
+/// `either_pass` once the gain maps were checked, the earlier pass's only when the lower encode's was rebuilt. An
+/// earlier pass kept over the rebuilt lower encode names that encode as missed, so its group learns no setting as low.
+fn kept_pass(
+	earlier: Pass,
+	lowered: Pass,
+	lowered_gain_map: &Result<Option<f64>, Tried>,
+	earlier_gain_map: Option<&Result<Option<f64>, Tried>>,
+) -> Result<Tried, Pass> {
+	let Ok(gain_map) = *lowered_gain_map else {
+		let _ = fs::remove_file(&lowered.path);
+		return Err(earlier);
+	};
+
+	if let Some(&Ok(earlier_gain_map)) = earlier_gain_map
 		&& earlier.size <= lowered.size
 	{
 		let _ = fs::remove_file(&lowered.path);
-		return Ok(Ok(earlier.passed(earlier_gain_map, false, None)));
+		return Ok(earlier.passed(earlier_gain_map, false, Some(lowered.candidate)));
 	}
 
 	let _ = fs::remove_file(&earlier.path);
-	Ok(Ok(lowered.passed(gain_map, false, None)))
+	Ok(lowered.passed(gain_map, false, None))
 }
 
 /// The score of the HDR gain map `pass` carries, if any, or what the candidate comes to when the gain map missed or
@@ -907,24 +999,37 @@ async fn gain_map_checked(
 		Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Err(Tried::Failed(err))),
 		Err(err) => return Err(err),
 	};
+
+	let unkeepable = |size| too_large(cx, size) || slot.beaten(size);
+	Ok(gain_map_verdict(pass, &checked, cx.forced, unkeepable))
+}
+
+/// What `checked` makes of `pass`, whose size becomes the rebuilt file's. `unkeepable` tells a size that saves too
+/// little or is beaten.
+fn gain_map_verdict(
+	pass: &mut Pass,
+	checked: &GainMapCheck,
+	forced: bool,
+	unkeepable: impl Fn(u64) -> bool,
+) -> Result<Option<f64>, Tried> {
 	pass.size = checked.rebuilt.unwrap_or(pass.size);
 	pass.rebuilt = checked.rebuilt.is_some();
 
-	if checked.missed && !cx.forced {
-		return Ok(Err(Tried::GainMapMissed {
+	if checked.missed && !forced {
+		return Err(Tried::GainMapMissed {
 			size: pass.size,
 			score: checked.score,
-		}));
+		});
 	}
 
-	if checked.rebuilt.is_some() && (too_large(cx, pass.size) || slot.beaten(pass.size)) {
-		return Ok(Err(Tried::TooLarge {
+	if checked.rebuilt.is_some() && unkeepable(pass.size) {
+		return Err(Tried::TooLarge {
 			size: pass.size,
 			score: None,
-		}));
+		});
 	}
 
-	Ok(Ok(Some(checked.score)))
+	Ok(Some(checked.score))
 }
 
 async fn verify_candidate(
@@ -1181,13 +1286,10 @@ fn finish_choice(
 	picked: Option<ImageDecision>,
 ) -> Result<ImageOutcome, JobError> {
 	for (candidate, err) in &choice.failures {
-		let reason = match &err.kind {
-			ErrorKind::EncodeFailed(reason) => reason.clone(),
-			other => other.to_string(),
-		};
 		warnings.push(format!(
-			"the {} candidate was discarded ({reason})",
-			candidate_name(*candidate)
+			"the {} candidate was discarded ({})",
+			candidate_name(*candidate),
+			failure_reason(err)
 		));
 	}
 
@@ -1210,6 +1312,21 @@ fn finish_choice(
 		Verdict::Kept(reason) => Ok(ImageOutcome::Kept(reason)),
 		Verdict::Failed(err) => Err(err),
 	}
+}
+
+fn failure_reason(err: &JobError) -> String {
+	match &err.kind {
+		ErrorKind::EncodeFailed(reason) => reason.clone(),
+		other => other.to_string(),
+	}
+}
+
+fn lower_discarded(candidate: Candidate, err: &JobError) -> String {
+	format!(
+		"a lower {} encode was discarded ({})",
+		candidate_name(candidate),
+		failure_reason(err)
+	)
 }
 
 fn verdict(choice: Choice, target: f64, source_bytes: u64) -> Verdict {
@@ -1593,6 +1710,190 @@ mod tests {
 		assert_eq!(choice.best, passed);
 		assert_eq!(choice.short_note(85.0), None);
 		assert_eq!(choice.passing_size(), Some(300));
+	}
+
+	fn avif_at(quality: f32) -> Candidate {
+		Candidate::Ravif(plan::RavifSettings {
+			quality,
+			..plan::ravif_settings(Speed::Fast)
+		})
+	}
+
+	fn written_pass(dir: &Path, name: &str, quality: f32, size: u64) -> Pass {
+		let path = dir.join(name);
+		fs::write(&path, b"candidate").unwrap();
+
+		Pass {
+			path,
+			size,
+			candidate: avif_at(quality),
+			score: 85.0,
+			parts: None,
+			rebuilt: false,
+		}
+	}
+
+	fn gain_map_missed() -> Tried {
+		Tried::GainMapMissed { size: 900, score: 60.0 }
+	}
+
+	#[test]
+	fn a_lower_encode_whose_gain_map_fails_gives_back_the_earlier_pass_unchecked() {
+		let dir = tempfile::tempdir().unwrap();
+		for failed in [
+			gain_map_missed(),
+			Tried::TooLarge {
+				size: 1100,
+				score: None,
+			},
+		] {
+			let earlier = written_pass(dir.path(), "candidate0.avif", 88.0, 1000);
+			let lowered = written_pass(dir.path(), "candidate0-lower.avif", 80.0, 900);
+			let lowered_path = lowered.path.clone();
+
+			let Err(given_back) = kept_pass(earlier, lowered, &Err(failed), None) else {
+				panic!("the lower encode was kept")
+			};
+
+			assert_eq!(given_back.candidate, avif_at(88.0));
+			assert!(given_back.path.exists());
+			assert!(!lowered_path.exists());
+		}
+	}
+
+	#[test]
+	fn an_earlier_pass_no_larger_than_the_rebuilt_lower_encode_is_kept_and_names_it_missed() {
+		let dir = tempfile::tempdir().unwrap();
+		let earlier = written_pass(dir.path(), "candidate0.avif", 88.0, 1000);
+		let mut lowered = written_pass(dir.path(), "candidate0-lower.avif", 80.0, 1000);
+		lowered.rebuilt = true;
+		let lowered_path = lowered.path.clone();
+
+		let kept = kept_pass(earlier, lowered, &Ok(Some(75.0)), Some(&Ok(Some(72.0)))).map_err(|pass| pass.candidate);
+
+		let Ok(Tried::Passed {
+			path,
+			candidate,
+			gain_map,
+			missed,
+			..
+		}) = kept
+		else {
+			panic!("{kept:?}")
+		};
+		assert_eq!((candidate, gain_map), (avif_at(88.0), Some(72.0)));
+		assert_eq!(missed, Some(avif_at(80.0)), "the group learns past the lower setting");
+		assert!(path.exists());
+		assert!(!lowered_path.exists());
+	}
+
+	#[test]
+	fn a_smaller_lower_encode_is_kept_when_the_earlier_gain_map_fails_or_was_not_checked() {
+		let dir = tempfile::tempdir().unwrap();
+		for earlier_gain_map in [None, Some(Err(gain_map_missed())), Some(Ok(Some(72.0)))] {
+			let earlier = written_pass(dir.path(), "candidate0.avif", 88.0, 1000);
+			let lowered = written_pass(dir.path(), "candidate0-lower.avif", 80.0, 900);
+			let earlier_path = earlier.path.clone();
+
+			let kept =
+				kept_pass(earlier, lowered, &Ok(Some(75.0)), earlier_gain_map.as_ref()).map_err(|pass| pass.candidate);
+
+			let Ok(Tried::Passed { candidate, missed, .. }) = kept else {
+				panic!("{kept:?}")
+			};
+			assert_eq!((candidate, missed), (avif_at(80.0), None));
+			assert!(!earlier_path.exists());
+		}
+	}
+
+	#[test]
+	fn a_reached_lower_encode_whose_gain_map_fails_leaves_the_candidate_too_large_at_the_smaller_size() {
+		let dir = tempfile::tempdir().unwrap();
+		let first = written_pass(dir.path(), "candidate0.avif", 88.0, 1000);
+		let lowered = written_pass(dir.path(), "candidate0-lower.avif", 80.0, 900);
+		let lowered_path = lowered.path.clone();
+
+		let tried = reached_lower(&first, lowered, &Err(gain_map_missed()));
+
+		assert!(matches!(tried, Tried::TooLarge { size: 900, score: None }), "{tried:?}");
+		assert!(!lowered_path.exists());
+	}
+
+	#[test]
+	fn a_reached_lower_encode_whose_gain_map_passes_replaces_the_first() {
+		let dir = tempfile::tempdir().unwrap();
+		let first = written_pass(dir.path(), "candidate0.avif", 88.0, 1000);
+		let lowered = written_pass(dir.path(), "candidate0-lower.avif", 80.0, 900);
+		let first_path = first.path.clone();
+
+		let tried = reached_lower(&first, lowered, &Ok(Some(75.0)));
+
+		assert!(
+			matches!(
+				tried,
+				Tried::Passed {
+					size: 900,
+					gain_map: Some(75.0),
+					missed: None,
+					..
+				}
+			),
+			"{tried:?}"
+		);
+		assert!(!first_path.exists());
+	}
+
+	#[test]
+	fn a_rebuilt_gain_map_counts_against_the_size_and_a_missed_one_only_when_not_requested() {
+		let dir = tempfile::tempdir().unwrap();
+		let check = |missed, rebuilt| GainMapCheck {
+			score: 72.0,
+			missed,
+			rebuilt,
+		};
+		let verdict = |checked: &GainMapCheck, forced| {
+			let mut pass = written_pass(dir.path(), "candidate0.avif", 88.0, 1000);
+			let verdict = gain_map_verdict(&mut pass, checked, forced, |size| size > 1100);
+			(verdict, pass.size, pass.rebuilt)
+		};
+
+		assert!(matches!(
+			verdict(&check(false, None), false),
+			(Ok(Some(72.0)), 1000, false)
+		));
+		assert!(matches!(
+			verdict(&check(false, Some(1100)), false),
+			(Ok(Some(72.0)), 1100, true)
+		));
+		assert!(matches!(
+			verdict(&check(false, Some(1200)), false),
+			(
+				Err(Tried::TooLarge {
+					size: 1200,
+					score: None
+				}),
+				1200,
+				true
+			)
+		));
+		assert!(matches!(
+			verdict(&check(true, Some(1100)), false),
+			(Err(Tried::GainMapMissed { size: 1100, .. }), 1100, true)
+		));
+		assert!(matches!(
+			verdict(&check(true, None), true),
+			(Ok(Some(72.0)), 1000, false)
+		));
+	}
+
+	#[test]
+	fn a_lower_encode_that_fails_its_verification_is_named_in_the_warnings() {
+		let (candidate, err) = failed_verification();
+
+		assert_eq!(
+			lower_discarded(candidate, &err),
+			"a lower AVIF encode was discarded (verification failed: the alpha channel is missing)"
+		);
 	}
 
 	#[test]

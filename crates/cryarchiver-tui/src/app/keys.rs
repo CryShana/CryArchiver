@@ -157,14 +157,8 @@ impl Ui {
 				self.actions.push(if paused { Action::Start } else { Action::Pause });
 			}
 			KeyCode::Char('e') => self.toggle_limit(source),
-			KeyCode::Char('z') => {
-				self.layout.maximized = !self.layout.maximized;
-				self.layout.log_maximized = false;
-			}
-			KeyCode::Char('L') => {
-				self.layout.log_maximized = !self.layout.log_maximized;
-				self.layout.maximized = false;
-			}
+			KeyCode::Char('z') => self.toggle_maximized(),
+			KeyCode::Char('L') => self.toggle_log_maximized(),
 			KeyCode::Char('l') if self.layout.log_maximized => {
 				self.layout.log_maximized = false;
 				self.layout.log_open = false;

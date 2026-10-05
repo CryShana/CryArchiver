@@ -474,7 +474,11 @@ async fn a_step_down_that_still_saves_too_little_keeps_the_original() {
 
 	let (outcome, stages) = run_counting_stages(&memory, &job(&photo), dir.path()).await;
 
-	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
+	assert_eq!(
+		stages,
+		[Stage::Encode, Stage::Verify, Stage::Encode],
+		"a lower encode that still saves too little is not verified"
+	);
 	let smallest = not_smaller_bytes(&outcome);
 	assert!(smallest * 10 > source_bytes * 9, "{smallest} of {source_bytes}");
 	assert!(memory.entries().is_empty(), "{:?}", memory.entries());

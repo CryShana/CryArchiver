@@ -304,7 +304,7 @@ fn copy_path_shows_the_full_source_path() {
 
 	let path = notifications
 		.iter()
-		.find(|notice| notice.text == expected)
+		.find(|notice| notice.text == format!("copied {expected}"))
 		.unwrap_or_else(|| panic!("no notice with the path: {notifications:?}"));
 	assert_eq!(path.level, NoticeLevel::Info);
 	assert_eq!(source.take_clipboard(), Some(expected));

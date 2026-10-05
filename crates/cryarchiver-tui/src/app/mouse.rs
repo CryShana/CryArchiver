@@ -160,14 +160,11 @@ impl Ui {
 		match hit {
 			Hit::Footer(code) => return self.on_key(source, KeyEvent::new(code, KeyModifiers::NONE), false),
 			Hit::Row { index, arrow_x } => self.on_row_click(index, arrow_x, position, double),
-			Hit::LibraryTitle if double => self.layout.maximized = !self.layout.maximized,
-			Hit::Maximize => self.layout.maximized = !self.layout.maximized,
+			Hit::LibraryTitle if double => self.toggle_maximized(),
+			Hit::Maximize => self.toggle_maximized(),
 			Hit::ProgressHeader => self.tree.cycle_sort(),
 			Hit::LogToggle => self.layout.log_open = !self.layout.log_open,
-			Hit::LogMaximize => {
-				self.layout.log_maximized = !self.layout.log_maximized;
-				self.layout.maximized = false;
-			}
+			Hit::LogMaximize => self.toggle_log_maximized(),
 			Hit::LogNewest => self.log_scroll.jump_to_newest(),
 			Hit::Issue(index) => {
 				self.select_issue(index);

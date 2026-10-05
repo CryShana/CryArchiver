@@ -209,7 +209,7 @@ impl ProjectSource {
 			Update::Path(path) => {
 				self.notifications.push(Notification {
 					level: NoticeLevel::Info,
-					text: path.clone(),
+					text: format!("copied {path}"),
 				});
 				self.clipboard = Some(path);
 			}

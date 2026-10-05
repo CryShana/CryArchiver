@@ -210,6 +210,7 @@ fn status_pieces(view: &ArchiveView, theme: &Theme) -> Vec<Piece> {
 	if low_disk {
 		ranked.reverse();
 	}
+
 	ranked.retain(|piece| !piece.text.is_empty());
 	ranked
 }

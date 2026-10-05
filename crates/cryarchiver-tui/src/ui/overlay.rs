@@ -17,8 +17,8 @@ const HELP_LEFT: [(&str, &str); 10] = [
 	("/", "filter by name"),
 	("Esc", "close / back / clear"),
 	("z", "maximize library"),
-	("L", "maximize log, where"),
-	("", "↑↓ Home End scroll it"),
+	("L", "maximize log"),
+	("", "↑↓ PgUp PgDn Home End scroll"),
 ];
 
 const HELP_RIGHT: [(&str, &str); 10] = [
@@ -37,7 +37,7 @@ const HELP_RIGHT: [(&str, &str); 10] = [
 const MOUSE_HELP: [&str; 3] = [
 	"Mouse  click selects · click ▸ folds · double-click opens details",
 	"       right-click menu · wheel scrolls · Shift+drag selects text",
-	"       right-click a log line copies it",
+	"       click Progress sorts · right-click a log line copies it",
 ];
 
 pub fn help(buf: &mut Buffer, screen: Rect, theme: &Theme) {

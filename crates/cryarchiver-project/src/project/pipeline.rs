@@ -83,7 +83,7 @@ pub(crate) struct Pipeline {
 	/// Files ready to start again while their earlier job still winds down; they start once it has finished.
 	pub(super) deferred: HashSet<FileId>,
 	pub(super) governor: Governor,
-	/// How many videos the encoder runs at once.
+	/// The backend's `video_jobs`: more videos started than that only wait in the encoder.
 	pub(super) video_slots: usize,
 	/// The last search of the encode queue for a video, or for anything but one, that found none, with the queue's
 	/// push count then: it can't find one before a file is queued again.
@@ -378,6 +378,7 @@ impl Owner {
 			if found.is_some() {
 				return found;
 			}
+
 			self.pipeline.fruitless_search = Some(search);
 		}
 
