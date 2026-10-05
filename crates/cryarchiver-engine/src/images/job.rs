@@ -32,8 +32,6 @@ use crate::video::run_ffmpeg;
 use crate::workspace::Workspace;
 
 const UPRIGHT_PNG: &str = "upright.png";
-/// How far past the largest size that saves enough a first encode may land and still be verified for a step-down.
-const STEP_DOWN_SIZE_REACH: f64 = 1.25;
 
 #[derive(Debug, Clone)]
 pub struct ImageInput {
@@ -158,6 +156,14 @@ struct Slot {
 	index: usize,
 	best: Option<u64>,
 	table: Option<Candidate>,
+}
+
+/// A candidate encode written but not yet verified.
+struct Encoded {
+	path: PathBuf,
+	candidate: Candidate,
+	bytes: Vec<u8>,
+	parts: Option<GainMapParts>,
 }
 
 /// A candidate encode that scored at least the target, or is written short because it was requested.
@@ -664,36 +670,21 @@ async fn try_candidate(
 		fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
 
 		let size = bytes.len() as u64;
-		if too_large(cx, size)
-			&& last_score.is_none()
-			&& let Some(fallback) = table.take()
-		{
-			candidate = fallback;
-			continue;
-		}
+		if too_large(cx, size) && last_score.is_none() {
+			if let Some(fallback) = table.take() {
+				candidate = fallback;
+				continue;
+			}
 
-		if too_large(cx, size)
-			&& last_score.is_none()
-			&& candidate.setting().is_some()
-			&& within_step_down_reach(cx, size)
-		{
-			(cx.on_event)(JobEvent::Stage(Stage::Verify));
-			let score = match verify_candidate(cx, still, env, candidate, &path, bytes).await {
-				Ok(score) => score,
-				Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => {
-					return Ok(Tried::TooLarge { size, score: None });
-				}
-				Err(err) => return Err(err),
-			};
-			let pass = Pass {
-				path,
-				size,
-				candidate,
-				score,
-				parts,
-				rebuilt: false,
-			};
-			return Box::pin(reached_down(cx, input, workspace, still, env, slot, pass)).await;
+			if candidate.setting().is_some() && !slot.beaten(size) && within_step_down_reach(cx, size) {
+				let first = Encoded {
+					path,
+					candidate,
+					bytes,
+					parts,
+				};
+				return Box::pin(reached_down(cx, input, workspace, still, env, slot, first)).await;
+			}
 		}
 
 		if too_large(cx, size) || slot.beaten(size) {
@@ -765,10 +756,10 @@ fn too_large(cx: &ImageContext<'_>, size: u64) -> bool {
 
 #[allow(clippy::cast_precision_loss)]
 fn within_step_down_reach(cx: &ImageContext<'_>, size: u64) -> bool {
-	(size as f64) <= (cx.source_bytes as f64) * (1.0 - cx.min_savings) * STEP_DOWN_SIZE_REACH
+	(size as f64) <= (cx.source_bytes as f64) * (1.0 - cx.min_savings) * plan::STEP_DOWN_SIZE_REACH
 }
 
-/// A verified first encode that saved too little, stepped down once when it cleared the target well. Only the lower
+/// A first encode that saved too little, verified and stepped down once when it cleared the target well. Only the lower
 /// encode can be kept, when it passes and saves enough; anything else leaves the candidate too large, at the smallest
 /// passing size seen, and without its score: a score would turn the keep reason into a missed quality target.
 async fn reached_down(
@@ -778,12 +769,30 @@ async fn reached_down(
 	still: &Still,
 	env: &Env<'_>,
 	slot: Slot,
-	pass: Pass,
+	first: Encoded,
 ) -> Result<Tried, JobError> {
+	let size = first.bytes.len() as u64;
+	(cx.on_event)(JobEvent::Stage(Stage::Verify));
+	let score = match verify_candidate(cx, still, env, first.candidate, &first.path, first.bytes).await {
+		Ok(score) => score,
+		Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Tried::Failed(err)),
+		Err(err) => return Err(err),
+	};
+
 	let too_large_at = |size| Tried::TooLarge { size, score: None };
-	if pass.score < still.plan.target {
-		return Ok(too_large_at(pass.size));
+
+	if score < still.plan.target {
+		return Ok(too_large_at(size));
 	}
+
+	let pass = Pass {
+		path: first.path,
+		size,
+		candidate: first.candidate,
+		score,
+		parts: first.parts,
+		rebuilt: false,
+	};
 
 	let StepDown::Passed(mut lowered) = Box::pin(step_down(cx, input, workspace, still, env, slot, &pass)).await?
 	else {

@@ -34,6 +34,8 @@ const STEP_DOWN_ABOVE: f64 = 2.0;
 const STEP_DOWN_AIM: f64 = 0.75;
 const STEP_DOWN_MIN_QUALITY: f64 = 0.5;
 const STEP_DOWN_MIN_DISTANCE: f64 = 0.05;
+/// How far past the largest size that saves enough a first encode may land and still be verified for a step-down.
+pub const STEP_DOWN_SIZE_REACH: f64 = 1.25;
 
 pub(crate) const CMYK_COMPONENTS: u8 = 4;
 const YCCK_TRANSFORM: u8 = 2;

@@ -319,13 +319,13 @@ async fn a_step_down_writes_and_scores_the_gain_map_of_the_encode_it_keeps() {
 	);
 }
 
-/// The AVIF the earlier pass at `quality` comes to once its gain map is rebuilt at the raised quality.
-fn rebuilt_pass(source: &Path, quality: f32) -> Vec<u8> {
+/// The AVIF of the Ultra HDR `source` at `quality`, carrying its gain map encoded at `gain_quality`.
+fn avif_with_gain_map(source: &Path, quality: f32, gain_quality: f32) -> Vec<u8> {
 	let jpeg = std::fs::read(source).unwrap();
 	let pixels = DynamicImage::ImageRgb8(image::load_from_memory(&jpeg).unwrap().to_rgb8());
 	let base = encode_avif(&pixels, false, RavifSettings { quality, speed: 9 }, 4).unwrap();
 	let metadata = build_output(&extract(&jpeg), MetadataMode::IccOnly, 256, 192);
-	let gain_map = gain_map::encode(&decoded_gain_map(source), RAISED_QUALITY, 9, 4).unwrap();
+	let gain_map = gain_map::encode(&decoded_gain_map(source), gain_quality, 9, 4).unwrap();
 	let input = GainMapInput {
 		encoded: &gain_map,
 		metadata: &UltraHdrOptions::default().metadata,
@@ -369,7 +369,7 @@ async fn a_step_down_whose_gain_map_is_rebuilt_keeps_the_smaller_of_the_two_chec
 		gain_map_av1(&avif).unwrap(),
 		encoded_gain_map(&decoded_gain_map(&source), RAISED_QUALITY)
 	);
-	let earlier = rebuilt_pass(&source, 80.0);
+	let earlier = avif_with_gain_map(&source, 80.0, RAISED_QUALITY);
 	assert!(
 		avif.len() < earlier.len(),
 		"{} vs the earlier pass {}",
@@ -2259,5 +2259,58 @@ async fn a_jpeg_without_a_gain_map_has_no_gain_map_item_or_score() {
 	assert_eq!(
 		avif, without_gain_map,
 		"the same bytes as the encode without a gain map"
+	);
+}
+
+#[tokio::test]
+async fn a_first_encode_with_a_gain_map_that_saves_too_little_keeps_the_lower_encode_once_its_gain_map_passes() {
+	let dir = tempfile::tempdir().unwrap();
+	let pixels = image::open(support::photo_png(dir.path(), "pixels.png", 256, 192))
+		.unwrap()
+		.to_rgb8();
+	let source = dir.path().join("photo.jpg");
+	std::fs::write(
+		&source,
+		ultra_hdr_jpeg(&pixels, &gain_levels(64, 48), &UltraHdrOptions::default()),
+	)
+	.unwrap();
+	let source_bytes = std::fs::metadata(&source).unwrap().len();
+	let first = avif_with_gain_map(&source, 92.0, 92.0).len() as u64;
+	assert!(
+		first * 10 > source_bytes * 9,
+		"the first encode at 92 saves too little: {first} of {source_bytes}"
+	);
+
+	let (outcome, stages) = run_counting_stages(
+		&Arc::new(SharedMemory::default()),
+		&targeted(&source, Speed::Fast, 85.0),
+		dir.path(),
+	)
+	.await;
+
+	let (quality, score) = chosen_quality(&outcome);
+	let JobOutcome::Encoded { output, decision, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let avif = std::fs::read(output).unwrap();
+	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
+	assert!(quality < 92.0 && score >= 85.0, "{quality} {score}");
+	assert!(
+		avif.len() as u64 * 10 <= source_bytes * 9,
+		"{} of {source_bytes}",
+		avif.len()
+	);
+	assert!(
+		decision
+			.image
+			.as_ref()
+			.unwrap()
+			.gain_map
+			.is_some_and(|score| score >= TARGET),
+		"{decision:?}"
+	);
+	assert_eq!(
+		gain_map_av1(&avif).unwrap(),
+		encoded_gain_map(&decoded_gain_map(&source), quality)
 	);
 }
