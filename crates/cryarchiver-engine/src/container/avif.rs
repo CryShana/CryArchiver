@@ -301,8 +301,9 @@ fn check_gain_map_item(meta: &Meta, bytes: &[u8], id: u32, coded_cicp: bool) -> 
 		return Err("the gain map item is not hidden".into());
 	}
 
-	let nclx: Vec<Nclx> = meta
-		.properties_of(id)
+	let properties: Vec<&Property> = meta.properties_of(id).collect();
+	let nclx: Vec<Nclx> = properties
+		.iter()
 		.filter_map(|property| match property {
 			Property::Nclx(nclx) => Some(*nclx),
 			_ => None,
@@ -321,18 +322,38 @@ fn check_gain_map_item(meta: &Meta, bytes: &[u8], id: u32, coded_cicp: bool) -> 
 		));
 	}
 
-	if coded_cicp {
-		let data = meta.item_data(bytes, id).map_err(|err| err.to_string())?;
-		let header = av1::read_sequence_header(&data).ok_or("the gain map item has no AV1 sequence header")?;
-		if [header.primaries, header.transfer]
+	let data = meta.item_data(bytes, id).map_err(|err| err.to_string())?;
+	let header = av1::read_sequence_header(&data).ok_or("the gain map item has no AV1 sequence header")?;
+	if !header.monochrome && header.subsampling != (false, false) {
+		return Err("the gain map is neither monochrome nor 4:4:4".into());
+	}
+
+	let channels = if header.monochrome { 1 } else { 3 };
+	if !properties.contains(&&Property::PixelDepths(vec![header.bit_depth; channels])) {
+		return Err(format!(
+			"the gain map's pixi box does not say {channels} channels of {} bits",
+			header.bit_depth
+		));
+	}
+
+	if header.matrix.is_some_and(|matrix| nclx.matrix != u16::from(matrix)) || nclx.full_range != header.full_range {
+		return Err(format!(
+			"the gain map's nclx box says {nclx:?} but its AV1 sequence header says matrix {:?} and full range {}",
+			header.matrix, header.full_range
+		));
+	}
+
+	check_av1_config(&properties, &header, "gain map item")?;
+
+	if coded_cicp
+		&& [header.primaries, header.transfer]
 			.into_iter()
 			.any(|code| code.is_some_and(|code| code != UNSPECIFIED_CICP))
-		{
-			return Err(format!(
-				"the gain map's AV1 sequence header says primaries {:?}, transfer {:?} but 2 and 2 were expected",
-				header.primaries, header.transfer
-			));
-		}
+	{
+		return Err(format!(
+			"the gain map's AV1 sequence header says primaries {:?}, transfer {:?} but 2 and 2 were expected",
+			header.primaries, header.transfer
+		));
 	}
 	Ok(())
 }
@@ -397,17 +418,17 @@ fn check_colour(
 	if meta.primary_icc() != expected.metadata.icc {
 		return Err("the ICC profile was not carried over unchanged".into());
 	}
-	check_av1_config(&properties, header)
+	check_av1_config(&properties, header, "colour item")
 }
 
-fn check_av1_config(properties: &[&Property], header: &SequenceHeader) -> Result<(), String> {
+fn check_av1_config(properties: &[&Property], header: &SequenceHeader, item: &str) -> Result<(), String> {
 	let config = properties
 		.iter()
 		.find_map(|property| match property {
 			Property::Av1Config(config) => Some(config.as_slice()),
 			_ => None,
 		})
-		.ok_or("the colour item has no av1C box")?;
+		.ok_or_else(|| format!("the {item} has no av1C box"))?;
 	let [_, profile_level, flags, ..] = config else {
 		return Err("the av1C box is too short".into());
 	};
@@ -419,7 +440,7 @@ fn check_av1_config(properties: &[&Property], header: &SequenceHeader) -> Result
 	if (profile, level, monochrome, subsampling)
 		!= (header.profile, header.level, header.monochrome, header.subsampling)
 	{
-		return Err("the av1C box does not match the AV1 sequence header".into());
+		return Err(format!("the {item}'s av1C box does not match its AV1 sequence header"));
 	}
 	Ok(())
 }

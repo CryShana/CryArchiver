@@ -275,12 +275,12 @@ async fn a_step_down_that_falls_below_the_target_keeps_the_first_pass_and_tries_
 	);
 }
 
-fn decoded_gain_map(source: &Path) -> GrayImage {
+fn decoded_gain_map(source: &Path) -> DynamicImage {
 	let bytes = std::fs::read(source).unwrap();
 	gain_map::decode(&bytes, &extract(&bytes).gain_map.unwrap(), 256 * 192).unwrap()
 }
 
-fn encoded_gain_map(gain: &GrayImage, quality: f32) -> Vec<u8> {
+fn encoded_gain_map(gain: &DynamicImage, quality: f32) -> Vec<u8> {
 	let avif = gain_map::encode(gain, quality, 9, 4).unwrap();
 	parse_meta(&avif).unwrap().item_data(&avif, 1).unwrap()
 }
@@ -1827,6 +1827,42 @@ async fn an_ultra_hdr_photo_becomes_avif_that_keeps_its_gain_map() {
 	assert_eq!(first_stream_size(&dir.path().join("quarter.cry.avif")), "256,192");
 }
 
+fn colour_gain_levels(width: u32, height: u32) -> RgbImage {
+	RgbImage::from_fn(width, height, |x, y| {
+		Rgb([
+			u8::try_from(30 + x * 150 / width).unwrap(),
+			u8::try_from(50 + y * 100 / height).unwrap(),
+			u8::try_from(180 - (x + y) * 90 / (width + height)).unwrap(),
+		])
+	})
+}
+
+#[tokio::test]
+async fn an_ultra_hdr_photo_with_a_colour_gain_map_keeps_it_in_colour() {
+	let dir = tempfile::tempdir().unwrap();
+
+	for (name, opts) in [
+		("one-channel.jpg", UltraHdrOptions::default()),
+		("three-channel.jpg", UltraHdrOptions::three_channel()),
+	] {
+		let source = ultra_hdr_photo(dir.path(), name, &colour_gain_levels(64, 48), &opts);
+
+		let (avif, warnings, gain_map) = encoded_with(run(&job(&source), dir.path()).await);
+
+		checked_avif(&avif, (256, 192), Some(&opts.metadata)).unwrap();
+		let meta = parse_meta(&avif).unwrap();
+		let gain_map_item = meta.gain_map().unwrap().gain_map;
+		assert!(
+			meta.properties_of(gain_map_item)
+				.any(|property| *property == Property::PixelDepths(vec![8, 8, 8])),
+			"{name}"
+		);
+		assert_eq!(gain_map_size(&avif), Some((64, 48)));
+		assert!(gain_map.is_some_and(|score| score >= TARGET), "{name}: {gain_map:?}");
+		assert!(warnings.is_empty(), "{name}: {warnings:?}");
+	}
+}
+
 #[tokio::test]
 async fn the_gain_map_is_turned_and_resized_with_the_photo() {
 	let dir = tempfile::tempdir().unwrap();
@@ -1956,10 +1992,10 @@ async fn drop_aux_keeps_a_gain_map_it_can_carry_and_drops_one_it_cannot() {
 		..UltraHdrOptions::default()
 	};
 	let motion = ultra_hdr_photo(dir.path(), "motion.jpg", &gain_levels(64, 48), &opts);
-	let colour = ultra_hdr_photo(
+	let oversized = ultra_hdr_photo(
 		dir.path(),
-		"colour.jpg",
-		&noisy_base(64, 48),
+		"oversized.jpg",
+		&gain_levels(257, 192),
 		&UltraHdrOptions::default(),
 	);
 	let dropping = |source: &Path| Job {
@@ -1968,7 +2004,7 @@ async fn drop_aux_keeps_a_gain_map_it_can_carry_and_drops_one_it_cannot() {
 	};
 
 	let (carried, motion_warnings, gain_map) = encoded_with(run(&dropping(&motion), dir.path()).await);
-	let (plain, colour_warnings, no_gain_map) = encoded_with(run(&dropping(&colour), dir.path()).await);
+	let (plain, oversized_warnings, no_gain_map) = encoded_with(run(&dropping(&oversized), dir.path()).await);
 
 	checked_avif(&carried, (256, 192), Some(&opts.metadata)).unwrap();
 	assert!(gain_map.is_some());
@@ -1976,8 +2012,8 @@ async fn drop_aux_keeps_a_gain_map_it_can_carry_and_drops_one_it_cannot() {
 	checked_avif(&plain, (256, 192), None).unwrap();
 	assert_eq!(no_gain_map, None);
 	assert_eq!(
-		colour_warnings,
-		["the HDR gain map was dropped: it is in colour, which is not supported"]
+		oversized_warnings,
+		["the HDR gain map was dropped: it is larger than the photo (257×192)"]
 	);
 }
 
@@ -2019,7 +2055,7 @@ async fn depth_maps_are_dropped_with_a_warning() {
 }
 
 #[tokio::test]
-async fn an_ultra_hdr_motion_photo_or_a_colour_or_oversized_gain_map_keeps_the_original() {
+async fn an_ultra_hdr_motion_photo_or_an_oversized_gain_map_keeps_the_original() {
 	let dir = tempfile::tempdir().unwrap();
 	let motion = ultra_hdr_photo(
 		dir.path(),
@@ -2030,12 +2066,6 @@ async fn an_ultra_hdr_motion_photo_or_a_colour_or_oversized_gain_map_keeps_the_o
 			..UltraHdrOptions::default()
 		},
 	);
-	let colour = ultra_hdr_photo(
-		dir.path(),
-		"colour.jpg",
-		&noisy_base(64, 48),
-		&UltraHdrOptions::default(),
-	);
 	let oversized = ultra_hdr_photo(
 		dir.path(),
 		"oversized.jpg",
@@ -2044,17 +2074,12 @@ async fn an_ultra_hdr_motion_photo_or_a_colour_or_oversized_gain_map_keeps_the_o
 	);
 
 	let motion = run(&job(&motion), dir.path()).await;
-	let colour = run(&job(&colour), dir.path()).await;
 	let oversized = run(&job(&oversized), dir.path()).await;
 
 	let reason = kept_reason(&motion);
 	assert!(
 		reason.contains("motion photo video") && reason.contains("which converting would drop"),
 		"{reason}"
-	);
-	assert_eq!(
-		kept_reason(&colour),
-		"its HDR gain map can't be carried: it is in colour, which is not supported"
 	);
 	assert_eq!(
 		kept_reason(&oversized),

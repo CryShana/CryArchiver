@@ -35,7 +35,7 @@ const STEP_DOWN_AIM: f64 = 0.75;
 const STEP_DOWN_MIN_QUALITY: f64 = 0.5;
 const STEP_DOWN_MIN_DISTANCE: f64 = 0.05;
 
-const CMYK_COMPONENTS: u8 = 4;
+pub(crate) const CMYK_COMPONENTS: u8 = 4;
 const YCCK_TRANSFORM: u8 = 2;
 const RAVIF_BYTES_PER_PIXEL: u64 = 34;
 const LIBJXL_BASE_BYTES: u64 = 250 << 20;

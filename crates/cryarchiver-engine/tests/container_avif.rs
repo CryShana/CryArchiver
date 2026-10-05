@@ -301,7 +301,7 @@ fn gain_map_levels(width: u32, height: u32) -> GrayImage {
 }
 
 fn grey_gain_map(width: u32, height: u32) -> Vec<u8> {
-	gain_map::encode(&gain_map_levels(width, height), 60.0, 10, 1).unwrap()
+	gain_map::encode(&gain_map_levels(width, height).into(), 60.0, 10, 1).unwrap()
 }
 
 fn ravif_gain_map(width: u32, height: u32) -> Vec<u8> {
@@ -540,6 +540,20 @@ fn check_refuses_tone_map_and_gain_map_items_that_break_libavifs_rules() {
 
 	let coloured = replaced(&avif, b"colrnclx\0\x02\0\x02", b"colrnclx\0\x01\0\x02");
 	assert!(refusal(&coloured).contains("nclx box says"));
+}
+
+#[test]
+fn check_refuses_a_gain_map_item_whose_boxes_disagree_with_its_av1() {
+	let metadata = gain_map_metadata();
+	let (avif, _) = with_gain_map(&AvifMetadata::default(), &metadata);
+	let expected = expectations(AvifMetadata::default(), Some(&metadata));
+	let refusal = |bytes: &[u8]| check(bytes, &expected).unwrap_err();
+
+	let ten_bit_pixi = replaced(&avif, b"pixi\0\0\0\0\x01\x08", b"pixi\0\0\0\0\x01\x0a");
+	assert!(refusal(&ten_bit_pixi).contains("pixi box"));
+
+	let other_matrix = replaced(&avif, b"colrnclx\0\x02\0\x02\0\x06", b"colrnclx\0\x02\0\x02\0\x01");
+	assert!(refusal(&other_matrix).contains("sequence header says matrix"));
 }
 
 #[test]

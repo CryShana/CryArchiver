@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use image::imageops::FilterType;
-use image::{DynamicImage, GenericImageView, GrayImage};
+use image::{DynamicImage, GenericImageView};
 use tokio_util::sync::CancellationToken;
 
 use crate::container::avif::GainMapInput;
@@ -97,7 +97,7 @@ struct Still {
 
 /// The source's HDR gain map, turned and scaled with the image, that AVIF candidates carry.
 struct CarriedGainMap {
-	image: Arc<GrayImage>,
+	image: Arc<DynamicImage>,
 	metadata: GainMapMetadata,
 }
 

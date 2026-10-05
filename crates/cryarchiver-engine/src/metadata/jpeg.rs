@@ -143,6 +143,18 @@ fn read_gain_map(bytes: &[u8], mpf: Option<(&[u8], usize)>, trailer: Option<AuxK
 	}
 }
 
+/// The number of colour components the JPEG's frame header declares.
+pub fn components(bytes: &[u8]) -> Option<u8> {
+	SegmentWalk::new(bytes).find_map(|segment| frame_components(segment.marker, segment.payload))
+}
+
+fn frame_components(marker: u8, payload: &[u8]) -> Option<u8> {
+	match marker {
+		0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => payload.get(5).copied(),
+		_ => None,
+	}
+}
+
 pub fn image_end(bytes: &[u8]) -> Result<usize, String> {
 	let mut at = 2;
 	let mut scanned = false;
@@ -287,10 +299,11 @@ fn read_segment<'a>(marker: u8, payload: &'a [u8], metadata: &mut SourceMetadata
 		COMMENT => metadata
 			.comments
 			.push(String::from_utf8_lossy(payload).trim_end_matches('\0').to_owned()),
-		0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF if payload.len() >= 6 => {
-			metadata.jpeg_components = Some(payload[5]);
+		_ => {
+			if let Some(components) = frame_components(marker, payload) {
+				metadata.jpeg_components = Some(components);
+			}
 		}
-		_ => {}
 	}
 }
 

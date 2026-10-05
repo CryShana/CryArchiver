@@ -73,6 +73,29 @@ impl Default for UltraHdrOptions {
 	}
 }
 
+impl UltraHdrOptions {
+	/// Metadata with a different maximum gain per colour channel, as a colour gain map may carry.
+	pub fn three_channel() -> Self {
+		let defaults = Self::default();
+		let channel = defaults.metadata.channels[0];
+		let with_max = |numerator| Channel {
+			max: Signed {
+				numerator,
+				denominator: 10,
+			},
+			..channel
+		};
+
+		Self {
+			metadata: GainMapMetadata {
+				channels: vec![with_max(23), with_max(20), with_max(17)],
+				..defaults.metadata
+			},
+			..defaults
+		}
+	}
+}
+
 pub fn ultra_hdr_jpeg<G: GenericImageView>(base: &image::RgbImage, gain: &G, opts: &UltraHdrOptions) -> Vec<u8>
 where
 	G::Pixel: PixelWithColorType,
