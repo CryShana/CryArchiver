@@ -178,13 +178,30 @@ impl Candidate {
 
 		let aimed = self.aimed_setting(score - target - STEP_DOWN_AIM)?;
 		let lowered = self.with_setting(speed, target, aimed);
-		let (current, lowered_setting) = (self.setting()?, lowered.setting()?);
-		let change = match self {
-			Self::Ravif(_) => (current - lowered_setting) >= STEP_DOWN_MIN_QUALITY,
-			Self::JxlLossy(_) => (lowered_setting - current) >= STEP_DOWN_MIN_DISTANCE,
-			Self::JxlLossless(_) => false,
+		let change = match (self, lowered) {
+			(Self::Ravif(current), Self::Ravif(lowered)) => {
+				f64::from(current.quality - lowered.quality) >= STEP_DOWN_MIN_QUALITY
+			}
+			(Self::JxlLossy(current), Self::JxlLossy(lowered)) => {
+				f64::from(lowered.distance - current.distance) >= STEP_DOWN_MIN_DISTANCE
+			}
+			_ => false,
 		};
 		change.then_some(lowered)
+	}
+
+	/// A `setting` this passing candidate teaches, kept a raise margin finer than `missed`, its lower encode that fell
+	/// below the target, but never finer than this candidate itself.
+	pub fn learned_past_miss(self, missed: Self, setting: f64) -> f64 {
+		match (self, missed) {
+			(Self::Ravif(kept), Self::Ravif(missed)) => {
+				setting.max((f64::from(missed.quality) + RAISE_QUALITY_MARGIN).min(f64::from(kept.quality)))
+			}
+			(Self::JxlLossy(kept), Self::JxlLossy(missed)) => {
+				setting.min((f64::from(missed.distance) - RAISE_DISTANCE_MARGIN).max(f64::from(kept.distance)))
+			}
+			_ => setting,
+		}
 	}
 
 	/// The setting expected to score `spare` points lower than this one did.
@@ -902,6 +919,21 @@ mod tests {
 			Candidate::JxlLossless(JXL_LOSSLESS).stepped_down(99.0, 85.0, Speed::Moderate),
 			None
 		);
+	}
+
+	#[test]
+	fn after_a_missed_step_down_the_group_learns_a_raise_margin_finer_than_the_miss() {
+		let ravif = |quality| Candidate::Ravif(RavifSettings { quality, speed: 9 });
+		let jxl = |distance| Candidate::JxlLossy(JxlSettings { distance, effort: 5 });
+		let near = |learned: f64, expected: f64| (learned - expected).abs() < 1e-4;
+
+		assert!(near(ravif(88.0).learned_past_miss(ravif(83.125), 83.3), 84.125));
+		assert!(near(ravif(88.0).learned_past_miss(ravif(83.125), 86.0), 86.0));
+		assert!(near(ravif(88.0).learned_past_miss(ravif(87.5), 83.3), 88.0));
+		assert!(near(jxl(1.0).learned_past_miss(jxl(1.625), 1.75), 1.525));
+		assert!(near(jxl(1.0).learned_past_miss(jxl(1.625), 1.25), 1.25));
+		assert!(near(jxl(1.0).learned_past_miss(jxl(1.0625), 1.75), 1.0));
+		assert!(near(ravif(88.0).learned_past_miss(jxl(1.0), 83.3), 83.3));
 	}
 
 	#[test]

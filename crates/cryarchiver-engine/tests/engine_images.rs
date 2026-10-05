@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, check};
+use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, GainMapInput, check};
 use cryarchiver_engine::container::isobmff::{Property, parse_meta};
 use cryarchiver_engine::container::jxl::read_boxes;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
@@ -210,7 +210,7 @@ async fn a_lower_image_target_gives_a_smaller_photo_and_a_higher_one_a_larger() 
 	assert!(sizes[0] < sizes[1] && sizes[1] < sizes[2], "{sizes:?}");
 }
 
-async fn run_counting_stages(job: &Job, out_dir: &Path) -> (JobOutcome, Vec<Stage>) {
+async fn run_counting_stages(memory: &Arc<SharedMemory>, job: &Job, out_dir: &Path) -> (JobOutcome, Vec<Stage>) {
 	let stages = Mutex::new(Vec::new());
 	let record = |event: JobEvent| {
 		if let JobEvent::Stage(stage @ (Stage::Encode | Stage::Verify)) = event {
@@ -219,13 +219,14 @@ async fn run_counting_stages(job: &Job, out_dir: &Path) -> (JobOutcome, Vec<Stag
 	};
 	let outcome = Engine::new(support::toolchain().await)
 		.with_image_threads(4)
+		.with_quality_memory(memory.clone())
 		.run(job, &sink(out_dir), &record, &CancellationToken::new())
 		.await;
 
 	(outcome, stages.into_inner().unwrap())
 }
 
-fn chosen_quality(outcome: &JobOutcome) -> (f64, f64) {
+fn chosen_quality(outcome: &JobOutcome) -> (f32, f64) {
 	let JobOutcome::Encoded { decision, .. } = outcome else {
 		panic!("{outcome:?}")
 	};
@@ -244,7 +245,9 @@ async fn a_photo_well_above_its_target_is_encoded_once_more_lower() {
 	let dir = tempfile::tempdir().unwrap();
 	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
 
-	let (outcome, stages) = run_counting_stages(&targeted(&photo, Speed::Fast, 75.0), dir.path()).await;
+	let memory = Arc::new(SharedMemory::default());
+
+	let (outcome, stages) = run_counting_stages(&memory, &targeted(&photo, Speed::Fast, 75.0), dir.path()).await;
 
 	let (quality, score) = chosen_quality(&outcome);
 	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
@@ -257,12 +260,151 @@ async fn a_step_down_that_falls_below_the_target_keeps_the_first_pass_and_tries_
 	let dir = tempfile::tempdir().unwrap();
 	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
 
-	let (outcome, stages) = run_counting_stages(&job(&photo), dir.path()).await;
+	let memory = Arc::new(SharedMemory::default());
+
+	let (outcome, stages) = run_counting_stages(&memory, &job(&photo), dir.path()).await;
 
 	let (quality, score) = chosen_quality(&outcome);
 	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
 	assert_eq!(quality, 88.0);
 	assert!(score >= 82.0, "the first pass, well above the target, is kept: {score}");
+	let learned = memory.entries()[0].1.setting;
+	assert!(
+		(84.0..88.0).contains(&learned),
+		"a raise margin above the missed quality 83.1, below the kept 88: {learned}"
+	);
+}
+
+fn decoded_gain_map(source: &Path) -> GrayImage {
+	let bytes = std::fs::read(source).unwrap();
+	gain_map::decode(&bytes, &extract(&bytes).gain_map.unwrap(), 256 * 192).unwrap()
+}
+
+fn encoded_gain_map(gain: &GrayImage, quality: f32) -> Vec<u8> {
+	let avif = gain_map::encode(gain, quality, 9, 4).unwrap();
+	parse_meta(&avif).unwrap().item_data(&avif, 1).unwrap()
+}
+
+#[tokio::test]
+async fn a_step_down_writes_and_scores_the_gain_map_of_the_encode_it_keeps() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = ultra_hdr_photo(
+		dir.path(),
+		"photo.jpg",
+		&gain_levels(64, 48),
+		&UltraHdrOptions::default(),
+	);
+	let memory = Arc::new(SharedMemory::default());
+
+	let (outcome, stages) = run_counting_stages(&memory, &targeted(&source, Speed::Fast, 70.0), dir.path()).await;
+
+	let (quality, _) = chosen_quality(&outcome);
+	let JobOutcome::Encoded { output, decision, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
+	assert!(quality < 80.0, "{quality}");
+	assert!(
+		decision
+			.image
+			.as_ref()
+			.unwrap()
+			.gain_map
+			.is_some_and(|score| score >= TARGET),
+		"{decision:?}"
+	);
+	assert_eq!(
+		gain_map_av1(&std::fs::read(output).unwrap()).unwrap(),
+		encoded_gain_map(&decoded_gain_map(&source), quality)
+	);
+}
+
+/// The AVIF the earlier pass at `quality` comes to once its gain map is rebuilt at the raised quality.
+fn rebuilt_pass(source: &Path, quality: f32) -> Vec<u8> {
+	let jpeg = std::fs::read(source).unwrap();
+	let pixels = DynamicImage::ImageRgb8(image::load_from_memory(&jpeg).unwrap().to_rgb8());
+	let base = encode_avif(&pixels, false, RavifSettings { quality, speed: 9 }, 4).unwrap();
+	let metadata = build_output(&extract(&jpeg), MetadataMode::IccOnly, 256, 192);
+	let gain_map = gain_map::encode(&decoded_gain_map(source), RAISED_QUALITY, 9, 4).unwrap();
+	let input = GainMapInput {
+		encoded: &gain_map,
+		metadata: &UltraHdrOptions::default().metadata,
+	};
+
+	finish(&base, AvifColour { icc: None, cicp: None }, &metadata, Some(&input)).unwrap()
+}
+
+#[tokio::test]
+async fn a_step_down_whose_gain_map_is_rebuilt_keeps_the_smaller_of_the_two_checked_passes() {
+	let dir = tempfile::tempdir().unwrap();
+	// The base steps down as in the test above, but this gain map misses at both the start and the lowered quality, so
+	// both files are rebuilt around the gain map encoded at the raised quality.
+	let source = ultra_hdr_photo(
+		dir.path(),
+		"photo.jpg",
+		&coarse_noise(64, 48),
+		&UltraHdrOptions::default(),
+	);
+	let memory = Arc::new(SharedMemory::default());
+
+	let (outcome, stages) = run_counting_stages(&memory, &targeted(&source, Speed::Fast, 70.0), dir.path()).await;
+
+	let (quality, _) = chosen_quality(&outcome);
+	let JobOutcome::Encoded { output, decision, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let avif = std::fs::read(output).unwrap();
+	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
+	assert!(quality < 80.0, "{quality}");
+	assert!(
+		decision
+			.image
+			.as_ref()
+			.unwrap()
+			.gain_map
+			.is_some_and(|score| score >= TARGET),
+		"{decision:?}"
+	);
+	assert_eq!(
+		gain_map_av1(&avif).unwrap(),
+		encoded_gain_map(&decoded_gain_map(&source), RAISED_QUALITY)
+	);
+	let earlier = rebuilt_pass(&source, 80.0);
+	assert!(
+		avif.len() < earlier.len(),
+		"{} vs the earlier pass {}",
+		avif.len(),
+		earlier.len()
+	);
+}
+
+#[tokio::test]
+async fn a_lower_encode_that_is_not_smaller_is_not_verified() {
+	let dir = tempfile::tempdir().unwrap();
+	let noise = dir.path().join("noise.png");
+	let mut state = 99_u32;
+	RgbImage::from_fn(16, 16, |_, _| {
+		state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+		let [red, green, blue, _] = state.to_be_bytes();
+		Rgb([red, green, blue])
+	})
+	.save(&noise)
+	.unwrap();
+	let strict = Job {
+		overrides: Overrides {
+			image: Some(95.0),
+			..Overrides::default()
+		},
+		..requested(&noise, OutputFormat::Jxl)
+	};
+
+	let (outcome, stages) = run_counting_stages(&Arc::new(SharedMemory::default()), &strict, dir.path()).await;
+
+	let JobOutcome::Encoded { decision, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode]);
+	assert_eq!(decision.image.unwrap().setting.as_deref(), Some("distance 0.10"));
 }
 
 const GRAPHIC_GROUP_AT_FAST: &str = "image/png/graphic/opaque/8bit/mp1|ravif-0.13.0|p9|t80.0";

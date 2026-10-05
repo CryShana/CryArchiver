@@ -165,6 +165,17 @@ struct Pass {
 	candidate: Candidate,
 	score: f64,
 	parts: Option<GainMapParts>,
+	/// The file was rebuilt around its gain map encoded again.
+	rebuilt: bool,
+}
+
+/// What became of the one lower encode after a pass well above the target.
+enum StepDown {
+	Passed(Pass),
+	/// It scored below the target.
+	Missed(Candidate),
+	/// It wasn't tried, wasn't smaller, or couldn't be verified.
+	Skipped,
 }
 
 #[derive(Debug)]
@@ -176,6 +187,8 @@ enum Tried {
 		score: f64,
 		gain_map: Option<f64>,
 		short: bool,
+		/// A lower encode of `candidate` that scored below the target.
+		missed: Option<Candidate>,
 	},
 	Rejected {
 		size: u64,
@@ -191,6 +204,26 @@ enum Tried {
 		score: f64,
 	},
 	Failed(JobError),
+}
+
+impl Slot {
+	fn beaten(self, size: u64) -> bool {
+		self.best.is_some_and(|best| best <= size)
+	}
+}
+
+impl Pass {
+	fn passed(self, gain_map: Option<f64>, short: bool, missed: Option<Candidate>) -> Tried {
+		Tried::Passed {
+			path: self.path,
+			size: self.size,
+			candidate: self.candidate,
+			score: self.score,
+			gain_map,
+			short,
+			missed,
+		}
+	}
 }
 
 impl Choice {
@@ -549,6 +582,7 @@ async fn encode_and_choose(
 				score,
 				gain_map,
 				short,
+				missed,
 			} => {
 				choice.note(size);
 				let offered = path.clone();
@@ -562,6 +596,7 @@ async fn encode_and_choose(
 					&& let Some(key) = key
 					&& let Some(setting) = candidate.needed_setting(score, still.plan.target, cx.speed)
 				{
+					let setting = missed.map_or(setting, |missed| candidate.learned_past_miss(missed, setting));
 					learned.push((
 						key,
 						Observation {
@@ -627,9 +662,7 @@ async fn try_candidate(
 		fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
 
 		let size = bytes.len() as u64;
-		let too_large = |size| !cx.forced && !saves_enough(cx.source_bytes, size, cx.min_savings);
-		let beaten = |size| slot.best.is_some_and(|best| best <= size);
-		if too_large(size)
+		if too_large(cx, size)
 			&& last_score.is_none()
 			&& let Some(fallback) = table.take()
 		{
@@ -637,7 +670,7 @@ async fn try_candidate(
 			continue;
 		}
 
-		if too_large(size) || beaten(size) {
+		if too_large(cx, size) || slot.beaten(size) {
 			return Ok(Tried::TooLarge {
 				size,
 				score: last_score,
@@ -675,50 +708,37 @@ async fn try_candidate(
 			candidate,
 			score,
 			parts,
+			rebuilt: false,
 		};
-		if !short && let Some(lowered) = Box::pin(step_down(cx, input, workspace, still, env, slot, &pass)).await? {
-			pass = lowered;
+		let mut missed = None;
+		if !short {
+			match Box::pin(step_down(cx, input, workspace, still, env, slot, &pass)).await? {
+				StepDown::Passed(lowered) => {
+					match Box::pin(either_pass(cx, workspace, still, env, slot, pass, lowered)).await? {
+						Ok(tried) => return Ok(tried),
+						Err(earlier) => pass = earlier,
+					}
+				}
+				StepDown::Missed(lowered) => missed = Some(lowered),
+				StepDown::Skipped => {}
+			}
 		}
 
-		let mut gain_map = None;
-		if let Some(parts) = pass.parts {
-			let checked = match Box::pin(check_gain_map(cx, workspace, still, env, &pass.path, parts)).await {
-				Ok(checked) => checked,
-				Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Tried::Failed(err)),
-				Err(err) => return Err(err),
-			};
-			pass.size = checked.rebuilt.unwrap_or(pass.size);
-
-			if checked.missed && !cx.forced {
-				return Ok(Tried::GainMapMissed {
-					size: pass.size,
-					score: checked.score,
-				});
-			}
-
-			if checked.rebuilt.is_some() && (too_large(pass.size) || beaten(pass.size)) {
-				return Ok(Tried::TooLarge {
-					size: pass.size,
-					score: None,
-				});
-			}
-
-			gain_map = Some(checked.score);
-		}
-
-		return Ok(Tried::Passed {
-			path: pass.path,
-			size: pass.size,
-			candidate: pass.candidate,
-			score: pass.score,
-			gain_map,
-			short,
-		});
+		return Ok(
+			match Box::pin(gain_map_checked(cx, workspace, still, env, slot, &mut pass)).await? {
+				Ok(gain_map) => pass.passed(gain_map, short, missed),
+				Err(tried) => tried,
+			},
+		);
 	}
 }
 
-/// Encodes a pass well above the target once more, aimed just above it, and returns that encode when it is smaller and
-/// still passes. Whichever of the two files is not kept is removed.
+fn too_large(cx: &ImageContext<'_>, size: u64) -> bool {
+	!cx.forced && !saves_enough(cx.source_bytes, size, cx.min_savings)
+}
+
+/// Encodes a pass well above the target once more, aimed just above it. A lower encode that isn't passed on is removed;
+/// the earlier pass is left to the caller.
 async fn step_down(
 	cx: &ImageContext<'_>,
 	input: &ImageInput,
@@ -727,10 +747,10 @@ async fn step_down(
 	env: &Env<'_>,
 	slot: Slot,
 	pass: &Pass,
-) -> Result<Option<Pass>, JobError> {
+) -> Result<StepDown, JobError> {
 	let target = still.plan.target;
 	let Some(lowered) = pass.candidate.stepped_down(pass.score, target, cx.speed) else {
-		return Ok(None);
+		return Ok(StepDown::Skipped);
 	};
 
 	(cx.on_event)(JobEvent::Stage(Stage::Encode));
@@ -739,7 +759,7 @@ async fn step_down(
 	fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
 
 	let size = bytes.len() as u64;
-	let score = if size < pass.size && slot.best.is_none_or(|best| size < best) {
+	let score = if size < pass.size && !slot.beaten(size) {
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
 		match verify_candidate(cx, still, env, lowered, &path, bytes).await {
 			Ok(score) => Some(score),
@@ -750,19 +770,88 @@ async fn step_down(
 		None
 	};
 
-	if let Some(score) = score.filter(|score| *score >= target) {
-		let _ = fs::remove_file(&pass.path);
-		return Ok(Some(Pass {
+	match score {
+		Some(score) if score >= target => Ok(StepDown::Passed(Pass {
 			path,
 			size,
 			candidate: lowered,
 			score,
 			parts,
+			rebuilt: false,
+		})),
+		missed => {
+			let _ = fs::remove_file(&path);
+			Ok(missed.map_or(StepDown::Skipped, |_| StepDown::Missed(lowered)))
+		}
+	}
+}
+
+/// The lower encode once its gain map passed, or, when that gain map had to be rebuilt, whichever of the two passes is
+/// smaller after both gain maps were checked. `Err` gives back the earlier pass, unchecked, when the lower encode's gain
+/// map failed it. The file not kept is removed.
+async fn either_pass(
+	cx: &ImageContext<'_>,
+	workspace: &Workspace,
+	still: &Still,
+	env: &Env<'_>,
+	slot: Slot,
+	mut earlier: Pass,
+	mut lowered: Pass,
+) -> Result<Result<Tried, Pass>, JobError> {
+	let Ok(gain_map) = Box::pin(gain_map_checked(cx, workspace, still, env, slot, &mut lowered)).await? else {
+		let _ = fs::remove_file(&lowered.path);
+		return Ok(Err(earlier));
+	};
+
+	if lowered.rebuilt
+		&& let Ok(earlier_gain_map) = Box::pin(gain_map_checked(cx, workspace, still, env, slot, &mut earlier)).await?
+		&& earlier.size <= lowered.size
+	{
+		let _ = fs::remove_file(&lowered.path);
+		return Ok(Ok(earlier.passed(earlier_gain_map, false, None)));
+	}
+
+	let _ = fs::remove_file(&earlier.path);
+	Ok(Ok(lowered.passed(gain_map, false, None)))
+}
+
+/// The score of the HDR gain map `pass` carries, if any, or what the candidate comes to when the gain map missed or
+/// the file rebuilt around it no longer fits.
+async fn gain_map_checked(
+	cx: &ImageContext<'_>,
+	workspace: &Workspace,
+	still: &Still,
+	env: &Env<'_>,
+	slot: Slot,
+	pass: &mut Pass,
+) -> Result<Result<Option<f64>, Tried>, JobError> {
+	let Some(parts) = pass.parts.take() else {
+		return Ok(Ok(None));
+	};
+
+	let checked = match Box::pin(check_gain_map(cx, workspace, still, env, &pass.path, parts)).await {
+		Ok(checked) => checked,
+		Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Err(Tried::Failed(err))),
+		Err(err) => return Err(err),
+	};
+	pass.size = checked.rebuilt.unwrap_or(pass.size);
+	pass.rebuilt = checked.rebuilt.is_some();
+
+	if checked.missed && !cx.forced {
+		return Ok(Err(Tried::GainMapMissed {
+			size: pass.size,
+			score: checked.score,
 		}));
 	}
 
-	let _ = fs::remove_file(&path);
-	Ok(None)
+	if checked.rebuilt.is_some() && (too_large(cx, pass.size) || slot.beaten(pass.size)) {
+		return Ok(Err(Tried::TooLarge {
+			size: pass.size,
+			score: None,
+		}));
+	}
+
+	Ok(Ok(Some(checked.score)))
 }
 
 async fn verify_candidate(
