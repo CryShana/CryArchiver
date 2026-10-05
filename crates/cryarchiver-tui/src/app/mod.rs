@@ -111,8 +111,12 @@ pub(crate) struct LogScroll {
 }
 
 impl LogScroll {
-	pub fn set_page(&mut self, rows: usize) {
+	/// A page that now reaches the newest line drops the anchor, so the log follows new lines again.
+	pub fn set_page(&mut self, rows: usize, log: &Log) {
 		self.page = rows;
+		if self.newer(log) == 0 {
+			self.top = None;
+		}
 	}
 
 	/// How many lines newer than the top one are scrolled out of view.
@@ -317,10 +321,11 @@ impl<S: ArchiveSource> App<S> {
 	fn take_copied(&mut self) {
 		let Some(text) = self.ui.copied.take() else { return };
 
-		self.show(Notification {
+		let notice = Notification {
 			level: NoticeLevel::Info,
 			text: "copied log line".to_owned(),
-		});
+		};
+		self.toast = Some((notice, Instant::now()));
 		self.clipboard = Some(text);
 	}
 
@@ -625,7 +630,7 @@ mod tests {
 	fn a_scrolled_log_keeps_its_top_line_while_the_oldest_ones_fall_off() {
 		let mut log = log_of(10, 0..10);
 		let mut scroll = LogScroll::default();
-		scroll.set_page(3);
+		scroll.set_page(3, &log);
 		scroll.scroll_by(&log, 4);
 		assert_eq!(top(scroll, &log), "5");
 
@@ -648,7 +653,7 @@ mod tests {
 	fn scrolling_stops_at_the_oldest_page_and_back_at_the_newest_follows_again() {
 		let mut log = log_of(50, 0..10);
 		let mut scroll = LogScroll::default();
-		scroll.set_page(4);
+		scroll.set_page(4, &log);
 
 		scroll.page_by(&log, 5);
 		assert_eq!(scroll.newer(&log), 6);
@@ -658,5 +663,21 @@ mod tests {
 		scroll.scroll_by(&log, -6);
 		push(&mut log, 10);
 		assert_eq!(scroll.newer(&log), 0, "at the newest line the log follows new lines");
+	}
+
+	#[test]
+	fn a_taller_page_that_shows_the_newest_line_follows_new_lines_again() {
+		let mut log = log_of(50, 0..10);
+		let mut scroll = LogScroll::default();
+		scroll.set_page(3, &log);
+		scroll.scroll_by(&log, 2);
+
+		scroll.set_page(20, &log);
+		for n in 10..25 {
+			push(&mut log, n);
+		}
+		scroll.set_page(20, &log);
+
+		assert_eq!(scroll.newer(&log), 0);
 	}
 }

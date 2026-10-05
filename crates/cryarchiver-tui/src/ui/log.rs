@@ -26,12 +26,13 @@ pub fn render(buf: &mut Buffer, area: Rect, log: &Log, toast: Option<&Notificati
 		focused: maximized,
 	};
 	let inner = panel(buf, area, &theme, &chrome);
-	ui.log_scroll.set_page(usize::from(inner.height));
+	ui.log_scroll.set_page(usize::from(inner.height), log);
 
 	ui.hits.push(area, Hit::LogPanel);
 	if !maximized {
 		ui.hits.push(Rect::new(area.x, area.y, area.width, 1), Hit::LogToggle);
 	}
+
 	title_extras(buf, area, title, log, toast, ui);
 
 	let message_width = usize::from(inner.width.saturating_sub(14));

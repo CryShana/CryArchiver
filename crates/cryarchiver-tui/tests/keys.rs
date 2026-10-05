@@ -555,3 +555,79 @@ fn right_click_on_empty_log_space_or_its_border_does_nothing() {
 		assert_eq!(app.take_clipboard(), None);
 	}
 }
+
+#[test]
+fn right_click_on_the_normal_log_outside_its_lines_does_nothing() {
+	let mut app = app();
+	let selected = app.selected();
+	let terminal = draw(&mut app, 120, 36);
+	let title_row = log_title_row(&terminal);
+	let toggle = find_on_row(&terminal, title_row, "[⤢]").unwrap();
+
+	for (x, y) in [
+		(0, title_row + 1),
+		(3, title_row),
+		(toggle + 1, title_row),
+		(60, title_row + 5),
+	] {
+		mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y, Instant::now());
+		assert_eq!(app.overlay(), None, "right-click at {x},{y}");
+		assert_eq!(app.take_clipboard(), None);
+		assert_eq!(app.selected(), selected);
+		draw(&mut app, 120, 36);
+	}
+}
+
+#[test]
+fn wheel_outside_the_maximized_log_leaves_the_hidden_library_alone() {
+	let mut app = app();
+	let before = support::row_text(&draw(&mut app, 120, 36), 12);
+	press(&mut app, KeyCode::Char('L'));
+	draw(&mut app, 120, 36);
+
+	mouse(&mut app, MouseEventKind::ScrollDown, 40, 0, Instant::now());
+	mouse(&mut app, MouseEventKind::ScrollDown, 40, 35, Instant::now());
+	press(&mut app, KeyCode::Char('L'));
+
+	assert_eq!(support::row_text(&draw(&mut app, 120, 36), 12), before);
+}
+
+#[test]
+fn i_from_the_maximized_log_always_shows_the_issues() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('i'));
+	press(&mut app, KeyCode::Char('L'));
+
+	press(&mut app, KeyCode::Char('i'));
+
+	assert!(!app.log_maximized());
+	assert_eq!(app.mode(), ViewMode::Issues);
+}
+
+#[test]
+fn the_copy_confirmation_shows_over_a_recent_warning() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let title_row = log_title_row(&terminal);
+	app.source_mut().perform(cryarchiver_tui::Action::ChangeSettings(
+		cryarchiver_tui::source::SettingsChange::DeleteOriginals {
+			enabled: true,
+			confirmation: "nope".to_owned(),
+		},
+	));
+	app.refresh();
+	assert_eq!(
+		app.toast().map(|toast| toast.level),
+		Some(cryarchiver_tui::view::NoticeLevel::Error)
+	);
+
+	mouse(
+		&mut app,
+		MouseEventKind::Down(MouseButton::Right),
+		60,
+		title_row + 1,
+		Instant::now(),
+	);
+
+	assert_eq!(app.toast().map(|toast| toast.text.as_str()), Some("copied log line"));
+}

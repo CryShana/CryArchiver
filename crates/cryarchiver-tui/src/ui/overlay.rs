@@ -7,7 +7,7 @@ use crate::app::{Hit, HitMap, Menu};
 use crate::format::{fit, width};
 use crate::theme::Theme;
 
-const HELP_LEFT: [(&str, &str); 9] = [
+const HELP_LEFT: [(&str, &str); 10] = [
 	("↑ ↓  j k", "move selection"),
 	("PgUp PgDn", "page"),
 	("Home End", "first / last"),
@@ -16,7 +16,8 @@ const HELP_LEFT: [(&str, &str); 9] = [
 	("/", "filter by name"),
 	("Esc", "close / back / clear"),
 	("z", "maximize library"),
-	("L", "maximize log"),
+	("L", "maximize log, where"),
+	("", "↑↓ Home End scroll it"),
 ];
 
 const HELP_RIGHT: [(&str, &str); 10] = [

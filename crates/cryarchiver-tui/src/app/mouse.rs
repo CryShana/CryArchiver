@@ -243,6 +243,10 @@ impl Ui {
 			return Outcome::Done;
 		}
 
+		if self.layout.log_maximized {
+			return Outcome::Ignored;
+		}
+
 		if self.issues_area.is_some_and(|area| area.contains(position)) {
 			let last = source.view().issues.len().saturating_sub(1);
 			let index = self.issue_selected.saturating_add_signed(rows.signum()).min(last);

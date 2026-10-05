@@ -150,8 +150,11 @@ impl Ui {
 				self.mode = ViewMode::Library;
 				self.search = Some(Input::new(self.filter.clone()));
 			}
-			KeyCode::Char('i') => {
+			KeyCode::Char('i') if self.layout.log_maximized => {
 				self.layout.log_maximized = false;
+				self.mode = ViewMode::Issues;
+			}
+			KeyCode::Char('i') => {
 				self.mode = if self.mode == ViewMode::Issues {
 					ViewMode::Library
 				} else {
