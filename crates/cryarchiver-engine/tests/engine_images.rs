@@ -407,6 +407,108 @@ async fn a_lower_encode_that_is_not_smaller_is_not_verified() {
 	assert_eq!(decision.image.unwrap().setting.as_deref(), Some("distance 0.10"));
 }
 
+fn jpeg_of(dir: &Path, name: &str, pixels: &RgbImage, quality: u8) -> (PathBuf, u64) {
+	let path = dir.join(name);
+	let mut jpeg = Vec::new();
+	JpegEncoder::new_with_quality(&mut jpeg, quality)
+		.encode_image(pixels)
+		.unwrap();
+	std::fs::write(&path, &jpeg).unwrap();
+	(path, jpeg.len() as u64)
+}
+
+fn photo_pixels(dir: &Path) -> RgbImage {
+	image::open(support::photo_png(dir, "pixels.png", 320, 240))
+		.unwrap()
+		.to_rgb8()
+}
+
+/// Gradients under strong grain, which ravif at FAST's quality 88 scores less than 2 points above 80.
+fn grainy(width: u32, height: u32) -> RgbImage {
+	let mut state = 7_u32;
+	RgbImage::from_fn(width, height, |x, y| {
+		state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+		let grain = (state >> 16) % 32;
+		Rgb([
+			u8::try_from(40 + x * 160 / width + grain).unwrap(),
+			u8::try_from(60 + y * 140 / height + grain).unwrap(),
+			u8::try_from(90 + (x + y) * 60 / (width + height) + grain).unwrap(),
+		])
+	})
+}
+
+fn not_smaller_bytes(outcome: &JobOutcome) -> u64 {
+	match outcome {
+		JobOutcome::KeptOriginal {
+			reason: KeepReason::NotSmaller { out_bytes, .. },
+		} => *out_bytes,
+		other => panic!("{other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn a_first_encode_that_saves_too_little_can_still_step_down_to_one_that_saves_enough() {
+	let dir = tempfile::tempdir().unwrap();
+	let (photo, source_bytes) = jpeg_of(dir.path(), "photo.jpg", &photo_pixels(dir.path()), 85);
+	let memory = Arc::new(SharedMemory::default());
+
+	let (outcome, stages) = run_counting_stages(&memory, &job(&photo), dir.path()).await;
+
+	let (quality, score) = chosen_quality(&outcome);
+	let JobOutcome::Encoded { output, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
+	assert!(quality < 88.0, "{quality}");
+	assert!(score >= 80.0, "{score}");
+	let written = std::fs::metadata(output).unwrap().len();
+	assert!(written * 10 <= source_bytes * 9, "{written} of {source_bytes}");
+	assert_eq!(memory.entries().len(), 1, "the written encode teaches its group");
+}
+
+#[tokio::test]
+async fn a_step_down_that_still_saves_too_little_keeps_the_original() {
+	let dir = tempfile::tempdir().unwrap();
+	let (photo, source_bytes) = jpeg_of(dir.path(), "photo.jpg", &photo_pixels(dir.path()), 80);
+	let memory = Arc::new(SharedMemory::default());
+
+	let (outcome, stages) = run_counting_stages(&memory, &job(&photo), dir.path()).await;
+
+	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
+	let smallest = not_smaller_bytes(&outcome);
+	assert!(smallest * 10 > source_bytes * 9, "{smallest} of {source_bytes}");
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn a_first_encode_that_saves_too_little_with_little_spare_keeps_the_original() {
+	let dir = tempfile::tempdir().unwrap();
+	let (photo, source_bytes) = jpeg_of(dir.path(), "grainy.jpg", &grainy(320, 240), 85);
+	let memory = Arc::new(SharedMemory::default());
+
+	let (outcome, stages) = run_counting_stages(&memory, &job(&photo), dir.path()).await;
+
+	assert_eq!(stages, [Stage::Encode, Stage::Verify]);
+	let first = not_smaller_bytes(&outcome);
+	assert!(first * 10 > source_bytes * 9, "{first} of {source_bytes}");
+	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+}
+
+#[tokio::test]
+async fn a_first_encode_far_past_the_savings_limit_is_not_verified() {
+	let dir = tempfile::tempdir().unwrap();
+	let (photo, source_bytes) = jpeg_of(dir.path(), "photo.jpg", &photo_pixels(dir.path()), 60);
+
+	let (outcome, stages) = run_counting_stages(&Arc::new(SharedMemory::default()), &job(&photo), dir.path()).await;
+
+	assert_eq!(stages, [Stage::Encode]);
+	let first = not_smaller_bytes(&outcome);
+	assert!(
+		first * 100 > source_bytes * 90 * 125 / 100,
+		"{first} is past 1.25 times the {source_bytes} B source's savings limit"
+	);
+}
+
 const GRAPHIC_GROUP_AT_FAST: &str = "image/png/graphic/opaque/8bit/mp1|ravif-0.13.0|p9|t80.0";
 const STRICT_GRAPHIC_GROUP_AT_FAST: &str = "image/png/graphic/opaque/8bit/mp1|ravif-0.13.0|p9|t95.0";
 
