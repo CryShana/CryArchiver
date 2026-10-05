@@ -269,6 +269,70 @@ fn videos_after_the_image_and_motion_photo_xmp_are_auxiliary() {
 	);
 }
 
+/// A Samsung SEF trailer: each record is two padding bytes, its type, its name's length and name, then its data;
+/// a `SEFH` directory of (padding, type, offset back from the directory, length) entries ends the file with `SEFT`.
+fn sef_trailer(records: &[(&[u8], usize)]) -> Vec<u8> {
+	let mut data = Vec::new();
+	let mut entries = Vec::new();
+	for (name, size) in records {
+		let start = data.len();
+		data.extend_from_slice(&[0, 0, 0x01, 0x0B]);
+		data.extend_from_slice(&u32::try_from(name.len()).unwrap().to_le_bytes());
+		data.extend_from_slice(name);
+		data.extend(std::iter::repeat_n(0x42, *size));
+		entries.push((start, data.len() - start));
+	}
+
+	let mut directory = b"SEFH".to_vec();
+	directory.extend_from_slice(&107u32.to_le_bytes());
+	directory.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_le_bytes());
+	for (start, length) in entries {
+		directory.extend_from_slice(&[0, 0, 0x01, 0x0B]);
+		directory.extend_from_slice(&u32::try_from(data.len() - start).unwrap().to_le_bytes());
+		directory.extend_from_slice(&u32::try_from(length).unwrap().to_le_bytes());
+	}
+	directory.extend_from_slice(&u32::try_from(directory.len()).unwrap().to_le_bytes());
+	directory.extend_from_slice(b"SEFT");
+	[data, directory].concat()
+}
+
+#[test]
+fn a_samsung_live_focus_trailer_is_named() {
+	let plain = jpeg(&[], 3);
+	let live_focus = [
+		plain.clone(),
+		sef_trailer(&[
+			(b"DualShot_1", 3000),
+			(b"DualShot_DepthMap_1", 1500),
+			(b"DualShot_Extra_Info", 64),
+		]),
+	]
+	.concat();
+	let other_sef = [plain.clone(), sef_trailer(&[(b"Image_UTC_Data", 3000)])].concat();
+	let mut lying_length = sef_trailer(&[(b"DualShot_1", 3000)]);
+	lying_length[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+	let lying = [plain.clone(), lying_length].concat();
+	let unframed = [plain, b"\x0a\0\0\0DualShot_1".to_vec(), vec![0x42; 3000]].concat();
+
+	assert_eq!(
+		extract(&live_focus).aux,
+		[AuxKind::Other(
+			"Samsung Live Focus: the unblurred original and its depth map".into()
+		)]
+	);
+	for (bytes, name) in [
+		(&other_sef, "other SEF"),
+		(&lying, "lying length"),
+		(&unframed, "no SEF framing"),
+	] {
+		assert!(
+			matches!(&extract(bytes).aux[..], [AuxKind::Other(detail)] if detail.ends_with("bytes after the image")),
+			"{name}: {:?}",
+			extract(bytes).aux
+		);
+	}
+}
+
 fn ultra_hdr(opts: &UltraHdrOptions) -> Vec<u8> {
 	let base = image::RgbImage::from_fn(64, 48, |x, y| {
 		image::Rgb([u8::try_from(x * 4).unwrap(), u8::try_from(y * 5).unwrap(), 90])

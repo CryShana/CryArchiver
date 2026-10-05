@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cryarchiver_engine::images::decode::{
-	Decoded, IMAGE_DECODE_ERRORS, Undecodable, decode, deep_pix_fmt, header_dimensions,
+	Decoded, IMAGE_DECODE_ERRORS, PamRequest, Undecodable, decode, deep_pix_fmt, header_dimensions, pam_command,
 };
 use cryarchiver_engine::images::props::effective;
 use cryarchiver_engine::metadata::extract;
@@ -384,5 +384,29 @@ async fn generated_images_decode_with_their_effective_properties() {
 			"{}",
 			path.display()
 		);
+	}
+}
+
+#[test]
+fn only_a_first_stream_request_picks_the_first_video_stream() {
+	let argv = |alpha_item: bool, first_stream: bool| -> Vec<String> {
+		let request = PamRequest {
+			alpha_item,
+			deep: true,
+			keep_stored_orientation: false,
+			first_stream,
+		};
+		pam_command(Path::new("ffmpeg"), Path::new("out.avif"), request)
+			.args
+			.iter()
+			.map(|arg| arg.to_string_lossy().into_owned())
+			.collect()
+	};
+	let mapped = argv(false, true);
+	let input = mapped.iter().position(|arg| arg == "-i").unwrap();
+
+	assert_eq!(mapped[input + 2..input + 4], ["-map", "0:v:0"]);
+	for unmapped in [argv(false, false), argv(true, false), argv(true, true)] {
+		assert!(!unmapped.iter().any(|arg| arg == "-map"), "{unmapped:?}");
 	}
 }

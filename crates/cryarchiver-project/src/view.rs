@@ -322,7 +322,7 @@ pub fn decision_lines(decision: &Decision) -> Vec<DecisionLine> {
 		}
 
 		if let Some(score) = image.gain_map {
-			lines.push(plain("HDR gain map", format!("kept · SSIMULACRA2 {score:.1}")));
+			lines.push(plain("HDR", format!("gain map kept · SSIMULACRA2 {score:.1}")));
 		}
 	}
 
@@ -749,9 +749,60 @@ mod tests {
 			[
 				line("Encoder", "AVIF, quality 88", false),
 				line("Check", "SSIMULACRA2 84.0 vs 80", false),
-				line("HDR gain map", "kept · SSIMULACRA2 81.2", false),
+				line("HDR", "gain map kept · SSIMULACRA2 81.2", false),
 			]
 		);
+	}
+
+	#[test]
+	fn every_decision_label_fits_the_details_label_column() {
+		// The TUI's details pane gives labels 9 cells, the last one for the gap before the value.
+		const DETAILS_LABEL_CELLS: usize = 8;
+
+		let decision = Decision {
+			video: Some(VideoDecision {
+				encoder: "SVT-AV1 preset 5".into(),
+				crf: Some(30.0),
+				chosen: Some(CrfChoice::Searched),
+				target: Some(Vmaf { mean: 91.0, p5: 86.5 }),
+				checks: vec![Measured::default(); 2],
+				reencode: Some(Reencode::default()),
+				near_miss: true,
+				grain: Some(4),
+				scan: Some(Scan::Interlaced),
+				resized: Some((1280, 720)),
+				..VideoDecision::default()
+			}),
+			image: Some(ImageDecision {
+				route: "AVIF".into(),
+				score: Some(84.0),
+				gain_map: Some(81.2),
+				..ImageDecision::default()
+			}),
+			audio: Some(AudioDecision {
+				tracks: vec![AudioTrack::default()],
+			}),
+			stages: vec![StageTime {
+				stage: "encode".into(),
+				seconds: 5.0,
+			}],
+			warnings: vec!["a note".into()],
+			..Decision::default()
+		};
+		let skipped = Decision {
+			video: Some(VideoDecision {
+				skipped_retry: Some(cryarchiver_engine::decision::SkippedRetry::default()),
+				..VideoDecision::default()
+			}),
+			..Decision::default()
+		};
+
+		let lines = [decision_lines(&decision), decision_lines(&skipped)].concat();
+
+		assert!(lines.len() >= 11, "{lines:?}");
+		for line in &lines {
+			assert!(line.label.chars().count() <= DETAILS_LABEL_CELLS, "{line:?}");
+		}
 	}
 
 	#[test]

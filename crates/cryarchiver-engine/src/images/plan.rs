@@ -267,6 +267,9 @@ pub fn precheck(input: &PrecheckInput<'_>) -> Result<Vec<String>, Gate> {
 		}
 
 		warnings.extend(depth.into_iter().filter_map(|aux| match aux {
+			AuxKind::Depth(detail) if detail.starts_with("urn:") => {
+				Some("the depth map was dropped (HEIF auxiliary image)".to_owned())
+			}
 			AuxKind::Depth(detail) => Some(format!("the depth map was dropped ({detail})")),
 			_ => None,
 		}));
@@ -929,6 +932,7 @@ mod tests {
 			aux: vec![
 				AuxKind::Depth("Google depth map".into()),
 				AuxKind::Depth("MPF disparity image".into()),
+				AuxKind::Depth("urn:mpeg:hevc:2015:auxid:2".into()),
 			],
 			..SourceMetadata::default()
 		};
@@ -946,6 +950,7 @@ mod tests {
 			Ok(vec![
 				"the depth map was dropped (Google depth map)".to_owned(),
 				"the depth map was dropped (MPF disparity image)".to_owned(),
+				"the depth map was dropped (HEIF auxiliary image)".to_owned(),
 			])
 		);
 		assert_eq!(

@@ -123,6 +123,7 @@ pub fn outcome_line_with(source: &Path, outcome: &JobOutcome, tail_lines: usize,
 			if decision.image.as_ref().is_some_and(|image| image.gain_map.is_some()) {
 				line.push_str(" + HDR gain map");
 			}
+
 			for warning in warnings.iter().filter(|warning| !shown.contains(warning)) {
 				let _ = write!(line, "\n    ⚠ {}", display_name(OsStr::new(warning)));
 			}

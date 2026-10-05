@@ -148,7 +148,6 @@ pub struct ImageDecision {
 	pub score: Option<f64>,
 	pub target: Option<f64>,
 	/// The SSIMULACRA2 score of the HDR gain map the output carries.
-	#[serde(default)]
 	pub gain_map: Option<f64>,
 }
 

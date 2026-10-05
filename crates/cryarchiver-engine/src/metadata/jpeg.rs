@@ -17,6 +17,9 @@ const APP13: u8 = 0xED;
 const APP14: u8 = 0xEE;
 const COMMENT: u8 = 0xFE;
 const SAMSUNG_MOTION_PHOTO: &[u8] = b"MotionPhoto_Data";
+const SEF_START: &[u8] = b"SEFH";
+const SEF_END: &[u8] = b"SEFT";
+const DUAL_SHOT: &[u8] = b"DualShot_";
 const MIN_TRAILING_CONTENT: usize = 1024;
 
 struct ExtendedPart<'a> {
@@ -129,6 +132,7 @@ fn read_gain_map(bytes: &[u8], mpf: Option<(&[u8], usize)>, trailer: Option<AuxK
 				metadata.gain_map_trailer =
 					trailer.map(|trailer| (trailer, trailing_content(bytes, found.jpeg.end, mpf)));
 			}
+
 			metadata.gain_map = Some(found);
 		}
 		Some(Err(reason)) => metadata
@@ -209,9 +213,40 @@ fn trailing_content(bytes: &[u8], image_end: usize, mpf: Option<(&[u8], usize)>)
 	let mp4 = unaccounted.get(4..8) == Some(b"ftyp");
 	Some(if mp4 {
 		AuxKind::MotionVideo("an MP4 video after the image".into())
+	} else if samsung_live_focus(unaccounted) {
+		AuxKind::Other("Samsung Live Focus: the unblurred original and its depth map".into())
 	} else {
 		AuxKind::Other(format!("{} bytes after the image", unaccounted.len()))
 	})
+}
+
+/// A Samsung SEF trailer (records, then a `SEFH` directory ending in `SEFT`) that holds a Live Focus `DualShot_`
+/// record.
+fn samsung_live_focus(trailer: &[u8]) -> bool {
+	if !trailer.ends_with(SEF_END) || !trailer.windows(SEF_START.len()).any(|window| window == SEF_START) {
+		return false;
+	}
+
+	trailer
+		.windows(DUAL_SHOT.len())
+		.enumerate()
+		.any(|(at, window)| window == DUAL_SHOT && sef_record_name_at(trailer, at))
+}
+
+/// Each SEF record starts with its name's length as a little-endian u32, then the name in ASCII.
+fn sef_record_name_at(trailer: &[u8], at: usize) -> bool {
+	let Some(length) = at
+		.checked_sub(4)
+		.and_then(|start| trailer.get(start..at))
+		.and_then(|length| <[u8; 4]>::try_from(length).ok())
+		.and_then(|length| usize::try_from(u32::from_le_bytes(length)).ok())
+	else {
+		return false;
+	};
+
+	at.checked_add(length)
+		.and_then(|end| trailer.get(at..end))
+		.is_some_and(|name| name.len() >= DUAL_SHOT.len() && name.iter().all(u8::is_ascii_graphic))
 }
 
 fn read_segment<'a>(marker: u8, payload: &'a [u8], metadata: &mut SourceMetadata, segments: &mut Segments<'a>) {

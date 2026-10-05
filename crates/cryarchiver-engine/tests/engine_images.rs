@@ -6,25 +6,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, check};
+use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, check, gain_map_av1};
 use cryarchiver_engine::container::isobmff::{Property, parse_meta};
 use cryarchiver_engine::container::jxl::read_boxes;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::animated;
-use cryarchiver_engine::images::avif::{AvifColour, output_cicp};
+use cryarchiver_engine::images::avif::{AvifColour, encode as encode_avif, finish, output_cicp};
 use cryarchiver_engine::images::decode::oriented;
-use cryarchiver_engine::images::gain_map::TARGET;
-use cryarchiver_engine::images::plan::{GAIN_MAP_NOT_IN_JXL, ImageRoute};
+use cryarchiver_engine::images::gain_map::{self, RAISED_QUALITY, TARGET};
+use cryarchiver_engine::images::plan::{GAIN_MAP_NOT_IN_JXL, ImageRoute, RavifSettings};
 use cryarchiver_engine::images::ssim::score;
 use cryarchiver_engine::metadata::exif::orientation;
 use cryarchiver_engine::metadata::gain_map::GainMapMetadata;
+use cryarchiver_engine::metadata::{MetadataMode, build_output, extract};
 use cryarchiver_engine::options::{Advanced, JobOptions, Resize};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
 use cryarchiver_engine::sink::CliSink;
-use cryarchiver_engine::workspace::CLI_WORK_DIR;
+use cryarchiver_engine::workspace::{CLI_WORK_DIR, Workspace};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::{DynamicImage, GenericImageView, GrayImage, ImageEncoder, Luma, PixelWithColorType, Rgb, RgbImage};
@@ -1603,14 +1604,110 @@ async fn the_gain_map_is_turned_and_resized_with_the_photo() {
 		&UltraHdrOptions::default(),
 	);
 
-	let (turned, _, _) = encoded_with(run(&job(&rotated), dir.path()).await);
+	let (turned, _, _) = encoded_with(run(&job(&rotated), &dir.path().join("turned")).await);
 	let (halved, _, gain_map) = encoded_with(run(&resized(job(&plain), Some(128), None), dir.path()).await);
+	let (both, _, _) = encoded_with(run(&resized(job(&rotated), Some(96), None), &dir.path().join("both")).await);
 
 	checked_avif(&turned, (192, 256), Some(&opts.metadata)).unwrap();
 	assert_eq!(gain_map_size(&turned), Some((48, 64)));
 	checked_avif(&halved, (128, 96), Some(&opts.metadata)).unwrap();
 	assert_eq!(gain_map_size(&halved), Some((32, 24)));
 	assert!(gain_map.is_some_and(|score| score >= TARGET), "{gain_map:?}");
+	checked_avif(&both, (96, 128), Some(&opts.metadata)).unwrap();
+	assert_eq!(gain_map_size(&both), Some((24, 32)));
+}
+
+/// Gain map levels that SSIMULACRA2 scores below `TARGET` at quality 80 and above it at 90.
+fn coarse_noise(width: u32, height: u32) -> GrayImage {
+	let mut state = 0x1234_5678_u32;
+	GrayImage::from_fn(width, height, |_, _| {
+		state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+		Luma([if state >> 31 == 1 { 160 } else { 96 }])
+	})
+}
+
+fn low_target(source: &Path) -> Job {
+	Job {
+		overrides: Overrides {
+			image: Some(50.0),
+			..Overrides::default()
+		},
+		..job(source)
+	}
+}
+
+async fn run_with(memory: &Arc<SharedMemory>, job: &Job, out_dir: &Path) -> JobOutcome {
+	Engine::new(support::toolchain().await)
+		.with_image_threads(4)
+		.with_quality_memory(memory.clone())
+		.run(job, &sink(out_dir), &|_| {}, &CancellationToken::new())
+		.await
+}
+
+#[tokio::test]
+async fn a_gain_map_that_misses_is_encoded_again_at_the_raised_quality() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let source = ultra_hdr_photo(
+		dir.path(),
+		"noisy.jpg",
+		&coarse_noise(64, 48),
+		&UltraHdrOptions::default(),
+	);
+	let plain = dir.path().join("plain.jpg");
+	let mut jpeg = Vec::new();
+	JpegEncoder::new_with_quality(&mut jpeg, 90)
+		.encode_image(&noisy_base(256, 192))
+		.unwrap();
+	std::fs::write(&plain, jpeg).unwrap();
+
+	let bytes = std::fs::read(&source).unwrap();
+	let gain = gain_map::decode(&bytes, &extract(&bytes).gain_map.unwrap()).unwrap();
+	let workspace = Workspace::create(&dir.path().join(".probe-work"), &source).unwrap();
+	let at_80 = gain_map::encode(&gain, 80.0, 9, 4).unwrap();
+	let first = gain_map::score(&tools, &workspace, &at_80, &gain, &CancellationToken::new())
+		.await
+		.unwrap();
+	assert!(first < TARGET, "the fixture must miss at quality 80, scored {first}");
+
+	let plain_memory = Arc::new(SharedMemory::default());
+	let hdr_memory = Arc::new(SharedMemory::default());
+	encoded(run_with(&plain_memory, &low_target(&plain), &dir.path().join("plain")).await);
+	encoded(run_with(&hdr_memory, &low_target(&source), &dir.path().join("hdr")).await);
+	let (key, plain_learned) = plain_memory.entries().remove(0);
+	assert_eq!(
+		hdr_memory.entries(),
+		[(key.clone(), plain_learned)],
+		"a carried gain map doesn't change what the base teaches"
+	);
+
+	let low = Arc::new(SharedMemory::with_entries([(
+		key,
+		GroupStats {
+			setting: 1.0,
+			slope: None,
+			bpp: None,
+			offset: None,
+			observations: 5,
+			without_grain: false,
+		},
+	)]));
+	let outcome = run_with(&low, &low_target(&source), &dir.path().join("low")).await;
+
+	let JobOutcome::Encoded { output, decision, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let image = decision.image.unwrap();
+	let avif = std::fs::read(output).unwrap();
+	assert_eq!(image.setting.as_deref(), Some("quality 80"));
+	assert!(image.gain_map.is_some_and(|score| score >= TARGET), "{image:?}");
+	checked_avif(&avif, (256, 192), Some(&UltraHdrOptions::default().metadata)).unwrap();
+	let raised = gain_map::encode(&gain, RAISED_QUALITY, 9, 4).unwrap();
+	assert_eq!(
+		gain_map_av1(&avif).unwrap(),
+		parse_meta(&raised).unwrap().item_data(&raised, 1).unwrap(),
+		"the written gain map is the one encoded again at the raised quality"
+	);
 }
 
 #[tokio::test]
@@ -1737,12 +1834,39 @@ async fn a_jpeg_without_a_gain_map_has_no_gain_map_item_or_score() {
 	JpegEncoder::new_with_quality(&mut jpeg, 90)
 		.encode_image(&noisy_base(256, 192))
 		.unwrap();
-	std::fs::write(&source, jpeg).unwrap();
+	std::fs::write(&source, &jpeg).unwrap();
 
-	let (avif, warnings, gain_map) = encoded_with(run(&job(&source), dir.path()).await);
+	let outcome = run(&job(&source), dir.path()).await;
 
+	let JobOutcome::Encoded {
+		output,
+		warnings,
+		decision,
+		..
+	} = outcome
+	else {
+		panic!("{outcome:?}")
+	};
+	let avif = std::fs::read(output).unwrap();
+	let image = decision.image.unwrap();
 	checked_avif(&avif, (256, 192), None).unwrap();
 	assert_eq!(gain_map_size(&avif), None);
-	assert_eq!(gain_map, None);
+	assert_eq!((image.route.as_str(), image.gain_map), ("AVIF", None));
 	assert!(warnings.is_empty(), "{warnings:?}");
+
+	let quality: f32 = image
+		.setting
+		.unwrap()
+		.strip_prefix("quality ")
+		.unwrap()
+		.parse()
+		.unwrap();
+	let pixels = DynamicImage::ImageRgb8(image::load_from_memory(&jpeg).unwrap().to_rgb8());
+	let base = encode_avif(&pixels, false, RavifSettings { quality, speed: 9 }, 4).unwrap();
+	let metadata = build_output(&extract(&jpeg), MetadataMode::IccOnly, 256, 192);
+	let without_gain_map = finish(&base, AvifColour { icc: None, cicp: None }, &metadata, None).unwrap();
+	assert_eq!(
+		avif, without_gain_map,
+		"the same bytes as the encode without a gain map"
+	);
 }

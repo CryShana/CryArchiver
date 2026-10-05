@@ -109,12 +109,29 @@ struct GainMapParts {
 	speed: u8,
 }
 
+/// A candidate's gain map score after at most one encode at `gain_map::RAISED_QUALITY`.
+struct GainMapCheck {
+	score: f64,
+	missed: bool,
+	/// The candidate file's size after it was rebuilt around the gain map encoded again.
+	rebuilt: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GainMapStep {
+	Passed,
+	Retry,
+	Missed,
+}
+
 #[derive(Debug, Default)]
 struct Choice {
 	best: Option<(PathBuf, u64)>,
 	/// The score of `best` when it misses the target and is written only because it was requested.
 	best_short: Option<f64>,
 	best_rejected: Option<f64>,
+	/// The best gain map score of candidates that passed but whose HDR gain map missed its target.
+	gain_map_missed: Option<f64>,
 	smallest: Option<u64>,
 	failures: Vec<(Candidate, JobError)>,
 }
@@ -158,6 +175,11 @@ enum Tried {
 	TooLarge {
 		size: u64,
 		score: Option<f64>,
+	},
+	/// The image passed, but its HDR gain map missed `gain_map::TARGET`.
+	GainMapMissed {
+		size: u64,
+		score: f64,
 	},
 	Failed(JobError),
 }
@@ -536,6 +558,10 @@ async fn encode_and_choose(
 					choice.reject(score);
 				}
 			}
+			Tried::GainMapMissed { size, score } => {
+				choice.note(size);
+				choice.gain_map_missed = Some(choice.gain_map_missed.map_or(score, |best| best.max(score)));
+			}
 			Tried::Failed(err) => choice.failures.push((candidate, err)),
 		}
 	}
@@ -547,6 +573,8 @@ async fn encode_and_choose(
 	{
 		notes.push(kept_as_requested(cx.source_bytes, *size, WrittenBy::Request));
 	}
+
+	notes.extend(gain_map_short_note(picked.as_ref()));
 
 	let mut warnings = still.warnings;
 	warnings.extend(notes);
@@ -597,59 +625,56 @@ async fn try_candidate(
 			Err(err) => return Err(err),
 		};
 
+		let short = if score >= still.plan.target {
+			false
+		} else {
+			match candidate
+				.raised(score, still.plan.target)
+				.filter(|_| retries < plan::MAX_RETRIES)
+			{
+				Some(raised) => {
+					candidate = raised;
+					retries += 1;
+					last_score = Some(score);
+					continue;
+				}
+				None if cx.forced => true,
+				None => return Ok(Tried::Rejected { size, score }),
+			}
+		};
+
 		let mut gain_map = None;
 		if let Some(parts) = parts {
-			let (gain_map_score, rebuilt) =
-				match Box::pin(check_gain_map(cx, workspace, still, env, &path, parts)).await {
-					Ok(checked) => checked,
-					Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Tried::Failed(err)),
-					Err(err) => return Err(err),
-				};
-			gain_map = Some(gain_map_score);
-
-			if let Some(rebuilt) = rebuilt {
-				size = rebuilt;
-				if too_large(size) || beaten(size) {
-					return Ok(Tried::TooLarge {
-						size,
-						score: last_score,
-					});
-				}
-			}
-		}
-
-		if score >= still.plan.target {
-			return Ok(Tried::Passed {
-				path,
-				size,
-				candidate,
-				score,
-				gain_map,
-				short: false,
-			});
-		}
-
-		match candidate
-			.raised(score, still.plan.target)
-			.filter(|_| retries < plan::MAX_RETRIES)
-		{
-			Some(raised) => {
-				candidate = raised;
-				retries += 1;
-				last_score = Some(score);
-			}
-			None if cx.forced => {
-				return Ok(Tried::Passed {
-					path,
+			let checked = match Box::pin(check_gain_map(cx, workspace, still, env, &path, parts)).await {
+				Ok(checked) => checked,
+				Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Tried::Failed(err)),
+				Err(err) => return Err(err),
+			};
+			size = checked.rebuilt.unwrap_or(size);
+			if checked.missed && !cx.forced {
+				return Ok(Tried::GainMapMissed {
 					size,
-					candidate,
-					score,
-					gain_map,
-					short: true,
+					score: checked.score,
 				});
 			}
-			None => return Ok(Tried::Rejected { size, score }),
+
+			if checked.rebuilt.is_some() && (too_large(size) || beaten(size)) {
+				return Ok(Tried::TooLarge {
+					size,
+					score: last_score,
+				});
+			}
+			gain_map = Some(checked.score);
 		}
+
+		return Ok(Tried::Passed {
+			path,
+			size,
+			candidate,
+			score,
+			gain_map,
+			short,
+		});
 	}
 }
 
@@ -824,8 +849,8 @@ fn with_gain_map(base: &[u8], gain_map: &[u8], still: &Still, env: &Env<'_>) -> 
 	Ok(avif::finish(base, env.colour, &still.metadata, Some(&input)).map_err(ErrorKind::EncodeFailed)?)
 }
 
-/// Scores the candidate's gain map; one that misses `gain_map::TARGET` is encoded once more at
-/// `gain_map::RAISED_QUALITY` and the file at `path` rebuilt around it, whose new size comes back with the score.
+/// Scores the candidate's gain map; one that misses `gain_map::TARGET` below `gain_map::RAISED_QUALITY` is encoded
+/// once more at it, and the file at `path` rebuilt around the new gain map.
 async fn check_gain_map(
 	cx: &ImageContext<'_>,
 	workspace: &Workspace,
@@ -833,15 +858,16 @@ async fn check_gain_map(
 	env: &Env<'_>,
 	path: &Path,
 	parts: GainMapParts,
-) -> Result<(f64, Option<u64>), JobError> {
+) -> Result<GainMapCheck, JobError> {
 	let carried = still.gain_map.as_ref().expect("only called with a carried gain map");
 	let score = gain_map::score(cx.tools, workspace, &parts.gain_map, &carried.image, cx.cancel).await?;
-	if score >= gain_map::TARGET {
-		return Ok((score, None));
-	}
-
-	if parts.quality >= gain_map::RAISED_QUALITY {
-		return Err(gain_map_missed(score));
+	let step = gain_map_step(score, parts.quality);
+	if step != GainMapStep::Retry {
+		return Ok(GainMapCheck {
+			score,
+			missed: step == GainMapStep::Missed,
+			rebuilt: None,
+		});
 	}
 
 	let gain_map = encode_gain_map(cx, carried, gain_map::RAISED_QUALITY, parts.speed).await?;
@@ -850,15 +876,28 @@ async fn check_gain_map(
 	verify::check_avif(&bytes, &env.expected)?;
 
 	let score = gain_map::score(cx.tools, workspace, &gain_map, &carried.image, cx.cancel).await?;
-	if score < gain_map::TARGET {
-		return Err(gain_map_missed(score));
-	}
-	Ok((score, Some(bytes.len() as u64)))
+	Ok(GainMapCheck {
+		score,
+		missed: gain_map_step(score, gain_map::RAISED_QUALITY) == GainMapStep::Missed,
+		rebuilt: Some(bytes.len() as u64),
+	})
 }
 
-fn gain_map_missed(score: f64) -> JobError {
-	JobError::verification(format!(
-		"the HDR gain map scored {score:.1}, below {:.0}",
+fn gain_map_step(score: f64, quality: f32) -> GainMapStep {
+	if score >= gain_map::TARGET {
+		GainMapStep::Passed
+	} else if quality < gain_map::RAISED_QUALITY {
+		GainMapStep::Retry
+	} else {
+		GainMapStep::Missed
+	}
+}
+
+/// The note for a requested output written although its HDR gain map missed its target.
+fn gain_map_short_note(picked: Option<&ImageDecision>) -> Option<String> {
+	let score = picked?.gain_map.filter(|score| *score < gain_map::TARGET)?;
+	Some(format!(
+		"the HDR gain map scored {score:.1}, below {:.0}; it was written because it was requested",
 		gain_map::TARGET
 	))
 }
@@ -928,6 +967,14 @@ fn verdict(choice: Choice, target: f64, source_bytes: u64) -> Verdict {
 	if let Some((path, bytes)) = choice.best {
 		return Verdict::Output(path, bytes);
 	}
+
+	if let Some(score) = choice.gain_map_missed {
+		return Verdict::Kept(KeepReason::QualityUnreachable(format!(
+			"its HDR gain map scored {score:.1}, below {:.0}",
+			gain_map::TARGET
+		)));
+	}
+
 	if let Some(score) = choice.best_rejected {
 		return Verdict::Kept(KeepReason::QualityUnreachable(format!(
 			"quality target not reached at a smaller size (SSIMULACRA2 {score:.1}, target {target:.0})"
@@ -1230,6 +1277,54 @@ mod tests {
 			verdict(Choice::default(), 80.0, 1000),
 			Verdict::Kept(KeepReason::NotSmaller { .. })
 		));
+	}
+
+	#[test]
+	fn a_gain_map_that_misses_keeps_the_original_unless_another_candidate_was_written() {
+		let missed = Choice {
+			gain_map_missed: Some(65.04),
+			smallest: Some(500),
+			..Choice::default()
+		};
+		let missed_and_written = Choice {
+			best: Some((PathBuf::from("candidate1.avif"), 400)),
+			gain_map_missed: Some(65.0),
+			..Choice::default()
+		};
+
+		assert!(matches!(
+			verdict(missed, 80.0, 1000),
+			Verdict::Kept(KeepReason::QualityUnreachable(reason)) if reason == "its HDR gain map scored 65.0, below 70"
+		));
+		assert!(matches!(
+			verdict(missed_and_written, 80.0, 1000),
+			Verdict::Output(_, 400)
+		));
+	}
+
+	#[test]
+	fn a_gain_map_below_its_target_is_encoded_again_only_below_the_raised_quality() {
+		assert_eq!(gain_map_step(gain_map::TARGET, 60.0), GainMapStep::Passed);
+		assert_eq!(gain_map_step(85.0, 95.0), GainMapStep::Passed);
+		assert_eq!(gain_map_step(65.0, 88.0), GainMapStep::Retry);
+		assert_eq!(gain_map_step(65.0, gain_map::RAISED_QUALITY), GainMapStep::Missed);
+		assert_eq!(gain_map_step(65.0, 95.0), GainMapStep::Missed);
+	}
+
+	#[test]
+	fn a_requested_output_with_a_gain_map_below_its_target_says_so() {
+		let decision = |gain_map| ImageDecision {
+			gain_map,
+			..ImageDecision::default()
+		};
+
+		assert_eq!(
+			gain_map_short_note(Some(&decision(Some(64.96)))).as_deref(),
+			Some("the HDR gain map scored 65.0, below 70; it was written because it was requested")
+		);
+		assert_eq!(gain_map_short_note(Some(&decision(Some(70.0)))), None);
+		assert_eq!(gain_map_short_note(Some(&decision(None))), None);
+		assert_eq!(gain_map_short_note(None), None);
 	}
 
 	#[test]
