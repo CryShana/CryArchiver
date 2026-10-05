@@ -49,7 +49,7 @@ fn an_opaque_still_becomes_a_checked_avif_with_its_metadata() {
 	};
 
 	let encoded = encode(&gradient(), false, QUICK, 2).unwrap();
-	let avif = finish(&encoded, colour, &metadata).unwrap();
+	let avif = finish(&encoded, colour, &metadata, None).unwrap();
 
 	check(
 		&avif,
@@ -86,6 +86,7 @@ fn transparent_and_sixteen_bit_stills_encode() {
 		&encode(&transparent, true, QUICK, 1).unwrap(),
 		AvifColour { icc: None, cicp: None },
 		&OutputMetadata::default(),
+		None,
 	)
 	.unwrap();
 	let from_sixteen_bits = encode(&widened, false, QUICK, 1).unwrap();

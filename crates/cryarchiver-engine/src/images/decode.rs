@@ -37,11 +37,14 @@ pub struct SourceLayout {
 	pub fancy_upsampling: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
 pub struct PamRequest {
 	pub alpha_item: bool,
 	pub deep: bool,
 	pub keep_stored_orientation: bool,
+	/// Decodes the first video stream only: ffmpeg also lists an AVIF's hidden gain map item as a video stream.
+	pub first_stream: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +52,8 @@ pub struct Decoded {
 	pub image: DynamicImage,
 	pub icc: Option<Vec<u8>>,
 	pub cicp: Option<Cicp>,
+	/// The EXIF or container orientation `image` was turned upright by.
+	pub orientation: u16,
 	pub decode_errors: usize,
 }
 
@@ -158,6 +163,7 @@ pub async fn decode(
 				alpha_item: layout.alpha_item,
 				deep: source_pix_fmt.is_some_and(deep_pix_fmt),
 				keep_stored_orientation: true,
+				first_stream: false,
 			};
 			let mut cmd = pam_command(&tools.ffmpeg, source, request);
 			cmd.capture_limit = Some(pam_capture_limit(header_dimensions(&bytes, None), request.deep));
@@ -177,6 +183,7 @@ pub async fn decode(
 		image,
 		icc: metadata.icc.clone(),
 		cicp: metadata.cicp,
+		orientation: layout.orientation,
 		decode_errors,
 	})
 }
@@ -220,6 +227,9 @@ pub fn pam_command(ffmpeg: &Path, source: &Path, request: PamRequest) -> ToolCom
 		cmd.arg("-filter_complex")
 			.arg(format!("[0:v:0][0:v:1]alphamerge,format={pix_fmt}"));
 	} else {
+		if request.first_stream {
+			cmd.args(["-map", "0:v:0"]);
+		}
 		cmd.args(["-pix_fmt", pix_fmt]);
 	}
 	cmd.args(["-frames:v", "1", "-c:v", "pam", "-f", "image2pipe", "-"]);
@@ -298,6 +308,7 @@ fn decode_jxl(bytes: &[u8]) -> Result<Decoded, Undecodable> {
 		image: decoded.ok_or_else(|| damaged("the rendered frame has the wrong size"))?,
 		icc,
 		cicp,
+		orientation: 1,
 		decode_errors: 0,
 	})
 }

@@ -107,6 +107,7 @@ fn decision(index: usize) -> Decision {
 			setting: Some(format!("quality {}", 55 + seed % 20)),
 			score: Some(80.0 + f64::from(tenths) / 10.0),
 			target: Some(80.0),
+			gain_map: None,
 		}),
 		source_bytes: Some(3_000_000 + seed % 2_000_000),
 		output_bytes: Some(1_200_000 + seed % 400_000),

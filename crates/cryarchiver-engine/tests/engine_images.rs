@@ -6,26 +6,32 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cryarchiver_engine::container::isobmff::parse_meta;
+use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, check};
+use cryarchiver_engine::container::isobmff::{Property, parse_meta};
 use cryarchiver_engine::container::jxl::read_boxes;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::images::animated;
+use cryarchiver_engine::images::avif::{AvifColour, output_cicp};
 use cryarchiver_engine::images::decode::oriented;
-use cryarchiver_engine::images::plan::ImageRoute;
+use cryarchiver_engine::images::gain_map::TARGET;
+use cryarchiver_engine::images::plan::{GAIN_MAP_NOT_IN_JXL, ImageRoute};
 use cryarchiver_engine::images::ssim::score;
 use cryarchiver_engine::metadata::exif::orientation;
+use cryarchiver_engine::metadata::gain_map::GainMapMetadata;
 use cryarchiver_engine::options::{Advanced, JobOptions, Resize};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::quality::memory::{GroupStats, SharedMemory};
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
+use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
-use image::{DynamicImage, GenericImageView, ImageEncoder};
+use image::{DynamicImage, GenericImageView, GrayImage, ImageEncoder, Luma, PixelWithColorType, Rgb, RgbImage};
 use jxl_oxide::{JxlImage, PixelFormat};
 use moxcms::ColorProfile;
 use support::heif::{Coding, avif_grid, heic_grid_coded, heic_still_coded, imir, irot};
+use support::ultra_hdr::{UltraHdrOptions, ultra_hdr_jpeg};
 use tokio_util::sync::CancellationToken;
 
 fn job(source: &Path) -> Job {
@@ -1467,4 +1473,276 @@ async fn a_resized_transparent_animation_keeps_its_alpha_at_the_new_size() {
 		.map(|stream| (stream.width, stream.height))
 		.collect();
 	assert_eq!(sequences, [(Some(80), Some(60)); 2]);
+}
+
+fn noisy_base(width: u32, height: u32) -> RgbImage {
+	let mut state = 0x2545_f491_u32;
+	RgbImage::from_fn(width, height, |x, y| {
+		state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+		let noise = u8::try_from(state >> 29).unwrap();
+		Rgb([
+			u8::try_from(40 + x * 160 / width).unwrap() + noise,
+			u8::try_from(60 + y * 140 / height).unwrap() + noise,
+			u8::try_from(90 + (x + y) * 60 / (width + height)).unwrap() + noise,
+		])
+	})
+}
+
+fn gain_levels(width: u32, height: u32) -> GrayImage {
+	GrayImage::from_fn(width, height, |x, y| {
+		Luma([u8::try_from(30 + x * 150 / width + y * 50 / height).unwrap()])
+	})
+}
+
+fn ultra_hdr_photo<G: GenericImageView>(dir: &Path, name: &str, gain: &G, opts: &UltraHdrOptions) -> PathBuf
+where
+	G::Pixel: PixelWithColorType,
+{
+	let path = dir.join(name);
+	std::fs::write(&path, ultra_hdr_jpeg(&noisy_base(256, 192), gain, opts)).unwrap();
+	path
+}
+
+fn checked_avif(avif: &[u8], (width, height): (u32, u32), gain_map: Option<&GainMapMetadata>) -> Result<(), String> {
+	check(
+		avif,
+		&AvifExpectations {
+			width,
+			height,
+			alpha: false,
+			cicp: output_cicp(AvifColour { icc: None, cicp: None }),
+			metadata: AvifMetadata::default(),
+			gain_map,
+			gain_map_coded_cicp: gain_map.is_some(),
+		},
+	)
+}
+
+fn gain_map_size(avif: &[u8]) -> Option<(u32, u32)> {
+	let meta = parse_meta(avif).unwrap();
+	let items = meta.gain_map()?;
+	meta.properties_of(items.gain_map).find_map(|property| match property {
+		Property::Size { width, height } => Some((*width, *height)),
+		_ => None,
+	})
+}
+
+fn first_stream_size(path: &Path) -> String {
+	let out = std::process::Command::new("ffprobe")
+		.args([
+			"-v",
+			"error",
+			"-select_streams",
+			"v:0",
+			"-show_entries",
+			"stream=width,height",
+			"-of",
+			"csv=p=0",
+		])
+		.arg(path)
+		.output()
+		.unwrap();
+	String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+fn encoded_with(outcome: JobOutcome) -> (Vec<u8>, Vec<String>, Option<f64>) {
+	match outcome {
+		JobOutcome::Encoded {
+			output,
+			warnings,
+			decision,
+			..
+		} => (
+			std::fs::read(output).unwrap(),
+			warnings,
+			decision.image.and_then(|image| image.gain_map),
+		),
+		other => panic!("{other:?}"),
+	}
+}
+
+fn kept_reason(outcome: &JobOutcome) -> &str {
+	match outcome {
+		JobOutcome::KeptOriginal {
+			reason: KeepReason::Unsupported(reason),
+		} => reason,
+		other => panic!("{other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn an_ultra_hdr_photo_becomes_avif_that_keeps_its_gain_map() {
+	let dir = tempfile::tempdir().unwrap();
+	let opts = UltraHdrOptions::default();
+	let quarter = ultra_hdr_photo(dir.path(), "quarter.jpg", &gain_levels(64, 48), &opts);
+	let full = ultra_hdr_photo(dir.path(), "full.jpg", &gain_levels(256, 192), &opts);
+
+	for (source, gain_size) in [(&quarter, (64, 48)), (&full, (256, 192))] {
+		let (avif, warnings, gain_map) = encoded_with(run(&job(source), dir.path()).await);
+
+		checked_avif(&avif, (256, 192), Some(&opts.metadata)).unwrap();
+		assert_eq!(gain_map_size(&avif), Some(gain_size));
+		assert!(gain_map.is_some_and(|score| score >= TARGET), "{gain_map:?}");
+		assert!(warnings.is_empty(), "{warnings:?}");
+	}
+	assert_eq!(first_stream_size(&dir.path().join("quarter.cry.avif")), "256,192");
+}
+
+#[tokio::test]
+async fn the_gain_map_is_turned_and_resized_with_the_photo() {
+	let dir = tempfile::tempdir().unwrap();
+	let opts = UltraHdrOptions {
+		exif_orientation: Some(6),
+		..UltraHdrOptions::default()
+	};
+	let rotated = ultra_hdr_photo(dir.path(), "rotated.jpg", &gain_levels(64, 48), &opts);
+	let plain = ultra_hdr_photo(
+		dir.path(),
+		"plain.jpg",
+		&gain_levels(64, 48),
+		&UltraHdrOptions::default(),
+	);
+
+	let (turned, _, _) = encoded_with(run(&job(&rotated), dir.path()).await);
+	let (halved, _, gain_map) = encoded_with(run(&resized(job(&plain), Some(128), None), dir.path()).await);
+
+	checked_avif(&turned, (192, 256), Some(&opts.metadata)).unwrap();
+	assert_eq!(gain_map_size(&turned), Some((48, 64)));
+	checked_avif(&halved, (128, 96), Some(&opts.metadata)).unwrap();
+	assert_eq!(gain_map_size(&halved), Some((32, 24)));
+	assert!(gain_map.is_some_and(|score| score >= TARGET), "{gain_map:?}");
+}
+
+#[tokio::test]
+async fn drop_aux_converts_an_ultra_hdr_photo_without_its_gain_map() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = ultra_hdr_photo(dir.path(), "hdr.jpg", &gain_levels(64, 48), &UltraHdrOptions::default());
+
+	let (avif, _, gain_map) = encoded_with(
+		run(
+			&Job {
+				drop_aux: true,
+				..job(&source)
+			},
+			dir.path(),
+		)
+		.await,
+	);
+
+	checked_avif(&avif, (256, 192), None).unwrap();
+	assert_eq!(gain_map, None);
+}
+
+#[tokio::test]
+async fn depth_maps_are_dropped_with_a_warning() {
+	let dir = tempfile::tempdir().unwrap();
+	let opts = UltraHdrOptions {
+		depth_item: true,
+		..UltraHdrOptions::default()
+	};
+	let ultra_hdr = ultra_hdr_photo(dir.path(), "portrait.jpg", &gain_levels(64, 48), &opts);
+	let depth_only = motion_photo_jpeg(
+		dir.path(),
+		"depth.jpg",
+		Some(
+			"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:GDepth='http://ns.google.com/photos/1.0/depthmap/' GDepth:Format='RangeInverse'/></rdf:RDF></x:xmpmeta>",
+		),
+		&[],
+	);
+
+	let (with_gain_map, ultra_hdr_warnings, gain_map) = encoded_with(run(&job(&ultra_hdr), dir.path()).await);
+	let (without, depth_warnings, no_gain_map) = encoded_with(
+		run(
+			&Job {
+				min_savings: 0.0,
+				..job(&depth_only)
+			},
+			dir.path(),
+		)
+		.await,
+	);
+
+	checked_avif(&with_gain_map, (256, 192), Some(&opts.metadata)).unwrap();
+	assert!(gain_map.is_some());
+	assert_eq!(ultra_hdr_warnings, ["the depth map was dropped (container item)"]);
+	checked_avif(&without, (320, 240), None).unwrap();
+	assert_eq!(no_gain_map, None);
+	assert_eq!(depth_warnings, ["the depth map was dropped (Google depth map)"]);
+}
+
+#[tokio::test]
+async fn an_ultra_hdr_motion_photo_or_colour_gain_map_keeps_the_original() {
+	let dir = tempfile::tempdir().unwrap();
+	let motion = ultra_hdr_photo(
+		dir.path(),
+		"motion.jpg",
+		&gain_levels(64, 48),
+		&UltraHdrOptions {
+			motion_photo: true,
+			..UltraHdrOptions::default()
+		},
+	);
+	let colour = ultra_hdr_photo(
+		dir.path(),
+		"colour.jpg",
+		&noisy_base(64, 48),
+		&UltraHdrOptions::default(),
+	);
+
+	let motion = run(&job(&motion), dir.path()).await;
+	let colour = run(&job(&colour), dir.path()).await;
+
+	let reason = kept_reason(&motion);
+	assert!(
+		reason.contains("motion photo video") && reason.contains("which converting would drop"),
+		"{reason}"
+	);
+	let reason = kept_reason(&colour);
+	assert!(reason.starts_with("its HDR gain map can't be carried"), "{reason}");
+}
+
+#[tokio::test]
+async fn an_ultra_hdr_photo_asked_for_as_jpeg_xl_drops_its_gain_map_with_a_warning() {
+	if !support::toolchain().await.has_libjxl() {
+		return;
+	}
+
+	let dir = tempfile::tempdir().unwrap();
+	let source = ultra_hdr_photo(dir.path(), "hdr.jpg", &gain_levels(64, 48), &UltraHdrOptions::default());
+
+	let outcome = run(&requested(&source, OutputFormat::Jxl), dir.path()).await;
+
+	let JobOutcome::Encoded {
+		output,
+		warnings,
+		decision,
+		..
+	} = outcome
+	else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output, dir.path().join("hdr.cry.jxl"));
+	assert!(
+		warnings.iter().any(|warning| warning == GAIN_MAP_NOT_IN_JXL),
+		"{warnings:?}"
+	);
+	assert_eq!(decision.image.and_then(|image| image.gain_map), None);
+}
+
+#[tokio::test]
+async fn a_jpeg_without_a_gain_map_has_no_gain_map_item_or_score() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = dir.path().join("plain.jpg");
+	let mut jpeg = Vec::new();
+	JpegEncoder::new_with_quality(&mut jpeg, 90)
+		.encode_image(&noisy_base(256, 192))
+		.unwrap();
+	std::fs::write(&source, jpeg).unwrap();
+
+	let (avif, warnings, gain_map) = encoded_with(run(&job(&source), dir.path()).await);
+
+	checked_avif(&avif, (256, 192), None).unwrap();
+	assert_eq!(gain_map_size(&avif), None);
+	assert_eq!(gain_map, None);
+	assert!(warnings.is_empty(), "{warnings:?}");
 }

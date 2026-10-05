@@ -119,6 +119,10 @@ pub fn outcome_line_with(source: &Path, outcome: &JobOutcome, tail_lines: usize,
 			if let Some(chosen) = decision.crf_and_score() {
 				let _ = write!(line, ", {chosen}");
 			}
+
+			if decision.image.as_ref().is_some_and(|image| image.gain_map.is_some()) {
+				line.push_str(" + HDR gain map");
+			}
 			for warning in warnings.iter().filter(|warning| !shown.contains(warning)) {
 				let _ = write!(line, "\n    ⚠ {}", display_name(OsStr::new(warning)));
 			}
@@ -153,7 +157,7 @@ fn percent(part: u64, whole: u64) -> f64 {
 mod tests {
 	use std::path::PathBuf;
 
-	use cryarchiver_engine::decision::{Decision, Measured, VideoDecision};
+	use cryarchiver_engine::decision::{Decision, ImageDecision, Measured, VideoDecision};
 	use cryarchiver_engine::outcome::{ErrorKind, JobError, KeepReason};
 
 	use super::*;
@@ -260,6 +264,34 @@ mod tests {
 		assert_eq!(
 			outcome_line(Path::new("clip.mp4"), &encoded),
 			"✓ clip.mp4 → clip.cry.mkv  1.75 GB → 152.00 MB (−91 %), CRF 36.75, VMAF 93.1 / 87.2\n    ⚠ a note"
+		);
+	}
+
+	#[test]
+	fn a_photo_line_says_it_kept_its_hdr_gain_map() {
+		let encoded = |gain_map| JobOutcome::Encoded {
+			output: PathBuf::from("photo.cry.avif"),
+			src_bytes: 4_000_000,
+			out_bytes: 1_000_000,
+			warnings: Vec::new(),
+			decision: Box::new(Decision {
+				image: Some(ImageDecision {
+					route: "AVIF".into(),
+					score: Some(84.0),
+					gain_map,
+					..ImageDecision::default()
+				}),
+				..Decision::default()
+			}),
+		};
+
+		assert_eq!(
+			outcome_line(Path::new("photo.jpg"), &encoded(Some(81.2))),
+			"✓ photo.jpg → photo.cry.avif  4.00 MB → 1.00 MB (−75 %) + HDR gain map"
+		);
+		assert_eq!(
+			outcome_line(Path::new("photo.jpg"), &encoded(None)),
+			"✓ photo.jpg → photo.cry.avif  4.00 MB → 1.00 MB (−75 %)"
 		);
 	}
 

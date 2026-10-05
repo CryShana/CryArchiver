@@ -142,7 +142,7 @@ impl SettingsRow {
 			Self::Watch => "Watch for new files",
 			Self::Limit => "Performance limit",
 			Self::StabilityWindow => "Stability window",
-			Self::KeepAuxiliaryImages => "Keep photos' auxiliary images",
+			Self::KeepAuxiliaryImages => "Keep motion photos as they are",
 			Self::DeleteOriginals => "Delete originals",
 			Self::Rescan => "Re-scan source now",
 			Self::RestartPendingJobs => "Restart jobs over the limit",

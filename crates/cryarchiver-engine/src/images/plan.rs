@@ -4,7 +4,7 @@ use crate::calibration::tables;
 use crate::images::props::Effective;
 use crate::images::ssim::padded_size;
 use crate::images::structure::Structure;
-use crate::metadata::{MetadataMode, SourceMetadata, exif, icc};
+use crate::metadata::{AuxKind, MetadataMode, SourceMetadata, exif, icc};
 use crate::outcome::{KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::toolchain::{LIBJXL, Toolchain};
@@ -16,6 +16,7 @@ pub const MAX_AVIF_PIXELS: u64 = 64_000_000;
 pub const BOMB_PIXELS: u64 = 500_000_000;
 pub const MAX_VERIFY_PIXELS: u64 = fast_ssim2::MAX_IMAGE_PIXELS as u64;
 pub const MAX_RETRIES: u32 = 2;
+pub const GAIN_MAP_NOT_IN_JXL: &str = "the HDR gain map was dropped: JPEG XL output can't carry it";
 
 const LEARNED_HEADROOM: f64 = 2.0;
 const RAISE_QUALITY_MARGIN: f64 = 1.0;
@@ -217,7 +218,8 @@ pub fn jxl_lossy_settings(speed: Speed) -> JxlSettings {
 	JxlSettings { distance, effort }
 }
 
-pub fn precheck(input: &PrecheckInput<'_>) -> Result<(), Gate> {
+/// Passes a source that may be converted, with the warnings for what converting it drops.
+pub fn precheck(input: &PrecheckInput<'_>) -> Result<Vec<String>, Gate> {
 	if let Some(damage) = &input.structure.damage {
 		return Err(Gate::Damaged(damage.clone()));
 	}
@@ -250,13 +252,26 @@ pub fn precheck(input: &PrecheckInput<'_>) -> Result<(), Gate> {
 		))));
 	}
 
-	if !metadata.aux.is_empty() && !input.drop_aux {
-		let kinds: Vec<String> = metadata.aux.iter().map(ToString::to_string).collect();
-		return Err(keep(format!(
-			"it has auxiliary images or video ({}); --drop-aux converts it without them",
-			kinds.join(", ")
-		)));
+	let mut warnings = Vec::new();
+	if !input.drop_aux {
+		let (depth, kept): (Vec<&AuxKind>, Vec<&AuxKind>) = metadata
+			.aux_without_gain_map()
+			.into_iter()
+			.partition(|aux| matches!(aux, AuxKind::Depth(_)));
+		if !kept.is_empty() {
+			let kinds: Vec<String> = kept.iter().map(ToString::to_string).collect();
+			return Err(keep(format!(
+				"it has {}, which converting would drop",
+				kinds.join(", ")
+			)));
+		}
+
+		warnings.extend(depth.into_iter().filter_map(|aux| match aux {
+			AuxKind::Depth(detail) => Some(format!("the depth map was dropped ({detail})")),
+			_ => None,
+		}));
 	}
+
 	if input.mode == MetadataMode::IccOnly
 		&& metadata.icc.is_none()
 		&& metadata.exif.as_deref().is_some_and(exif::adobe_rgb_only)
@@ -276,7 +291,7 @@ pub fn precheck(input: &PrecheckInput<'_>) -> Result<(), Gate> {
 	if pixels > MAX_VERIFY_PIXELS {
 		return Err(keep(format!("{} MP is too large to verify", pixels / 1_000_000)));
 	}
-	Ok(())
+	Ok(warnings)
 }
 
 fn keep(reason: String) -> Gate {
@@ -344,6 +359,31 @@ pub fn plan_still(
 		candidates,
 		target: image_target(speed, overrides),
 	})
+}
+
+/// Narrows `plan` to the candidates that carry the source's HDR gain map, which only AVIF keeps. `Ok(false)` leaves a
+/// requested JPEG XL route as it is, encoded without the gain map.
+pub fn carry_gain_map(plan: &mut StillPlan, facts: &StillFacts, route: Option<ImageRoute>) -> Result<bool, KeepReason> {
+	if matches!(route, Some(ImageRoute::Jxl | ImageRoute::JxlLossless)) {
+		return Ok(false);
+	}
+
+	let avif: Vec<Candidate> = plan
+		.candidates
+		.iter()
+		.copied()
+		.filter(|candidate| matches!(candidate, Candidate::Ravif(_)))
+		.collect();
+	if avif.is_empty() {
+		return Err(KeepReason::Unsupported(format!(
+			"it has an HDR gain map, which only AVIF keeps, and {}",
+			not_avif(facts)
+		)));
+	}
+
+	plan.memory_bytes = memory_estimate(facts.width, facts.height, &avif);
+	plan.candidates = avif;
+	Ok(true)
 }
 
 fn not_avif(facts: &StillFacts) -> String {
@@ -571,7 +611,7 @@ mod tests {
 				dimensions: Some((16_000, 16_000)),
 				..input(&healthy, &plain)
 			}),
-			Ok(())
+			Ok(Vec::new())
 		);
 	}
 
@@ -803,7 +843,7 @@ mod tests {
 			..SourceMetadata::default()
 		};
 		let plain = SourceMetadata::default();
-		let unsupported = |gate: Result<(), Gate>| match gate {
+		let unsupported = |gate: Result<Vec<String>, Gate>| match gate {
 			Err(Gate::Keep(KeepReason::Unsupported(reason))) => reason,
 			other => panic!("{other:?}"),
 		};
@@ -841,7 +881,7 @@ mod tests {
 			}),
 			Err(Gate::Damaged(_))
 		));
-		assert_eq!(precheck(&input(&healthy, &plain)), Ok(()));
+		assert_eq!(precheck(&input(&healthy, &plain)), Ok(Vec::new()));
 	}
 
 	#[test]
@@ -861,14 +901,14 @@ mod tests {
 		};
 
 		assert!(
-			matches!(precheck(&input(&healthy, &gain_map)), Err(Gate::Keep(KeepReason::Unsupported(reason))) if reason.contains("--drop-aux"))
+			matches!(precheck(&input(&healthy, &gain_map)), Err(Gate::Keep(KeepReason::Unsupported(reason))) if reason == "it has gain map (Ultra HDR), which converting would drop")
 		);
 		assert_eq!(
 			precheck(&PrecheckInput {
 				drop_aux: true,
 				..input(&healthy, &gain_map)
 			}),
-			Ok(())
+			Ok(Vec::new())
 		);
 		assert!(
 			matches!(precheck(&input(&healthy, &r03)), Err(Gate::Keep(KeepReason::Unsupported(reason))) if reason.contains("only in EXIF"))
@@ -878,7 +918,86 @@ mod tests {
 				mode: MetadataMode::Full,
 				..input(&healthy, &r03)
 			}),
-			Ok(())
+			Ok(Vec::new())
+		);
+	}
+
+	#[test]
+	fn depth_maps_are_dropped_with_a_warning_and_motion_photos_keep_the_original() {
+		let healthy = Structure::default();
+		let depth = SourceMetadata {
+			aux: vec![
+				AuxKind::Depth("Google depth map".into()),
+				AuxKind::Depth("MPF disparity image".into()),
+			],
+			..SourceMetadata::default()
+		};
+		let motion = SourceMetadata {
+			aux: vec![
+				AuxKind::Depth("container item".into()),
+				AuxKind::MotionVideo("Google motion photo".into()),
+				AuxKind::Other("container item 'Panorama'".into()),
+			],
+			..SourceMetadata::default()
+		};
+
+		assert_eq!(
+			precheck(&input(&healthy, &depth)),
+			Ok(vec![
+				"the depth map was dropped (Google depth map)".to_owned(),
+				"the depth map was dropped (MPF disparity image)".to_owned(),
+			])
+		);
+		assert_eq!(
+			precheck(&PrecheckInput {
+				drop_aux: true,
+				..input(&healthy, &depth)
+			}),
+			Ok(Vec::new())
+		);
+		assert_eq!(
+			precheck(&input(&healthy, &motion)),
+			Err(keep(
+				"it has motion photo video (Google motion photo), auxiliary image (container item 'Panorama'), which \
+				 converting would drop"
+					.into()
+			))
+		);
+	}
+
+	#[test]
+	fn a_carried_gain_map_keeps_only_avif_candidates() {
+		let graphic = StillFacts {
+			graphic: true,
+			..facts(800, 600)
+		};
+		let mut photo = plan_still(&graphic, Speed::Fast, &Overrides::default(), true, None).unwrap();
+		let mut requested_jxl = plan_still(
+			&graphic,
+			Speed::Fast,
+			&Overrides::default(),
+			true,
+			Some(ImageRoute::Jxl),
+		)
+		.unwrap();
+		let mut too_large = plan_still(&facts(20_000, 800), Speed::Fast, &Overrides::default(), true, None).unwrap();
+		let untouched = requested_jxl.clone();
+
+		assert_eq!(carry_gain_map(&mut photo, &graphic, None), Ok(true));
+		assert_eq!(kinds(&photo), ["ravif"]);
+		assert_eq!(photo.memory_bytes, memory_estimate(800, 600, &photo.candidates));
+		assert_eq!(
+			carry_gain_map(&mut requested_jxl, &graphic, Some(ImageRoute::Jxl)),
+			Ok(false)
+		);
+		assert_eq!(requested_jxl, untouched);
+		assert_eq!(
+			carry_gain_map(&mut too_large, &facts(20_000, 800), None),
+			Err(KeepReason::Unsupported(
+				"it has an HDR gain map, which only AVIF keeps, and this image can't be stored as AVIF: it is larger \
+				 than 16384 pixels on a side or 64 MP"
+					.into()
+			))
 		);
 	}
 }

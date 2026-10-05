@@ -144,7 +144,10 @@ struct CompressArgs {
 	quality: QualityArgs,
 	#[arg(long, help = "Keep personal metadata and the source's file timestamps")]
 	keep_metadata: bool,
-	#[arg(long, help = "Convert photos that have gain or depth maps, dropping the extras")]
+	#[arg(
+		long,
+		help = "Convert photos with motion video or other extras too, dropping them (HDR gain maps too)"
+	)]
 	drop_aux: bool,
 	#[arg(long, help = "Keep only the main video and the audio")]
 	strip: bool,

@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use image::imageops::FilterType;
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView, GrayImage};
 use tokio_util::sync::CancellationToken;
 
+use crate::container::avif::GainMapInput;
 use crate::decision::ImageDecision;
 use crate::engine::{JobEvent, Stage};
 use crate::format::ANIMATED_JXL;
@@ -16,7 +17,8 @@ use crate::images::jxl::{self, JxlJob, JxlPixels};
 use crate::images::plan::{self, Candidate, Gate, ImageRoute, PrecheckInput, StillFacts, StillPlan};
 use crate::images::props::{self, Effective};
 use crate::images::verify::{self, Expected};
-use crate::images::{blocking, structure};
+use crate::images::{blocking, gain_map, structure};
+use crate::metadata::gain_map::{GainMapMetadata, GainMapSource};
 use crate::metadata::icc::{self, Cicp};
 use crate::metadata::{self, ImageFormat, MetadataMode, OutputMetadata, SourceMetadata, exif, sniff};
 use crate::options::{Resize, WrittenBy, kept_as_requested, kept_as_requested_part, upscaled};
@@ -39,6 +41,7 @@ pub struct ImageInput {
 	pub pix_fmt: Option<String>,
 	pub animated: bool,
 	pub memory_bytes: u64,
+	pub drop_aux: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +91,22 @@ struct Still {
 	graphic: bool,
 	plan: StillPlan,
 	metadata: OutputMetadata,
+	gain_map: Option<CarriedGainMap>,
 	warnings: Vec<String>,
+}
+
+/// The source's HDR gain map, turned and scaled with the image, that AVIF candidates carry.
+struct CarriedGainMap {
+	image: Arc<GrayImage>,
+	metadata: GainMapMetadata,
+}
+
+/// An AVIF candidate's parts when it carries a gain map, to rebuild it around a gain map encoded again.
+struct GainMapParts {
+	base: Vec<u8>,
+	gain_map: Vec<u8>,
+	quality: f32,
+	speed: u8,
 }
 
 #[derive(Debug, Default)]
@@ -130,6 +148,7 @@ enum Tried {
 		size: u64,
 		candidate: Candidate,
 		score: f64,
+		gain_map: Option<f64>,
 		short: bool,
 	},
 	Rejected {
@@ -203,13 +222,19 @@ pub fn prepare(
 		drop_aux,
 		mode,
 	};
-	match plan::precheck(&input) {
+	let dropped = match plan::precheck(&input) {
 		Err(Gate::Damaged(reason)) => return Err(ErrorKind::SourceDamaged(reason).into()),
 		Err(Gate::Keep(reason)) => return Ok(Err(reason)),
-		Ok(()) => {}
-	}
+		Ok(dropped) => dropped,
+	};
 
-	let warnings = structure.warnings.iter().chain(&metadata.warnings).cloned().collect();
+	let warnings = structure
+		.warnings
+		.iter()
+		.chain(&metadata.warnings)
+		.cloned()
+		.chain(dropped)
+		.collect();
 	let sequence = info
 		.streams
 		.iter()
@@ -221,6 +246,7 @@ pub fn prepare(
 		pix_fmt: video.and_then(|stream| stream.pix_fmt.clone()),
 		animated: animated || sequence,
 		memory_bytes: dimensions.map_or(0, |dimensions| memory_bytes(dimensions, resize)),
+		drop_aux,
 	}))
 }
 
@@ -262,6 +288,7 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		image,
 		icc,
 		cicp,
+		orientation,
 		decode_errors,
 	} = match decode::decode(
 		cx.tools,
@@ -290,6 +317,7 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		.await?
 	};
 
+	let upright = image.dimensions();
 	let (image, resize_warning) = match cx.resize {
 		Some(resize) => resized(cx, image, resize).await?,
 		None => (image, None),
@@ -303,11 +331,27 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		graphic,
 		grey_icc: grey_profile(icc.as_deref()),
 	};
-	let plan = match plan::plan_still(&facts, cx.speed, &cx.overrides, cx.caps.libjxl, cx.route) {
+	let mut plan = match plan::plan_still(&facts, cx.speed, &cx.overrides, cx.caps.libjxl, cx.route) {
 		Ok(plan) => plan,
 		Err(Refusal::Keep(reason)) => return Ok(Err(reason)),
 		Err(Refusal::Impossible(reason)) => return Err(ErrorKind::EncodeFailed(reason).into()),
 	};
+
+	let mut gain_map = None;
+	let mut gain_map_warning = None;
+	if let Some(source) = input.metadata.gain_map.as_ref().filter(|_| !input.drop_aux) {
+		match plan::carry_gain_map(&mut plan, &facts, cx.route) {
+			Ok(true) => match fitted_gain_map(cx, input, source, orientation, upright, (width, height)).await? {
+				Ok(carried) => gain_map = Some(carried),
+				Err(err) => {
+					let reason = format!("its HDR gain map can't be carried: {err}");
+					return Ok(Err(KeepReason::Unsupported(reason)));
+				}
+			},
+			Ok(false) => gain_map_warning = Some(plan::GAIN_MAP_NOT_IN_JXL.to_owned()),
+			Err(reason) => return Ok(Err(reason)),
+		}
+	}
 
 	let metadata = metadata::build_output(&input.metadata, cx.mode, width, height);
 	let mut warnings = input.warnings.clone();
@@ -316,6 +360,7 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		warnings.push(format!("{decode_errors} decoding errors were concealed"));
 	}
 	warnings.extend(resize_warning);
+	warnings.extend(gain_map_warning);
 	Ok(Ok(Still {
 		image,
 		icc,
@@ -324,7 +369,30 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 		graphic,
 		plan,
 		metadata,
+		gain_map,
 		warnings,
+	}))
+}
+
+/// The source's gain map put through what the base went through: the base's orientation, then its resize from
+/// `upright` to `size`.
+async fn fitted_gain_map(
+	cx: &ImageContext<'_>,
+	input: &ImageInput,
+	source: &GainMapSource,
+	orientation: u16,
+	upright: (u32, u32),
+	size: (u32, u32),
+) -> Result<Result<CarriedGainMap, String>, JobError> {
+	let (bytes, jpeg) = (Arc::clone(&input.bytes), source.clone());
+	let fitted = blocking(cx.cancel, move || {
+		gain_map::decode(&bytes, &jpeg).map(|gain| gain_map::fit(gain, orientation, upright, size))
+	})
+	.await?;
+
+	Ok(fitted.map(|image| CarriedGainMap {
+		image: Arc::new(image),
+		metadata: source.metadata.clone(),
 	}))
 }
 
@@ -404,6 +472,7 @@ async fn encode_and_choose(
 			icc: still.icc.as_deref(),
 			cicp: avif::output_cicp(colour),
 			metadata: &still.metadata,
+			gain_map: still.gain_map.as_ref().map(|carried| &carried.metadata),
 		},
 		reference: eight_bit_reference(cx, &still).await?,
 		upright: upright_for_libjxl(cx, workspace, &still).await?,
@@ -430,13 +499,14 @@ async fn encode_and_choose(
 				size,
 				candidate,
 				score,
+				gain_map,
 				short,
 			} => {
 				choice.note(size);
 				let offered = path.clone();
 				choice.offer(path, size, short.then_some(score));
 				if choice.best.as_ref().is_some_and(|(best, _)| *best == offered) {
-					picked = Some(candidate_decision(candidate, score, still.plan.target));
+					picked = Some(candidate_decision(candidate, score, still.plan.target, gain_map));
 				}
 
 				if !short
@@ -499,12 +569,13 @@ async fn try_candidate(
 	loop {
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 		let path = workspace.file(&format!("candidate{}.{}", slot.index, candidate.extension()));
-		let bytes = encode_candidate(cx, input, workspace, still, env, candidate).await?;
+		let (bytes, parts) = encode_candidate(cx, input, workspace, still, env, candidate).await?;
 		fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
 
-		let size = bytes.len() as u64;
-		let too_large = !cx.forced && !saves_enough(cx.source_bytes, size, cx.min_savings);
-		if too_large
+		let mut size = bytes.len() as u64;
+		let too_large = |size| !cx.forced && !saves_enough(cx.source_bytes, size, cx.min_savings);
+		let beaten = |size| slot.best.is_some_and(|best| best <= size);
+		if too_large(size)
 			&& last_score.is_none()
 			&& let Some(fallback) = table.take()
 		{
@@ -512,7 +583,7 @@ async fn try_candidate(
 			continue;
 		}
 
-		if too_large || slot.best.is_some_and(|best| best <= size) {
+		if too_large(size) || beaten(size) {
 			return Ok(Tried::TooLarge {
 				size,
 				score: last_score,
@@ -525,12 +596,35 @@ async fn try_candidate(
 			Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Tried::Failed(err)),
 			Err(err) => return Err(err),
 		};
+
+		let mut gain_map = None;
+		if let Some(parts) = parts {
+			let (gain_map_score, rebuilt) =
+				match Box::pin(check_gain_map(cx, workspace, still, env, &path, parts)).await {
+					Ok(checked) => checked,
+					Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Tried::Failed(err)),
+					Err(err) => return Err(err),
+				};
+			gain_map = Some(gain_map_score);
+
+			if let Some(rebuilt) = rebuilt {
+				size = rebuilt;
+				if too_large(size) || beaten(size) {
+					return Ok(Tried::TooLarge {
+						size,
+						score: last_score,
+					});
+				}
+			}
+		}
+
 		if score >= still.plan.target {
 			return Ok(Tried::Passed {
 				path,
 				size,
 				candidate,
 				score,
+				gain_map,
 				short: false,
 			});
 		}
@@ -550,6 +644,7 @@ async fn try_candidate(
 					size,
 					candidate,
 					score,
+					gain_map,
 					short: true,
 				});
 			}
@@ -662,7 +757,7 @@ async fn encode_candidate(
 	still: &Still,
 	env: &Env<'_>,
 	candidate: Candidate,
-) -> Result<Vec<u8>, JobError> {
+) -> Result<(Vec<u8>, Option<GainMapParts>), JobError> {
 	match candidate {
 		Candidate::Ravif(settings) => {
 			let pixels = Arc::clone(env.reference.as_ref().expect("prepared for AVIF candidates"));
@@ -670,7 +765,22 @@ async fn encode_candidate(
 			let encoded = blocking(cx.cancel, move || avif::encode(&pixels, alpha, settings, threads))
 				.await?
 				.map_err(ErrorKind::EncodeFailed)?;
-			Ok(avif::finish(&encoded, env.colour, &still.metadata).map_err(ErrorKind::EncodeFailed)?)
+
+			let Some(carried) = &still.gain_map else {
+				let bytes =
+					avif::finish(&encoded, env.colour, &still.metadata, None).map_err(ErrorKind::EncodeFailed)?;
+				return Ok((bytes, None));
+			};
+
+			let gain_map = encode_gain_map(cx, carried, settings.quality, settings.speed).await?;
+			let bytes = with_gain_map(&encoded, &gain_map, still, env)?;
+			let parts = GainMapParts {
+				base: encoded,
+				gain_map,
+				quality: settings.quality,
+				speed: settings.speed,
+			};
+			Ok((bytes, Some(parts)))
 		}
 		Candidate::JxlLossy(_) | Candidate::JxlLossless(_) => {
 			let (source, layout) = match env.upright.as_deref() {
@@ -678,16 +788,79 @@ async fn encode_candidate(
 				None => (cx.source, decode::layout(&input.bytes, &input.metadata)),
 			};
 			let job = jxl_job(source, layout, still, candidate, cx.threads);
-			jxl::encode(
+			let bytes = jxl::encode(
 				&cx.tools.ffmpeg,
 				&job,
 				&workspace.file("libjxl.jxl"),
 				&still.metadata,
 				cx.cancel,
 			)
-			.await
+			.await?;
+			Ok((bytes, None))
 		}
 	}
+}
+
+async fn encode_gain_map(
+	cx: &ImageContext<'_>,
+	carried: &CarriedGainMap,
+	quality: f32,
+	speed: u8,
+) -> Result<Vec<u8>, JobError> {
+	let (gain, threads) = (Arc::clone(&carried.image), cx.threads);
+	Ok(
+		blocking(cx.cancel, move || gain_map::encode(&gain, quality, speed, threads))
+			.await?
+			.map_err(ErrorKind::EncodeFailed)?,
+	)
+}
+
+fn with_gain_map(base: &[u8], gain_map: &[u8], still: &Still, env: &Env<'_>) -> Result<Vec<u8>, JobError> {
+	let carried = still.gain_map.as_ref().expect("only called with a carried gain map");
+	let input = GainMapInput {
+		encoded: gain_map,
+		metadata: &carried.metadata,
+	};
+	Ok(avif::finish(base, env.colour, &still.metadata, Some(&input)).map_err(ErrorKind::EncodeFailed)?)
+}
+
+/// Scores the candidate's gain map; one that misses `gain_map::TARGET` is encoded once more at
+/// `gain_map::RAISED_QUALITY` and the file at `path` rebuilt around it, whose new size comes back with the score.
+async fn check_gain_map(
+	cx: &ImageContext<'_>,
+	workspace: &Workspace,
+	still: &Still,
+	env: &Env<'_>,
+	path: &Path,
+	parts: GainMapParts,
+) -> Result<(f64, Option<u64>), JobError> {
+	let carried = still.gain_map.as_ref().expect("only called with a carried gain map");
+	let score = gain_map::score(cx.tools, workspace, &parts.gain_map, &carried.image, cx.cancel).await?;
+	if score >= gain_map::TARGET {
+		return Ok((score, None));
+	}
+
+	if parts.quality >= gain_map::RAISED_QUALITY {
+		return Err(gain_map_missed(score));
+	}
+
+	let gain_map = encode_gain_map(cx, carried, gain_map::RAISED_QUALITY, parts.speed).await?;
+	let bytes = with_gain_map(&parts.base, &gain_map, still, env)?;
+	fs::write(path, &bytes).map_err(|err| JobError::io(IoSide::Destination(path), &err))?;
+	verify::check_avif(&bytes, &env.expected)?;
+
+	let score = gain_map::score(cx.tools, workspace, &gain_map, &carried.image, cx.cancel).await?;
+	if score < gain_map::TARGET {
+		return Err(gain_map_missed(score));
+	}
+	Ok((score, Some(bytes.len() as u64)))
+}
+
+fn gain_map_missed(score: f64) -> JobError {
+	JobError::verification(format!(
+		"the HDR gain map scored {score:.1}, below {:.0}",
+		gain_map::TARGET
+	))
 }
 
 fn jxl_job<'a>(
@@ -769,7 +942,7 @@ fn verdict(choice: Choice, target: f64, source_bytes: u64) -> Verdict {
 	})
 }
 
-fn candidate_decision(candidate: Candidate, score: f64, target: f64) -> ImageDecision {
+fn candidate_decision(candidate: Candidate, score: f64, target: f64, gain_map: Option<f64>) -> ImageDecision {
 	let (route, setting) = match candidate {
 		Candidate::Ravif(settings) => ("AVIF", Some(format!("quality {}", settings.quality))),
 		Candidate::JxlLossy(settings) => ("JPEG XL", Some(format!("distance {:.2}", settings.distance))),
@@ -780,6 +953,7 @@ fn candidate_decision(candidate: Candidate, score: f64, target: f64) -> ImageDec
 		setting,
 		score: Some(score),
 		target: Some(target),
+		gain_map,
 	}
 }
 
@@ -926,6 +1100,7 @@ pub async fn encode_animation(
 			setting: Some(format!("CRF {}", settings.crf)),
 			score: Some(score),
 			target: Some(target),
+			gain_map: None,
 		},
 	})
 }

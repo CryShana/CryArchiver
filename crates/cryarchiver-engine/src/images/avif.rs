@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use image::{DynamicImage, GenericImageView, RgbImage, RgbaImage};
 use ravif::{AlphaColorMode, BitDepth, Encoder, Img, RGB8, RGBA8};
 
-use crate::container::avif::{self, AvifMetadata};
+use crate::container::avif::{self, AvifMetadata, GainMapInput};
 use crate::images::plan::RavifSettings;
 use crate::images::props;
 use crate::metadata::OutputMetadata;
@@ -62,7 +62,12 @@ pub fn encode(image: &DynamicImage, alpha: bool, settings: RavifSettings, thread
 	})
 }
 
-pub fn finish(encoded: &[u8], colour: AvifColour<'_>, metadata: &OutputMetadata) -> Result<Vec<u8>, String> {
+pub fn finish(
+	encoded: &[u8],
+	colour: AvifColour<'_>,
+	metadata: &OutputMetadata,
+	gain_map: Option<&GainMapInput<'_>>,
+) -> Result<Vec<u8>, String> {
 	avif::rewrite(
 		encoded,
 		output_cicp(colour),
@@ -71,7 +76,7 @@ pub fn finish(encoded: &[u8], colour: AvifColour<'_>, metadata: &OutputMetadata)
 			exif: metadata.exif.as_deref(),
 			xmp: metadata.xmp.as_deref(),
 		},
-		None,
+		gain_map,
 	)
 	.map_err(|err| err.to_string())
 }

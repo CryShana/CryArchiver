@@ -247,6 +247,7 @@ pub async fn score(
 		alpha_item: false,
 		deep: false,
 		keep_stored_orientation: false,
+		first_stream: false,
 	};
 	let (decoded, errors) = run_pam(&pam_command(&tools.ffmpeg, &path, request), cancel)
 		.await

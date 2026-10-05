@@ -46,7 +46,7 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, aspect ratio k
 
 **Quality.** At `--speed moderate` (the default) and `slow`, each video's setting is found by encoding a few seconds of samples and measuring them with VMAF; the finished video is then measured over its whole length. A video that misses the target is encoded once more with more quality; a miss of at most 0.5 VMAF is written with a warning instead. Images are checked with SSIMULACRA2 and encoded again, at most twice, when they miss. What worked is remembered for similar files. `--speed fast` uses fixed settings and doesn't measure video. Noisy video is denoised and gets AV1 film grain back. The result line shows the CRF and the measured VMAF.
 
-**When the original is kept.** When no setting reaches the target, or the output wouldn't be at least `--min-savings` smaller. A requested output (`--ss/--to`, `-f`, `--strip`, `--burn-subs`, `--merge-audio`, `--resize`, `--max-bitrate`) is always written, with a warning if it misses. RAW, PSD/XCF, CMYK JPEG and multi-page TIFF files are never converted; photos with HDR gain maps or depth maps are kept unless `--drop-aux` is given.
+**When the original is kept.** When no setting reaches the target, or the output wouldn't be at least `--min-savings` smaller. A requested output (`--ss/--to`, `-f`, `--strip`, `--burn-subs`, `--merge-audio`, `--resize`, `--max-bitrate`) is always written, with a warning if it misses. RAW, PSD/XCF, CMYK JPEG and multi-page TIFF files are never converted. Motion photos, and photos with other unknown extras, are kept unless `--drop-aux` is given; depth maps are dropped with a note. Phone photos with an HDR gain map (Ultra HDR) become AVIF that keeps the gain map: HDR in Chrome, Edge and Safari, the normal picture in other viewers.
 
 **Other behaviour.**
 - One video runs at a time while audio and images run in parallel; `-j N` allows N videos. Measuring uses only cores other files leave idle.
@@ -70,7 +70,7 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, aspect ratio k
 | `--image-target N` | Image quality target | the preset's |
 | `--audio-kbps N` | Stereo audio bitrate | the preset's |
 | `--keep-metadata` | Keep personal metadata and timestamps | off |
-| `--drop-aux` | Convert photos with gain or depth maps, dropping the extras | off |
+| `--drop-aux` | Convert photos with motion video or other extras too, dropping them (HDR gain maps too) | off |
 | `--ss TIME`, `--to TIME` | Cut audio or video: `90`, `1:30` or `00:01:30.500` | whole file |
 | `--merge-audio` | Mix all audio tracks into one | off |
 | `--burn-subs[=TRACK\|LANG]` | Draw subtitles into the picture | off |

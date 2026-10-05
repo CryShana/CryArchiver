@@ -40,6 +40,7 @@ fn expected(metadata: &OutputMetadata) -> Expected<'_> {
 		icc: None,
 		cicp: Cicp::SRGB,
 		metadata,
+		gain_map: None,
 	}
 }
 
@@ -158,6 +159,7 @@ async fn a_good_avif_passes_its_checks_and_scores_well() {
 		&encode_avif(&source, false, settings, 2).unwrap(),
 		AvifColour { icc: None, cicp: None },
 		&metadata,
+		None,
 	)
 	.unwrap();
 	let output = dir.path().join("out.avif");

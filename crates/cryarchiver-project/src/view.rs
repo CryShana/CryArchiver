@@ -320,6 +320,10 @@ pub fn decision_lines(decision: &Decision) -> Vec<DecisionLine> {
 			let target = image.target.map_or_else(String::new, |target| format!(" vs {target}"));
 			lines.push(plain("Check", format!("SSIMULACRA2 {score:.1}{target}")));
 		}
+
+		if let Some(score) = image.gain_map {
+			lines.push(plain("HDR gain map", format!("kept · SSIMULACRA2 {score:.1}")));
+		}
 	}
 
 	if let Some(audio) = &decision.audio
@@ -692,6 +696,7 @@ mod tests {
 				setting: Some("quality 62".into()),
 				score: Some(86.44),
 				target: Some(85.0),
+				gain_map: None,
 			}),
 			..Decision::default()
 		};
@@ -724,6 +729,53 @@ mod tests {
 			[line("Audio", "Opus 128 kbps, 2 ch · copied", false)]
 		);
 		assert!(decision_lines(&Decision::default()).is_empty());
+	}
+
+	#[test]
+	fn a_carried_gain_map_has_its_own_row() {
+		let decision = Decision {
+			image: Some(ImageDecision {
+				route: "AVIF".into(),
+				setting: Some("quality 88".into()),
+				score: Some(84.0),
+				target: Some(80.0),
+				gain_map: Some(81.2),
+			}),
+			..Decision::default()
+		};
+
+		assert_eq!(
+			labelled(&decision_lines(&decision)),
+			[
+				line("Encoder", "AVIF, quality 88", false),
+				line("Check", "SSIMULACRA2 84.0 vs 80", false),
+				line("HDR gain map", "kept · SSIMULACRA2 81.2", false),
+			]
+		);
+	}
+
+	#[test]
+	fn an_image_record_written_before_gain_maps_still_reads() {
+		#[derive(serde::Serialize)]
+		struct Older {
+			route: &'static str,
+			setting: Option<&'static str>,
+			score: Option<f64>,
+			target: Option<f64>,
+		}
+
+		let older = rmp_serde::to_vec_named(&Older {
+			route: "AVIF",
+			setting: Some("quality 62"),
+			score: Some(86.44),
+			target: Some(85.0),
+		})
+		.unwrap();
+
+		let image: ImageDecision = rmp_serde::from_slice(&older).unwrap();
+
+		assert_eq!(image.route, "AVIF");
+		assert_eq!(image.gain_map, None);
 	}
 
 	#[test]

@@ -9,7 +9,7 @@ use crate::format::fit;
 use crate::theme::Theme;
 use crate::view::ArchiveView;
 
-const LABEL: u16 = 32;
+const LABEL: u16 = 33;
 
 /// `row` is the selected row, with the quality value being typed into it, if any.
 pub fn render(

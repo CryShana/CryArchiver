@@ -12,6 +12,7 @@ use crate::images::decode::{PamRequest, pam_command, run_pam};
 use crate::images::jxl::libjxl_cicp;
 use crate::images::ssim;
 use crate::metadata::OutputMetadata;
+use crate::metadata::gain_map::GainMapMetadata;
 use crate::metadata::icc::Cicp;
 use crate::outcome::JobError;
 use crate::toolchain::Toolchain;
@@ -24,6 +25,8 @@ pub struct Expected<'a> {
 	pub icc: Option<&'a [u8]>,
 	pub cicp: Cicp,
 	pub metadata: &'a OutputMetadata,
+	/// The HDR gain map an AVIF output carries.
+	pub gain_map: Option<&'a GainMapMetadata>,
 }
 
 pub async fn verify_avif(
@@ -34,25 +37,13 @@ pub async fn verify_avif(
 	expected: &Expected<'_>,
 	cancel: &CancellationToken,
 ) -> Result<f64, JobError> {
-	let expectations = AvifExpectations {
-		width: expected.width,
-		height: expected.height,
-		alpha: expected.alpha,
-		cicp: expected.cicp,
-		metadata: AvifMetadata {
-			icc: expected.icc,
-			exif: expected.metadata.exif.as_deref(),
-			xmp: expected.metadata.xmp.as_deref(),
-		},
-		gain_map: None,
-		gain_map_coded_cicp: false,
-	};
-	avif::check(bytes, &expectations).map_err(JobError::verification)?;
+	check_avif(bytes, expected)?;
 
 	let request = PamRequest {
 		alpha_item: expected.alpha,
 		deep: true,
 		keep_stored_orientation: false,
+		first_stream: expected.gain_map.is_some(),
 	};
 	let (decoded, errors) = run_pam(&pam_command(&tools.ffmpeg, output, request), cancel)
 		.await
@@ -66,6 +57,24 @@ pub async fn verify_avif(
 	blocking(cancel, move || ssim::score(&reference, &decoded))
 		.await?
 		.map_err(JobError::verification)
+}
+
+/// The structural part of `verify_avif`.
+pub fn check_avif(bytes: &[u8], expected: &Expected<'_>) -> Result<(), JobError> {
+	let expectations = AvifExpectations {
+		width: expected.width,
+		height: expected.height,
+		alpha: expected.alpha,
+		cicp: expected.cicp,
+		metadata: AvifMetadata {
+			icc: expected.icc,
+			exif: expected.metadata.exif.as_deref(),
+			xmp: expected.metadata.xmp.as_deref(),
+		},
+		gain_map: expected.gain_map,
+		gain_map_coded_cicp: expected.gain_map.is_some(),
+	};
+	avif::check(bytes, &expectations).map_err(JobError::verification)
 }
 
 pub async fn verify_jxl(

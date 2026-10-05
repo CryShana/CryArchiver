@@ -18,6 +18,7 @@ pub struct UltraHdrOptions {
 	/// What the gain map's XMP says when it should differ from `metadata`.
 	pub xmp_metadata: Option<GainMapMetadata>,
 	pub depth_item: bool,
+	pub motion_photo: bool,
 	pub exif_orientation: Option<u16>,
 	pub trailer: Option<Vec<u8>>,
 }
@@ -64,6 +65,7 @@ impl Default for UltraHdrOptions {
 			},
 			xmp_metadata: None,
 			depth_item: false,
+			motion_photo: false,
 			exif_orientation: None,
 			trailer: None,
 		}
@@ -86,7 +88,11 @@ where
 	if opts.xmp {
 		head.extend(segment(
 			0xE1,
-			&[XMP, primary_xmp(gain_map.len(), opts.depth_item).as_bytes()].concat(),
+			&[
+				XMP,
+				primary_xmp(gain_map.len(), opts.depth_item, opts.motion_photo).as_bytes(),
+			]
+			.concat(),
 		));
 	}
 
@@ -179,9 +185,14 @@ fn mpf_segment(primary_len: usize, gain_map_len: usize, gain_map_offset: usize) 
 	segment(0xE2, &[MPF, &tiff].concat())
 }
 
-fn primary_xmp(gain_map_len: usize, depth_item: bool) -> String {
+fn primary_xmp(gain_map_len: usize, depth_item: bool, motion_photo: bool) -> String {
 	let depth = if depth_item {
 		"<rdf:li rdf:parseType='Resource'><Container:Item Item:Semantic='Depth' Item:Mime='image/jpeg'/></rdf:li>"
+	} else {
+		""
+	};
+	let camera = if motion_photo {
+		" xmlns:GCamera='http://ns.google.com/photos/1.0/camera/' GCamera:MotionPhoto='1'"
 	} else {
 		""
 	};
@@ -189,7 +200,7 @@ fn primary_xmp(gain_map_len: usize, depth_item: bool) -> String {
 		"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>\
 		 <rdf:Description rdf:about='' xmlns:Container='http://ns.google.com/photos/1.0/container/' \
 		 xmlns:Item='http://ns.google.com/photos/1.0/container/item/' xmlns:hdrgm='http://ns.adobe.com/hdr-gain-map/1.0/' \
-		 hdrgm:Version='1.0'><Container:Directory><rdf:Seq>\
+		 hdrgm:Version='1.0'{camera}><Container:Directory><rdf:Seq>\
 		 <rdf:li rdf:parseType='Resource'><Container:Item Item:Semantic='Primary' Item:Mime='image/jpeg'/></rdf:li>\
 		 <rdf:li rdf:parseType='Resource'><Container:Item Item:Semantic='GainMap' Item:Mime='image/jpeg' Item:Length='{gain_map_len}'/></rdf:li>\
 		 {depth}</rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>"
