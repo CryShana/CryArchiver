@@ -5,6 +5,7 @@ use std::io::Write;
 use cryarchiver_engine::container::jxl::{Codestream, JxlMetadata, write_container};
 use cryarchiver_engine::metadata::gain_map::{Channel, GainMapMetadata, Signed, Unsigned};
 use cryarchiver_engine::metadata::icc::Cicp;
+use cryarchiver_engine::metadata::jpeg::image_end;
 use cryarchiver_engine::metadata::{AuxKind, ImageFormat, extract, sniff};
 use moxcms::ColorProfile;
 use support::heif::{HeifFile, HeifItem, aux_c, colr_icc, colr_nclx, exif_item, ispe};
@@ -451,6 +452,99 @@ fn a_cut_off_gain_map_is_a_warning() {
 		metadata.warnings
 	);
 	assert_eq!(metadata.aux_without_gain_map().len(), metadata.aux.len());
+}
+
+#[test]
+fn without_mpf_the_gain_map_is_not_counted_as_trailing_data() {
+	let base = image::RgbImage::new(64, 48);
+	let noisy_gain = image::GrayImage::from_fn(48, 36, |x, y| {
+		image::Luma([u8::try_from((x * 37 + y * 91 + x * y * 13) % 256).unwrap()])
+	});
+	let trailer: Vec<u8> = [b"SEFH".as_slice(), &[0x5A; 2040], b"SEFT"].concat();
+	let without_mpf = extract(&ultra_hdr_jpeg(
+		&base,
+		&noisy_gain,
+		&UltraHdrOptions {
+			mpf: false,
+			..UltraHdrOptions::default()
+		},
+	));
+	let with_trailer = extract(&ultra_hdr_jpeg(
+		&base,
+		&noisy_gain,
+		&UltraHdrOptions {
+			mpf: false,
+			trailer: Some(trailer),
+			..UltraHdrOptions::default()
+		},
+	));
+	let trailing = |aux: &AuxKind| matches!(aux, AuxKind::Other(detail) if detail.ends_with("bytes after the image"));
+
+	assert!(without_mpf.aux.iter().any(trailing), "{:?}", without_mpf.aux);
+	assert!(
+		without_mpf.aux_without_gain_map().is_empty(),
+		"{:?}",
+		without_mpf.aux_without_gain_map()
+	);
+	assert_eq!(with_trailer.aux.iter().filter(|aux| trailing(aux)).count(), 1);
+	assert_eq!(
+		with_trailer.aux_without_gain_map(),
+		[&AuxKind::Other("2048 bytes after the image".into())]
+	);
+}
+
+#[test]
+fn the_fallback_skips_embedded_images_that_are_not_the_gain_map() {
+	let bytes = ultra_hdr(&UltraHdrOptions {
+		mpf: false,
+		..UltraHdrOptions::default()
+	});
+	let primary_end = image_end(&bytes).unwrap();
+	let decoy = jpeg(&[], 3);
+	let with_decoy = [&bytes[..primary_end], &decoy, &bytes[primary_end..]].concat();
+
+	let found = extract(&with_decoy).gain_map.expect("the gain map after the decoy");
+
+	assert_eq!(found.jpeg.start, primary_end + decoy.len());
+	assert_eq!(found.metadata, UltraHdrOptions::default().metadata);
+}
+
+#[test]
+fn broken_gain_map_signals_are_warnings_not_panics() {
+	let hdrgm = xmp_segment(
+		"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:hdrgm='http://ns.adobe.com/hdr-gain-map/1.0/' hdrgm:Version='1.0'/></rdf:RDF></x:xmpmeta>",
+	);
+	let iso = |payload: &[u8]| segment(0xE2, &[b"urn:iso:std:iso:ts:21496:-1\0".as_slice(), payload].concat());
+	let version_only = jpeg(&[iso(&[0; 4])], 3);
+	let cases = [
+		(
+			jpeg(&[hdrgm.clone(), mpf_with_image(5000, u32::MAX)], 3),
+			"no gain map image follows",
+		),
+		(
+			jpeg(&[hdrgm.clone(), mpf_with_image(5000, 1 << 20)], 3),
+			"no gain map image follows",
+		),
+		(jpeg(&[hdrgm], 3), "no gain map image follows"),
+		(
+			[version_only.clone(), version_only.clone()].concat(),
+			"no gain map metadata",
+		),
+		([version_only, jpeg(&[iso(&[0, 0, 0, 0, 0x40])], 3)].concat(), "cut off"),
+	];
+
+	for (bytes, reason) in cases {
+		let metadata = extract(&bytes);
+		let warnings: Vec<&String> = metadata
+			.warnings
+			.iter()
+			.filter(|warning| warning.starts_with("the HDR gain map can't be read: "))
+			.collect();
+
+		assert_eq!(metadata.gain_map, None);
+		assert_eq!(warnings.len(), 1, "{:?}", metadata.warnings);
+		assert!(warnings[0].contains(reason), "{warnings:?}");
+	}
 }
 
 fn chunk(kind: [u8; 4], body: &[u8]) -> Vec<u8> {

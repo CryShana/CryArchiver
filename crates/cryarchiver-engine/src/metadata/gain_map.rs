@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use crate::metadata::auxiliary::{self, HDR_GAIN_MAP};
-use crate::metadata::{AuxKind, jpeg, xmp};
+use crate::metadata::{jpeg, xmp};
 
 const MULTICHANNEL: u8 = 0x80;
 const USE_BASE_COLOUR_SPACE: u8 = 0x40;
@@ -10,7 +10,7 @@ const BACKWARD_DIRECTION: u8 = 0x04;
 const HDR_BASE: &str = "HDR base rendition is not supported";
 const DEFAULT_OFFSET: f64 = 1.0 / 64.0;
 const MAX_FRACTION_ITERATIONS: usize = 39;
-const SOI: [u8; 3] = [0xFF, 0xD8, 0xFF];
+const JPEG_START: [u8; 3] = [0xFF, 0xD8, 0xFF];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signed {
@@ -181,6 +181,7 @@ impl GainMapMetadata {
 		if alternate_headroom <= base_headroom || base_headroom < 0.0 {
 			return Err("hdrgm:HDRCapacityMax must exceed hdrgm:HDRCapacityMin, which can't be negative".into());
 		}
+
 		for c in 0..3 {
 			if max[c] < min[c] || base_offset[c] < 0.0 || alternate_offset[c] < 0.0 || gamma[c] <= 0.0 {
 				return Err(format!("the hdrgm values of channel {c} are out of range"));
@@ -219,6 +220,7 @@ impl GainMapMetadata {
 		if !matches!(self.channels.len(), 1 | 3) {
 			return Err(format!("{} gain map channels instead of 1 or 3", self.channels.len()));
 		}
+
 		if self.base_headroom.denominator == 0 || self.alternate_headroom.denominator == 0 {
 			return Err("a headroom has a zero denominator".into());
 		}
@@ -227,9 +229,11 @@ impl GainMapMetadata {
 			if channel.denominators().contains(&0) {
 				return Err("a gain map value has a zero denominator".into());
 			}
+
 			if channel.gamma.numerator == 0 {
 				return Err("the gain map gamma is zero".into());
 			}
+
 			if channel.max.scaled(channel.min.denominator) < channel.min.scaled(channel.max.denominator) {
 				return Err("the gain map maximum is below its minimum".into());
 			}
@@ -248,6 +252,7 @@ impl GainMapMetadata {
 		if self.channels.len() == 3 {
 			flags |= MULTICHANNEL;
 		}
+
 		if self.use_base_colour_space {
 			flags |= USE_BASE_COLOUR_SPACE;
 		}
@@ -269,13 +274,7 @@ impl GainMapMetadata {
 
 pub fn find(bytes: &[u8], mpf: Option<(&[u8], usize)>) -> Option<Result<GainMapSource, String>> {
 	let primary = Header::of(bytes);
-	let signalled = primary.iso.is_some()
-		|| primary.xmp.is_some_and(|xmp| {
-			auxiliary::from_xmp(xmp)
-				.iter()
-				.any(|aux| matches!(aux, AuxKind::GainMap(_)))
-		});
-	if !signalled {
+	if primary.iso.is_none() && !primary.xmp.is_some_and(auxiliary::signals_gain_map) {
 		return None;
 	}
 
@@ -291,7 +290,7 @@ pub fn find(bytes: &[u8], mpf: Option<(&[u8], usize)>) -> Option<Result<GainMapS
 		return Some(read(bytes, start));
 	}
 
-	Some(second_image(bytes).and_then(|start| read(bytes, start)))
+	Some(embedded_image(bytes).and_then(|start| read(bytes, start)))
 }
 
 struct Reader<'a> {
@@ -348,41 +347,17 @@ struct Header<'a> {
 impl<'a> Header<'a> {
 	fn of(image: &'a [u8]) -> Self {
 		let mut header = Self { xmp: None, iso: None };
-		let mut at = 2;
-
-		while let Some(&[0xFF, marker]) = image.get(at..at + 2) {
-			match marker {
-				0xFF => {
-					at += 1;
-					continue;
-				}
-				0x01 | 0xD0..=0xD8 => {
-					at += 2;
-					continue;
-				}
-				0xD9 | 0xDA => break,
-				_ => {}
-			}
-
-			let Some(len) = image
-				.get(at + 2..at + 4)
-				.map(|len| usize::from(u16::from_be_bytes([len[0], len[1]])))
-			else {
-				break;
-			};
-			let Some(payload) = image.get(at + 4..at + 2 + len.max(2)) else {
-				break;
-			};
-			match marker {
+		for segment in jpeg::SegmentWalk::new(image) {
+			match segment.marker {
 				0xE1 if header.xmp.is_none() => {
-					header.xmp = payload
+					header.xmp = segment
+						.payload
 						.strip_prefix(jpeg::XMP)
 						.and_then(|xmp| std::str::from_utf8(xmp).ok());
 				}
-				0xE2 if header.iso.is_none() => header.iso = payload.strip_prefix(jpeg::ISO_GAIN_MAP),
+				0xE2 if header.iso.is_none() => header.iso = segment.payload.strip_prefix(jpeg::ISO_GAIN_MAP),
 				_ => {}
 			}
-			at += 2 + len.max(2);
 		}
 		header
 	}
@@ -401,16 +376,22 @@ impl<'a> Header<'a> {
 }
 
 fn image_at(bytes: &[u8], start: usize) -> Option<&[u8]> {
-	bytes.get(start..).filter(|image| image.starts_with(&SOI))
+	bytes.get(start..).filter(|image| image.starts_with(&JPEG_START))
 }
 
-fn second_image(bytes: &[u8]) -> Result<usize, String> {
+fn embedded_image(bytes: &[u8]) -> Result<usize, String> {
 	let primary_end = jpeg::image_end(bytes).map_err(|err| format!("the primary image is broken ({err})"))?;
-	bytes[primary_end..]
-		.windows(SOI.len())
-		.position(|window| window == SOI)
-		.map(|position| primary_end + position)
-		.ok_or_else(|| "no gain map image follows the primary image".into())
+	let mut starts = bytes[primary_end..]
+		.windows(JPEG_START.len())
+		.enumerate()
+		.filter(|(_, window)| *window == JPEG_START)
+		.map(|(position, _)| primary_end + position)
+		.peekable();
+	let first = *starts.peek().ok_or("no gain map image follows the primary image")?;
+
+	Ok(starts
+		.find(|&start| image_at(bytes, start).is_some_and(|image| Header::of(image).carries_gain_map()))
+		.unwrap_or(first))
 }
 
 fn read(bytes: &[u8], start: usize) -> Result<GainMapSource, String> {

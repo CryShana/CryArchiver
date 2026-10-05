@@ -12,6 +12,7 @@ const GOOGLE_DEPTH: &str = "http://ns.google.com/photos/1.0/depthmap/";
 const GOOGLE_IMAGE: &str = "http://ns.google.com/photos/1.0/image/";
 const GOOGLE_ITEM: &str = "http://ns.google.com/photos/1.0/container/item/";
 const GOOGLE_CAMERA: &str = "http://ns.google.com/photos/1.0/camera/";
+const GAIN_MAP_ITEM: &str = "GainMap";
 
 pub(crate) struct MpEntry {
 	pub kind: u32,
@@ -102,7 +103,8 @@ pub(crate) fn mp_entries(mpf: &[u8]) -> Result<Vec<MpEntry>, String> {
 
 pub fn from_xmp(xmp: &str) -> Vec<AuxKind> {
 	let mut found = Vec::new();
-	if xmp::uses_namespace(xmp, HDR_GAIN_MAP) {
+	let hdr_gain_map = xmp::uses_namespace(xmp, HDR_GAIN_MAP);
+	if hdr_gain_map {
 		found.push(AuxKind::GainMap("Ultra HDR".into()));
 	}
 	if xmp::uses_namespace(xmp, GOOGLE_DEPTH) {
@@ -111,28 +113,39 @@ pub fn from_xmp(xmp: &str) -> Vec<AuxKind> {
 	if xmp::uses_namespace(xmp, GOOGLE_IMAGE) {
 		found.push(AuxKind::Other("Google embedded image".into()));
 	}
-	let mut gain_map_item = false;
 	let mut motion_photo = ["MicroVideo", "MotionPhoto"].iter().any(|name| {
 		xmp::values(xmp, GOOGLE_CAMERA, name)
 			.iter()
 			.any(|value| value.trim() == "1")
 	});
-	for semantic in xmp::values(xmp, GOOGLE_ITEM, "Semantic") {
+	let semantics = container_semantics(xmp);
+	for semantic in &semantics {
 		match semantic.as_str() {
-			"Primary" => {}
-			"GainMap" => gain_map_item = true,
+			"Primary" | GAIN_MAP_ITEM => {}
 			"MotionPhoto" => motion_photo = true,
 			"Depth" => found.push(AuxKind::Depth("container item".into())),
 			other => found.push(AuxKind::Other(format!("container item '{other}'"))),
 		}
 	}
-	if gain_map_item && !found.iter().any(|aux| matches!(aux, AuxKind::GainMap(_))) {
+	if names_gain_map_item(&semantics) && !hdr_gain_map {
 		found.push(AuxKind::GainMap("container item".into()));
 	}
 	if motion_photo {
 		found.push(AuxKind::MotionVideo("Google motion photo".into()));
 	}
 	found
+}
+
+pub(crate) fn signals_gain_map(xmp: &str) -> bool {
+	xmp::uses_namespace(xmp, HDR_GAIN_MAP) || names_gain_map_item(&container_semantics(xmp))
+}
+
+fn container_semantics(xmp: &str) -> Vec<String> {
+	xmp::values(xmp, GOOGLE_ITEM, "Semantic")
+}
+
+fn names_gain_map_item(semantics: &[String]) -> bool {
+	semantics.iter().any(|semantic| semantic == GAIN_MAP_ITEM)
 }
 
 pub fn from_heif(meta: &Meta) -> Vec<AuxKind> {

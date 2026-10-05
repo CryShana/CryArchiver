@@ -79,12 +79,14 @@ pub fn ultra_hdr_jpeg(base: &image::RgbImage, gain: &image::GrayImage, opts: &Ul
 		let exif = super::exif_block(orientation, base.width(), base.height());
 		head.extend(segment(0xE1, &[b"Exif\0\0".as_slice(), &exif].concat()));
 	}
+
 	if opts.xmp {
 		head.extend(segment(
 			0xE1,
 			&[XMP, primary_xmp(gain_map.len(), opts.depth_item).as_bytes()].concat(),
 		));
 	}
+
 	if opts.iso {
 		head.extend(segment(0xE2, &[ISO, &[0, 0, 0, 0]].concat()));
 	}
@@ -113,6 +115,7 @@ fn gain_map_jpeg(gain: &image::GrayImage, opts: &UltraHdrOptions) -> Vec<u8> {
 		let metadata = opts.xmp_metadata.as_ref().unwrap_or(&opts.metadata);
 		out.extend(segment(0xE1, &[XMP, gain_map_xmp(metadata).as_bytes()].concat()));
 	}
+
 	if opts.iso {
 		let payload = if opts.legacy_common_denominator {
 			legacy_iso(&opts.metadata)
@@ -121,6 +124,7 @@ fn gain_map_jpeg(gain: &image::GrayImage, opts: &UltraHdrOptions) -> Vec<u8> {
 		};
 		out.extend(segment(0xE2, &[ISO, &payload].concat()));
 	}
+
 	out.extend_from_slice(&encoded[2..]);
 	out
 }
@@ -233,14 +237,13 @@ fn legacy_iso(metadata: &GainMapMetadata) -> Vec<u8> {
 	let channels = &metadata.channels;
 	let all_equal = channels.iter().all(|c| {
 		[
+			metadata.alternate_headroom.denominator,
 			c.min.denominator,
 			c.max.denominator,
 			c.gamma.denominator,
 			c.base_offset.denominator,
-		]
-		.into_iter()
-		.chain([c.alternate_offset.denominator, metadata.alternate_headroom.denominator])
-		.all(|d| d == denominator)
+			c.alternate_offset.denominator,
+		] == [denominator; 6]
 	});
 	assert!(all_equal, "the legacy layout needs one common denominator");
 
@@ -248,6 +251,7 @@ fn legacy_iso(metadata: &GainMapMetadata) -> Vec<u8> {
 	if channels.len() == 3 {
 		flags |= 0x80;
 	}
+
 	if metadata.use_base_colour_space {
 		flags |= 0x40;
 	}

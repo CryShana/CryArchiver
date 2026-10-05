@@ -74,6 +74,9 @@ pub struct SourceMetadata {
 	pub gain_map: Option<GainMapSource>,
 	/// The `aux` entry that the gain map's own MPF entry produced.
 	pub gain_map_mpf_entry: Option<AuxKind>,
+	/// When the MPF doesn't account for the gain map: the `aux` trailer entry that includes it, and what remains
+	/// after it.
+	pub gain_map_trailer: Option<(AuxKind, Option<AuxKind>)>,
 	pub warnings: Vec<String>,
 }
 
@@ -84,18 +87,30 @@ impl SourceMetadata {
 		}
 
 		let mut mpf_entry = self.gain_map_mpf_entry.as_ref();
+		let mut trailer = self.gain_map_trailer.as_ref().map(|(trailer, _)| trailer);
+		let remainder = self
+			.gain_map_trailer
+			.as_ref()
+			.and_then(|(_, remainder)| remainder.as_ref());
 		self.aux
 			.iter()
 			.filter(|aux| {
 				if matches!(aux, AuxKind::GainMap(_)) {
 					return false;
 				}
+
 				if mpf_entry == Some(*aux) {
 					mpf_entry = None;
 					return false;
 				}
+
+				if trailer == Some(*aux) {
+					trailer = None;
+					return false;
+				}
 				true
 			})
+			.chain(remainder)
 			.collect()
 	}
 }

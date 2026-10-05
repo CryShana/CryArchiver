@@ -35,50 +35,107 @@ struct Segments<'a> {
 	iso_gain_map: bool,
 }
 
+pub(super) struct Segment<'a> {
+	pub marker: u8,
+	pub at: usize,
+	pub payload: &'a [u8],
+}
+
+/// The marker segments before the first scan. `cut_off` names the marker whose segment ran past the end.
+pub(super) struct SegmentWalk<'a> {
+	bytes: &'a [u8],
+	at: usize,
+	pub cut_off: Option<u8>,
+}
+
+impl<'a> SegmentWalk<'a> {
+	pub(super) fn new(bytes: &'a [u8]) -> Self {
+		Self {
+			bytes,
+			at: 2,
+			cut_off: None,
+		}
+	}
+}
+
+impl<'a> Iterator for SegmentWalk<'a> {
+	type Item = Segment<'a>;
+
+	fn next(&mut self) -> Option<Segment<'a>> {
+		while let Some(&[0xFF, marker]) = self.bytes.get(self.at..self.at + 2) {
+			match marker {
+				0xFF => {
+					self.at += 1;
+					continue;
+				}
+				0x01 | 0xD0..=0xD8 => {
+					self.at += 2;
+					continue;
+				}
+				0xD9 | 0xDA => return None,
+				_ => {}
+			}
+
+			let at = self.at;
+			let len = self
+				.bytes
+				.get(at + 2..at + 4)
+				.map(|len| usize::from(u16::from_be_bytes([len[0], len[1]])))?;
+			let Some(payload) = self.bytes.get(at + 4..(at + 2 + len).max(at + 4)) else {
+				self.cut_off = Some(marker);
+				return None;
+			};
+
+			self.at += 2 + len.max(2);
+			return Some(Segment { marker, at, payload });
+		}
+		None
+	}
+}
+
 pub(super) fn extract(bytes: &[u8]) -> SourceMetadata {
 	let mut metadata = SourceMetadata::default();
 	let mut segments = Segments::default();
-	let mut at = 2;
 
-	while let Some(&[0xFF, marker]) = bytes.get(at..at + 2) {
-		match marker {
-			0xFF => {
-				at += 1;
-				continue;
-			}
-			0x01 | 0xD0..=0xD8 => {
-				at += 2;
-				continue;
-			}
-			0xD9 | 0xDA => break,
-			_ => {}
-		}
-
-		let Some(len) = bytes
-			.get(at + 2..at + 4)
-			.map(|len| usize::from(u16::from_be_bytes([len[0], len[1]])))
-		else {
-			break;
-		};
-		let Some(payload) = bytes.get(at + 4..(at + 2 + len).max(at + 4)) else {
-			metadata.warnings.push(format!("the FF{marker:02X} segment is cut off"));
-			break;
-		};
+	let mut walk = SegmentWalk::new(bytes);
+	for Segment { marker, at, payload } in walk.by_ref() {
 		if marker == APP2 && payload.starts_with(MPF) {
 			segments.mpf_at = at + 4 + MPF.len();
 		}
 		read_segment(marker, payload, &mut metadata, &mut segments);
-		at += 2 + len.max(2);
+	}
+	if let Some(marker) = walk.cut_off {
+		metadata.warnings.push(format!("the FF{marker:02X} segment is cut off"));
 	}
 
-	if let Some(trailer) = image_end(bytes)
-		.ok()
-		.and_then(|end| trailing_content(bytes, end, &segments))
-	{
-		metadata.aux.push(trailer);
+	let mpf = segments.mpf.map(|mpf| (mpf, segments.mpf_at));
+	let trailer = image_end(bytes).ok().and_then(|end| trailing_content(bytes, end, mpf));
+	if let Some(trailer) = &trailer {
+		metadata.aux.push(trailer.clone());
 	}
-	finish(bytes, &mut metadata, segments);
+
+	finish(&mut metadata, segments);
+	read_gain_map(bytes, mpf, trailer, &mut metadata);
 	metadata
+}
+
+fn read_gain_map(bytes: &[u8], mpf: Option<(&[u8], usize)>, trailer: Option<AuxKind>, metadata: &mut SourceMetadata) {
+	match gain_map::find(bytes, mpf) {
+		Some(Ok(found)) => {
+			metadata.gain_map_mpf_entry =
+				mpf.and_then(|(mpf, mpf_at)| auxiliary::mpf_entry_at(mpf, found.jpeg.start.checked_sub(mpf_at)?));
+
+			if listed_images_end(mpf).is_none_or(|end| end < found.jpeg.end) {
+				metadata.gain_map_trailer =
+					trailer.map(|trailer| (trailer, trailing_content(bytes, found.jpeg.end, mpf)));
+			}
+			metadata.gain_map = Some(found);
+		}
+		Some(Err(reason)) => metadata
+			.warnings
+			.push(format!("the HDR gain map can't be read: {reason}")),
+		None => {}
+	}
 }
 
 pub fn image_end(bytes: &[u8]) -> Result<usize, String> {
@@ -128,7 +185,12 @@ fn skip_entropy_data(bytes: &[u8], mut at: usize) -> usize {
 	bytes.len()
 }
 
-fn trailing_content(bytes: &[u8], image_end: usize, segments: &Segments<'_>) -> Option<AuxKind> {
+fn listed_images_end(mpf: Option<(&[u8], usize)>) -> Option<usize> {
+	let (mpf, mpf_at) = mpf?;
+	auxiliary::mpf_images_end(mpf).map(|end| mpf_at.saturating_add(end))
+}
+
+fn trailing_content(bytes: &[u8], image_end: usize, mpf: Option<(&[u8], usize)>) -> Option<AuxKind> {
 	let after_image = bytes.get(image_end..)?;
 	if after_image
 		.windows(SAMSUNG_MOTION_PHOTO.len())
@@ -137,10 +199,7 @@ fn trailing_content(bytes: &[u8], image_end: usize, segments: &Segments<'_>) -> 
 		return Some(AuxKind::MotionVideo("Samsung motion photo".into()));
 	}
 
-	let mpf_end = segments
-		.mpf
-		.and_then(auxiliary::mpf_images_end)
-		.map(|end| segments.mpf_at.saturating_add(end));
+	let mpf_end = listed_images_end(mpf);
 	let unaccounted = bytes.get(mpf_end.map_or(image_end, |end| end.max(image_end))..)?;
 	let padding = unaccounted.iter().all(|&byte| byte == 0x00 || byte == 0xFF);
 	if unaccounted.len() < MIN_TRAILING_CONTENT || padding {
@@ -198,7 +257,7 @@ fn read_segment<'a>(marker: u8, payload: &'a [u8], metadata: &mut SourceMetadata
 	}
 }
 
-fn finish(bytes: &[u8], metadata: &mut SourceMetadata, segments: Segments<'_>) {
+fn finish(metadata: &mut SourceMetadata, segments: Segments<'_>) {
 	if !segments.icc_chunks.is_empty() {
 		match reassemble_icc(segments.icc_chunks) {
 			Ok(icc) => metadata.icc = Some(icc),
@@ -241,20 +300,6 @@ fn finish(bytes: &[u8], metadata: &mut SourceMetadata, segments: Segments<'_>) {
 		metadata
 			.aux
 			.push(crate::metadata::AuxKind::GainMap("ISO 21496-1 metadata".into()));
-	}
-
-	match gain_map::find(bytes, segments.mpf.map(|mpf| (mpf, segments.mpf_at))) {
-		Some(Ok(found)) => {
-			metadata.gain_map_mpf_entry = segments.mpf.and_then(|mpf| {
-				let offset = found.jpeg.start.checked_sub(segments.mpf_at)?;
-				auxiliary::mpf_entry_at(mpf, offset)
-			});
-			metadata.gain_map = Some(found);
-		}
-		Some(Err(reason)) => metadata
-			.warnings
-			.push(format!("the HDR gain map can't be read: {reason}")),
-		None => {}
 	}
 }
 
