@@ -291,6 +291,21 @@ pub fn with_jpeg_segment(jpeg: &[u8], marker: u8, payload: &[u8]) -> Vec<u8> {
 	out
 }
 
+pub fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+	assert_eq!(from.len(), to.len());
+	let mut found = bytes
+		.windows(from.len())
+		.enumerate()
+		.filter(|(_, window)| *window == from)
+		.map(|(at, _)| at);
+	let at = found.next().expect("the pattern is in the bytes");
+	assert_eq!(found.next(), None, "the pattern is in the bytes more than once");
+
+	let mut out = bytes.to_vec();
+	out[at..at + to.len()].copy_from_slice(to);
+	out
+}
+
 pub fn photo_png(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
 	let path = dir.join(name);
 	let (x1, y1) = (width - 1, height - 1);

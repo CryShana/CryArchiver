@@ -4,6 +4,7 @@ use avif_serialize::constants::{ColorPrimaries, MatrixCoefficients, TransferChar
 use avif_serialize::{AlternateColour, Av1Config, Aviffy, GainMap};
 use cryarchiver_engine::container::isobmff::{EntityGroup, GainMapItems, Nclx, brands, parse_meta};
 use support::heif::{HeifFile, HeifItem, aux_c, boxed, colr_icc, colr_nclx, exif_item, full_box, imir, irot, ispe};
+use support::replaced;
 
 const TIFF: &[u8] = b"MM\0*\0\0\0\x08\0\0\0\0\0\0";
 const ALPHA: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
@@ -129,13 +130,6 @@ fn with_gain_map() -> Vec<u8> {
 		},
 	});
 	aviffy.to_vec(&[0xAA; 16], None, 60, 40, 8)
-}
-
-fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-	let at = bytes.windows(from.len()).position(|window| window == from).unwrap();
-	let mut out = bytes.to_vec();
-	out[at..at + to.len()].copy_from_slice(to);
-	out
 }
 
 #[test]

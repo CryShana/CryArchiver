@@ -14,6 +14,7 @@ use cryarchiver_engine::metadata::gain_map::GainMapMetadata;
 use cryarchiver_engine::metadata::icc::Cicp;
 use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
 use moxcms::ColorProfile;
+use support::replaced;
 use support::ultra_hdr::UltraHdrOptions;
 
 const QUICK: RavifSettings = RavifSettings {
@@ -95,6 +96,7 @@ fn metadata_and_colour_boxes_follow_the_libavif_conventions() {
 		cicp: Cicp::UNSPECIFIED,
 		metadata,
 		gain_map: None,
+		gain_map_coded_cicp: false,
 	};
 	check(&avif, &expected).unwrap();
 	let meta = parse_meta(&avif).unwrap();
@@ -140,6 +142,7 @@ fn a_two_stream_alpha_still_keeps_its_alpha_item() {
 			cicp: Cicp::SRGB,
 			metadata: AvifMetadata::default(),
 			gain_map: None,
+			gain_map_coded_cicp: false,
 		},
 	)
 	.unwrap();
@@ -165,6 +168,7 @@ fn colour_codes_avif_cannot_carry_become_unspecified() {
 			cicp: Cicp::UNSPECIFIED,
 			metadata: AvifMetadata::default(),
 			gain_map: None,
+			gain_map_coded_cicp: false,
 		},
 	)
 	.unwrap();
@@ -201,6 +205,7 @@ fn check_names_what_does_not_match() {
 		cicp: Cicp::SRGB,
 		metadata: AvifMetadata::default(),
 		gain_map: None,
+		gain_map_coded_cicp: false,
 	};
 	let tiff = support::exif_block(1, 64, 48);
 
@@ -308,6 +313,7 @@ fn expectations<'a>(metadata: AvifMetadata<'a>, gain_map: Option<&'a GainMapMeta
 		cicp: Cicp::SRGB,
 		metadata,
 		gain_map,
+		gain_map_coded_cicp: false,
 	}
 }
 
@@ -319,13 +325,6 @@ fn with_gain_map(metadata: &AvifMetadata<'_>, gain_map: &GainMapMetadata) -> (Ve
 	};
 	let avif = rewrite(&ravif_still(false), Cicp::SRGB, metadata, Some(&input)).unwrap();
 	(avif, gain_map_avif)
-}
-
-fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-	let at = bytes.windows(from.len()).position(|window| window == from).unwrap();
-	let mut out = bytes.to_vec();
-	out[at..at + to.len()].copy_from_slice(to);
-	out
 }
 
 fn nclx_of(meta: &Meta, id: u32) -> Vec<Nclx> {
@@ -475,6 +474,73 @@ fn check_refuses_gain_maps_readers_would_ignore_or_misread() {
 
 	let plain = rewrite(&ravif_still(false), Cicp::SRGB, &AvifMetadata::default(), None).unwrap();
 	assert!(refusal(&plain, &expected).contains("'tmap'"));
+}
+
+fn ipma_entry(meta: &Meta, id: u32) -> Vec<u8> {
+	let links = &meta.item(id).unwrap().properties;
+	let mut entry = u16::try_from(id).unwrap().to_be_bytes().to_vec();
+	entry.push(u8::try_from(links.len()).unwrap());
+	entry.extend(
+		links
+			.iter()
+			.map(|link| u8::try_from(link.index).unwrap() | if link.essential { 0x80 } else { 0 }),
+	);
+	entry
+}
+
+#[test]
+fn check_refuses_tone_map_and_gain_map_items_that_break_libavifs_rules() {
+	let metadata = gain_map_metadata();
+	let (avif, _) = with_gain_map(&AvifMetadata::default(), &metadata);
+	let expected = expectations(AvifMetadata::default(), Some(&metadata));
+	let refusal = |bytes: &[u8]| check(bytes, &expected).unwrap_err();
+	let meta = parse_meta(&avif).unwrap();
+
+	let only_major = replaced(&avif, b"avif\0\0\0\0mif1miaftmap", b"tmap\0\0\0\0mif1miafavif");
+	assert!(refusal(&only_major).contains("compatible brands"));
+
+	let gain_map_size = meta
+		.item(3)
+		.unwrap()
+		.properties
+		.iter()
+		.find(|link| matches!(meta.properties[link.index - 1], Property::Size { width: 6, height: 4 }));
+	let tmap_entry = ipma_entry(&meta, 2);
+	let mut resized_entry = tmap_entry.clone();
+	resized_entry[3] = u8::try_from(gain_map_size.unwrap().index).unwrap();
+	let resized = replaced(&avif, &tmap_entry, &resized_entry);
+	assert!(refusal(&resized).contains("tone map item is Some((6, 4))"));
+
+	let transformed = replaced(&avif, b"colrnclx\0\x01\0\x10", b"paspnclx\0\x01\0\x10");
+	assert!(refusal(&transformed).contains("transform box"));
+
+	let not_av1 = replaced(&avif, b"\0\x03\0\0av01GMap", b"\0\x03\0\0hvc1GMap");
+	assert!(refusal(&not_av1).contains("not AV1"));
+
+	let shown = replaced(&avif, b"infe\x02\0\0\x01", b"infe\x02\0\0\0");
+	assert!(refusal(&shown).contains("not hidden"));
+
+	let without_nclx = replaced(&avif, b"colrnclx\0\x02\0\x02", b"colrnclX\0\x02\0\x02");
+	assert!(refusal(&without_nclx).contains("found 0"));
+
+	let coloured = replaced(&avif, b"colrnclx\0\x02\0\x02", b"colrnclx\0\x01\0\x02");
+	assert!(refusal(&coloured).contains("nclx box says"));
+}
+
+#[test]
+fn the_coded_gain_map_cicp_check_refuses_ravifs_described_header() {
+	let metadata = gain_map_metadata();
+	let (avif, _) = with_gain_map(&AvifMetadata::default(), &metadata);
+	let header = read_sequence_header(&gain_map_av1(&avif).unwrap()).unwrap();
+
+	let strict = AvifExpectations {
+		gain_map_coded_cicp: true,
+		..expectations(AvifMetadata::default(), Some(&metadata))
+	};
+
+	assert_eq!((header.primaries, header.transfer), (Some(1), Some(13)));
+	assert!(check(&avif, &strict).unwrap_err().contains("sequence header"));
+	check(&avif, &expectations(AvifMetadata::default(), Some(&metadata))).unwrap();
 }
 
 #[test]

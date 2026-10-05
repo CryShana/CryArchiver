@@ -64,6 +64,7 @@ fn an_opaque_still_becomes_a_checked_avif_with_its_metadata() {
 				xmp: metadata.xmp.as_deref(),
 			},
 			gain_map: None,
+			gain_map_coded_cicp: false,
 		},
 	)
 	.unwrap();
@@ -98,6 +99,7 @@ fn transparent_and_sixteen_bit_stills_encode() {
 			cicp: Cicp::SRGB,
 			metadata: AvifMetadata::default(),
 			gain_map: None,
+			gain_map_coded_cicp: false,
 		},
 	)
 	.unwrap();

@@ -986,6 +986,41 @@ fn gain_map_with_alpha_is_refused() {
 }
 
 #[cfg(test)]
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// A change to these bytes changes every file written without a gain map.
+#[test]
+fn output_without_gain_map_is_pinned() {
+    let color = [0x12, 0x34, 0x56, 0x78, 0x9a];
+    let alpha = [0xab, 0xcd, 0xef];
+    let pin = |aviffy: &Aviffy, alpha: Option<&[u8]>| {
+        let avif = aviffy.to_vec(&color, alpha, 10, 20, 10);
+        (avif.len(), fnv1a(&avif))
+    };
+
+    let plain = pin(&Aviffy::new(), None);
+    let with_alpha = pin(Aviffy::new().set_premultiplied_alpha(true), Some(&alpha));
+    let with_metadata = pin(Aviffy::new()
+        .set_exif(test_tiff_exif())
+        .set_xmp(b"<x:xmpmeta/>".to_vec())
+        .set_icc_profile(b"fake icc profile".to_vec())
+        .set_matrix_coefficients(constants::MatrixCoefficients::Bt709)
+        .set_content_light_level(1000, 400), None);
+    let with_everything = pin(Aviffy::new()
+        .set_exif(test_tiff_exif())
+        .set_xmp(b"<x:xmpmeta/>".to_vec())
+        .set_icc_profile(b"fake icc profile".to_vec())
+        .set_seq_level_idx(8, 9), Some(&alpha));
+
+    assert_eq!(plain, (267, 5651259945971848704));
+    assert_eq!(with_alpha, (434, 6486856381273295406));
+    assert_eq!(with_metadata, (496, 17760809143564655889));
+    assert_eq!(with_everything, (624, 14606325890317880465));
+}
+
+#[cfg(test)]
 fn test_heif_exif(tiff_exif: &[u8]) -> Vec<u8> {
     let mut heif_exif = 0_u32.to_be_bytes().to_vec();
     heif_exif.extend_from_slice(tiff_exif);

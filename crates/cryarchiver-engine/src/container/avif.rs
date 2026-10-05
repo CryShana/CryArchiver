@@ -8,7 +8,7 @@ use crate::metadata::icc::Cicp;
 
 const UNSPECIFIED_MATRIX: u8 = 2;
 const BT601_MATRIX: u8 = 6;
-const UNSPECIFIED_CICP: u16 = 2;
+const UNSPECIFIED_CICP: u8 = 2;
 const DEFAULT_LEVEL: u8 = 31;
 const TMAP_VERSION: u8 = 0;
 
@@ -37,11 +37,15 @@ pub struct AvifExpectations<'a> {
 	pub cicp: Cicp,
 	pub metadata: AvifMetadata<'a>,
 	pub gain_map: Option<&'a GainMapMetadata>,
+	/// With a gain map: its AV1 sequence header, when it has a colour description, must also say primaries 2 and
+	/// transfer 2, as its `nclx` box does.
+	pub gain_map_coded_cicp: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct GainMapInput<'a> {
-	/// A complete single-image AVIF holding only the gain map (what Task 3's encoder returns), from which the AV1 data and its sequence header are taken.
+	/// A complete single-image AVIF holding only the gain map (as the gain map encoder returns it), from which the AV1
+	/// data and its sequence header are taken.
 	pub encoded: &'a [u8],
 	pub metadata: &'a GainMapMetadata,
 }
@@ -251,8 +255,9 @@ fn check_gain_map(
 	expected: &AvifExpectations<'_>,
 	gain_map: &GainMapMetadata,
 ) -> Result<(), String> {
-	if !isobmff::brands(bytes).is_some_and(|brands| brands.contains(b"tmap")) {
-		return Err("the output has a gain map but is not branded 'tmap'".into());
+	// libavif looks for the brand among the compatible brands only, never the major brand.
+	if !isobmff::brands(bytes).is_some_and(|brands| brands[1..].contains(b"tmap")) {
+		return Err("the output has a gain map but 'tmap' is not among its compatible brands".into());
 	}
 
 	let items = meta
@@ -278,11 +283,11 @@ fn check_gain_map(
 		return Err("the tone map item carries a transform box".into());
 	}
 
-	check_gain_map_item(meta, items.gain_map)?;
+	check_gain_map_item(meta, bytes, items.gain_map, expected.gain_map_coded_cicp)?;
 
 	let payload = meta.item_data(bytes, items.tmap).map_err(|err| err.to_string())?;
 	let Some((&TMAP_VERSION, iso)) = payload.split_first() else {
-		return Err("the tone map item's version is not 0".into());
+		return Err("the tone map item is empty or its version is not 0".into());
 	};
 	let stored =
 		GainMapMetadata::parse_iso(iso).map_err(|err| format!("the gain map metadata can't be read back: {err}"))?;
@@ -292,7 +297,7 @@ fn check_gain_map(
 	Ok(())
 }
 
-fn check_gain_map_item(meta: &Meta, id: u32) -> Result<(), String> {
+fn check_gain_map_item(meta: &Meta, bytes: &[u8], id: u32, coded_cicp: bool) -> Result<(), String> {
 	let item = meta.item(id).ok_or("the gain map item is missing")?;
 	if item.kind != *b"av01" {
 		return Err("the gain map item is not AV1".into());
@@ -315,10 +320,25 @@ fn check_gain_map_item(meta: &Meta, id: u32) -> Result<(), String> {
 			nclx.len()
 		));
 	};
-	if (nclx.primaries, nclx.transfer) != (UNSPECIFIED_CICP, UNSPECIFIED_CICP) {
+	let unspecified = u16::from(UNSPECIFIED_CICP);
+	if (nclx.primaries, nclx.transfer) != (unspecified, unspecified) {
 		return Err(format!(
 			"the gain map's nclx box says {nclx:?} but primaries 2 and transfer 2 were expected"
 		));
+	}
+
+	if coded_cicp {
+		let data = meta.item_data(bytes, id).map_err(|err| err.to_string())?;
+		let header = av1::read_sequence_header(&data).ok_or("the gain map item has no AV1 sequence header")?;
+		if [header.primaries, header.transfer]
+			.into_iter()
+			.any(|code| code.is_some_and(|code| code != UNSPECIFIED_CICP))
+		{
+			return Err(format!(
+				"the gain map's AV1 sequence header says primaries {:?}, transfer {:?} but 2 and 2 were expected",
+				header.primaries, header.transfer
+			));
+		}
 	}
 	Ok(())
 }
