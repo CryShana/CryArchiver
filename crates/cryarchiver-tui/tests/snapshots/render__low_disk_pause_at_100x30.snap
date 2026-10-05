@@ -26,7 +26,7 @@ expression: terminal.backend()
 "│        ● GOPR0292.MP4                                      encode     ━─────── 10.2% AV1         ┃"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
 "╭─ Log ──────────────────────────────────────────────────────────────────────── l to collapse ─[⤢]─╮"
-"│ 14:02:47 → paused: low disk space on E: · resumes when space frees                               │"
+"│ 14:02:47 → paused: low disk space on E: · resumes when space frees                               ┃"
 "│ 14:02:45 ✓ IMG_5164.JPG → AVIF 1.71 MB (−81 %)                                                   │"
 "│ 14:02:44 ✓ GOPR0042.MP4 → AV1 1.61 GB (−59 %)                                                    │"
 "│ 14:02:43 ↪ IMG_5163.JPG is a duplicate · placeholder written                                     │"

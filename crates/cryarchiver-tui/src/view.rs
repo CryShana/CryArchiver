@@ -447,7 +447,7 @@ pub enum FilterEntry {
 	File { folder: NodeId, row: FileRow },
 }
 
-/// Seconds since midnight, shown as `hh:mm:ss`.
+/// Local wall-clock seconds since midnight, shown as `hh:mm:ss`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockTime(pub u32);
 

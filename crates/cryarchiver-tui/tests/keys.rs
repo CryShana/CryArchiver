@@ -1270,3 +1270,128 @@ fn every_outcome_group_is_clickable_at_100_and_120_columns() {
 		}
 	}
 }
+
+/// The column and the screen rows of the Library's scrollbar track.
+fn library_track(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> (u16, Vec<u16>) {
+	let header = find_row(terminal, "Status").unwrap();
+	let column = terminal.backend().buffer().area.width - 1;
+	(column, library_body(terminal, header))
+}
+
+fn left(kind: fn(MouseButton) -> MouseEventKind) -> MouseEventKind {
+	kind(MouseButton::Left)
+}
+
+#[test]
+fn dragging_the_library_scrollbar_moves_the_view_and_leaves_the_selection() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let (column, track) = library_track(&terminal);
+	let (top, bottom) = (track[0], *track.last().unwrap());
+	let middle = top + (bottom - top) / 2;
+	let deepest = app.visible_rows() - track.len();
+	let selected = app.selected();
+	let now = Instant::now();
+
+	mouse(&mut app, left(MouseEventKind::Down), column, top, now);
+	assert_eq!(app.library_scroll(), 0);
+
+	mouse(&mut app, left(MouseEventKind::Drag), column, bottom, now);
+	assert_eq!(
+		app.library_scroll(),
+		deepest,
+		"the bottom of the track shows the last rows"
+	);
+
+	mouse(&mut app, left(MouseEventKind::Drag), 40, middle, now);
+	let halfway = app.library_scroll();
+	assert!(
+		halfway.abs_diff(deepest / 2) <= deepest.div_ceil(track.len()),
+		"the middle of the track shows the middle rows, away from the scrollbar too: {halfway} of {deepest}"
+	);
+
+	mouse(&mut app, left(MouseEventKind::Drag), 40, 0, now);
+	assert_eq!(app.library_scroll(), 0, "above the track is the top");
+
+	mouse(&mut app, left(MouseEventKind::Drag), 5, 35, now);
+	assert_eq!(app.library_scroll(), deepest, "below the track is the bottom");
+	assert_eq!(app.selected(), selected);
+
+	mouse(&mut app, left(MouseEventKind::Up), 5, 35, now);
+	mouse(&mut app, left(MouseEventKind::Drag), column, top, now);
+	assert_eq!(app.library_scroll(), deepest, "a released button drags nothing");
+	assert_eq!(app.selected(), selected);
+}
+
+#[test]
+fn clicking_the_library_track_jumps_there() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let (column, track) = library_track(&terminal);
+	let deepest = app.visible_rows() - track.len();
+	let selected = app.selected();
+	let now = Instant::now();
+
+	click(&mut app, column, *track.last().unwrap(), now);
+	assert_eq!(app.library_scroll(), deepest);
+	let terminal = draw(&mut app, 120, 36);
+	assert!(
+		!support::row_text(&terminal, track[0]).contains("Family"),
+		"the view shows the last rows"
+	);
+
+	mouse(&mut app, left(MouseEventKind::Up), column, *track.last().unwrap(), now);
+	click(&mut app, column, track[0], now + Duration::from_secs(1));
+	assert_eq!(app.library_scroll(), 0);
+	assert_eq!(app.selected(), selected, "a scrollbar press selects nothing");
+}
+
+#[test]
+fn dragging_the_log_scrollbar_scrolls_the_log() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let title_row = log_title_row(&terminal);
+	let column = 119;
+	let (top, bottom) = (title_row + 1, title_row + 4);
+	let selected = app.selected();
+	let now = Instant::now();
+
+	mouse(&mut app, left(MouseEventKind::Down), column, bottom, now);
+	assert_eq!(
+		app.log_scrolled_back(),
+		4,
+		"the bottom of the track shows the oldest lines"
+	);
+	let terminal = draw(&mut app, 120, 36);
+	assert!(support::row_text(&terminal, title_row).contains("↑ 4 newer"));
+
+	mouse(&mut app, left(MouseEventKind::Drag), 40, top, now);
+	assert_eq!(app.log_scrolled_back(), 0, "the top of the track is the newest line");
+
+	mouse(&mut app, left(MouseEventKind::Drag), 40, 35, now);
+	assert_eq!(app.log_scrolled_back(), 4);
+	assert_eq!(app.selected(), selected);
+	assert!(!app.log_maximized() && app.log_open(), "the press toggles nothing");
+}
+
+#[test]
+fn dragging_the_maximized_log_scrollbar_reaches_its_oldest_line() {
+	let mut app = app();
+	for _ in 0..40 {
+		press(&mut app, KeyCode::Char('p'));
+	}
+	press(&mut app, KeyCode::Char('L'));
+	let terminal = draw(&mut app, 120, 36);
+	let bottom = find_row(&terminal, "╰").unwrap() - 1;
+	let now = Instant::now();
+
+	mouse(&mut app, left(MouseEventKind::Down), 119, 2, now);
+	assert_eq!(app.log_scrolled_back(), 0);
+
+	mouse(&mut app, left(MouseEventKind::Drag), 60, bottom, now);
+	let deepest = app.log_scrolled_back();
+	assert!(deepest > 0);
+	let terminal = draw(&mut app, 120, 36);
+	assert!(support::row_text(&terminal, 1).contains(&format!("↑ {deepest} newer")));
+	assert!(app.log_maximized());
+}

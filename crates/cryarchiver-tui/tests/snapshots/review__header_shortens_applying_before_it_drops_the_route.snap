@@ -26,8 +26,8 @@ expression: terminal.backend()
 "│        ! half-copied.jpg                     damaged    —              AVIF  1.26 MB                  │"
 "╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯"
 "╭─ Log ───────────────────────────────────────────────────────────────────────────── l to collapse ─[⤢]─╮"
-"│ 14:02:13 → performance limit 25 % · applying… extra jobs finish first, or restart them now            │"
-"│ 14:02:13 → deleting originals is ON · each is deleted permanently after its archive is verified       │"
+"│ 14:02:13 → performance limit 25 % · applying… extra jobs finish first, or restart them now            ┃"
+"│ 14:02:13 → deleting originals is ON · each is deleted permanently after its archive is verified       ┃"
 "│ 14:02:08 ◌ concert_1080i.mkv: CRF 30.75 → VMAF 94.9 (4 probes) · encoding                             │"
 "│ 14:02:07 ✓ 02. 夜明け.mp3 → Opus 1.71 MB (−53 %) · cover + tags kept                                  │" Hidden by multi-width symbols: [(18, " "), (20, " "), (22, " ")]
 "╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯"

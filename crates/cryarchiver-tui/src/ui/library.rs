@@ -1,13 +1,12 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::symbols::scrollbar;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Table, Widget};
+use ratatui::widgets::{Cell, Row, Table, Widget};
 
-use super::widgets::{Chrome, bold, fg, gauge, pad_left, panel, put, to_u16};
+use super::widgets::{Chrome, bold, fg, gauge, pad_left, panel, put, scrollbar, to_u16};
 use crate::app::tree::{self, Fold, ProgressSort, RowKind};
-use crate::app::{Hit, Ui};
+use crate::app::{Bar, Hit, Ui};
 use crate::format::{bytes, find_ignore_case, fit, fit_middle, percent, saving, short_count, thousands, width};
 use crate::source::ArchiveSource;
 use crate::theme::{Theme, glyph, label};
@@ -131,7 +130,8 @@ pub fn render(buf: &mut Buffer, area: Rect, source: &dyn ArchiveSource, ui: &mut
 	}
 
 	if rows.len() > usize::from(body.height) {
-		scrollbar(buf, area, body, rows.len(), start, &theme);
+		let track = scrollbar(buf, area, body, rows.len(), start, &theme);
+		ui.hits.push(track, Hit::Scrollbar(Bar::Library));
 	}
 }
 
@@ -394,24 +394,4 @@ fn file_progress(status: &FileStatus, theme: &Theme) -> Line<'static> {
 		(crate::view::FileState::Queued, _) => Line::raw(""),
 		_ => Line::styled(fit("—", PROGRESS), fg(theme.dim)),
 	}
-}
-
-fn scrollbar(buf: &mut Buffer, area: Rect, body: Rect, rows: usize, scroll: usize, theme: &Theme) {
-	let track = Rect::new(area.right() - 1, body.y, 1, body.height);
-	let mut state = ScrollbarState::new(rows.saturating_sub(usize::from(body.height)))
-		.position(scroll)
-		.viewport_content_length(usize::from(body.height));
-
-	Scrollbar::new(ScrollbarOrientation::VerticalRight)
-		.symbols(scrollbar::Set {
-			track: "│",
-			thumb: "┃",
-			begin: "",
-			end: "",
-		})
-		.begin_symbol(None)
-		.end_symbol(None)
-		.track_style(fg(theme.border))
-		.thumb_style(fg(theme.accent))
-		.render(track, buf, &mut state);
 }

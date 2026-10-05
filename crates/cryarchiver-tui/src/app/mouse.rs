@@ -30,13 +30,25 @@ pub enum Hit {
 	Link { file: FileId, folder: NodeId },
 	Modal,
 	SettingsRow(usize),
+	Scrollbar(Bar),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bar {
+	Library,
+	Log,
 }
 
 impl Hit {
 	fn on_log(self) -> bool {
 		matches!(
 			self,
-			Self::LogToggle | Self::LogMaximize | Self::LogNewest | Self::LogLine(_) | Self::LogPanel
+			Self::LogToggle
+				| Self::LogMaximize
+				| Self::LogNewest
+				| Self::LogLine(_)
+				| Self::LogPanel
+				| Self::Scrollbar(Bar::Log)
 		)
 	}
 }
@@ -61,11 +73,12 @@ impl<H: Copy> HitMap<H> {
 	}
 
 	pub fn at(&self, position: Position) -> Option<H> {
-		self.0
-			.iter()
-			.rev()
-			.find(|(area, _)| area.contains(position))
-			.map(|&(_, hit)| hit)
+		self.find(position).map(|(_, hit)| hit)
+	}
+
+	/// The region under `position` along with what it is.
+	pub fn find(&self, position: Position) -> Option<(Rect, H)> {
+		self.0.iter().rev().find(|(area, _)| area.contains(position)).copied()
 	}
 }
 
@@ -75,13 +88,27 @@ pub(super) struct Click {
 	at: Instant,
 }
 
+/// A scrollbar the left button went down on. It follows the pointer's row wherever the pointer goes until the button
+/// comes up.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ScrollDrag {
+	bar: Bar,
+	track: Rect,
+}
+
 impl Ui {
 	pub(super) fn on_mouse(&mut self, source: &dyn ArchiveSource, mouse: MouseEvent, now: Instant) -> Outcome {
 		let position = Position::new(mouse.column, mouse.row);
 		match mouse.kind {
 			MouseEventKind::Down(MouseButton::Left) => {
+				self.scroll_drag = None;
 				let double = self.register_click(position, now);
 				self.on_click(source, position, double)
+			}
+			MouseEventKind::Drag(MouseButton::Left) => self.on_drag(source, position),
+			MouseEventKind::Up(MouseButton::Left) => {
+				self.scroll_drag = None;
+				Outcome::Ignored
 			}
 			MouseEventKind::Down(MouseButton::Right) => self.on_right_click(source, position),
 			MouseEventKind::ScrollDown => self.on_wheel(source, position, WHEEL_ROWS),
@@ -104,7 +131,8 @@ impl Ui {
 	}
 
 	fn on_click(&mut self, source: &dyn ArchiveSource, position: Position, double: bool) -> Outcome {
-		let hit = self.hits.at(position);
+		let found = self.hits.find(position);
+		let hit = found.map(|(_, hit)| hit);
 
 		match &self.overlay {
 			Some(Overlay::Menu(menu)) => {
@@ -151,10 +179,40 @@ impl Ui {
 			None => {}
 		}
 
-		let Some(hit) = hit else {
+		match found {
+			Some((track, Hit::Scrollbar(bar))) => {
+				self.scroll_drag = Some(ScrollDrag { bar, track });
+				self.drag_to(source, position.y);
+				Outcome::Done
+			}
+			Some((_, hit)) => self.on_hit(source, hit, position, double),
+			None => Outcome::Ignored,
+		}
+	}
+
+	fn on_drag(&mut self, source: &dyn ArchiveSource, position: Position) -> Outcome {
+		if self.scroll_drag.is_none() || self.overlay.is_some() {
 			return Outcome::Ignored;
-		};
-		self.on_hit(source, hit, position, double)
+		}
+
+		self.drag_to(source, position.y);
+		Outcome::Done
+	}
+
+	fn drag_to(&mut self, source: &dyn ArchiveSource, row: u16) {
+		let Some(drag) = self.scroll_drag else { return };
+
+		match drag.bar {
+			Bar::Library => {
+				let top = scroll_for_pointer(drag.track, row, self.tree.deepest_scroll());
+				self.tree.scroll_to(top);
+			}
+			Bar::Log => {
+				let log = &source.view().log;
+				let back = scroll_for_pointer(drag.track, row, self.log_scroll.deepest(log));
+				self.log_scroll.scroll_to(log, back);
+			}
+		}
 	}
 
 	fn on_hit(&mut self, source: &dyn ArchiveSource, hit: Hit, position: Position, double: bool) -> Outcome {
@@ -192,7 +250,8 @@ impl Ui {
 			| Hit::Modal
 			| Hit::SettingsRow(_)
 			| Hit::LogLine(_)
-			| Hit::LogPanel => {
+			| Hit::LogPanel
+			| Hit::Scrollbar(_) => {
 				return Outcome::Ignored;
 			}
 		}
@@ -272,5 +331,47 @@ impl Ui {
 			return Outcome::Done;
 		}
 		Outcome::Ignored
+	}
+}
+
+/// The scroll offset, out of `0..=deepest`, that a pointer on `row` asks of a scrollbar `track`: its top cell shows the
+/// start, its bottom cell the end, and rows beyond the track count as its ends.
+fn scroll_for_pointer(track: Rect, row: u16, deepest: usize) -> usize {
+	let last = usize::from(track.height.saturating_sub(1));
+	if last == 0 {
+		return 0;
+	}
+
+	let offset = usize::from(row.saturating_sub(track.y)).min(last);
+	(offset * deepest + last / 2) / last
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const TRACK: Rect = Rect::new(119, 10, 1, 11);
+
+	#[test]
+	fn the_track_maps_rows_onto_the_whole_scroll_range() {
+		assert_eq!(scroll_for_pointer(TRACK, 10, 100), 0, "top");
+		assert_eq!(scroll_for_pointer(TRACK, 15, 100), 50, "middle");
+		assert_eq!(scroll_for_pointer(TRACK, 20, 100), 100, "bottom");
+		assert_eq!(scroll_for_pointer(TRACK, 11, 100), 10);
+		assert_eq!(scroll_for_pointer(TRACK, 11, 4), 0, "rounds to the nearest offset");
+		assert_eq!(scroll_for_pointer(TRACK, 12, 4), 1);
+	}
+
+	#[test]
+	fn rows_beyond_the_track_count_as_its_ends() {
+		assert_eq!(scroll_for_pointer(TRACK, 0, 100), 0);
+		assert_eq!(scroll_for_pointer(TRACK, 9, 100), 0);
+		assert_eq!(scroll_for_pointer(TRACK, 21, 100), 100);
+		assert_eq!(scroll_for_pointer(TRACK, u16::MAX, 100), 100);
+	}
+
+	#[test]
+	fn a_one_row_track_stays_at_the_top() {
+		assert_eq!(scroll_for_pointer(Rect::new(0, 3, 1, 1), 3, 50), 0);
 	}
 }

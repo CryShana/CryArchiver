@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
 	self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyEventKind,
-	MouseEventKind,
+	MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -222,7 +222,9 @@ fn redraw(event: &Event) -> Redraw {
 	match event {
 		Event::Key(key) if key.kind == KeyEventKind::Press => Redraw::Now,
 		Event::Mouse(mouse) => match mouse.kind {
-			MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => Redraw::Paced,
+			MouseEventKind::ScrollDown | MouseEventKind::ScrollUp | MouseEventKind::Drag(MouseButton::Left) => {
+				Redraw::Paced
+			}
 			MouseEventKind::Down(_) => Redraw::Now,
 			_ => Redraw::Never,
 		},
@@ -231,8 +233,8 @@ fn redraw(event: &Event) -> Redraw {
 	}
 }
 
-/// When the next frame is due: every [`FRAME`] for the source's changes, at once for input, and for the wheel no
-/// sooner than [`WHEEL_FRAME`] after the last frame.
+/// When the next frame is due: every [`FRAME`] for the source's changes, at once for input, and for the wheel and
+/// scrollbar drags no sooner than [`WHEEL_FRAME`] after the last frame.
 #[derive(Debug, Clone, Copy)]
 struct Pacer {
 	next: Instant,
@@ -539,10 +541,11 @@ mod tests {
 		assert_eq!(redraw(&Event::Resize(80, 24)), Redraw::Now);
 		assert_eq!(redraw(&mouse(MouseEventKind::ScrollDown)), Redraw::Paced);
 		assert_eq!(redraw(&mouse(MouseEventKind::ScrollUp)), Redraw::Paced);
+		assert_eq!(redraw(&mouse(MouseEventKind::Drag(MouseButton::Left))), Redraw::Paced);
 
 		assert_eq!(redraw(&mouse(MouseEventKind::Moved)), Redraw::Never);
 		assert_eq!(redraw(&mouse(MouseEventKind::Up(MouseButton::Left))), Redraw::Never);
-		assert_eq!(redraw(&mouse(MouseEventKind::Drag(MouseButton::Left))), Redraw::Never);
+		assert_eq!(redraw(&mouse(MouseEventKind::Drag(MouseButton::Right))), Redraw::Never);
 		assert_eq!(redraw(&released(KeyCode::Down)), Redraw::Never);
 		assert_eq!(redraw(&Event::FocusLost), Redraw::Never);
 	}

@@ -15,8 +15,8 @@ use tui_input::Input;
 
 pub(crate) use self::burst::{BURST_GAP, burst_flags};
 pub(crate) use self::menu::Menu;
-use self::mouse::Click;
-pub(crate) use self::mouse::{DOUBLE_CLICK, Hit, HitMap};
+pub(crate) use self::mouse::{Bar, DOUBLE_CLICK, Hit, HitMap};
+use self::mouse::{Click, ScrollDrag};
 pub(crate) use self::settings::{FAST_NEVER_MEASURES_VIDEO, QUALITY_FIELDS, QualityField, SETTINGS_ROWS, SettingsRow};
 pub use self::tree::Selection;
 use self::tree::TreeState;
@@ -129,7 +129,12 @@ impl LogScroll {
 	}
 
 	pub fn scroll_by(&mut self, log: &Log, rows: isize) {
-		let back = self.newer(log).saturating_add_signed(rows).min(self.deepest(log));
+		self.scroll_to(log, self.newer(log).saturating_add_signed(rows));
+	}
+
+	/// Shows the page whose top line is `back` lines older than the newest one.
+	pub fn scroll_to(&mut self, log: &Log, back: usize) {
+		let back = back.min(self.deepest(log));
 		let back_lines = u64::try_from(back).unwrap_or(u64::MAX);
 		self.top = (back > 0).then(|| log.pushed().saturating_sub(1).saturating_sub(back_lines));
 	}
@@ -147,7 +152,8 @@ impl LogScroll {
 		self.scroll_by(log, isize::MAX);
 	}
 
-	fn deepest(&self, log: &Log) -> usize {
+	/// The farthest back the Log scrolls: its oldest page.
+	pub fn deepest(&self, log: &Log) -> usize {
 		log.len().saturating_sub(self.page)
 	}
 }
@@ -177,6 +183,7 @@ pub(crate) struct Ui {
 	/// The overlay the quit question replaced, shown again when the user stays.
 	pub before_quit: Option<Overlay>,
 	last_click: Option<Click>,
+	scroll_drag: Option<ScrollDrag>,
 }
 
 impl<S: ArchiveSource> App<S> {
@@ -223,6 +230,7 @@ impl<S: ArchiveSource> App<S> {
 			copied: None,
 			before_quit: None,
 			last_click: None,
+			scroll_drag: None,
 		};
 		Self {
 			source,
@@ -507,6 +515,16 @@ impl<S: ArchiveSource> App<S> {
 
 	pub fn visible_rows(&self) -> usize {
 		self.ui.tree.rows().len()
+	}
+
+	/// The index of the Library row at the top of the view.
+	pub fn library_scroll(&self) -> usize {
+		self.ui.tree.scroll()
+	}
+
+	/// How many lines newer than the Log's top line are scrolled out of view.
+	pub fn log_scrolled_back(&self) -> usize {
+		self.ui.log_scroll.newer(&self.source.view().log)
 	}
 
 	pub fn selected_issue(&self) -> usize {

@@ -14,6 +14,7 @@ use cryarchiver_project::tree::{FileId as ProjectFileId, FolderId, FolderStats a
 use cryarchiver_project::view::{self as project_view, RowState, Update};
 use cryarchiver_project::{Command, Project, Target as ProjectTarget};
 
+use crate::clock;
 use crate::source::{Action, ArchiveSource, SettingsChange, Target};
 use crate::view::{
 	ArchiveView, ClockTime, DecisionLine, Duplicates, FileDetails, FileId, FileRow, FileState, FileStatus, FilterEntry,
@@ -47,6 +48,8 @@ pub struct ProjectSource {
 	savings: VecDeque<u64>,
 	cpu: VecDeque<u64>,
 	last_history: Option<Instant>,
+	/// The local zone's offset from UTC, read at most once per refresh.
+	utc_offset: Option<i32>,
 }
 
 impl ProjectSource {
@@ -123,6 +126,7 @@ impl ProjectSource {
 			savings: VecDeque::new(),
 			cpu: VecDeque::new(),
 			last_history: None,
+			utc_offset: None,
 			project,
 		}
 	}
@@ -191,7 +195,10 @@ impl ProjectSource {
 					.insert((IssueId(issue.0), attempt), Some(lines));
 			}
 			Update::Log(entry) => self.view.log.push(LogLine {
-				time: ClockTime(entry.time),
+				time: ClockTime(clock::local_seconds(
+					entry.time,
+					*self.utc_offset.get_or_insert_with(clock::utc_offset),
+				)),
 				marker: match entry.kind {
 					project_view::LogKind::Row(state) => LogMarker::State(file_state(state)),
 					project_view::LogKind::Action => LogMarker::Action,
@@ -497,6 +504,8 @@ impl ProjectSource {
 
 impl ArchiveSource for ProjectSource {
 	fn refresh(&mut self) -> bool {
+		self.utc_offset = None;
+
 		let mut changed = false;
 		for _ in 0..UPDATES_PER_REFRESH {
 			let Some(update) = self.project.try_update() else {

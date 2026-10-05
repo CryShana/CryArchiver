@@ -4,8 +4,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Widget};
 
-use super::widgets::{Chrome, bold, fg, panel, put, to_u16};
-use crate::app::{Hit, Ui};
+use super::widgets::{Chrome, bold, fg, panel, put, scrollbar, to_u16};
+use crate::app::{Bar, Hit, Ui};
 use crate::format::{fit, width};
 use crate::theme::{Theme, marker_glyph};
 use crate::view::{Log, NoticeLevel, Notification};
@@ -59,6 +59,11 @@ pub fn render(buf: &mut Buffer, area: Rect, log: &Log, toast: Option<&Notificati
 	for (row, &(number, _)) in shown.iter().enumerate() {
 		let line_area = Rect::new(inner.x, inner.y + to_u16(row), inner.width, 1);
 		ui.hits.push(line_area, Hit::LogLine(number));
+	}
+
+	if log.len() > usize::from(inner.height) {
+		let track = scrollbar(buf, area, inner, log.len(), ui.log_scroll.newer(log), &theme);
+		ui.hits.push(track, Hit::Scrollbar(Bar::Log));
 	}
 }
 

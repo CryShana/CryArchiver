@@ -20,6 +20,12 @@ thiserror.workspace = true
 throbber-widgets-tui.workspace = true
 tui-input.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
 [dev-dependencies]
 insta.workspace = true
 redb.workspace = true

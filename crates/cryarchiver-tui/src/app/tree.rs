@@ -373,8 +373,17 @@ impl TreeState {
 	}
 
 	pub fn scroll_by(&mut self, delta: isize) {
-		self.scroll = self.scroll.saturating_add_signed(delta);
+		self.scroll_to(self.scroll.saturating_add_signed(delta));
+	}
+
+	pub fn scroll_to(&mut self, top: usize) {
+		self.scroll = top;
 		self.clamp_scroll();
+	}
+
+	/// The top row index that shows the last page.
+	pub fn deepest_scroll(&self) -> usize {
+		self.rows.len().saturating_sub(self.page)
 	}
 
 	pub fn select_file_step(&mut self, forward: bool) {
@@ -586,7 +595,7 @@ impl TreeState {
 	}
 
 	fn clamp_scroll(&mut self) {
-		self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.page));
+		self.scroll = self.scroll.min(self.deepest_scroll());
 	}
 }
 

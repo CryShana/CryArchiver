@@ -3,8 +3,11 @@ use std::borrow::Cow;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Widget};
+use ratatui::widgets::{
+	Block, BorderType, Clear, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
+};
 
 use crate::format::{filled_cells, filled_eighths, fit, width};
 use crate::theme::Theme;
@@ -215,4 +218,26 @@ pub fn pad_left(text: &str, cells: usize) -> String {
 	let mut out = " ".repeat(cells.saturating_sub(width(text)));
 	out.push_str(text);
 	out
+}
+
+/// Draws a vertical scrollbar over the panel's right border, beside `body`, and returns its track.
+pub fn scrollbar(buf: &mut Buffer, area: Rect, body: Rect, rows: usize, scroll: usize, theme: &Theme) -> Rect {
+	let track = Rect::new(area.right() - 1, body.y, 1, body.height);
+	let mut state = ScrollbarState::new(rows.saturating_sub(usize::from(body.height)))
+		.position(scroll)
+		.viewport_content_length(usize::from(body.height));
+
+	Scrollbar::new(ScrollbarOrientation::VerticalRight)
+		.symbols(symbols::scrollbar::Set {
+			track: "│",
+			thumb: "┃",
+			begin: "",
+			end: "",
+		})
+		.begin_symbol(None)
+		.end_symbol(None)
+		.track_style(fg(theme.border))
+		.thumb_style(fg(theme.accent))
+		.render(track, buf, &mut state);
+	track
 }

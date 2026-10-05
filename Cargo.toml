@@ -66,7 +66,7 @@ ulid = "3.0.0"
 unicode-normalization = "0.1.25"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Time"] }
 
 [patch.crates-io]
 avif-serialize = { path = "vendor/avif-serialize" }
