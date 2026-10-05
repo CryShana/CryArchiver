@@ -3,8 +3,8 @@ mod support;
 use std::time::{Duration, Instant};
 
 use cryarchiver_tui::view::{
-	ArchiveView, FileDetails, FileId, FileRow, FileState, FilterResult, Issue, IssueId, IssueKind, IssueVerbs, Limit,
-	NodeId, Notification, RunState,
+	ArchiveView, FileDetails, FileId, FileRow, FileState, FilterEntry, FilterResult, Issue, IssueId, IssueKind,
+	IssueVerbs, Limit, NodeId, Notification, RunState, StateFilter,
 };
 use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, MockSource, OverlayKind, Selection, ViewMode};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -1101,4 +1101,171 @@ fn a_folder_without_failed_files_offers_no_retry() {
 	press(&mut app, KeyCode::Char('m'));
 	assert!(has(&app, "Copy path"));
 	assert!(!has(&app, "Retry failed in folder"));
+}
+
+/// Where the issues, kept and dup groups of the Overall panel are: their row and the column of each glyph. The count
+/// starts two cells after the glyph.
+fn outcome_groups(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> (u16, [u16; 3]) {
+	let row = find_row(terminal, " kept ").unwrap();
+	let at = |glyph| find_on_row(terminal, row, glyph).unwrap();
+	(row, [at("! "), at("= "), at("↪ ")])
+}
+
+fn shown_files(app: &App<MockSource>) -> Vec<FileState> {
+	let result = app.source().filter().unwrap();
+	result
+		.rows
+		.iter()
+		.filter_map(|row| match &row.entry {
+			FilterEntry::File { row, .. } => Some(row.status.state),
+			FilterEntry::Folder(_) => None,
+		})
+		.collect()
+}
+
+#[test]
+fn clicking_an_outcome_filters_the_library_and_clicking_it_again_clears_it() {
+	let mut app = app();
+	let before = draw(&mut app, 160, 45);
+	let (row, [issues, kept, dup]) = outcome_groups(&before);
+	let line = support::row_text(&before, row);
+	let plain = before.backend().buffer()[(kept + 2, row)].bg;
+
+	click(&mut app, kept + 2, row, Instant::now());
+	assert_eq!(app.state_filter(), Some(StateFilter::Kept));
+	let states = shown_files(&app);
+	assert_eq!(states.len() as u64, app.source().view().overall.kept);
+	assert!(states.iter().all(|&state| state == FileState::KeptOriginal));
+
+	let after = draw(&mut app, 160, 45);
+	let buffer = after.backend().buffer();
+	assert_eq!(support::row_text(&after, row), line, "the line keeps its layout");
+	assert_ne!(buffer[(kept + 2, row)].bg, plain, "the active group is highlighted");
+	assert_eq!(buffer[(kept, row)].bg, buffer[(kept + 2, row)].bg, "its glyph too");
+	assert_eq!(buffer[(issues + 2, row)].bg, plain);
+
+	click(&mut app, dup + 2, row, Instant::now());
+	assert_eq!(app.state_filter(), Some(StateFilter::Duplicates));
+	assert!(shown_files(&app).iter().all(|&state| state == FileState::Duplicate));
+
+	click(&mut app, issues, row, Instant::now());
+	assert_eq!(
+		app.state_filter(),
+		Some(StateFilter::Issues),
+		"the glyph is part of the group"
+	);
+	let with_issues = app
+		.source()
+		.view()
+		.issues
+		.iter()
+		.filter(|issue| issue.file.is_some())
+		.count();
+	assert_eq!(shown_files(&app).len(), with_issues);
+
+	draw(&mut app, 160, 45);
+	click(&mut app, issues + 2, row, Instant::now());
+	assert_eq!(app.state_filter(), None);
+	assert!(app.source().filter().is_none());
+	let cleared = draw(&mut app, 160, 45);
+	assert_eq!(cleared.backend().buffer()[(issues + 2, row)].bg, plain);
+}
+
+#[test]
+fn clicking_an_outcome_from_another_view_shows_the_library() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('i'));
+	let terminal = draw(&mut app, 160, 45);
+	let (row, [_, kept, _]) = outcome_groups(&terminal);
+
+	click(&mut app, kept, row, Instant::now());
+
+	assert_eq!(app.mode(), ViewMode::Library);
+	assert_eq!(app.state_filter(), Some(StateFilter::Kept));
+}
+
+#[test]
+fn esc_clears_the_state_filter_before_the_name_filter() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('/'));
+	type_text(&mut app, "e");
+	press(&mut app, KeyCode::Enter);
+	let terminal = draw(&mut app, 160, 45);
+	let (row, [_, kept, _]) = outcome_groups(&terminal);
+	click(&mut app, kept, row, Instant::now());
+	assert_eq!((app.filter(), app.state_filter()), ("e", Some(StateFilter::Kept)));
+	let result = app.source().filter().unwrap();
+	assert_eq!((result.query.as_str(), result.state), ("e", Some(StateFilter::Kept)));
+
+	press(&mut app, KeyCode::Esc);
+	assert_eq!((app.filter(), app.state_filter()), ("e", None));
+
+	press(&mut app, KeyCode::Esc);
+	assert_eq!((app.filter(), app.state_filter()), ("", None));
+}
+
+#[test]
+fn searching_keeps_the_state_filter_and_its_esc_clears_only_the_query() {
+	let mut app = app();
+	let terminal = draw(&mut app, 160, 45);
+	let (row, [_, kept, _]) = outcome_groups(&terminal);
+	click(&mut app, kept, row, Instant::now());
+	let all_kept = app.visible_rows();
+
+	press(&mut app, KeyCode::Char('/'));
+	type_text(&mut app, "short-film");
+	assert_eq!(app.state_filter(), Some(StateFilter::Kept));
+	assert!(app.visible_rows() < all_kept);
+
+	press(&mut app, KeyCode::Esc);
+	assert_eq!((app.filter(), app.state_filter()), ("", Some(StateFilter::Kept)));
+	assert_eq!(app.visible_rows(), all_kept);
+}
+
+#[test]
+fn the_footer_offers_to_clear_a_state_filter() {
+	let mut app = app();
+	let terminal = draw(&mut app, 160, 45);
+	assert!(find_on_row(&terminal, 44, "clear filter").is_none());
+	let (row, [_, kept, _]) = outcome_groups(&terminal);
+	click(&mut app, kept, row, Instant::now());
+
+	let terminal = draw(&mut app, 160, 45);
+	let chip = find_on_row(&terminal, 44, " Esc ").unwrap();
+	assert!(find_on_row(&terminal, 44, "clear filter").is_some());
+	click(&mut app, chip + 1, 44, Instant::now());
+
+	assert_eq!(app.state_filter(), None);
+}
+
+#[test]
+fn a_state_filter_without_files_says_so() {
+	let mut app = App::new(MockSource::completed(support::SEED), ColorDepth::TrueColor);
+	let terminal = draw(&mut app, 160, 45);
+	let (row, [issues, _, _]) = outcome_groups(&terminal);
+
+	click(&mut app, issues, row, Instant::now());
+
+	let terminal = draw(&mut app, 160, 45);
+	assert!(find_row(&terminal, "Library · issues · 0 files").is_some());
+	assert!(find_row(&terminal, "No files with an open issue").is_some());
+}
+
+#[test]
+fn every_outcome_group_is_clickable_at_100_and_120_columns() {
+	for (width, height) in [(100, 30), (120, 36)] {
+		let mut app = app();
+		let terminal = draw(&mut app, width, height);
+		let row = find_row(&terminal, "= 520").unwrap();
+		let at = |glyph| find_on_row(&terminal, row, glyph).unwrap();
+
+		for (glyph, state) in [
+			("! ", StateFilter::Issues),
+			("= ", StateFilter::Kept),
+			("↪ ", StateFilter::Duplicates),
+		] {
+			click(&mut app, at(glyph) + 2, row, Instant::now());
+			assert_eq!(app.state_filter(), Some(state), "{glyph} at {width} columns");
+		}
+	}
 }

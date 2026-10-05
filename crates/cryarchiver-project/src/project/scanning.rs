@@ -432,7 +432,7 @@ impl Owner {
 		self.tree.remove_file(file);
 		self.track_issue(file);
 		self.save_file(file);
-		self.touch_folder(folder);
+		self.touch_file(file);
 		if self.view.watched.contains(&folder) {
 			self.send(Update::FileRemoved { folder, file });
 		}

@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::MockSource;
 use crate::format::find_ignore_case;
-use crate::view::{FilterEntry, FilterResult, FilterRow, NodeId};
+use crate::view::{FileId, FileRow, FileState, Filter, FilterEntry, FilterResult, FilterRow, NodeId, StateFilter};
 
 struct Matches {
 	kept: Vec<bool>,
@@ -10,21 +10,28 @@ struct Matches {
 }
 
 impl MockSource {
-	pub(super) fn set_filter(&mut self, query: String) {
-		self.filter = (!query.is_empty()).then(|| self.compute_filter(query));
+	pub(super) fn set_filter(&mut self, filter: Filter) {
+		self.filter = (!filter.is_empty()).then(|| self.compute_filter(filter));
 		self.rows_version += 1;
 	}
 
-	/// New files can add matches, so the result is rebuilt and the version bumped only after an insert. Otherwise
-	/// the statuses are patched into the rows in place, as `ArchiveSource::rows_version` promises.
+	/// New files can add matches, and with a state set so can every status change, so the result is rebuilt; the
+	/// version is bumped only when the rows changed. Otherwise the statuses are patched into the rows in place, as
+	/// `ArchiveSource::rows_version` promises.
 	pub(super) fn refresh_filter(&mut self, inserted: bool) {
-		let Some(query) = self.filter.as_ref().map(|filter| filter.query.clone()) else {
+		let Some(current) = &self.filter else {
 			return;
 		};
 
-		if inserted {
-			self.filter = Some(self.compute_filter(query));
-			self.rows_version += 1;
+		if inserted || current.state.is_some() {
+			let fresh = self.compute_filter(Filter {
+				query: current.query.clone(),
+				state: current.state,
+			});
+			if !same_rows(current, &fresh) {
+				self.rows_version += 1;
+			}
+			self.filter = Some(fresh);
 			return;
 		}
 
@@ -36,21 +43,32 @@ impl MockSource {
 		}
 	}
 
-	fn compute_filter(&self, query: String) -> FilterResult {
-		let matches = self.matches(&query);
+	fn compute_filter(&self, filter: Filter) -> FilterResult {
+		let matches = self.matches(&filter);
 		let matching_files = matches.files.values().map(Vec::len).sum();
 
 		let mut rows = Vec::new();
 		self.filtered_rows(self.view.library.root(), 0, &matches, &mut rows);
 		FilterResult {
-			query,
+			query: filter.query,
+			state: filter.state,
 			rows,
 			matching_files,
 		}
 	}
 
-	fn matches(&self, query: &str) -> Matches {
+	fn matches(&self, filter: &Filter) -> Matches {
 		let library = &self.view.library;
+		let with_issues: BTreeSet<FileId> = self.view.issues.iter().filter_map(|issue| issue.file).collect();
+		let passes = |row: &FileRow| {
+			let in_state = filter.state.is_none_or(|state| match state {
+				StateFilter::Issues => with_issues.contains(&row.id),
+				StateFilter::Kept => row.status.state == FileState::KeptOriginal,
+				StateFilter::Duplicates => row.status.state == FileState::Duplicate,
+			});
+			in_state && (filter.query.is_empty() || find_ignore_case(&row.name, &filter.query).is_some())
+		};
+
 		let mut files: BTreeMap<NodeId, Vec<usize>> = BTreeMap::new();
 		for folder in library.ids() {
 			let hits: Vec<usize> = self
@@ -58,7 +76,7 @@ impl MockSource {
 				.in_folder(folder)
 				.iter()
 				.enumerate()
-				.filter(|(_, row)| find_ignore_case(&row.name, query).is_some())
+				.filter(|(_, row)| passes(row))
 				.map(|(index, _)| index)
 				.collect();
 			if !hits.is_empty() {
@@ -69,7 +87,8 @@ impl MockSource {
 		let mut kept = vec![false; library.len()];
 		for folder in library.ids().rev() {
 			let node = library.node(folder);
-			kept[folder.index()] |= files.contains_key(&folder) || find_ignore_case(&node.name, query).is_some();
+			kept[folder.index()] |=
+				files.contains_key(&folder) || find_ignore_case(&node.name, &filter.query).is_some();
 			if kept[folder.index()]
 				&& let Some(parent) = node.parent
 			{
@@ -105,4 +124,17 @@ impl MockSource {
 			});
 		}
 	}
+}
+
+fn same_rows(old: &FilterResult, new: &FilterResult) -> bool {
+	old.rows.len() == new.rows.len() && old.rows.iter().zip(&new.rows).all(|(old, new)| same_row(old, new))
+}
+
+fn same_row(old: &FilterRow, new: &FilterRow) -> bool {
+	old.depth == new.depth
+		&& match (&old.entry, &new.entry) {
+			(FilterEntry::Folder(old), FilterEntry::Folder(new)) => old == new,
+			(FilterEntry::File { row: old, .. }, FilterEntry::File { row: new, .. }) => old.id == new.id,
+			_ => false,
+		}
 }

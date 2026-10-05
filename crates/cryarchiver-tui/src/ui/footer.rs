@@ -194,12 +194,17 @@ fn library_chips(view: &ArchiveView, ui: &Ui) -> Vec<Chip> {
 		chip("←→", "fold", None),
 		chip("⏎", "details", Some(KeyCode::Enter)),
 		chip("/", "search", Some(KeyCode::Char('/'))),
-		chip(
-			"z",
-			if ui.layout.maximized { "restore" } else { "maximize" },
-			Some(KeyCode::Char('z')),
-		),
 	];
+
+	if !ui.filter.is_empty() {
+		chips.push(chip("Esc", "clear filter", Some(KeyCode::Esc)));
+	}
+
+	chips.push(chip(
+		"z",
+		if ui.layout.maximized { "restore" } else { "maximize" },
+		Some(KeyCode::Char('z')),
+	));
 
 	if !ui.layout.maximized {
 		chips.push(chip("l", "log", Some(KeyCode::Char('l'))));

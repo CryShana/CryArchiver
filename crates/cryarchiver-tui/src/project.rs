@@ -19,7 +19,7 @@ use crate::view::{
 	ArchiveView, ClockTime, DecisionLine, Duplicates, FileDetails, FileId, FileRow, FileState, FileStatus, FilterEntry,
 	FilterResult, FilterRow, FolderStats, Header, Issue, IssueId, IssueKind, IssueSummary, IssueVerbs, JobActivity,
 	Library, LiveProgress, Log, LogLine, LogMarker, NodeId, NoticeLevel, Notification, Overall, Parity, PathLink,
-	PlanLine, RunState, Settings, Speed, StageMark, SystemStats, Verb, WorkKind, WorkerJob, Workers,
+	PlanLine, RunState, Settings, Speed, StageMark, StateFilter, SystemStats, Verb, WorkKind, WorkerJob, Workers,
 };
 
 const LOG_CAPACITY: usize = 500;
@@ -366,6 +366,11 @@ impl ProjectSource {
 
 			FilterResult {
 				query: filter.query,
+				state: filter.state.map(|state| match state {
+					project_view::StateFilter::Issues => StateFilter::Issues,
+					project_view::StateFilter::Kept => StateFilter::Kept,
+					project_view::StateFilter::Duplicates => StateFilter::Duplicates,
+				}),
 				rows,
 				matching_files: filter.matching_files,
 			}
@@ -595,12 +600,19 @@ impl ArchiveSource for ProjectSource {
 				}
 				Command::Watch(folder, open)
 			}
-			Action::SetFilter(query) => {
-				if query.is_empty() && self.filter.take().is_some() {
+			Action::SetFilter(filter) => {
+				if filter.is_empty() && self.filter.take().is_some() {
 					self.filter_positions.clear();
 					self.rows_version += 1;
 				}
-				Command::Filter(query)
+				Command::Filter {
+					query: filter.query,
+					state: filter.state.map(|state| match state {
+						StateFilter::Issues => project_view::StateFilter::Issues,
+						StateFilter::Kept => project_view::StateFilter::Kept,
+						StateFilter::Duplicates => project_view::StateFilter::Duplicates,
+					}),
+				}
 			}
 			Action::OpenSourceFolder(target) => {
 				let Some(target) = self.target(target) else { return };

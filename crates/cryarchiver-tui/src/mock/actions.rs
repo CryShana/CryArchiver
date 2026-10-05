@@ -17,7 +17,7 @@ impl MockSource {
 			Action::Resolve(issue, verb) => self.resolve(issue, verb),
 			Action::RetryFailedIn(folder) => self.retry_failed_in(folder),
 			Action::Expanded(folder, open) => self.expanded(folder, open),
-			Action::SetFilter(query) => self.set_filter(query),
+			Action::SetFilter(filter) => self.set_filter(filter),
 			Action::OpenSourceFolder(target) => {
 				let folder = self.source_folder(target);
 				self.log_action(format!("opened {folder}"));

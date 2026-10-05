@@ -39,7 +39,7 @@ use crate::settings::{
 };
 use crate::store::{Store, StoreError};
 use crate::tree::{FileId, FolderId};
-use crate::view::Update;
+use crate::view::{StateFilter, Update};
 use owner::Owner;
 
 pub const PROJECT_EXTENSION: &str = "cryarchive";
@@ -143,8 +143,12 @@ pub enum Command {
 	RetryFailedIn(FolderId),
 	/// A folder was opened or closed in the front end: its rows are sent, then kept up to date, or released.
 	Watch(FolderId, bool),
-	/// An empty query clears the filter.
-	Filter(String),
+	/// Narrows the rows to files that match the name query and have the state. An empty query without a state clears
+	/// the filter. While a state is set, the result follows the run.
+	Filter {
+		query: String,
+		state: Option<StateFilter>,
+	},
 	Details(FileId),
 	IssueLog(IssueId, u32),
 	/// Opens the folder, or the file's folder, in the system's file manager: the source side, or the archive's.

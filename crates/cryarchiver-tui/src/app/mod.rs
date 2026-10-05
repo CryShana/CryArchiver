@@ -22,7 +22,7 @@ pub use self::tree::Selection;
 use self::tree::TreeState;
 use crate::source::{Action, ArchiveSource};
 use crate::theme::{ColorDepth, Theme};
-use crate::view::{FileDetails, FileId, IssueId, Library, Log, NodeId, NoticeLevel, Notification};
+use crate::view::{FileDetails, FileId, Filter, IssueId, Library, Log, NodeId, NoticeLevel, Notification, StateFilter};
 
 const TOAST_LIFETIME: Duration = Duration::from_secs(6);
 
@@ -158,7 +158,7 @@ pub(crate) struct Ui {
 	pub mode: ViewMode,
 	pub overlay: Option<Overlay>,
 	pub search: Option<Input>,
-	pub filter: String,
+	pub filter: Filter,
 	pub tree: TreeState,
 	pub issue_selected: usize,
 	/// How many attempts back from the latest the Issues log shows.
@@ -195,7 +195,7 @@ impl<S: ArchiveSource> App<S> {
 		for action in tree.take_actions() {
 			source.perform(action);
 		}
-		tree.sync(&source, "");
+		tree.sync(&source, &Filter::default());
 
 		let ui = Ui {
 			theme: Theme::dark(depth),
@@ -207,7 +207,7 @@ impl<S: ArchiveSource> App<S> {
 			mode: ViewMode::Library,
 			overlay: None,
 			search: None,
-			filter: String::new(),
+			filter: Filter::default(),
 			tree,
 			issue_selected: 0,
 			attempt_back: 0,
@@ -483,8 +483,13 @@ impl<S: ArchiveSource> App<S> {
 		self.ui.search.is_some()
 	}
 
+	/// The name query the Library is filtered by.
 	pub fn filter(&self) -> &str {
-		&self.ui.filter
+		&self.ui.filter.query
+	}
+
+	pub fn state_filter(&self) -> Option<StateFilter> {
+		self.ui.filter.state
 	}
 
 	pub fn selected(&self) -> Option<Selection> {
@@ -536,7 +541,7 @@ impl Ui {
 	}
 
 	/// Clearing the filter keeps what was selected in it, now shown in its own folder.
-	fn set_filter(&mut self, library: &Library, filter: String) {
+	fn set_filter(&mut self, library: &Library, filter: Filter) {
 		if filter == self.filter {
 			return;
 		}
@@ -552,6 +557,20 @@ impl Ui {
 		}
 	}
 
+	fn set_query(&mut self, library: &Library, query: String) {
+		let state = self.filter.state;
+		self.set_filter(library, Filter { query, state });
+	}
+
+	/// The state already on is turned off again; the name query stays either way.
+	fn toggle_state_filter(&mut self, library: &Library, state: StateFilter) {
+		let filter = Filter {
+			query: self.filter.query.clone(),
+			state: (self.filter.state != Some(state)).then_some(state),
+		};
+		self.set_filter(library, filter);
+	}
+
 	fn reveal_file(&mut self, source: &dyn ArchiveSource, folder: NodeId, file: FileId) {
 		let visible = self
 			.tree
@@ -560,7 +579,7 @@ impl Ui {
 			.any(|row| matches!(row.kind, tree::RowKind::File { file: id, .. } if id == file));
 		let library = &source.view().library;
 		if !self.filter.is_empty() && !visible {
-			self.set_filter(library, String::new());
+			self.set_filter(library, Filter::default());
 		}
 
 		self.tree.reveal_file(library, folder, file);
@@ -581,10 +600,13 @@ impl Ui {
 			return Outcome::Done;
 		}
 
+		let library = &source.view().library;
 		if self.mode != ViewMode::Library {
 			self.mode = ViewMode::Library;
+		} else if self.filter.state.is_some() {
+			self.set_filter(library, Filter::name(self.filter.query.clone()));
 		} else if !self.filter.is_empty() {
-			self.set_filter(&source.view().library, String::new());
+			self.set_filter(library, Filter::default());
 		} else if self.layout.maximized {
 			self.layout.maximized = false;
 		} else {

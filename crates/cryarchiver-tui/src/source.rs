@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use crate::view::{
-	ArchiveView, FileDetails, FileId, FileRow, FilterResult, IssueId, NodeId, Notification, Overrides, Speed, Verb,
+	ArchiveView, FileDetails, FileId, FileRow, Filter, FilterResult, IssueId, NodeId, Notification, Overrides, Speed,
+	Verb,
 };
 
 /// Everything the TUI reads from an archive run and every command it sends back (project layer spec §11.3).
@@ -21,7 +22,8 @@ pub trait ArchiveSource {
 	/// result's rows alike, and never bump it; the TUI reads statuses afresh every frame.
 	fn rows_version(&self) -> u64;
 
-	/// The result of the last [`Action::SetFilter`] with a non-empty query, once it is ready.
+	/// The result of the last [`Action::SetFilter`] with a non-empty filter, once it is ready. While the filter has a
+	/// state, the result follows the run, and a file joining or leaving it bumps [`Self::rows_version`].
 	fn filter(&self) -> Option<&FilterResult>;
 
 	/// Built on demand while the file details are open, so it may be more expensive than [`Self::view`].
@@ -60,8 +62,8 @@ pub enum Action {
 	RetryFailedIn(NodeId),
 	/// The folder was opened or closed in the Library, so its file rows can be loaded or released.
 	Expanded(NodeId, bool),
-	/// An empty query clears the filter.
-	SetFilter(String),
+	/// An empty filter clears it.
+	SetFilter(Filter),
 	OpenSourceFolder(Target),
 	OpenOutputFolder(Target),
 	CopyPath(Target),

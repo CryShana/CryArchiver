@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::source::{Action, ArchiveSource};
-use crate::view::{FileId, FileRow, FileState, FilterEntry, Library, NodeId};
+use crate::view::{FileId, FileRow, FileState, Filter, FilterEntry, Library, NodeId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expansion {
@@ -174,7 +174,7 @@ struct RowsKey {
 	structure_version: u64,
 	rows_version: u64,
 	expansion: u64,
-	filter: String,
+	filter: Filter,
 	sort: ProgressSort,
 	values: u64,
 }
@@ -274,13 +274,13 @@ impl TreeState {
 		std::mem::take(&mut self.outbox)
 	}
 
-	pub fn sync(&mut self, source: &dyn ArchiveSource, filter: &str) {
+	pub fn sync(&mut self, source: &dyn ArchiveSource, filter: &Filter) {
 		let library = &source.view().library;
 		let key = RowsKey {
 			structure_version: library.structure_version(),
 			rows_version: source.rows_version(),
 			expansion: self.expansion,
-			filter: filter.to_owned(),
+			filter: filter.clone(),
 			sort: self.sort,
 			values: self.values,
 		};
@@ -458,7 +458,7 @@ impl TreeState {
 		self.expansion += 1;
 	}
 
-	fn rebuild(&mut self, source: &dyn ArchiveSource, filter: &str) {
+	fn rebuild(&mut self, source: &dyn ArchiveSource, filter: &Filter) {
 		self.list(source, filter);
 
 		if self.sort != ProgressSort::Off {
@@ -466,7 +466,7 @@ impl TreeState {
 		}
 	}
 
-	fn list(&mut self, source: &dyn ArchiveSource, filter: &str) {
+	fn list(&mut self, source: &dyn ArchiveSource, filter: &Filter) {
 		self.rows.clear();
 		self.matching_files = Some(0);
 
@@ -475,7 +475,10 @@ impl TreeState {
 			return;
 		}
 
-		let Some(result) = source.filter().filter(|result| result.query == filter) else {
+		let Some(result) = source
+			.filter()
+			.filter(|result| result.query == filter.query && result.state == filter.state)
+		else {
 			self.matching_files = None;
 			return;
 		};

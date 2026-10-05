@@ -15,7 +15,7 @@ use cryarchiver_engine::text::display_path;
 use cryarchiver_project::{Backend, Project, ProjectOptions, SystemSample, Tuning};
 use cryarchiver_tui::recent::{FILE_NAME, RecentStore};
 use cryarchiver_tui::source::{SettingsChange, Target};
-use cryarchiver_tui::view::{FileState, NoticeLevel, RunState};
+use cryarchiver_tui::view::{FileState, Filter, FilterEntry, NoticeLevel, RunState, StateFilter};
 use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, OverlayKind, ProjectSource, StartMenu};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -220,7 +220,7 @@ fn filter_results_arrive_after_the_request() {
 	let mut source = open(&setup.project);
 	refresh_until(&mut source, "the finish", finished);
 
-	source.perform(Action::SetFilter("sunset".into()));
+	source.perform(Action::SetFilter(Filter::name("sunset")));
 	assert!(source.filter().is_none());
 	refresh_until(&mut source, "the filter", |s| s.filter().is_some());
 
@@ -229,8 +229,30 @@ fn filter_results_arrive_after_the_request() {
 	assert_eq!(filter.matching_files, 1);
 	assert_eq!(filter.rows.len(), 3);
 
-	source.perform(Action::SetFilter(String::new()));
+	source.perform(Action::SetFilter(Filter::default()));
 	assert!(source.filter().is_none());
+}
+
+#[test]
+fn a_state_filter_reaches_the_project() {
+	let setup = setup(&[
+		("Photos/bad.jpg", b"\xFF\xD8\xFF\xE0 not really a photo".as_slice()),
+		("other.txt", b"o".as_slice()),
+	]);
+	let mut source = open(&setup.project);
+	refresh_until(&mut source, "the issue", |s| !s.view().issues.is_empty());
+
+	source.perform(Action::SetFilter(Filter {
+		query: String::new(),
+		state: Some(StateFilter::Issues),
+	}));
+	refresh_until(&mut source, "the filter", |s| s.filter().is_some());
+
+	let filter = source.filter().unwrap();
+	assert_eq!(filter.state, Some(StateFilter::Issues));
+	assert_eq!(filter.matching_files, 1);
+	assert_eq!(filter.rows.len(), 3, "the root, Photos and the failed photo");
+	assert!(matches!(&filter.rows[2].entry, FilterEntry::File { row, .. } if row.name == "bad.jpg"));
 }
 
 #[test]

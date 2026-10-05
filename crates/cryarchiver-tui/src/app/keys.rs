@@ -61,7 +61,7 @@ impl Ui {
 		}
 
 		if let Some(query) = self.search.as_ref().map(|input| input.value().to_owned()) {
-			self.set_filter(&source.view().library, query);
+			self.set_query(&source.view().library, query);
 		}
 	}
 
@@ -70,7 +70,7 @@ impl Ui {
 		match key.code {
 			KeyCode::Esc => {
 				self.search = None;
-				self.set_filter(library, String::new());
+				self.set_query(library, String::new());
 			}
 			KeyCode::Enter => self.search = None,
 			KeyCode::Up => self.tree.move_by(-1),
@@ -83,7 +83,7 @@ impl Ui {
 				};
 				input.handle_event(&Event::Key(key));
 				let query = input.value().to_owned();
-				self.set_filter(library, query);
+				self.set_query(library, query);
 			}
 		}
 		Outcome::Done
@@ -167,7 +167,7 @@ impl Ui {
 			KeyCode::Char('/') => {
 				self.layout.log_maximized = false;
 				self.mode = ViewMode::Library;
-				self.search = Some(Input::new(self.filter.clone()));
+				self.search = Some(Input::new(self.filter.query.clone()));
 			}
 			KeyCode::Char('i') if self.layout.log_maximized => {
 				self.layout.log_maximized = false;

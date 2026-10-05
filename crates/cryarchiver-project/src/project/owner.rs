@@ -197,7 +197,7 @@ impl Owner {
 			}
 			Command::ChangeSettings(change) => self.change_settings(&change),
 			Command::Watch(folder, watched) => self.watch_folder(folder, watched),
-			Command::Filter(query) => self.set_filter(query),
+			Command::Filter { query, state } => self.set_filter(query, state),
 			Command::Details(file) => self.send_details(file),
 			Command::IssueLog(issue, attempt) => self.send_issue_log(issue, attempt),
 			Command::Reveal { target, destination } => self.reveal(target, destination),

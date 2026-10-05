@@ -153,9 +153,21 @@ pub enum FilterEntry {
 	File { folder: FolderId, row: FileRow },
 }
 
+/// Narrows the filter to files with one outcome. Folders then show only as the ancestors of matching files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateFilter {
+	/// Files with an open issue.
+	Issues,
+	/// Files whose original was kept because the encode didn't save enough.
+	Kept,
+	/// Duplicates archived as a placeholder.
+	Duplicates,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilterView {
 	pub query: String,
+	pub state: Option<StateFilter>,
 	/// Matches and their ancestors in display order, each with its depth below the root.
 	pub rows: Vec<(u16, FilterEntry)>,
 	pub matching_files: usize,

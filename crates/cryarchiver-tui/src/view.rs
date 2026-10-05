@@ -386,10 +386,49 @@ impl Library {
 	}
 }
 
-/// The tree narrowed to a name filter: matches plus their ancestors, in display order.
+/// Narrows the Library to files with one outcome, as the Overall panel counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateFilter {
+	Issues,
+	Kept,
+	Duplicates,
+}
+
+impl StateFilter {
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Issues => "issues",
+			Self::Kept => "kept",
+			Self::Duplicates => "duplicates",
+		}
+	}
+}
+
+/// What the Library is narrowed to: files whose name contains the query and that have the state, when one is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filter {
+	pub query: String,
+	pub state: Option<StateFilter>,
+}
+
+impl Filter {
+	pub fn name(query: impl Into<String>) -> Self {
+		Self {
+			query: query.into(),
+			state: None,
+		}
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.query.is_empty() && self.state.is_none()
+	}
+}
+
+/// The tree narrowed to a filter: matches plus their ancestors, in display order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilterResult {
 	pub query: String,
+	pub state: Option<StateFilter>,
 	pub rows: Vec<FilterRow>,
 	pub matching_files: usize,
 }

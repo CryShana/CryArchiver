@@ -6,7 +6,7 @@ use ratatui::layout::{Position, Rect};
 use super::tree::Selection;
 use super::{Outcome, Overlay, Ui, ViewMode};
 use crate::source::ArchiveSource;
-use crate::view::{FileId, NodeId};
+use crate::view::{FileId, NodeId, StateFilter};
 
 pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const WHEEL_ROWS: isize = 3;
@@ -17,6 +17,7 @@ pub enum Hit {
 	Row { index: usize, arrow_x: u16 },
 	LibraryTitle,
 	ProgressHeader,
+	Outcome(StateFilter),
 	Maximize,
 	LogToggle,
 	LogMaximize,
@@ -163,6 +164,10 @@ impl Ui {
 			Hit::LibraryTitle if double => self.toggle_maximized(),
 			Hit::Maximize => self.toggle_maximized(),
 			Hit::ProgressHeader => self.tree.cycle_sort(),
+			Hit::Outcome(state) => {
+				self.toggle_state_filter(&source.view().library, state);
+				self.mode = ViewMode::Library;
+			}
 			Hit::LogToggle => self.layout.log_open = !self.layout.log_open,
 			Hit::LogMaximize => self.toggle_log_maximized(),
 			Hit::LogNewest => self.log_scroll.jump_to_newest(),

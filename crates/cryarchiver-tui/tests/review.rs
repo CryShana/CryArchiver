@@ -3,7 +3,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use cryarchiver_tui::source::SettingsChange;
-use cryarchiver_tui::view::{FilterEntry, NoticeLevel, RunState};
+use cryarchiver_tui::view::{Filter, FilterEntry, NoticeLevel, RunState};
 use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, MockSource, OverlayKind};
 use insta::assert_snapshot;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
@@ -254,7 +254,7 @@ fn statuses_update_in_place_without_a_new_rows_version() {
 		library.ids().find(|&id| library.node(id).name == "Dune").unwrap()
 	};
 	source.perform(Action::Expanded(dune, true));
-	source.perform(Action::SetFilter("birthday clip".to_owned()));
+	source.perform(Action::SetFilter(Filter::name("birthday clip")));
 	let version = source.rows_version();
 	let progress = |source: &MockSource| {
 		source

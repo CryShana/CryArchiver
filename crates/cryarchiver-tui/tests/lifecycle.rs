@@ -123,5 +123,8 @@ fn issues_survive_first_on_a_narrow_overall_panel() {
 	let issues = app.source().view().issues.len();
 	let terminal = draw(&mut app, 100, 30);
 
-	assert!(support::find_row(&terminal, &format!("! {issues} issues")).is_some());
+	assert!(
+		support::find_row(&terminal, &format!("! {issues}  = ")).is_some(),
+		"the counts stay, without their words"
+	);
 }

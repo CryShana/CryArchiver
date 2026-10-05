@@ -120,6 +120,17 @@ fn search_at_120x36() {
 }
 
 #[test]
+fn kept_filter_at_120x36() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let row = find_row(&terminal, " kept").unwrap();
+	let kept = support::find_on_row(&terminal, row, "= ").unwrap();
+	support::click(&mut app, kept, row, Instant::now());
+
+	assert_snapshot!(draw(&mut app, 120, 36).backend());
+}
+
+#[test]
 fn too_small_at_80x24() {
 	assert_snapshot!(draw(&mut app(), 80, 24).backend());
 }

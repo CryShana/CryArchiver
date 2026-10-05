@@ -123,7 +123,11 @@ pub fn draw(frame: &mut Frame, source: &dyn ArchiveSource, fetched: &Fetched, ui
 	header::render(buf, areas.header, view, &ui.theme);
 
 	if let Some(top) = areas.top {
-		ui.spinner_drawn = panels::render(buf, top, view, &ui.theme, &ui.spinner);
+		let state = panels::OverallState {
+			spinner: &ui.spinner,
+			active: ui.filter.state,
+		};
+		ui.spinner_drawn = panels::render(buf, top, view, &ui.theme, &state, &mut ui.hits);
 	}
 
 	if let Some(main) = areas.main {

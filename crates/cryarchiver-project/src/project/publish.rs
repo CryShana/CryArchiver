@@ -16,16 +16,24 @@ use crate::record::{CopyReason, FileState, How, IssueKind, MediaClass};
 use crate::tree::{FileId, FolderId};
 use crate::view::{
 	DecisionLine, Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, KEPT_LABEL, LogEntry,
-	LogKind, Notice, NoticeLevel, Overall, Parity, PathLink, RowState, RunState, Status, Update, Worker,
+	LogKind, Notice, NoticeLevel, Overall, Parity, PathLink, RowState, RunState, StateFilter, Status, Update, Worker,
 	decision_lines, size_text,
 };
 
 const THROUGHPUT_WINDOW: Duration = Duration::from_mins(5);
 
 #[derive(Debug)]
+pub(super) struct ActiveFilter {
+	query: String,
+	needle: String,
+	state: Option<StateFilter>,
+	hits: HashSet<FileId>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ViewState {
 	pub(super) watched: HashSet<FolderId>,
-	pub(super) filter: Option<(String, HashSet<FileId>)>,
+	pub(super) filter: Option<ActiveFilter>,
 	dirty_folders: HashSet<FolderId>,
 	dirty_files: HashSet<FileId>,
 	pub(super) status_dirty: bool,
@@ -116,12 +124,18 @@ impl Owner {
 			self.send(Update::Folder(folder, self.tree.stats(folder)));
 		}
 
+		self.refilter_if_moved();
+
 		let mut files: Vec<FileId> = self.view.dirty_files.drain().collect();
 		files.sort();
 		for file in files {
 			let entry = self.tree.file(file);
 			let shown = self.view.watched.contains(&entry.folder)
-				|| self.view.filter.as_ref().is_some_and(|(_, hits)| hits.contains(&file));
+				|| self
+					.view
+					.filter
+					.as_ref()
+					.is_some_and(|filter| filter.hits.contains(&file));
 			if shown && !entry.removed {
 				self.send(Update::FileStatus {
 					folder: entry.folder,
@@ -352,28 +366,29 @@ impl Owner {
 		self.send(Update::Files { folder, rows });
 	}
 
-	/// Matches and their ancestors, in display order: a folder, its subfolders, then its matching files.
-	pub(super) fn set_filter(&mut self, query: String) {
-		if query.is_empty() {
+	/// Matches and their ancestors, in display order: a folder, its subfolders, then its matching files. A folder whose
+	/// name matches the query is shown too, without files of its own unless they match.
+	pub(super) fn set_filter(&mut self, query: String, state: Option<StateFilter>) {
+		if query.is_empty() && state.is_none() {
 			self.view.filter = None;
 			self.send(Update::Filter(None));
 			return;
 		}
 
 		let needle = query.to_lowercase();
-		let matches = |name: &OsStr| display_name(name).to_lowercase().contains(&needle);
 		let mut hits: HashSet<FileId> = HashSet::new();
 		let mut kept = vec![false; self.tree.folder_count()];
 		for folder in self.tree.folder_ids().rev() {
 			let entry = self.tree.folder(folder);
 			for &file in &entry.files {
-				if !self.tree.file(file).removed && matches(&self.tree.file(file).name) {
+				if self.filter_passes(file, &needle, state) {
 					hits.insert(file);
 					kept[folder.0 as usize] = true;
 				}
 			}
 
-			kept[folder.0 as usize] |= folder != FolderId::ROOT && matches(&entry.name);
+			kept[folder.0 as usize] |=
+				folder != FolderId::ROOT && !needle.is_empty() && name_matches(&entry.name, &needle);
 			if kept[folder.0 as usize]
 				&& let Some(parent) = entry.parent
 			{
@@ -384,12 +399,53 @@ impl Owner {
 		let mut rows = Vec::new();
 		self.filter_rows(FolderId::ROOT, 0, &kept, &hits, &mut rows);
 		let view = FilterView {
-			query,
+			query: query.clone(),
+			state,
 			matching_files: hits.len(),
 			rows,
 		};
-		self.view.filter = Some((needle, hits));
+		self.view.filter = Some(ActiveFilter {
+			query,
+			needle,
+			state,
+			hits,
+		});
 		self.send(Update::Filter(Some(view)));
+	}
+
+	/// A state filter follows the run: when a changed file joins or leaves it, the result is sent again. Only the files
+	/// that changed since the last publish are checked, and the result is rebuilt at most once per publish.
+	fn refilter_if_moved(&mut self) {
+		let Some(filter) = self.view.filter.as_ref().filter(|filter| filter.state.is_some()) else {
+			return;
+		};
+
+		let moved = self
+			.view
+			.dirty_files
+			.iter()
+			.any(|&file| self.filter_passes(file, &filter.needle, filter.state) != filter.hits.contains(&file));
+		if moved {
+			let (query, state) = (filter.query.clone(), filter.state);
+			self.set_filter(query, state);
+		}
+	}
+
+	fn filter_passes(&self, file: FileId, needle: &str, state: Option<StateFilter>) -> bool {
+		let entry = self.tree.file(file);
+		!entry.removed
+			&& state.is_none_or(|state| self.in_state(file, state))
+			&& (needle.is_empty() || name_matches(&entry.name, needle))
+	}
+
+	/// The same membership the outcome counts in [`Overall`] use.
+	fn in_state(&self, file: FileId, state: StateFilter) -> bool {
+		let output = self.tree.file(file).record.state.output();
+		match state {
+			StateFilter::Issues => self.issue_files.contains(&file),
+			StateFilter::Kept => output.is_some_and(|output| output.how == How::Copied(CopyReason::KeptOriginal)),
+			StateFilter::Duplicates => output.is_some_and(|output| matches!(output.how, How::Placeholder { .. })),
+		}
 	}
 
 	fn filter_rows(
@@ -679,18 +735,215 @@ pub(super) fn codec_label(how: &How, output_name: &OsStr) -> String {
 	}
 }
 
+fn name_matches(name: &OsStr, needle: &str) -> bool {
+	display_name(name).to_lowercase().contains(needle)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::fs;
+	use std::path::Path;
+	use std::sync::mpsc::Receiver;
 
 	use cryarchiver_engine::engine::Stage;
 
 	use super::*;
 	use crate::keys::RelPath;
 	use crate::project::pipeline::tests::running_job;
-	use crate::project::scanning::tests::{key, list, owner};
-	use crate::record::FileRecord;
+	use crate::project::scanning::tests::{key, list, list_queued, owner};
+	use crate::record::{FileRecord, Output};
 	use crate::schedule::Work;
+
+	const KEPT: &str = "Photos/Beach/sunset.jpg";
+	const ALSO_KEPT: &str = "Photos/Beach/other.jpg";
+	const DUPLICATE: &str = "Photos/City/sunset copy.jpg";
+	const FAILED: &str = "Docs/notes.txt";
+
+	fn done(how: How) -> FileState {
+		FileState::Done(Output {
+			how,
+			path: key("out"),
+			size: 1,
+			hash: None,
+		})
+	}
+
+	fn failed() -> FileState {
+		FileState::Issue {
+			kind: IssueKind::Unrecoverable { damaged: false },
+			attempt: 1,
+			reason: "broken".into(),
+			output: None,
+		}
+	}
+
+	fn file(owner: &Owner, path: &str) -> FileId {
+		owner.tree.file_id(&key(path)).unwrap()
+	}
+
+	/// One kept original beside another, a duplicate, a failed file, a folder named like the kept one and a file that
+	/// is still queued.
+	fn outcomes(dir: &Path) -> (Owner, Receiver<Update>) {
+		let source = dir.join("source");
+		for path in [KEPT, ALSO_KEPT, DUPLICATE, FAILED, "Sunset/readme.txt", "queued.txt"] {
+			let path = source.join(path);
+			fs::create_dir_all(path.parent().unwrap()).unwrap();
+			fs::write(path, b"x").unwrap();
+		}
+
+		let (mut owner, updates) = owner(&source, &dir.join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		list_queued(&mut owner);
+
+		owner.set_state(file(&owner, KEPT), done(How::Copied(CopyReason::KeptOriginal)));
+		owner.set_state(file(&owner, ALSO_KEPT), done(How::Copied(CopyReason::KeptOriginal)));
+		let placeholder = How::Placeholder {
+			canonical: key(KEPT),
+			lost: false,
+		};
+		owner.set_state(file(&owner, DUPLICATE), done(placeholder));
+		owner.set_state(file(&owner, FAILED), failed());
+		owner.publish();
+		updates.try_iter().for_each(drop);
+		(owner, updates)
+	}
+
+	/// Every filter result sent since the last call, as (depth, name) rows; the root folder is `/`.
+	fn filter_results(owner: &Owner, updates: &Receiver<Update>) -> Vec<Vec<(u16, String)>> {
+		updates
+			.try_iter()
+			.filter_map(|update| match update {
+				Update::Filter(Some(view)) => Some(view),
+				_ => None,
+			})
+			.map(|view| {
+				view.rows
+					.iter()
+					.map(|(depth, entry)| match entry {
+						FilterEntry::Folder(folder) if *folder == FolderId::ROOT => (*depth, "/".to_owned()),
+						FilterEntry::Folder(folder) => (*depth, display_name(&owner.tree.folder(*folder).name)),
+						FilterEntry::File { row, .. } => (*depth, row.name.clone()),
+					})
+					.collect()
+			})
+			.collect()
+	}
+
+	fn rows(shape: &[(u16, &str)]) -> Vec<(u16, String)> {
+		shape.iter().map(|&(depth, name)| (depth, name.to_owned())).collect()
+	}
+
+	#[test]
+	fn a_state_filter_shows_only_its_files_with_their_folders_as_ancestors() {
+		let dir = tempfile::tempdir().unwrap();
+		let (mut owner, updates) = outcomes(dir.path());
+
+		owner.set_filter(String::new(), Some(StateFilter::Kept));
+		owner.set_filter(String::new(), Some(StateFilter::Duplicates));
+		owner.set_filter(String::new(), Some(StateFilter::Issues));
+
+		assert_eq!(
+			filter_results(&owner, &updates),
+			[
+				rows(&[
+					(0, "/"),
+					(1, "Photos"),
+					(2, "Beach"),
+					(3, "other.jpg"),
+					(3, "sunset.jpg")
+				]),
+				rows(&[(0, "/"), (1, "Photos"), (2, "City"), (3, "sunset copy.jpg")]),
+				rows(&[(0, "/"), (1, "Docs"), (2, "notes.txt")]),
+			]
+		);
+	}
+
+	#[test]
+	fn a_state_filter_with_a_name_query_needs_both() {
+		let dir = tempfile::tempdir().unwrap();
+		let (mut owner, updates) = outcomes(dir.path());
+
+		owner.set_filter("SUNSET".into(), Some(StateFilter::Kept));
+
+		assert_eq!(
+			filter_results(&owner, &updates),
+			[rows(&[
+				(0, "/"),
+				(1, "Photos"),
+				(2, "Beach"),
+				(3, "sunset.jpg"),
+				(1, "Sunset")
+			])]
+		);
+		let filter = owner.view.filter.as_ref().unwrap();
+		assert_eq!(filter.hits, HashSet::from([file(&owner, KEPT)]));
+	}
+
+	#[test]
+	fn a_state_filter_follows_the_run_once_per_publish() {
+		let dir = tempfile::tempdir().unwrap();
+		let (mut owner, updates) = outcomes(dir.path());
+		owner.set_filter(String::new(), Some(StateFilter::Issues));
+		updates.try_iter().for_each(drop);
+
+		owner.set_state(file(&owner, "queued.txt"), failed());
+		owner.set_state(file(&owner, ALSO_KEPT), failed());
+		owner.publish();
+		assert_eq!(
+			filter_results(&owner, &updates),
+			[rows(&[
+				(0, "/"),
+				(1, "Docs"),
+				(2, "notes.txt"),
+				(1, "Photos"),
+				(2, "Beach"),
+				(3, "other.jpg"),
+				(1, "queued.txt")
+			])]
+		);
+
+		owner.set_state(file(&owner, FAILED), done(How::Encoded));
+		owner.publish();
+		assert_eq!(
+			filter_results(&owner, &updates),
+			[rows(&[
+				(0, "/"),
+				(1, "Photos"),
+				(2, "Beach"),
+				(3, "other.jpg"),
+				(1, "queued.txt")
+			])],
+			"a resolved issue leaves the result"
+		);
+
+		owner.set_state(file(&owner, ALSO_KEPT), failed());
+		owner.publish();
+		assert!(
+			filter_results(&owner, &updates).is_empty(),
+			"a change that keeps a file in the result sends no new one"
+		);
+
+		owner.forget_file(file(&owner, ALSO_KEPT));
+		owner.publish();
+		assert_eq!(
+			filter_results(&owner, &updates),
+			[rows(&[(0, "/"), (1, "queued.txt")])],
+			"a file that leaves the project leaves the result"
+		);
+	}
+
+	#[test]
+	fn a_name_filter_without_a_state_is_not_rebuilt_on_state_changes() {
+		let dir = tempfile::tempdir().unwrap();
+		let (mut owner, updates) = outcomes(dir.path());
+		owner.set_filter("notes".into(), None);
+		updates.try_iter().for_each(drop);
+
+		owner.set_state(file(&owner, FAILED), done(How::Encoded));
+		owner.publish();
+
+		assert!(filter_results(&owner, &updates).is_empty());
+	}
 
 	#[test]
 	fn more_jobs_over_the_limit_than_workers_shown_never_panics() {

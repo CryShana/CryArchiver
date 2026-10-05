@@ -238,7 +238,10 @@ fn the_filter_answers_with_matches_and_their_ancestors() {
 		s.scan_complete() && s.root().files_total == 3
 	});
 
-	project.send(Command::Filter("SUNSET".into()));
+	project.send(Command::Filter {
+		query: "SUNSET".into(),
+		state: None,
+	});
 	wait_for(&project, &mut snapshot, "the filter", |s| s.filter.is_some());
 
 	let filter = snapshot.filter.clone().unwrap();
@@ -264,7 +267,10 @@ fn the_filter_answers_with_matches_and_their_ancestors() {
 		]
 	);
 
-	project.send(Command::Filter(String::new()));
+	project.send(Command::Filter {
+		query: String::new(),
+		state: None,
+	});
 	wait_for(&project, &mut snapshot, "the filter to clear", |s| s.filter.is_none());
 }
 

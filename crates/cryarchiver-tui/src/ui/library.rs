@@ -11,7 +11,7 @@ use crate::app::{Hit, Ui};
 use crate::format::{bytes, find_ignore_case, fit, fit_middle, percent, saving, short_count, thousands, width};
 use crate::source::ArchiveSource;
 use crate::theme::{Theme, glyph, label};
-use crate::view::{ArchiveView, FileState, FileStatus, FolderStats};
+use crate::view::{ArchiveView, FileState, FileStatus, FolderStats, StateFilter};
 
 const STATUS: usize = 11;
 const PROGRESS: usize = 15;
@@ -84,9 +84,14 @@ pub fn render(buf: &mut Buffer, area: Rect, source: &dyn ArchiveSource, ui: &mut
 	let columns = Columns::for_width(usize::from(inner.width));
 	let rows = ui.tree.rows();
 	if rows.is_empty() {
-		let message = match ui.tree.matching_files() {
-			None => "searching…".to_owned(),
-			Some(_) => format!("No files match “{}”", ui.filter),
+		let message = match (ui.tree.matching_files(), ui.filter.state) {
+			(None, _) => "searching…".to_owned(),
+			(Some(_), Some(state)) if ui.filter.query.is_empty() => match state {
+				StateFilter::Issues => "No files with an open issue".to_owned(),
+				StateFilter::Kept => "No kept originals".to_owned(),
+				StateFilter::Duplicates => "No duplicates".to_owned(),
+			},
+			(Some(_), _) => format!("No files match “{}”", ui.filter.query),
 		};
 		put(buf, body.x + 1, body.y, &message, fg(theme.dim), body.right());
 		return;
@@ -101,7 +106,7 @@ pub fn render(buf: &mut Buffer, area: Rect, source: &dyn ArchiveSource, ui: &mut
 				source,
 				row: rows[index],
 				selected: selected == Some(index),
-				filter: &ui.filter,
+				filter: &ui.filter.query,
 				theme: &theme,
 			};
 			table_row(&context, columns)
@@ -136,8 +141,17 @@ fn library_title(ui: &Ui) -> String {
 	} else {
 		"Library".to_owned()
 	};
-	if !ui.filter.is_empty() {
-		title = format!("{title} · filter “{}”", ui.filter);
+	if !ui.filter.query.is_empty() {
+		title = format!("{title} · filter “{}”", ui.filter.query);
+	}
+
+	if let Some(state) = ui.filter.state {
+		let count = match ui.tree.matching_files() {
+			Some(1) => "1 file".to_owned(),
+			Some(count) => format!("{} files", thousands(u64::try_from(count).unwrap_or(u64::MAX))),
+			None => "…".to_owned(),
+		};
+		title = format!("{title} · {} · {count}", state.label());
 	}
 	title
 }

@@ -8,9 +8,10 @@ use ratatui::widgets::{Sparkline, Widget};
 use throbber_widgets_tui::{Set, Throbber, ThrobberState};
 
 use super::widgets::{Chrome, Parts, block_gauge, bold, fg, gauge, pad_left, panel, put, put_line, to_u16, wrap};
+use crate::app::{Hit, HitMap};
 use crate::format::{bytes, fit, fit_middle, fps, fraction, percent, round_to_u32, speed, thousands, width};
 use crate::theme::{Theme, label};
-use crate::view::{ArchiveView, JobActivity, Overall, Parity, RunState, SystemStats, WorkKind, WorkerJob};
+use crate::view::{ArchiveView, JobActivity, Overall, Parity, RunState, StateFilter, SystemStats, WorkKind, WorkerJob};
 
 const SPINNER: Set = Set {
 	full: "⠿",
@@ -23,20 +24,35 @@ const MAX_GAUGE: usize = 24;
 const MAX_CODEC: usize = 4;
 const MIN_STATUS: usize = 7;
 const MAX_STATUS: usize = 18;
+/// The groups of the outcomes line, in the order they are drawn.
+const OUTCOMES: [StateFilter; 3] = [StateFilter::Issues, StateFilter::Kept, StateFilter::Duplicates];
 
 /// The Overall panel's lines and border at this terminal width. Workers and System are drawn into whatever height the
 /// caller settles on.
 pub fn height(width: u16, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) -> u16 {
 	let cells = usize::from(overall_width(width)).saturating_sub(4);
-	to_u16(overall_lines(&view.overall, cells, theme, spinner).lines.len()) + 2
+	to_u16(overall_lines(&view.overall, cells, theme, spinner, None).lines.len()) + 2
 }
 
 fn overall_width(width: u16) -> u16 {
 	to_u16(usize::from(width) * 30 / 100)
 }
 
+/// What the Overall panel shows besides the view: the spinner frame and the state filter the Library is narrowed to.
+pub struct OverallState<'a> {
+	pub spinner: &'a ThrobberState,
+	pub active: Option<StateFilter>,
+}
+
 /// Returns whether the scanning spinner made it onto the screen.
-pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) -> bool {
+pub fn render(
+	buf: &mut Buffer,
+	area: Rect,
+	view: &ArchiveView,
+	theme: &Theme,
+	state: &OverallState,
+	hits: &mut HitMap,
+) -> bool {
 	let overall_width = overall_width(area.width);
 	let workers_width = to_u16((usize::from(area.width) * 43 + 50) / 100);
 	let [overall, workers, system] = Layout::horizontal([
@@ -48,7 +64,7 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, s
 
 	render_workers(buf, workers, view, theme);
 	render_system(buf, system, view, theme);
-	render_overall(buf, overall, view, theme, spinner)
+	render_overall(buf, overall, view, theme, state, hits)
 }
 
 fn content(inner: Rect) -> Rect {
@@ -63,7 +79,14 @@ fn cow<'a>(text: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
 	text.into()
 }
 
-fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) -> bool {
+fn render_overall(
+	buf: &mut Buffer,
+	area: Rect,
+	view: &ArchiveView,
+	theme: &Theme,
+	state: &OverallState,
+	hits: &mut HitMap,
+) -> bool {
 	let chrome = Chrome {
 		title: "Overall",
 		right: None,
@@ -73,12 +96,26 @@ fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 	let overall = &view.overall;
 	let OverallLines {
 		lines,
+		outcomes_row,
 		saved_row,
 		spinning,
-	} = overall_lines(overall, usize::from(body.width), theme, spinner);
+	} = overall_lines(overall, usize::from(body.width), theme, state.spinner, state.active);
 
 	for (row, line) in (body.y..body.bottom()).zip(&lines) {
 		put_line(buf, body.x, row, line, body.right());
+	}
+
+	let outcomes_y = body.y + to_u16(outcomes_row);
+	if outcomes_y < body.bottom() {
+		let mut x = body.x;
+		for (group, state) in lines[outcomes_row].spans.chunks(3).zip(OUTCOMES) {
+			let shown = to_u16(group[..2].iter().map(|span| width(&span.content)).sum());
+			hits.push(
+				Rect::new(x, outcomes_y, shown, 1).intersection(body),
+				Hit::Outcome(state),
+			);
+			x += shown + to_u16(width(&group[2].content));
+		}
 	}
 
 	let spark_x = body.x + to_u16(lines[saved_row].width()) + 2;
@@ -97,11 +134,18 @@ fn render_overall(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 
 struct OverallLines<'a> {
 	lines: Vec<Line<'a>>,
+	outcomes_row: usize,
 	saved_row: usize,
 	spinning: bool,
 }
 
-fn overall_lines<'a>(overall: &Overall, cells: usize, theme: &Theme, spinner: &ThrobberState) -> OverallLines<'a> {
+fn overall_lines<'a>(
+	overall: &Overall,
+	cells: usize,
+	theme: &Theme,
+	spinner: &ThrobberState,
+	active: Option<StateFilter>,
+) -> OverallLines<'a> {
 	let gauge_color = if overall.parity.is_some() {
 		theme.done
 	} else {
@@ -120,7 +164,8 @@ fn overall_lines<'a>(overall: &Overall, cells: usize, theme: &Theme, spinner: &T
 	if overall.parity.is_none() {
 		lines.push(counts_line(overall, cells, theme));
 	}
-	lines.push(outcomes_line(overall, cells, theme));
+	let outcomes_row = lines.len();
+	lines.push(outcomes_line(overall, cells, theme, active));
 	if overall.originals_deleted > 0 {
 		lines.push(deleted_line(overall, cells, theme));
 	}
@@ -137,6 +182,7 @@ fn overall_lines<'a>(overall: &Overall, cells: usize, theme: &Theme, spinner: &T
 
 	OverallLines {
 		lines,
+		outcomes_row,
 		saved_row,
 		spinning,
 	}
@@ -184,21 +230,62 @@ fn counts_line<'a>(overall: &Overall, cells: usize, theme: &Theme) -> Line<'a> {
 	parts.line()
 }
 
-fn outcomes_line<'a>(overall: &Overall, cells: usize, theme: &Theme) -> Line<'a> {
+/// Each group is its glyph, its label and the gap after it, so the clickable part is easy to find again. The group the
+/// Library is filtered by is highlighted without changing a cell's width. When the words don't fit, the counts stand
+/// alone, so every group stays on screen.
+fn outcomes_line<'a>(overall: &Overall, cells: usize, theme: &Theme, active: Option<StateFilter>) -> Line<'a> {
+	let groups = [
+		(
+			StateFilter::Issues,
+			"! ",
+			bold(theme.error),
+			overall.open_issues.to_string(),
+			" issues",
+		),
+		(
+			StateFilter::Kept,
+			"= ",
+			fg(theme.warn),
+			thousands(overall.kept),
+			" kept",
+		),
+		(
+			StateFilter::Duplicates,
+			"↪ ",
+			fg(theme.search),
+			thousands(overall.duplicates),
+			" dup",
+		),
+	];
+	let full_width: usize = groups
+		.iter()
+		.map(|(_, glyph, _, count, word)| width(glyph) + width(count) + width(word))
+		.sum::<usize>()
+		+ groups.len()
+		- 1;
+	let (words, gap) = if full_width <= cells {
+		(true, " ")
+	} else {
+		(false, "  ")
+	};
+
 	let mut parts = Parts::new(cells);
-	parts
-		.group([
-			(cow("! "), bold(theme.error)),
-			(cow(format!("{} issues  ", overall.open_issues)), fg(theme.text)),
-		])
-		.group([
-			(cow("= "), fg(theme.warn)),
-			(cow(format!("{} kept  ", thousands(overall.kept))), fg(theme.text)),
-		])
-		.group([
-			(cow("↪ "), fg(theme.search)),
-			(cow(format!("{} dup", thousands(overall.duplicates))), fg(theme.text)),
+	let last = groups.len() - 1;
+	for (index, (state, glyph, glyph_style, count, word)) in groups.into_iter().enumerate() {
+		let (glyph_style, label_style) = if active == Some(state) {
+			let highlight = bold(theme.background).bg(theme.accent);
+			(highlight, highlight)
+		} else {
+			(glyph_style, fg(theme.text))
+		};
+		let label = if words { count + word } else { count };
+		let gap = if index == last { "" } else { gap };
+		parts.group([
+			(cow(glyph), glyph_style),
+			(cow(label), label_style),
+			(cow(gap), fg(theme.text)),
 		]);
+	}
 	parts.line()
 }
 
@@ -585,10 +672,34 @@ mod tests {
 		let spinner = ThrobberState::default();
 		let area = Rect::new(0, 0, width, height(width, view, &theme, &spinner));
 		let mut buf = Buffer::empty(area);
-		render(&mut buf, area, view, &theme, &spinner);
+		let state = OverallState {
+			spinner: &spinner,
+			active: None,
+		};
+		render(&mut buf, area, view, &theme, &state, &mut HitMap::default());
 		(0..area.height)
 			.map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
 			.collect()
+	}
+
+	#[test]
+	fn every_outcome_group_stays_on_screen_and_only_the_words_give_way() {
+		let view = view();
+		let outcomes = |width| panels(&view, width).into_iter().find(|row| row.contains("= ")).unwrap();
+
+		let wide = outcomes(120);
+		assert!(
+			wide.contains(" issues ") && wide.contains(" kept ") && wide.contains(" dup"),
+			"{wide}"
+		);
+		assert!(wide.contains("↪ "), "{wide}");
+
+		let narrow = outcomes(100);
+		assert!(
+			narrow.contains("! ") && narrow.contains("= ") && narrow.contains("↪ "),
+			"{narrow}"
+		);
+		assert!(!narrow.contains("kept"), "{narrow}");
 	}
 
 	#[test]

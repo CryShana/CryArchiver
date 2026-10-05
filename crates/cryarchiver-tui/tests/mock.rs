@@ -1,5 +1,7 @@
 use cryarchiver_tui::source::SettingsChange;
-use cryarchiver_tui::view::{FileState, FilterEntry, IssueKind, Limit, NodeId, RunState, Verb, WorkKind};
+use cryarchiver_tui::view::{
+	FileState, Filter, FilterEntry, IssueKind, Limit, NodeId, RunState, StateFilter, Verb, WorkKind,
+};
 use cryarchiver_tui::{Action, ArchiveSource, MockSource};
 
 fn stepped(seed: u64, steps: usize) -> MockSource {
@@ -97,15 +99,38 @@ fn folders_roll_up_their_whole_subtree() {
 #[test]
 fn filter_returns_matches_with_their_ancestors() {
 	let mut source = MockSource::new(3);
-	source.perform(Action::SetFilter("さくら".to_owned()));
+	source.perform(Action::SetFilter(Filter::name("さくら")));
 	let result = source.filter().unwrap();
 
 	assert_eq!(result.matching_files, 1);
 	assert_eq!(result.rows.len(), 4);
 	assert!(matches!(&result.rows[3].entry, FilterEntry::File { row, .. } if row.name == "01.さくら.mp3"));
 
-	source.perform(Action::SetFilter(String::new()));
+	source.perform(Action::SetFilter(Filter::default()));
 	assert!(source.filter().is_none());
+}
+
+#[test]
+fn a_state_filter_follows_the_run() {
+	let mut source = MockSource::new(3);
+	source.perform(Action::SetFilter(Filter {
+		query: String::new(),
+		state: Some(StateFilter::Kept),
+	}));
+	let first = source.view().overall.kept;
+	let version = source.rows_version();
+
+	for _ in 0..2_000 {
+		source.step();
+		let result = source.filter().unwrap();
+		assert_eq!(result.matching_files as u64, source.view().overall.kept);
+		if source.view().overall.kept != first {
+			break;
+		}
+	}
+
+	assert_ne!(source.view().overall.kept, first, "the run kept another original");
+	assert_ne!(source.rows_version(), version, "the new rows replaced the old ones");
 }
 
 #[test]
