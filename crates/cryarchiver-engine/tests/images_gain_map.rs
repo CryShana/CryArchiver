@@ -67,6 +67,28 @@ async fn an_encoded_gain_map_scores_above_the_target_against_its_source() {
 	assert!(resized.unwrap_err().kind.to_string().contains("verification failed"));
 }
 
+#[tokio::test]
+async fn single_pixel_and_odd_sized_gain_maps_encode_and_decode_at_their_size() {
+	let dir = tempfile::tempdir().unwrap();
+	let tools = support::toolchain().await;
+	let workspace = Workspace::create(&dir.path().join(".cry-work"), &dir.path().join("photo.jpg")).unwrap();
+	let cancel = CancellationToken::new();
+
+	for (width, height) in [(1, 1), (7, 5), (1, 9)] {
+		let source = gradient(width, height);
+		let encoded = encode(&source, 60.0, 10, 1).unwrap();
+
+		let (meta, av1) = primary_av1(&encoded);
+		let header = read_sequence_header(&av1).unwrap();
+		let scored = score(&tools, &workspace, &encoded, &source, &cancel).await.unwrap();
+
+		assert_eq!(meta.primary_size(), Some((width, height)));
+		assert_eq!((header.width, header.height), (width, height));
+		assert!(header.monochrome);
+		assert!(scored >= TARGET, "{width}×{height}: {scored}");
+	}
+}
+
 #[test]
 fn a_gain_map_turns_with_the_base_orientation() {
 	let gain = GrayImage::from_fn(4, 2, |x, y| Luma([u8::try_from(x + 10 * y).unwrap()]));

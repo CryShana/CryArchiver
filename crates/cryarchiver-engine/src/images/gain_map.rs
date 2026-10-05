@@ -265,8 +265,7 @@ pub async fn score(
 		)));
 	}
 
-	let reference = DynamicImage::ImageRgb8(DynamicImage::ImageLuma8(reference.clone()).into_rgb8());
-	let decoded = DynamicImage::ImageRgb8(decoded.into_rgb8());
+	let reference = DynamicImage::ImageLuma8(reference.clone());
 	blocking(cancel, move || ssim::score(&reference, &decoded))
 		.await?
 		.map_err(JobError::verification)

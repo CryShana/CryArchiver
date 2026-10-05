@@ -985,6 +985,20 @@ fn gain_map_with_alpha_is_refused() {
     assert!(aviffy.write_slice(&mut vec![], &[1, 2, 3], None).is_ok());
 }
 
+#[test]
+fn monochrome_color_image_has_one_channel_pixi() {
+    let contains = |avif: &[u8], expected: &[u8]| avif.windows(expected.len()).any(|window| window == expected);
+    let one_channel = b"pixi\0\0\0\0\x01\x08";
+    let three_channels = b"pixi\0\0\0\0\x03\x08\x08\x08";
+
+    let monochrome = Aviffy::new().set_monochrome(true).to_vec(&[1, 2, 3], None, 10, 20, 8);
+    let color = Aviffy::new().to_vec(&[1, 2, 3], None, 10, 20, 8);
+
+    assert!(contains(&monochrome, one_channel));
+    assert!(!contains(&monochrome, three_channels));
+    assert!(contains(&color, three_channels));
+}
+
 #[cfg(test)]
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
