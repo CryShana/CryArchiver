@@ -2,7 +2,7 @@
 source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app, 100, 30).backend()"
 ---
-" CryArchiver   DEMO  D:\Archive\Family → E:\Ar…mily  MODERATE · LATEST        ETA 9h 8m · ▶ running "
+" CryArchiver   DEMO  D:\Archi…mily  MODERATE · LATEST   saved 223 GB (65 %) · ETA 9h 8m · ▶ running "
 "╭─ birthday clip 2.mov ──────────────────────────────────────────────────── ⏎ back · ↑↓ prev/next ─╮"
 "│ Source   D:\Archive\Family\Photos\2020\Dune\bir…ip 2.mov  ffmpeg (live tail)                     │"
 "│ Output   E:\Archive-AV1\Family\Photos\2020\Dune…ip 2.mkv  frame=  1013 fps=88 q=31.2 size=11.1 … │"

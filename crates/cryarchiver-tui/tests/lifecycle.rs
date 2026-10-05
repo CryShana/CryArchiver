@@ -28,7 +28,7 @@ fn header_keeps_the_run_state_at_every_size() {
 }
 
 #[test]
-fn header_adds_eta_before_the_saving_as_room_grows() {
+fn header_adds_the_eta_then_the_saving_then_the_free_space_as_room_grows() {
 	let mut limited = app();
 	press(&mut limited, KeyCode::Char('e'));
 	let crowded = row_text(&draw(&mut limited, 100, 30), 0);
@@ -36,8 +36,8 @@ fn header_adds_eta_before_the_saving_as_room_grows() {
 	let wide = row_text(&draw(&mut app(), 160, 45), 0);
 
 	assert!(crowded.contains("applying…") && crowded.contains("▶ running") && !crowded.contains("ETA"));
-	assert!(narrow.contains("ETA") && !narrow.contains("saved"));
-	assert!(wide.contains("ETA") && wide.contains("saved"));
+	assert!(narrow.contains("ETA") && narrow.contains("saved") && !narrow.contains("free"));
+	assert!(wide.contains("ETA") && wide.contains("saved") && wide.contains("free"));
 }
 
 #[test]

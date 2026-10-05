@@ -2,7 +2,7 @@
 source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app, 120, 36).backend()"
 ---
-" CryArchiver   DEMO  D:\Archive\Family → E:\Archive-…mily  MODERATE · LATEST           saved 482 GB (66 %) · ✓ complete "
+" CryArchiver   DEMO  D:\Archive\Family → E:\A…mily  MODERATE · LATEST   1.08 TB free · saved 482 GB (66 %) · ✓ complete "
 "╭─ Overall ────────────────────────╮╭─ Workers ─── 0 active · 3 video + 3 image slots ─╮╭─ System ─────────────────────╮"
 "│ 100% of 44,463 files             ││ all work finished                                ││ CPU ████████████▏      72%   │"
 "│ ████████████████████████████████ ││                                                  ││     ▅▅▇▇▇▅▅▆▆▇▅▆▅▅▆█▇        │"

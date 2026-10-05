@@ -2,7 +2,7 @@
 source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app(), 100, 30).backend()"
 ---
-" CryArchiver   DEMO  D:\Archive\Family → E:\Ar…mily  MODERATE · LATEST        ETA 9h 8m · ▶ running "
+" CryArchiver   DEMO  D:\Archi…mily  MODERATE · LATEST   saved 223 GB (65 %) · ETA 9h 8m · ▶ running "
 "╭─ Overall ──────────────────╮╭─ Workers ───────────────────────────────╮╭─ System ────────────────╮"
 "│ 38.6% of 44,559+ files     ││ #1 AV1  birthd…p 2.mov encode   64.9%   ││ CPU ██████████▍   87%   │"
 "│ ██████████                 ││ #2 AV1  2018 -…Pro.mkv encode   98.6%   ││     ▆▆▆▇▇▇▇▇▇██▇        │"

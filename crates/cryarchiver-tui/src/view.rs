@@ -213,7 +213,6 @@ pub struct SystemStats {
 	pub cpu_history: Vec<u64>,
 	pub ram_used: u64,
 	pub ram_total: u64,
-	pub disk_label: String,
 	pub disk_free: u64,
 	pub low_priority: bool,
 	pub toolchain: String,

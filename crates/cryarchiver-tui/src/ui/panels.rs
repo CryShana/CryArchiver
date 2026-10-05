@@ -614,6 +614,15 @@ mod tests {
 		let mut view = view();
 		assert_eq!(height(100, &view, &theme, &spinner), 7);
 
+		view.workers.jobs = (0..8).map(|_| job("AVIF", "encoding")).collect();
+		assert_eq!(
+			height(100, &view, &theme, &spinner),
+			7,
+			"the worker count never moves the top"
+		);
+		view.workers.jobs.clear();
+		assert_eq!(height(100, &view, &theme, &spinner), 7);
+
 		view.overall.originals_deleted = 12;
 		assert_eq!(height(100, &view, &theme, &spinner), 8);
 		assert!(panels(&view, 100)[6].contains("Saved"));

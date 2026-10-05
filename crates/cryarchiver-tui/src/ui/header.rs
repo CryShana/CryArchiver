@@ -87,19 +87,22 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 		None => format!(" {profile} "),
 	};
 	let (run, run_color) = run_state(header.run_state, theme);
-	let pinned = if header.run_state == RunState::PausedLowDisk {
-		width(&free_space(view)) + width(SEPARATOR) + 1
-	} else {
-		0
-	};
+	let pieces = status_pieces(view, theme);
 	let squeeze_beside = |reserved: usize| {
 		let room = usize::from(area.width).saturating_sub(width(run) + 2 + reserved);
 		squeeze(view, &preset, room, usize::from(area.width) * 3 / 10)
 	};
-	let mut left = squeeze_beside(pinned);
-	if left.badge == SHORT_BADGE {
-		left = squeeze_beside(0);
-	}
+
+	// The route gives way to the status pieces down to its minimum width, but it is never dropped and nothing else on
+	// the left is shortened just to make room for them.
+	let bare = squeeze_beside(0);
+	let left = (1..=pieces.len())
+		.rev()
+		.map(|count| squeeze_beside(reserve(&pieces[..count])))
+		.find(|left| {
+			left.badge == bare.badge && left.limit == bare.limit && (left.route_width > 0) == (bare.route_width > 0)
+		})
+		.unwrap_or(bare);
 
 	let mut x = put(
 		buf,
@@ -143,7 +146,13 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme) {
 	}
 
 	let status = Status { run, color: run_color };
-	render_status(buf, Rect::new(x, y, right.saturating_sub(x), 1), view, &status, theme);
+	render_status(
+		buf,
+		Rect::new(x, y, right.saturating_sub(x), 1),
+		&pieces,
+		&status,
+		theme,
+	);
 }
 
 struct Status {
@@ -162,19 +171,15 @@ fn run_state(state: RunState, theme: &Theme) -> (&'static str, Color) {
 	}
 }
 
-fn free_space(view: &ArchiveView) -> String {
-	format!("{} free", bytes(view.system.disk_free))
-}
-
 struct Piece {
 	text: String,
 	color: Color,
 }
 
-/// The run state always shows; the ETA, then the saving, then the destination's free space join it while they fit.
+/// The status pieces, the one kept longest first: the ETA, then the saving, then the destination's free space.
 /// While paused for disk space the order turns round: the free space stays beside the run state and the ETA goes
-/// first. Each piece is drawn followed by its separator, so the lowest-ranked piece is always the leftmost.
-fn render_status(buf: &mut Buffer, area: Rect, view: &ArchiveView, status: &Status, theme: &Theme) {
+/// first. Pieces with nothing to say, such as a free space not yet measured, are left out.
+fn status_pieces(view: &ArchiveView, theme: &Theme) -> Vec<Piece> {
 	let overall = &view.overall;
 	let low_disk = view.header.run_state == RunState::PausedLowDisk;
 	let eta = Piece {
@@ -194,19 +199,37 @@ fn render_status(buf: &mut Buffer, area: Rect, view: &ArchiveView, status: &Stat
 		color: theme.dim,
 	};
 	let free = Piece {
-		text: free_space(view),
+		text: match view.system.disk_free {
+			0 => String::new(),
+			free => format!("{} free", bytes(free)),
+		},
 		color: if low_disk { theme.error } else { theme.dim },
 	};
-	let mut ranked = [eta, saved, free];
+
+	let mut ranked = vec![eta, saved, free];
 	if low_disk {
 		ranked.reverse();
 	}
-	let pieces: Vec<&Piece> = ranked.iter().filter(|piece| !piece.text.is_empty()).collect();
+	ranked.retain(|piece| !piece.text.is_empty());
+	ranked
+}
 
+/// The cells `render_status` needs beyond the run state to show these pieces.
+fn reserve(pieces: &[Piece]) -> usize {
+	pieces
+		.iter()
+		.map(|piece| width(&piece.text) + width(SEPARATOR))
+		.sum::<usize>()
+		+ 1
+}
+
+/// The run state always shows; the pieces join it in rank order while they fit. Each piece is drawn followed by its
+/// separator, so the lowest-ranked piece is always the leftmost.
+fn render_status(buf: &mut Buffer, area: Rect, pieces: &[Piece], status: &Status, theme: &Theme) {
 	let room = usize::from(area.width).saturating_sub(2);
 	let mut used = width(status.run) + 1;
 	let mut shown = 0;
-	for piece in &pieces {
+	for piece in pieces {
 		let cells = width(&piece.text) + width(SEPARATOR);
 		if used + cells > room {
 			break;
@@ -253,12 +276,57 @@ mod tests {
 		let (run, color) = run_state(view.header.run_state, theme);
 		let area = Rect::new(0, 0, cells, 1);
 		let mut buf = Buffer::empty(area);
-		render_status(&mut buf, area, view, &Status { run, color }, theme);
+		render_status(
+			&mut buf,
+			area,
+			&status_pieces(view, theme),
+			&Status { run, color },
+			theme,
+		);
 		buf
 	}
 
 	fn text(buf: &Buffer) -> String {
 		(0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect()
+	}
+
+	fn header(view: &ArchiveView, cells: u16) -> String {
+		let theme = Theme::dark(ColorDepth::TrueColor);
+		let area = Rect::new(0, 0, cells, 1);
+		let mut buf = Buffer::empty(area);
+		render(&mut buf, area, view, &theme);
+		text(&buf)
+	}
+
+	#[test]
+	fn the_route_gives_way_so_the_free_space_shows_at_common_widths() {
+		let demo = view(RunState::Running);
+		let mut real = demo.clone();
+		real.header.demo = false;
+		real.header.codecs = None;
+
+		for (view, cells) in [(&real, 100), (&real, 120), (&demo, 120)] {
+			let header = header(view, cells);
+			assert!(
+				header.contains("412 GB free · saved 223 GB (65 %) · ETA 3h 0m"),
+				"{cells}: {header}"
+			);
+			assert!(header.contains("D:\\"), "the route stays: {header}");
+			assert!(header.contains(" CryArchiver "), "{header}");
+		}
+	}
+
+	#[test]
+	fn an_unmeasured_free_space_shows_nothing() {
+		let theme = Theme::dark(ColorDepth::TrueColor);
+
+		for run_state in [RunState::Running, RunState::PausedLowDisk] {
+			let mut view = view(run_state);
+			view.system.disk_free = 0;
+			let shown = text(&status(&view, 110, &theme));
+			assert!(!shown.contains("free"), "{shown}");
+			assert!(shown.contains("saved 223 GB"), "{shown}");
+		}
 	}
 
 	#[test]

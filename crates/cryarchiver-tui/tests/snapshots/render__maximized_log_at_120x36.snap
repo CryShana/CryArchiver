@@ -2,7 +2,7 @@
 source: crates/cryarchiver-tui/tests/render.rs
 expression: "draw(&mut app, 120, 36).backend()"
 ---
-" CryArchiver   DEMO  D:\Archive\Family → E:\Archive-…mily  MODERATE · LATEST                      ETA 9h 8m · ▶ running "
+" CryArchiver   DEMO  D:\Archive\Fa…mily  MODERATE · LATEST   1.20 TB free · saved 223 GB (65 %) · ETA 9h 8m · ▶ running "
 "╭─ Log · maximized ────────────────────────────────────────────────────────────────────────────────────────────────[⤡]─╮"
 "│ 14:02:08 ◌ concert_1080i.mkv: CRF 30.75 → VMAF 94.9 (4 probes) · encoding                                            │"
 "│ 14:02:07 ✓ 02. 夜明け.mp3 → Opus 1.71 MB (−53 %) · cover + tags kept                                                 │" Hidden by multi-width symbols: [(18, " "), (20, " "), (22, " ")]

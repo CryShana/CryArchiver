@@ -139,7 +139,6 @@ impl MockSource {
 					cpu_history: initial_history(&mut rng, 60, 92),
 					ram_used: 11_200_000_000,
 					ram_total: 32_000_000_000,
-					disk_label: "E:".to_owned(),
 					disk_free: 1_200_000_000_000,
 					low_priority: false,
 					toolchain: "ffmpeg 9.0.1 · SVT-AV1 4.2".to_owned(),

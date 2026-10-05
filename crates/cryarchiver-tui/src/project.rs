@@ -100,7 +100,6 @@ impl ProjectSource {
 					cpu_history: Vec::new(),
 					ram_used: 0,
 					ram_total: 0,
-					disk_label: display_path(&settings.destination),
 					disk_free: 0,
 					low_priority: settings.performance_limit.is_some(),
 					toolchain: String::new(),
