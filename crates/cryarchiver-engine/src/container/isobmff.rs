@@ -70,6 +70,7 @@ pub struct Item {
 	pub id: u32,
 	pub kind: [u8; 4],
 	pub content_type: Option<String>,
+	pub hidden: bool,
 	pub properties: Vec<PropertyLink>,
 }
 
@@ -93,6 +94,20 @@ pub struct Reference {
 	pub to: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityGroup {
+	pub kind: [u8; 4],
+	pub id: u32,
+	pub entities: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GainMapItems {
+	pub tmap: u32,
+	pub base: u32,
+	pub gain_map: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Meta {
 	pub handler: Option<[u8; 4]>,
@@ -102,6 +117,7 @@ pub struct Meta {
 	pub references: Vec<Reference>,
 	pub locations: Vec<Location>,
 	pub idat: Vec<u8>,
+	pub groups: Vec<EntityGroup>,
 }
 
 struct Reader<'a> {
@@ -234,10 +250,33 @@ pub fn parse_meta(file: &[u8]) -> Result<Meta, IsobmffError> {
 			b"iloc" => parsed.locations = locations(&mut reader)?,
 			b"idat" => parsed.idat = child.body.to_vec(),
 			b"iprp" => parsed.properties = item_properties(child.body, &mut parsed.items)?,
+			b"grpl" => parsed.groups = entity_groups(child.body),
 			_ => {}
 		}
 	}
 	Ok(parsed)
+}
+
+// Lenient: a broken group only hides that group, it never makes a file unreadable.
+fn entity_groups(grpl: &[u8]) -> Vec<EntityGroup> {
+	let group = |found: BoxRef<'_>| {
+		let mut reader = Reader::new(found.body);
+		reader.u32().ok()?;
+		let id = reader.u32().ok()?;
+		let count = usize::try_from(reader.u32().ok()?).ok()?;
+		if count.checked_mul(4)? > reader.remaining() {
+			return None;
+		}
+
+		let entities = (0..count).map(|_| reader.u32().ok()).collect::<Option<_>>()?;
+		Some(EntityGroup {
+			kind: found.kind,
+			id,
+			entities,
+		})
+	};
+
+	boxes(grpl).unwrap_or_default().into_iter().filter_map(group).collect()
 }
 
 fn item_infos(reader: &mut Reader<'_>) -> Result<Vec<Item>, IsobmffError> {
@@ -247,7 +286,8 @@ fn item_infos(reader: &mut Reader<'_>) -> Result<Vec<Item>, IsobmffError> {
 	let mut items = Vec::new();
 	for entry in boxes(reader.rest())?.into_iter().filter(|entry| &entry.kind == b"infe") {
 		let mut infe = Reader::new(entry.body);
-		let version = infe.u32()? >> 24;
+		let version_and_flags = infe.u32()?;
+		let version = version_and_flags >> 24;
 		if version < 2 {
 			continue;
 		}
@@ -261,6 +301,7 @@ fn item_infos(reader: &mut Reader<'_>) -> Result<Vec<Item>, IsobmffError> {
 			id,
 			kind,
 			content_type,
+			hidden: version_and_flags & 1 != 0,
 			properties: Vec::new(),
 		});
 	}
@@ -544,6 +585,53 @@ impl Meta {
 				self.properties_of(from)
 					.any(|property| matches!(property, Property::Auxiliary(urn) if ALPHA_URNS.contains(&urn.as_str())))
 			})
+	}
+
+	/// The gain map as libavif finds it: a `tmap` without `thmb` whose `dimg` inputs are exactly [primary, gain map],
+	/// listed before the primary in an `altr` group.
+	pub fn gain_map(&self) -> Option<GainMapItems> {
+		let primary = self.primary?;
+		let has_reference = |kind: &[u8; 4], from: u32| {
+			self.references
+				.iter()
+				.any(|reference| &reference.kind == kind && reference.from == from)
+		};
+
+		let found = self
+			.items
+			.iter()
+			.filter(|item| &item.kind == b"tmap" && !has_reference(b"thmb", item.id))
+			.find_map(|tmap| {
+				let inputs: Vec<u32> = self
+					.references
+					.iter()
+					.filter(|reference| &reference.kind == b"dimg" && reference.from == tmap.id)
+					.flat_map(|reference| reference.to.iter().copied())
+					.collect();
+				match inputs.as_slice() {
+					&[base, gain_map] if base == primary && gain_map != base && self.item(gain_map).is_some() => {
+						Some(GainMapItems {
+							tmap: tmap.id,
+							base,
+							gain_map,
+						})
+					}
+					_ => None,
+				}
+			})?;
+
+		self.prefers(found.tmap, primary).then_some(found)
+	}
+
+	fn prefers(&self, preferred: u32, other: u32) -> bool {
+		self.groups
+			.iter()
+			.filter(|group| &group.kind == b"altr")
+			.find_map(|group| {
+				let other_at = group.entities.iter().position(|&entity| entity == other)?;
+				Some(group.entities[..other_at].contains(&preferred))
+			})
+			.unwrap_or(false)
 	}
 
 	pub fn premultiplied(&self) -> bool {

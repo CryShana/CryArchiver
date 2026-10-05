@@ -1,12 +1,16 @@
-use avif_serialize::Aviffy;
 use avif_serialize::constants::{ColorPrimaries, MatrixCoefficients, TransferCharacteristics};
+use avif_serialize::{AlternateColour, Av1Config, Aviffy, GainMap};
 
 use crate::container::av1::{self, SequenceHeader};
-use crate::container::isobmff::{self, Meta, Property};
+use crate::container::isobmff::{self, Meta, Nclx, Property};
+use crate::metadata::gain_map::GainMapMetadata;
 use crate::metadata::icc::Cicp;
 
 const UNSPECIFIED_MATRIX: u8 = 2;
+const BT601_MATRIX: u8 = 6;
+const UNSPECIFIED_CICP: u16 = 2;
 const DEFAULT_LEVEL: u8 = 31;
+const TMAP_VERSION: u8 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -32,6 +36,14 @@ pub struct AvifExpectations<'a> {
 	pub alpha: bool,
 	pub cicp: Cicp,
 	pub metadata: AvifMetadata<'a>,
+	pub gain_map: Option<&'a GainMapMetadata>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GainMapInput<'a> {
+	/// A complete single-image AVIF holding only the gain map (what Task 3's encoder returns), from which the AV1 data and its sequence header are taken.
+	pub encoded: &'a [u8],
+	pub metadata: &'a GainMapMetadata,
 }
 
 pub fn writable_cicp(cicp: Cicp) -> Cicp {
@@ -41,7 +53,12 @@ pub fn writable_cicp(cicp: Cicp) -> Cicp {
 	}
 }
 
-pub fn rewrite(encoded: &[u8], cicp: Cicp, metadata: &AvifMetadata<'_>) -> Result<Vec<u8>, AvifError> {
+pub fn rewrite(
+	encoded: &[u8],
+	cicp: Cicp,
+	metadata: &AvifMetadata<'_>,
+	gain_map: Option<&GainMapInput<'_>>,
+) -> Result<Vec<u8>, AvifError> {
 	let cicp = writable_cicp(cicp);
 	let meta = isobmff::parse_meta(encoded)?;
 	let primary = meta
@@ -61,6 +78,7 @@ pub fn rewrite(encoded: &[u8], cicp: Cicp, metadata: &AvifMetadata<'_>) -> Resul
 		.matrix
 		.or_else(|| meta.primary_nclx().and_then(|nclx| u8::try_from(nclx.matrix).ok()))
 		.unwrap_or(UNSPECIFIED_MATRIX);
+	let base_matrix = matrix(matrix_value)?;
 	av1::patch_cicp(&mut color, cicp.primaries, cicp.transfer);
 
 	let mut aviffy = Aviffy::new();
@@ -71,7 +89,7 @@ pub fn rewrite(encoded: &[u8], cicp: Cicp, metadata: &AvifMetadata<'_>) -> Resul
 		.set_seq_profile(header.profile)
 		.set_monochrome(header.monochrome)
 		.set_chroma_subsampling(header.subsampling)
-		.set_matrix_coefficients(matrix(matrix_value)?)
+		.set_matrix_coefficients(base_matrix)
 		.set_full_color_range(header.full_range)
 		.set_color_primaries(primaries(cicp.primaries))
 		.set_transfer_characteristics(transfer(cicp.transfer))
@@ -87,11 +105,68 @@ pub fn rewrite(encoded: &[u8], cicp: Cicp, metadata: &AvifMetadata<'_>) -> Resul
 		aviffy.set_xmp(xmp.to_vec());
 	}
 
+	if let Some(gain_map) = gain_map {
+		aviffy.set_gain_map(gain_map_parts(
+			gain_map,
+			primaries(cicp.primaries),
+			base_matrix,
+			metadata.icc,
+		)?);
+	}
+
 	let mut out = Vec::with_capacity(encoded.len() + 4096);
 	aviffy
 		.write_slice(&mut out, &color, alpha.as_deref())
 		.map_err(|err| AvifError(format!("could not write the AVIF: {err}")))?;
 	Ok(out)
+}
+
+fn gain_map_parts(
+	input: &GainMapInput<'_>,
+	base_primaries: ColorPrimaries,
+	base_matrix: MatrixCoefficients,
+	base_icc: Option<&[u8]>,
+) -> Result<GainMap, AvifError> {
+	let meta = isobmff::parse_meta(input.encoded)?;
+	let primary = meta
+		.primary
+		.ok_or_else(|| AvifError("the gain map encoder output has no primary item".into()))?;
+	let av1_data = meta.item_data(input.encoded, primary)?;
+	let header = av1::read_sequence_header(&av1_data)
+		.ok_or_else(|| AvifError("the gain map item has no AV1 sequence header".into()))?;
+	let (width, height) = meta.primary_size().unwrap_or((header.width, header.height));
+
+	let mut tmap_payload = vec![TMAP_VERSION];
+	tmap_payload.extend(input.metadata.to_iso());
+
+	Ok(GainMap {
+		av1_data,
+		width,
+		height,
+		config: Av1Config {
+			seq_profile: header.profile,
+			seq_level_idx: header.level,
+			bit_depth: header.bit_depth,
+			monochrome: header.monochrome,
+			chroma_subsampling: header.subsampling,
+		},
+		matrix_coefficients: matrix(header.matrix.unwrap_or(BT601_MATRIX))?,
+		full_range: header.full_range,
+		tmap_payload,
+		alternate: AlternateColour {
+			color_primaries: base_primaries,
+			transfer_characteristics: TransferCharacteristics::Smpte2084,
+			matrix_coefficients: base_matrix,
+			full_range: true,
+			icc: base_icc.map(<[u8]>::to_vec),
+		},
+	})
+}
+
+pub fn gain_map_av1(bytes: &[u8]) -> Result<Vec<u8>, String> {
+	let meta = isobmff::parse_meta(bytes).map_err(|err| err.to_string())?;
+	let items = meta.gain_map().ok_or("the AVIF has no gain map")?;
+	meta.item_data(bytes, items.gain_map).map_err(|err| err.to_string())
 }
 
 fn primaries(value: u8) -> ColorPrimaries {
@@ -158,8 +233,92 @@ pub fn check(bytes: &[u8], expected: &AvifExpectations<'_>) -> Result<(), String
 	check_colour(&meta, primary.id, &header, expected)?;
 	check_metadata(&meta, bytes, &expected.metadata)?;
 
+	match expected.gain_map {
+		Some(gain_map) => check_gain_map(&meta, bytes, expected, gain_map)?,
+		None if meta.has_item_kind(*b"tmap") => return Err("the output has an unexpected gain map".into()),
+		None => {}
+	}
+
 	if meta.locations.iter().any(|location| location.extents.len() != 1) {
 		return Err("an item is split over several extents".into());
+	}
+	Ok(())
+}
+
+fn check_gain_map(
+	meta: &Meta,
+	bytes: &[u8],
+	expected: &AvifExpectations<'_>,
+	gain_map: &GainMapMetadata,
+) -> Result<(), String> {
+	if !isobmff::brands(bytes).is_some_and(|brands| brands.contains(b"tmap")) {
+		return Err("the output has a gain map but is not branded 'tmap'".into());
+	}
+
+	let items = meta
+		.gain_map()
+		.ok_or("the gain map is missing or not laid out as libavif reads it (tmap, dimg, altr)")?;
+
+	let tmap_properties: Vec<&Property> = meta.properties_of(items.tmap).collect();
+	let tmap_size = tmap_properties.iter().find_map(|property| match property {
+		Property::Size { width, height } => Some((*width, *height)),
+		_ => None,
+	});
+	if tmap_size != Some((expected.width, expected.height)) {
+		return Err(format!(
+			"the tone map item is {tmap_size:?} but {}×{} was expected",
+			expected.width, expected.height
+		));
+	}
+
+	if tmap_properties.iter().any(|property| {
+		matches!(property, Property::Rotation(_) | Property::Mirror(_))
+			|| matches!(property, Property::Other(kind) if kind == b"clap" || kind == b"pasp")
+	}) {
+		return Err("the tone map item carries a transform box".into());
+	}
+
+	check_gain_map_item(meta, items.gain_map)?;
+
+	let payload = meta.item_data(bytes, items.tmap).map_err(|err| err.to_string())?;
+	let Some((&TMAP_VERSION, iso)) = payload.split_first() else {
+		return Err("the tone map item's version is not 0".into());
+	};
+	let stored =
+		GainMapMetadata::parse_iso(iso).map_err(|err| format!("the gain map metadata can't be read back: {err}"))?;
+	if stored != *gain_map {
+		return Err("the gain map metadata was not carried over unchanged".into());
+	}
+	Ok(())
+}
+
+fn check_gain_map_item(meta: &Meta, id: u32) -> Result<(), String> {
+	let item = meta.item(id).ok_or("the gain map item is missing")?;
+	if item.kind != *b"av01" {
+		return Err("the gain map item is not AV1".into());
+	}
+
+	if !item.hidden {
+		return Err("the gain map item is not hidden".into());
+	}
+
+	let nclx: Vec<Nclx> = meta
+		.properties_of(id)
+		.filter_map(|property| match property {
+			Property::Nclx(nclx) => Some(*nclx),
+			_ => None,
+		})
+		.collect();
+	let [nclx] = nclx.as_slice() else {
+		return Err(format!(
+			"expected one nclx colour box on the gain map, found {}",
+			nclx.len()
+		));
+	};
+	if (nclx.primaries, nclx.transfer) != (UNSPECIFIED_CICP, UNSPECIFIED_CICP) {
+		return Err(format!(
+			"the gain map's nclx box says {nclx:?} but primaries 2 and transfer 2 were expected"
+		));
 	}
 	Ok(())
 }

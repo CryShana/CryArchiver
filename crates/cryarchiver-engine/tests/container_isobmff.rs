@@ -1,6 +1,8 @@
 mod support;
 
-use cryarchiver_engine::container::isobmff::{Nclx, brands, parse_meta};
+use avif_serialize::constants::{ColorPrimaries, MatrixCoefficients, TransferCharacteristics};
+use avif_serialize::{AlternateColour, Av1Config, Aviffy, GainMap};
+use cryarchiver_engine::container::isobmff::{EntityGroup, GainMapItems, Nclx, brands, parse_meta};
 use support::heif::{HeifFile, HeifItem, aux_c, boxed, colr_icc, colr_nclx, exif_item, full_box, imir, irot, ispe};
 
 const TIFF: &[u8] = b"MM\0*\0\0\0\x08\0\0\0\0\0\0";
@@ -100,6 +102,91 @@ fn alpha_and_other_auxiliary_items_are_told_apart() {
 	assert!(meta.premultiplied());
 	assert_eq!(meta.auxiliary_urns(), ["urn:mpeg:hevc:2015:auxid:2"]);
 	assert!(meta.has_item_kind(*b"tmap"));
+}
+
+fn with_gain_map() -> Vec<u8> {
+	let mut aviffy = Aviffy::new();
+	aviffy.set_gain_map(GainMap {
+		av1_data: vec![0xBB; 8],
+		width: 15,
+		height: 10,
+		config: Av1Config {
+			seq_profile: 0,
+			seq_level_idx: 31,
+			bit_depth: 8,
+			monochrome: true,
+			chroma_subsampling: (true, true),
+		},
+		matrix_coefficients: MatrixCoefficients::Bt601,
+		full_range: true,
+		tmap_payload: vec![0; 62],
+		alternate: AlternateColour {
+			color_primaries: ColorPrimaries::Bt709,
+			transfer_characteristics: TransferCharacteristics::Smpte2084,
+			matrix_coefficients: MatrixCoefficients::Bt601,
+			full_range: true,
+			icc: None,
+		},
+	});
+	aviffy.to_vec(&[0xAA; 16], None, 60, 40, 8)
+}
+
+fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+	let at = bytes.windows(from.len()).position(|window| window == from).unwrap();
+	let mut out = bytes.to_vec();
+	out[at..at + to.len()].copy_from_slice(to);
+	out
+}
+
+#[test]
+fn hidden_items_and_entity_groups_are_read() {
+	let file = with_gain_map();
+
+	let meta = parse_meta(&file).unwrap();
+
+	let hidden: Vec<(u32, bool)> = meta.items.iter().map(|item| (item.id, item.hidden)).collect();
+	assert_eq!(hidden, [(1, false), (2, false), (3, true)]);
+	assert_eq!(
+		meta.groups,
+		[EntityGroup {
+			kind: *b"altr",
+			id: 4,
+			entities: vec![2, 1]
+		}]
+	);
+	assert_eq!(
+		meta.gain_map(),
+		Some(GainMapItems {
+			tmap: 2,
+			base: 1,
+			gain_map: 3
+		})
+	);
+	assert_eq!(meta.item_data(&file, 3).unwrap(), [0xBB; 8]);
+}
+
+#[test]
+fn a_tmap_without_its_altr_group_is_no_gain_map() {
+	let file = replaced(&with_gain_map(), b"altr", b"ster");
+
+	let meta = parse_meta(&file).unwrap();
+
+	assert_eq!(meta.groups[0].kind, *b"ster");
+	assert_eq!(meta.gain_map(), None);
+	assert!(meta.has_item_kind(*b"tmap"));
+}
+
+#[test]
+fn a_broken_group_is_skipped_without_failing_the_parse() {
+	let mut count_too_large = b"altr\0\0\0\0\0\0\0\x04".to_vec();
+	count_too_large.extend_from_slice(&u32::MAX.to_be_bytes());
+	let file = replaced(&with_gain_map(), b"altr\0\0\0\0\0\0\0\x04\0\0\0\x02", &count_too_large);
+
+	let meta = parse_meta(&file).unwrap();
+
+	assert!(meta.groups.is_empty());
+	assert_eq!(meta.gain_map(), None);
+	assert_eq!(meta.items.len(), 3);
 }
 
 #[test]

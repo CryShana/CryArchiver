@@ -4,10 +4,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cryarchiver_engine::container::av1::read_sequence_header;
-use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, check, rewrite, writable_cicp};
-use cryarchiver_engine::container::isobmff::{Nclx, Property, parse_meta};
+use cryarchiver_engine::container::avif::{
+	AvifExpectations, AvifMetadata, GainMapInput, check, gain_map_av1, rewrite, writable_cicp,
+};
+use cryarchiver_engine::container::isobmff::{EntityGroup, Meta, Nclx, Property, brands, parse_meta};
+use cryarchiver_engine::images::avif::encode;
+use cryarchiver_engine::images::plan::RavifSettings;
+use cryarchiver_engine::metadata::gain_map::GainMapMetadata;
 use cryarchiver_engine::metadata::icc::Cicp;
+use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
 use moxcms::ColorProfile;
+use support::ultra_hdr::UltraHdrOptions;
+
+const QUICK: RavifSettings = RavifSettings {
+	quality: 80.0,
+	speed: 10,
+};
 
 fn libaom_still(dir: &Path, alpha: bool) -> Vec<u8> {
 	let path = dir.join(if alpha { "alpha.avif" } else { "opaque.avif" });
@@ -74,7 +86,7 @@ fn metadata_and_colour_boxes_follow_the_libavif_conventions() {
 		xmp: Some(b"<x:xmpmeta/>"),
 	};
 
-	let avif = rewrite(&encoded, Cicp::UNSPECIFIED, &metadata).unwrap();
+	let avif = rewrite(&encoded, Cicp::UNSPECIFIED, &metadata, None).unwrap();
 
 	let expected = AvifExpectations {
 		width: 64,
@@ -82,6 +94,7 @@ fn metadata_and_colour_boxes_follow_the_libavif_conventions() {
 		alpha: false,
 		cicp: Cicp::UNSPECIFIED,
 		metadata,
+		gain_map: None,
 	};
 	check(&avif, &expected).unwrap();
 	let meta = parse_meta(&avif).unwrap();
@@ -116,7 +129,7 @@ fn a_two_stream_alpha_still_keeps_its_alpha_item() {
 	let dir = tempfile::tempdir().unwrap();
 	let encoded = libaom_still(dir.path(), true);
 
-	let avif = rewrite(&encoded, Cicp::SRGB, &AvifMetadata::default()).unwrap();
+	let avif = rewrite(&encoded, Cicp::SRGB, &AvifMetadata::default(), None).unwrap();
 
 	check(
 		&avif,
@@ -126,6 +139,7 @@ fn a_two_stream_alpha_still_keeps_its_alpha_item() {
 			alpha: true,
 			cicp: Cicp::SRGB,
 			metadata: AvifMetadata::default(),
+			gain_map: None,
 		},
 	)
 	.unwrap();
@@ -140,7 +154,7 @@ fn colour_codes_avif_cannot_carry_become_unspecified() {
 		transfer: 12,
 	};
 
-	let avif = rewrite(&libaom_still(dir.path(), false), legacy, &AvifMetadata::default()).unwrap();
+	let avif = rewrite(&libaom_still(dir.path(), false), legacy, &AvifMetadata::default(), None).unwrap();
 
 	check(
 		&avif,
@@ -150,6 +164,7 @@ fn colour_codes_avif_cannot_carry_become_unspecified() {
 			alpha: false,
 			cicp: Cicp::UNSPECIFIED,
 			metadata: AvifMetadata::default(),
+			gain_map: None,
 		},
 	)
 	.unwrap();
@@ -172,13 +187,20 @@ fn colour_codes_avif_cannot_carry_become_unspecified() {
 #[test]
 fn check_names_what_does_not_match() {
 	let dir = tempfile::tempdir().unwrap();
-	let avif = rewrite(&libaom_still(dir.path(), false), Cicp::SRGB, &AvifMetadata::default()).unwrap();
+	let avif = rewrite(
+		&libaom_still(dir.path(), false),
+		Cicp::SRGB,
+		&AvifMetadata::default(),
+		None,
+	)
+	.unwrap();
 	let expected = AvifExpectations {
 		width: 64,
 		height: 48,
 		alpha: false,
 		cicp: Cicp::SRGB,
 		metadata: AvifMetadata::default(),
+		gain_map: None,
 	};
 	let tiff = support::exif_block(1, 64, 48);
 
@@ -219,6 +241,263 @@ fn check_names_what_does_not_match() {
 	assert!(check(&avif, &wants_exif).unwrap_err().contains("EXIF"));
 }
 
+fn ravif_still(alpha: bool) -> Vec<u8> {
+	let image = if alpha {
+		DynamicImage::ImageRgba8(ImageBuffer::from_fn(24, 16, |x, y| {
+			Rgba([
+				u8::try_from(x * 10).unwrap(),
+				u8::try_from(y * 15).unwrap(),
+				90,
+				if x < 12 { 255 } else { 0 },
+			])
+		}))
+	} else {
+		DynamicImage::ImageRgb8(ImageBuffer::from_fn(24, 16, |x, y| {
+			Rgb([u8::try_from(x * 10).unwrap(), u8::try_from(y * 15).unwrap(), 90])
+		}))
+	};
+	encode(&image, alpha, QUICK, 1).unwrap()
+}
+
+#[test]
+fn without_a_gain_map_the_output_bytes_stay_as_before() {
+	let mut icc = ColorProfile::new_srgb().encode().unwrap();
+	for (at, field) in [2026u16, 10, 5, 7, 3, 28].into_iter().enumerate() {
+		icc[24 + 2 * at..26 + 2 * at].copy_from_slice(&field.to_be_bytes());
+	}
+	let tiff = support::exif_block(1, 24, 16);
+	let metadata = AvifMetadata {
+		icc: Some(&icc),
+		exif: Some(&tiff),
+		xmp: Some(b"<x:xmpmeta/>"),
+	};
+	let opaque = ravif_still(false);
+	let alpha = ravif_still(true);
+	let fingerprint = |bytes: &[u8]| (bytes.len(), crc32fast::hash(bytes));
+
+	let with_metadata = rewrite(&opaque, Cicp::SRGB, &metadata, None).unwrap();
+	let with_alpha = rewrite(&alpha, Cicp::UNSPECIFIED, &AvifMetadata::default(), None).unwrap();
+
+	// The output fingerprints were taken from the writer before it knew gain maps, with moxcms's ICC creation time
+	// (header bytes 24..36) fixed as above. If the inputs no longer match, moxcms, ravif or rav1e changed and the pins need
+	// retaking from that writer.
+	assert_eq!(fingerprint(&icc), (612, 124_158_978));
+	assert_eq!(fingerprint(&opaque), (339, 1_661_020_295));
+	assert_eq!(fingerprint(&alpha), (560, 1_567_315_361));
+	assert_eq!(fingerprint(&with_metadata), (1190, 2_001_786_637));
+	assert_eq!(fingerprint(&with_alpha), (560, 213_443_570));
+}
+
+fn grey_gain_map(width: u32, height: u32) -> Vec<u8> {
+	let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(width, height, |x, y| {
+		let level = u8::try_from((x * 7 + y * 11) % 256).unwrap();
+		Rgb([level, level, level])
+	}));
+	encode(&image, false, QUICK, 1).unwrap()
+}
+
+fn gain_map_metadata() -> GainMapMetadata {
+	UltraHdrOptions::default().metadata
+}
+
+fn expectations<'a>(metadata: AvifMetadata<'a>, gain_map: Option<&'a GainMapMetadata>) -> AvifExpectations<'a> {
+	AvifExpectations {
+		width: 24,
+		height: 16,
+		alpha: false,
+		cicp: Cicp::SRGB,
+		metadata,
+		gain_map,
+	}
+}
+
+fn with_gain_map(metadata: &AvifMetadata<'_>, gain_map: &GainMapMetadata) -> (Vec<u8>, Vec<u8>) {
+	let gain_map_avif = grey_gain_map(6, 4);
+	let input = GainMapInput {
+		encoded: &gain_map_avif,
+		metadata: gain_map,
+	};
+	let avif = rewrite(&ravif_still(false), Cicp::SRGB, metadata, Some(&input)).unwrap();
+	(avif, gain_map_avif)
+}
+
+fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+	let at = bytes.windows(from.len()).position(|window| window == from).unwrap();
+	let mut out = bytes.to_vec();
+	out[at..at + to.len()].copy_from_slice(to);
+	out
+}
+
+fn nclx_of(meta: &Meta, id: u32) -> Vec<Nclx> {
+	meta.properties_of(id)
+		.filter_map(|property| match property {
+			Property::Nclx(nclx) => Some(*nclx),
+			_ => None,
+		})
+		.collect()
+}
+
+#[test]
+fn a_gain_map_is_stored_in_libavifs_layout() {
+	let dir = tempfile::tempdir().unwrap();
+	let metadata = gain_map_metadata();
+
+	let (avif, gain_map_avif) = with_gain_map(&AvifMetadata::default(), &metadata);
+
+	check(&avif, &expectations(AvifMetadata::default(), Some(&metadata))).unwrap();
+	assert_eq!(brands(&avif).unwrap(), [*b"avif", *b"mif1", *b"miaf", *b"tmap"]);
+	let meta = parse_meta(&avif).unwrap();
+	let items: Vec<(u32, [u8; 4], bool)> = meta
+		.items
+		.iter()
+		.map(|item| (item.id, item.kind, item.hidden))
+		.collect();
+	assert_eq!(items, [(1, *b"av01", false), (2, *b"tmap", false), (3, *b"av01", true)]);
+	assert_eq!(meta.primary, Some(1));
+	let dimg: Vec<(u32, Vec<u32>)> = meta
+		.references
+		.iter()
+		.filter(|reference| &reference.kind == b"dimg")
+		.map(|reference| (reference.from, reference.to.clone()))
+		.collect();
+	assert_eq!(dimg, [(2, vec![1, 3])]);
+	assert_eq!(
+		meta.groups,
+		[EntityGroup {
+			kind: *b"altr",
+			id: 4,
+			entities: vec![2, 1]
+		}]
+	);
+
+	let tmap: Vec<&Property> = meta.properties_of(2).collect();
+	let base_matrix = nclx_of(&meta, 1)[0].matrix;
+	assert_eq!(
+		tmap,
+		[
+			&Property::Size { width: 24, height: 16 },
+			&Property::PixelDepths(vec![10, 10, 10]),
+			&Property::Nclx(Nclx {
+				primaries: 1,
+				transfer: 16,
+				matrix: base_matrix,
+				full_range: true
+			})
+		]
+	);
+	let gain_map_properties: Vec<&Property> = meta.properties_of(3).collect();
+	assert!(gain_map_properties.contains(&&Property::Size { width: 6, height: 4 }));
+	assert_eq!(nclx_of(&meta, 3)[0].primaries, 2);
+	assert_eq!(nclx_of(&meta, 3)[0].transfer, 2);
+	assert!(meta.item(3).unwrap().properties.iter().any(|link| link.essential));
+
+	let payload = meta.item_data(&avif, 2).unwrap();
+	assert_eq!(payload.len(), 62);
+	assert_eq!(payload[0], 0);
+	assert_eq!(GainMapMetadata::parse_iso(&payload[1..]).unwrap(), metadata);
+	let encoded_gain_map = parse_meta(&gain_map_avif)
+		.unwrap()
+		.item_data(&gain_map_avif, 1)
+		.unwrap();
+	assert_eq!(gain_map_av1(&avif).unwrap(), encoded_gain_map);
+	assert!(ffmpeg_decodes(&written(dir.path(), "gain-map.avif", &avif), false));
+}
+
+#[test]
+fn metadata_items_follow_the_gain_map_items() {
+	let icc = ColorProfile::new_display_p3().encode().unwrap();
+	let tiff = support::exif_block(1, 24, 16);
+	let metadata = AvifMetadata {
+		icc: Some(&icc),
+		exif: Some(&tiff),
+		xmp: Some(b"<x:xmpmeta/>"),
+	};
+	let gain_map = gain_map_metadata();
+
+	let (avif, _) = with_gain_map(&metadata, &gain_map);
+
+	check(&avif, &expectations(metadata, Some(&gain_map))).unwrap();
+	let meta = parse_meta(&avif).unwrap();
+	let items: Vec<(u32, [u8; 4])> = meta.items.iter().map(|item| (item.id, item.kind)).collect();
+	assert_eq!(
+		items,
+		[
+			(1, *b"av01"),
+			(2, *b"tmap"),
+			(3, *b"av01"),
+			(4, *b"Exif"),
+			(5, *b"mime")
+		]
+	);
+	assert_eq!(meta.groups[0].id, 6);
+	assert_eq!(meta.groups[0].entities, [2, 1]);
+	let icc_link = |id: u32| {
+		meta.item(id)
+			.unwrap()
+			.properties
+			.iter()
+			.map(|link| link.index)
+			.find(|&index| matches!(meta.properties[index - 1], Property::Icc(_)))
+	};
+	assert!(icc_link(1).is_some());
+	assert_eq!(icc_link(2), icc_link(1));
+	assert_eq!(icc_link(3), None);
+}
+
+#[test]
+fn check_refuses_gain_maps_readers_would_ignore_or_misread() {
+	let metadata = gain_map_metadata();
+	let (avif, _) = with_gain_map(&AvifMetadata::default(), &metadata);
+	let expected = expectations(AvifMetadata::default(), Some(&metadata));
+	let refusal = |bytes: &[u8], expected: &AvifExpectations<'_>| check(bytes, expected).unwrap_err();
+
+	let unbranded = replaced(&avif, b"miaftmap", b"miafmiaf");
+	assert!(refusal(&unbranded, &expected).contains("'tmap'"));
+
+	let swapped_inputs = replaced(&avif, b"dimg\0\x02\0\x02\0\x01\0\x03", b"dimg\0\x02\0\x02\0\x03\0\x01");
+	assert!(refusal(&swapped_inputs, &expected).contains("libavif"));
+
+	let base_preferred = replaced(
+		&avif,
+		b"altr\0\0\0\0\0\0\0\x04\0\0\0\x02\0\0\0\x02\0\0\0\x01",
+		b"altr\0\0\0\0\0\0\0\x04\0\0\0\x02\0\0\0\x01\0\0\0\x02",
+	);
+	assert!(refusal(&base_preferred, &expected).contains("libavif"));
+
+	let mut other = metadata.clone();
+	other.alternate_headroom.numerator += 1;
+	assert!(
+		refusal(&avif, &expectations(AvifMetadata::default(), Some(&other)))
+			.contains("gain map metadata was not carried over")
+	);
+
+	assert!(refusal(&avif, &expectations(AvifMetadata::default(), None)).contains("unexpected gain map"));
+
+	let plain = rewrite(&ravif_still(false), Cicp::SRGB, &AvifMetadata::default(), None).unwrap();
+	assert!(refusal(&plain, &expected).contains("'tmap'"));
+}
+
+#[test]
+#[ignore = "writes CRY_GAINMAP_OUT for libavif's avifgainmaputil"]
+fn writes_a_gain_map_avif_for_external_checks() {
+	let Some(out) = std::env::var_os("CRY_GAINMAP_OUT") else {
+		return;
+	};
+	let icc = ColorProfile::new_srgb().encode().unwrap();
+	let tiff = support::exif_block(1, 24, 16);
+	let metadata = AvifMetadata {
+		icc: Some(&icc),
+		exif: Some(&tiff),
+		xmp: Some(b"<x:xmpmeta/>"),
+	};
+	let gain_map = gain_map_metadata();
+
+	let (avif, _) = with_gain_map(&metadata, &gain_map);
+
+	check(&avif, &expectations(metadata, Some(&gain_map))).unwrap();
+	std::fs::write(out, avif).unwrap();
+}
+
 #[test]
 fn rewrapping_a_profiled_avif_with_its_own_profile_keeps_its_colour_boxes() {
 	let dir = tempfile::tempdir().unwrap();
@@ -230,6 +509,7 @@ fn rewrapping_a_profiled_avif_with_its_own_profile_keeps_its_colour_boxes() {
 			icc: Some(&icc),
 			..AvifMetadata::default()
 		},
+		None,
 	)
 	.unwrap();
 	let embedded = parse_meta(&profiled).unwrap().primary_icc().unwrap().to_vec();
@@ -241,6 +521,7 @@ fn rewrapping_a_profiled_avif_with_its_own_profile_keeps_its_colour_boxes() {
 			icc: Some(&embedded),
 			..AvifMetadata::default()
 		},
+		None,
 	)
 	.unwrap();
 

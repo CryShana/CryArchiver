@@ -91,7 +91,7 @@ const FULL_BOX_SIZE: usize = BASIC_BOX_SIZE + 4;
 pub struct FtypBox {
     pub major_brand: FourCC,
     pub minor_version: u32,
-    pub compatible_brands: ArrayVec<FourCC, 2>,
+    pub compatible_brands: ArrayVec<FourCC, 3>,
 }
 
 /// File Type box (chunk)
@@ -124,6 +124,8 @@ pub struct MetaBox<'data> {
     pub pitm: PitmBox,
     pub iprp: IprpBox,
     pub iref: IrefBox,
+    /// Written after `iprp`, where libavif puts it
+    pub grpl: Option<GrplBox>,
 }
 
 impl MpegBox for MetaBox<'_> {
@@ -136,6 +138,7 @@ impl MpegBox for MetaBox<'_> {
             + self.iinf.len()
             + self.iprp.len()
             + if !self.iref.is_empty() { self.iref.len() } else { 0 }
+            + self.grpl.as_ref().map_or(0, |grpl| grpl.len())
     }
 
     fn write<B: WriterBackend>(&self, w: &mut Writer<B>) -> Result<(), B::Error> {
@@ -147,14 +150,64 @@ impl MpegBox for MetaBox<'_> {
         if !self.iref.is_empty() {
             self.iref.write(&mut b)?;
         }
-        self.iprp.write(&mut b)
+        self.iprp.write(&mut b)?;
+        if let Some(grpl) = &self.grpl {
+            grpl.write(&mut b)?;
+        }
+        Ok(())
+    }
+}
+
+/// Groups List box, holding one `altr` (alternatives) entity group
+#[derive(Debug, Clone)]
+pub struct GrplBox {
+    pub altr: AltrBox,
+}
+
+impl MpegBox for GrplBox {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        BASIC_BOX_SIZE + self.altr.len()
+    }
+
+    fn write<B: WriterBackend>(&self, w: &mut Writer<B>) -> Result<(), B::Error> {
+        let mut b = w.basic_box(self.len(), *b"grpl")?;
+        self.altr.write(&mut b)
+    }
+}
+
+/// Entities that are alternatives of each other, the preferred one first
+#[derive(Debug, Clone)]
+pub struct AltrBox {
+    /// Must differ from every item id
+    pub group_id: u32,
+    pub entity_ids: ArrayVec<u32, 2>,
+}
+
+impl MpegBox for AltrBox {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        FULL_BOX_SIZE
+            + 4 // group_id
+            + 4 // num_entities_in_group
+            + 4 * self.entity_ids.len()
+    }
+
+    fn write<B: WriterBackend>(&self, w: &mut Writer<B>) -> Result<(), B::Error> {
+        let mut b = w.full_box(self.len(), *b"altr", 0)?;
+        b.u32(self.group_id)?;
+        b.u32(self.entity_ids.len() as u32)?;
+        for &id in &self.entity_ids {
+            b.u32(id)?;
+        }
+        Ok(())
     }
 }
 
 /// Item Info box
 #[derive(Debug, Clone)]
 pub struct IinfBox {
-    pub items: ArrayVec<InfeBox, 4>,
+    pub items: ArrayVec<InfeBox, 5>,
 }
 
 impl MpegBox for IinfBox {
@@ -183,6 +236,8 @@ pub struct InfeBox {
     pub name: &'static str,
     /// Only written for `mime` items
     pub content_type: &'static str,
+    /// Sets flag 1: the item is not meant to be shown on its own
+    pub hidden: bool,
 }
 
 impl MpegBox for InfeBox {
@@ -197,7 +252,8 @@ impl MpegBox for InfeBox {
     }
 
     fn write<B: WriterBackend>(&self, w: &mut Writer<B>) -> Result<(), B::Error> {
-        let mut b = w.full_box(self.len(), *b"infe", 2)?;
+        let mut b = w.basic_box(self.len(), *b"infe")?;
+        b.push(&[2, 0, 0, u8::from(self.hidden)])?; // version 2, flags
         b.u16(self.id)?;
         b.u16(0)?;
         b.push(&self.typ.0)?;
@@ -296,12 +352,18 @@ impl IpcoProp {
             Self::Mdcv(p) => p.write(w),
         }
     }
+
+    fn to_bytes(&self) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write(&mut Writer::new(&mut out)).ok()?;
+        Some(out)
+    }
 }
 
 /// Item Property Container box
 #[derive(Debug, Clone)]
 pub struct IpcoBox {
-    props: ArrayVec<IpcoProp, 10>,
+    props: ArrayVec<IpcoProp, 16>,
 }
 
 impl IpcoBox {
@@ -313,6 +375,16 @@ impl IpcoBox {
     pub fn push(&mut self, prop: IpcoProp) -> Option<u8> {
         self.props.try_push(prop).ok()?;
         Some(self.props.len() as u8) // the spec wants them off by one
+    }
+
+    /// Like [`Self::push`], but reuses an already pushed property with identical bytes, as libavif does
+    #[must_use]
+    pub fn push_shared(&mut self, prop: IpcoProp) -> Option<u8> {
+        let bytes = prop.to_bytes()?;
+        match self.props.iter().position(|p| p.to_bytes().as_deref() == Some(bytes.as_slice())) {
+            Some(index) => Some(index as u8 + 1),
+            None => self.push(prop),
+        }
     }
 
     pub(crate) fn ispe(&self) -> Option<&IspeBox> {
@@ -408,7 +480,7 @@ pub struct IpmaEntry {
 
 #[derive(Debug, Clone)]
 pub struct IpmaBox {
-    pub entries: ArrayVec<IpmaEntry, 2>,
+    pub entries: ArrayVec<IpmaEntry, 3>,
 }
 
 impl MpegBox for IpmaBox {
@@ -433,10 +505,11 @@ impl MpegBox for IpmaBox {
 }
 
 /// Item Reference box
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct IrefEntryBox {
     pub from_id: u16,
-    pub to_id: u16,
+    /// In order: `dimg` inputs are read by position
+    pub to_ids: ArrayVec<u16, 2>,
     pub typ: FourCC,
 }
 
@@ -446,20 +519,23 @@ impl MpegBox for IrefEntryBox {
         BASIC_BOX_SIZE
             + 2 // from
             + 2 // refcount
-            + 2 // to
+            + 2 * self.to_ids.len()
     }
 
     fn write<B: WriterBackend>(&self, w: &mut Writer<B>) -> Result<(), B::Error> {
         let mut b = w.basic_box(self.len(), self.typ.0)?;
         b.u16(self.from_id)?;
-        b.u16(1)?;
-        b.u16(self.to_id)
+        b.u16(self.to_ids.len() as u16)?;
+        for &to_id in &self.to_ids {
+            b.u16(to_id)?;
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct IrefBox {
-    pub entries: ArrayVec<IrefEntryBox, 4>,
+    pub entries: ArrayVec<IrefEntryBox, 5>,
 }
 
 impl IrefBox {
@@ -677,7 +753,7 @@ impl MpegBox for PitmBox {
 pub struct IlocBox<'data> {
     /// update before writing
     pub absolute_offset_start: Option<NonZeroU32>,
-    pub items: ArrayVec<IlocItem<'data>, 4>,
+    pub items: ArrayVec<IlocItem<'data>, 5>,
 }
 
 #[derive(Debug, Clone)]

@@ -71,6 +71,7 @@ pub fn finish(encoded: &[u8], colour: AvifColour<'_>, metadata: &OutputMetadata)
 			exif: metadata.exif.as_deref(),
 			xmp: metadata.xmp.as_deref(),
 		},
+		None,
 	)
 	.map_err(|err| err.to_string())
 }

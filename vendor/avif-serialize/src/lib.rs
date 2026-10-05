@@ -37,6 +37,52 @@ pub struct Aviffy {
     xmp: Option<Vec<u8>>,
     color_seq_level_idx: u8,
     alpha_seq_level_idx: u8,
+    gain_map: Option<GainMap>,
+}
+
+/// What the `av1C` box of an AV1 item says. Must match the item's AV1 sequence header.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Av1Config {
+    pub seq_profile: u8,
+    pub seq_level_idx: u8,
+    /// 8, 10 or 12
+    pub bit_depth: u8,
+    pub monochrome: bool,
+    /// `(false, false)` is 4:4:4, `(true, true)` is 4:2:0
+    pub chroma_subsampling: (bool, bool),
+}
+
+/// Colour of the rendition the gain map produces (the HDR one, when the base is SDR).
+///
+/// Written as the `colr` boxes of the `tmap` item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlternateColour {
+    pub color_primaries: constants::ColorPrimaries,
+    pub transfer_characteristics: constants::TransferCharacteristics,
+    pub matrix_coefficients: constants::MatrixCoefficients,
+    pub full_range: bool,
+    /// Written as a `colr` box of type `prof` before the `nclx` one.
+    pub icc: Option<Vec<u8>>,
+}
+
+/// An ISO 21496-1 gain map, stored the way libavif stores it.
+///
+/// The file gets a `tmap` derived item (2) built from the color image (1) and a hidden gain map image (3),
+/// an `altr` group preferring the `tmap` over the color image, and the `tmap` brand.
+/// Readers that don't know gain maps show the color image.
+#[derive(Debug, Clone)]
+pub struct GainMap {
+    /// Already-encoded AV1 data of the gain map image.
+    pub av1_data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub config: Av1Config,
+    /// Written in the gain map's `nclx` box, whose primaries and transfer are always unspecified.
+    pub matrix_coefficients: constants::MatrixCoefficients,
+    pub full_range: bool,
+    /// The `tmap` item's data: the version byte 0 followed by the ISO 21496-1 metadata. Written verbatim.
+    pub tmap_payload: Vec<u8>,
+    pub alternate: AlternateColour,
 }
 
 /// Makes an AVIF file given encoded AV1 data (create the data with [`rav1e`](https://lib.rs/rav1e))
@@ -87,7 +133,15 @@ impl Aviffy {
             xmp: None,
             color_seq_level_idx: 31,
             alpha_seq_level_idx: 31,
+            gain_map: None,
         }
+    }
+
+    /// Adds a gain map. Can't be combined with alpha: writing fails if both are given.
+    #[inline]
+    pub fn set_gain_map(&mut self, gain_map: GainMap) -> &mut Self {
+        self.gain_map = Some(gain_map);
+        self
     }
 
     /// If set, must match the AV1 color payload, and will result in `colr` box added to AVIF.
@@ -209,6 +263,18 @@ impl Aviffy {
         if ![8, 10, 12].contains(&depth_bits) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "depth must be 8/10/12"));
         }
+        let gain_map = self.gain_map.as_ref();
+        if let Some(gain_map) = gain_map {
+            if alpha_av1_data.is_some() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "a gain map can't be combined with alpha"));
+            }
+            if ![8, 10, 12].contains(&gain_map.config.bit_depth) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "gain map depth must be 8/10/12"));
+            }
+            if gain_map.width == 0 || gain_map.height == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing gain map width/height"));
+            }
+        }
 
         let mut image_items = ArrayVec::new();
         let mut iloc_items = ArrayVec::new();
@@ -217,8 +283,9 @@ impl Aviffy {
         let mut ipco = IpcoBox::new();
         let color_image_id = 1;
         let alpha_image_id = 2;
-        let exif_id = 3;
-        let xmp_id = 4;
+        let tmap_id = 2;
+        let gain_map_id = 3;
+        let (exif_id, xmp_id) = if gain_map.is_some() { (4, 5) } else { (3, 4) };
         const ESSENTIAL_BIT: u8 = 0x80;
         let color_depth_bits = depth_bits;
         let alpha_depth_bits = depth_bits; // Sadly, the spec requires these to match.
@@ -226,8 +293,9 @@ impl Aviffy {
         image_items.push(InfeBox {
             id: color_image_id,
             typ: FourCC(*b"av01"),
-            name: "",
+            name: if gain_map.is_some() { "Color" } else { "" },
             content_type: "",
+            hidden: false,
         });
 
         let ispe_prop = ipco.push(IpcoProp::Ispe(IspeBox { width, height })).ok_or(io::ErrorKind::InvalidInput)?;
@@ -279,12 +347,97 @@ impl Aviffy {
 
         ipma_entries.push(ipma);
 
+        if let Some(gain_map) = gain_map {
+            image_items.push(InfeBox {
+                id: tmap_id,
+                typ: FourCC(*b"tmap"),
+                name: "GMap",
+                content_type: "",
+                hidden: false,
+            });
+            image_items.push(InfeBox {
+                id: gain_map_id,
+                typ: FourCC(*b"av01"),
+                name: "GMap",
+                content_type: "",
+                hidden: true,
+            });
+
+            // Readers take the first input as the base image and the second as the gain map.
+            irefs.push(IrefEntryBox {
+                from_id: tmap_id,
+                to_ids: from_array([color_image_id, gain_map_id]),
+                typ: FourCC(*b"dimg"),
+            });
+
+            // No av1C, and never irot/imir/clap/pasp: libavif rejects a tmap that has them.
+            let alternate = &gain_map.alternate;
+            let mut tmap_ipma = IpmaEntry {
+                item_id: tmap_id,
+                prop_ids: ArrayVec::new(),
+            };
+            tmap_ipma.prop_ids.push(ipco.push_shared(IpcoProp::Ispe(IspeBox { width, height })).ok_or(io::ErrorKind::InvalidInput)?);
+            tmap_ipma.prop_ids.push(ipco.push_shared(IpcoProp::Pixi(PixiBox {
+                channels: 3,
+                depth: color_depth_bits,
+            })).ok_or(io::ErrorKind::InvalidInput)?);
+            if let Some(icc) = &alternate.icc {
+                tmap_ipma.prop_ids.push(ipco.push_shared(IpcoProp::ColrIcc(ColrIccBox { icc: icc.clone() })).ok_or(io::ErrorKind::InvalidInput)?);
+            }
+            tmap_ipma.prop_ids.push(ipco.push_shared(IpcoProp::Colr(ColrBox {
+                color_primaries: alternate.color_primaries,
+                transfer_characteristics: alternate.transfer_characteristics,
+                matrix_coefficients: alternate.matrix_coefficients,
+                full_range_flag: alternate.full_range,
+            })).ok_or(io::ErrorKind::InvalidInput)?);
+            ipma_entries.push(tmap_ipma);
+
+            let config = gain_map.config;
+            let gain_map_props = [
+                ipco.push_shared(IpcoProp::Ispe(IspeBox {
+                    width: gain_map.width,
+                    height: gain_map.height,
+                })),
+                ipco.push_shared(IpcoProp::Pixi(PixiBox {
+                    channels: if config.monochrome { 1 } else { 3 },
+                    depth: config.bit_depth,
+                })),
+                ipco.push_shared(IpcoProp::Av1C(Av1CBox {
+                    seq_profile: config.seq_profile,
+                    seq_level_idx_0: config.seq_level_idx,
+                    seq_tier_0: false,
+                    high_bitdepth: config.bit_depth >= 10,
+                    twelve_bit: config.bit_depth >= 12,
+                    monochrome: config.monochrome,
+                    chroma_subsampling_x: config.chroma_subsampling.0,
+                    chroma_subsampling_y: config.chroma_subsampling.1,
+                    chroma_sample_position: 0,
+                })).map(|prop| prop | ESSENTIAL_BIT),
+                // The spec requires unspecified primaries and transfer on a gain map.
+                ipco.push_shared(IpcoProp::Colr(ColrBox {
+                    color_primaries: constants::ColorPrimaries::Unspecified,
+                    transfer_characteristics: constants::TransferCharacteristics::Unspecified,
+                    matrix_coefficients: gain_map.matrix_coefficients,
+                    full_range_flag: gain_map.full_range,
+                })),
+            ];
+            let mut gain_map_ipma = IpmaEntry {
+                item_id: gain_map_id,
+                prop_ids: ArrayVec::new(),
+            };
+            for prop in gain_map_props {
+                gain_map_ipma.prop_ids.push(prop.ok_or(io::ErrorKind::InvalidInput)?);
+            }
+            ipma_entries.push(gain_map_ipma);
+        }
+
         if let Some(exif_data) = self.exif.as_deref() {
             image_items.push(InfeBox {
                 id: exif_id,
                 typ: FourCC(*b"Exif"),
                 name: "",
                 content_type: "",
+                hidden: false,
             });
 
             iloc_items.push(IlocItem {
@@ -294,7 +447,7 @@ impl Aviffy {
 
             irefs.push(IrefEntryBox {
                 from_id: exif_id,
-                to_id: color_image_id,
+                to_ids: from_array([color_image_id]),
                 typ: FourCC(*b"cdsc"),
             });
         }
@@ -305,6 +458,7 @@ impl Aviffy {
                 typ: FourCC(*b"mime"),
                 name: "",
                 content_type: "application/rdf+xml",
+                hidden: false,
             });
 
             iloc_items.push(IlocItem {
@@ -314,8 +468,29 @@ impl Aviffy {
 
             irefs.push(IrefEntryBox {
                 from_id: xmp_id,
-                to_id: color_image_id,
+                to_ids: from_array([color_image_id]),
                 typ: FourCC(*b"cdsc"),
+            });
+        }
+
+        // mdat order as libavif's: metadata, then the gain map, then color
+        let mut grpl = None;
+        if let Some(gain_map) = gain_map {
+            iloc_items.push(IlocItem {
+                id: tmap_id,
+                extents: from_array([IlocExtent { data: &gain_map.tmap_payload }]),
+            });
+            iloc_items.push(IlocItem {
+                id: gain_map_id,
+                extents: from_array([IlocExtent { data: &gain_map.av1_data }]),
+            });
+
+            let last_item_id = image_items.iter().map(|item| item.id).max().unwrap_or(0);
+            grpl = Some(GrplBox {
+                altr: AltrBox {
+                    group_id: u32::from(last_item_id) + 1,
+                    entity_ids: from_array([u32::from(tmap_id), u32::from(color_image_id)]),
+                },
             });
         }
 
@@ -325,18 +500,19 @@ impl Aviffy {
                 typ: FourCC(*b"av01"),
                 name: "",
                 content_type: "",
+                hidden: false,
             });
 
             irefs.push(IrefEntryBox {
                 from_id: alpha_image_id,
-                to_id: color_image_id,
+                to_ids: from_array([color_image_id]),
                 typ: FourCC(*b"auxl"),
             });
 
             if self.premultiplied_alpha {
                 irefs.push(IrefEntryBox {
                     from_id: color_image_id,
-                    to_id: alpha_image_id,
+                    to_ids: from_array([alpha_image_id]),
                     typ: FourCC(*b"prem"),
                 });
             }
@@ -381,11 +557,17 @@ impl Aviffy {
             extents: from_array([IlocExtent { data: color_av1_data }]),
         });
 
+        let mut compatible_brands = from_array([FourCC(*b"mif1"), FourCC(*b"miaf")]);
+        if gain_map.is_some() {
+            // libavif ignores tmap items in files without this brand
+            compatible_brands.push(FourCC(*b"tmap"));
+        }
+
         Ok(AvifFile {
             ftyp: FtypBox {
                 major_brand: FourCC(*b"avif"),
                 minor_version: 0,
-                compatible_brands: [FourCC(*b"mif1"), FourCC(*b"miaf")].into(),
+                compatible_brands,
             },
             meta: MetaBox {
                 hdlr: HdlrBox {},
@@ -402,6 +584,7 @@ impl Aviffy {
                     ipma: IpmaBox { entries: ipma_entries },
                 },
                 iref: IrefBox { entries: irefs },
+                grpl,
             },
             // Here's the actual data. If HEIF wasn't such a kitchen sink, this
             // would have been the only data this file needs.
@@ -751,6 +934,55 @@ fn no_hdr_metadata_by_default() {
     let parser = avif_parse::read_avif(&mut avif.as_slice()).unwrap();
     assert!(parser.content_light_level.is_none());
     assert!(parser.mastering_display.is_none());
+}
+
+#[cfg(test)]
+fn test_gain_map() -> GainMap {
+    GainMap {
+        av1_data: vec![9, 8, 7],
+        width: 5,
+        height: 10,
+        config: Av1Config {
+            seq_profile: 0,
+            seq_level_idx: 31,
+            bit_depth: 8,
+            monochrome: true,
+            chroma_subsampling: (true, true),
+        },
+        matrix_coefficients: constants::MatrixCoefficients::Bt601,
+        full_range: true,
+        tmap_payload: vec![0; 62],
+        alternate: AlternateColour {
+            color_primaries: constants::ColorPrimaries::Bt709,
+            transfer_characteristics: constants::TransferCharacteristics::Smpte2084,
+            matrix_coefficients: constants::MatrixCoefficients::Bt601,
+            full_range: true,
+            icc: None,
+        },
+    }
+}
+
+#[test]
+fn gain_map_keeps_the_color_image_primary() {
+    let test_img = [1, 2, 3, 4, 5, 6];
+    let avif = Aviffy::new()
+        .set_gain_map(test_gain_map())
+        .set_exif(test_tiff_exif())
+        .to_vec(&test_img, None, 10, 20, 8);
+
+    let ctx = mp4parse::read_avif(&mut avif.as_slice(), mp4parse::ParseStrictness::Normal).unwrap();
+    assert_eq!(&test_img[..], ctx.primary_item_coded_data().unwrap());
+    let ctx = avif_parse::read_avif(&mut avif.as_slice()).unwrap();
+    assert_eq!(&test_img[..], ctx.primary_item.as_slice());
+}
+
+#[test]
+fn gain_map_with_alpha_is_refused() {
+    let mut aviffy = Aviffy::new();
+    aviffy.set_width(10).set_height(20).set_bit_depth(8).set_gain_map(test_gain_map());
+
+    assert!(aviffy.write_slice(&mut vec![], &[1, 2, 3], Some(&[4, 5])).is_err());
+    assert!(aviffy.write_slice(&mut vec![], &[1, 2, 3], None).is_ok());
 }
 
 #[cfg(test)]

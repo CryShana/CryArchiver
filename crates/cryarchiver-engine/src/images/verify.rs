@@ -44,6 +44,7 @@ pub async fn verify_avif(
 			exif: expected.metadata.exif.as_deref(),
 			xmp: expected.metadata.xmp.as_deref(),
 		},
+		gain_map: None,
 	};
 	avif::check(bytes, &expectations).map_err(JobError::verification)?;
 
