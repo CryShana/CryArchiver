@@ -302,12 +302,15 @@ pub fn size_text(bytes: u64) -> String {
 /// The label of a decision line that holds one of the engine's warnings, as `display_name` shows it.
 pub const WARNING_LABEL: &str = "Warning";
 
+/// The label of the decision line that says why the original was kept.
+pub const KEPT_LABEL: &str = "Kept";
+
 /// A file's decision record in the words its details show it with.
 pub fn decision_lines(decision: &Decision) -> Vec<DecisionLine> {
 	let mut lines = Vec::new();
 
 	if let Some(reason) = &decision.kept {
-		lines.push(plain("Kept", reason.clone()));
+		lines.push(plain(KEPT_LABEL, reason.clone()));
 	}
 
 	if let Some(video) = &decision.video {

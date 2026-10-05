@@ -437,7 +437,7 @@ impl Owner {
 			}
 			JobMessage::Placed => self.placed(file),
 			JobMessage::Taken => self.name_taken(file),
-			JobMessage::Kept(reason) => self.note(file, format!("kept the original: {reason}")),
+			JobMessage::Kept(reason) => self.note(file, kept_note(&reason)),
 			JobMessage::NotSameFile => {
 				if let Some(job) = self.pipeline.jobs.get_mut(&file) {
 					job.not_same_file = true;
@@ -1069,6 +1069,10 @@ impl Owner {
 	pub(super) fn release_all_claims(&mut self, file: FileId) {
 		self.pipeline.claims.retain(|_, holder| *holder != file);
 	}
+}
+
+pub(super) fn kept_note(reason: &str) -> String {
+	format!("kept the original: {reason}")
 }
 
 fn name_key(path: &RelPath) -> (RelPath, String) {

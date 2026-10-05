@@ -130,7 +130,8 @@ fn an_orientation_that_is_not_a_single_number_is_left_with_a_warning() {
 		count: 2,
 		..orientation_entry(3, [bytes16(true, 6), bytes16(true, 6)].concat())
 	};
-	for entry in [two_shorts, ascii(0x0112, "6")] {
+	let rational = orientation_entry(5, [bytes32(true, 6), bytes32(true, 1)].concat());
+	for entry in [two_shorts, ascii(0x0112, "6"), rational] {
 		let original = tiff(true, &[entry], &[], &[]);
 		let mut block = original.clone();
 		assert_eq!(orientation(&block), None);

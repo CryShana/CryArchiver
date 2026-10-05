@@ -10,13 +10,14 @@ use cryarchiver_engine::engine::Stage;
 use cryarchiver_engine::text::{display_name, display_path};
 
 use super::owner::Owner;
+use super::pipeline::kept_note;
 use crate::issues::{IssueId, IssueKey, Problem, UNREADABLE_FOLDER_VERBS, UNREADABLE_SOURCE_VERBS, Verbs};
 use crate::record::{CopyReason, FileState, How, IssueKind, MediaClass};
 use crate::tree::{FileId, FolderId};
 use crate::view::{
-	DecisionLine, Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, LogEntry, LogKind,
-	Notice, NoticeLevel, Overall, Parity, PathLink, RowState, RunState, Status, Update, Worker, decision_lines,
-	size_text,
+	DecisionLine, Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, KEPT_LABEL, LogEntry,
+	LogKind, Notice, NoticeLevel, Overall, Parity, PathLink, RowState, RunState, Status, Update, Worker,
+	decision_lines, size_text,
 };
 
 const THROUGHPUT_WINDOW: Duration = Duration::from_mins(5);
@@ -440,7 +441,12 @@ impl Owner {
 		let output = record.state.output();
 		let status = self.file_status(file);
 
-		let notes = self.pipeline.notes.get(&file).cloned().unwrap_or_default();
+		let mut notes = self.pipeline.notes.get(&file).cloned().unwrap_or_default();
+		if let Some(kept) = decision.iter().find(|line| line.label == KEPT_LABEL) {
+			let shown = kept_note(&kept.value);
+			notes.retain(|note| *note != shown);
+		}
+
 		let stage = self
 			.pipeline
 			.jobs

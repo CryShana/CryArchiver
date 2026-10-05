@@ -250,9 +250,10 @@ impl JobContext {
 					.into_inner()
 					.unwrap_or_else(PoisonError::into_inner)
 					.unwrap_or_default();
-				decision.kept = Some(reason.description());
+				let why = reason.description();
+				decision.kept = Some(why.clone());
 
-				self.send(JobMessage::Kept(reason.description()));
+				self.send(JobMessage::Kept(why));
 				self.copy(CopyReason::KeptOriginal, Some(decision)).await
 			}
 			JobOutcome::Skipped { .. } => self.copy(CopyReason::NotMedia, None).await,

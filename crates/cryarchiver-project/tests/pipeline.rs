@@ -250,9 +250,16 @@ fn a_kept_file_without_a_record_gets_one_with_why_it_was_kept() {
 	start(&project);
 	wait_for(&project, &mut snapshot, "everything archived", complete);
 	let shown = decision_shown(&project, &mut snapshot, "kept.jpg");
+	let notes = snapshot.details[&snapshot.row(FolderId::ROOT, "kept.jpg").id]
+		.notes
+		.clone();
 	drop(project);
 
 	assert_eq!(shown, [("Kept".to_owned(), fake_keep_reason())]);
+	assert!(
+		!notes.iter().any(|note| note.contains(&fake_keep_reason())),
+		"the Kept row already says why: {notes:?}"
+	);
 	let (store, _, _) = Store::open(&setup.project).unwrap();
 	assert_eq!(
 		store
