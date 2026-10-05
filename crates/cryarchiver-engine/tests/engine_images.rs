@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, check, gain_map_av1};
+use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, check};
 use cryarchiver_engine::container::isobmff::{Property, parse_meta};
 use cryarchiver_engine::container::jxl::read_boxes;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
@@ -32,7 +32,7 @@ use image::{DynamicImage, GenericImageView, GrayImage, ImageEncoder, Luma, Pixel
 use jxl_oxide::{JxlImage, PixelFormat};
 use moxcms::ColorProfile;
 use support::heif::{Coding, avif_grid, heic_grid_coded, heic_still_coded, imir, irot};
-use support::ultra_hdr::{UltraHdrOptions, ultra_hdr_jpeg};
+use support::ultra_hdr::{UltraHdrOptions, gain_map_av1, ultra_hdr_jpeg};
 use tokio_util::sync::CancellationToken;
 
 fn job(source: &Path) -> Job {
@@ -1662,7 +1662,7 @@ async fn a_gain_map_that_misses_is_encoded_again_at_the_raised_quality() {
 	std::fs::write(&plain, jpeg).unwrap();
 
 	let bytes = std::fs::read(&source).unwrap();
-	let gain = gain_map::decode(&bytes, &extract(&bytes).gain_map.unwrap()).unwrap();
+	let gain = gain_map::decode(&bytes, &extract(&bytes).gain_map.unwrap(), 256 * 192).unwrap();
 	let workspace = Workspace::create(&dir.path().join(".probe-work"), &source).unwrap();
 	let at_80 = gain_map::encode(&gain, 80.0, 9, 4).unwrap();
 	let first = gain_map::score(&tools, &workspace, &at_80, &gain, &CancellationToken::new())
@@ -1711,23 +1711,36 @@ async fn a_gain_map_that_misses_is_encoded_again_at_the_raised_quality() {
 }
 
 #[tokio::test]
-async fn drop_aux_converts_an_ultra_hdr_photo_without_its_gain_map() {
+async fn drop_aux_keeps_a_gain_map_it_can_carry_and_drops_one_it_cannot() {
 	let dir = tempfile::tempdir().unwrap();
-	let source = ultra_hdr_photo(dir.path(), "hdr.jpg", &gain_levels(64, 48), &UltraHdrOptions::default());
-
-	let (avif, _, gain_map) = encoded_with(
-		run(
-			&Job {
-				drop_aux: true,
-				..job(&source)
-			},
-			dir.path(),
-		)
-		.await,
+	let opts = UltraHdrOptions {
+		motion_photo: true,
+		..UltraHdrOptions::default()
+	};
+	let motion = ultra_hdr_photo(dir.path(), "motion.jpg", &gain_levels(64, 48), &opts);
+	let colour = ultra_hdr_photo(
+		dir.path(),
+		"colour.jpg",
+		&noisy_base(64, 48),
+		&UltraHdrOptions::default(),
 	);
+	let dropping = |source: &Path| Job {
+		drop_aux: true,
+		..job(source)
+	};
 
-	checked_avif(&avif, (256, 192), None).unwrap();
-	assert_eq!(gain_map, None);
+	let (carried, motion_warnings, gain_map) = encoded_with(run(&dropping(&motion), dir.path()).await);
+	let (plain, colour_warnings, no_gain_map) = encoded_with(run(&dropping(&colour), dir.path()).await);
+
+	checked_avif(&carried, (256, 192), Some(&opts.metadata)).unwrap();
+	assert!(gain_map.is_some());
+	assert_eq!(motion_warnings, Vec::<String>::new());
+	checked_avif(&plain, (256, 192), None).unwrap();
+	assert_eq!(no_gain_map, None);
+	assert_eq!(
+		colour_warnings,
+		["the HDR gain map was dropped: it is in colour, which is not supported"]
+	);
 }
 
 #[tokio::test]
@@ -1768,7 +1781,7 @@ async fn depth_maps_are_dropped_with_a_warning() {
 }
 
 #[tokio::test]
-async fn an_ultra_hdr_motion_photo_or_colour_gain_map_keeps_the_original() {
+async fn an_ultra_hdr_motion_photo_or_a_colour_or_oversized_gain_map_keeps_the_original() {
 	let dir = tempfile::tempdir().unwrap();
 	let motion = ultra_hdr_photo(
 		dir.path(),
@@ -1785,17 +1798,30 @@ async fn an_ultra_hdr_motion_photo_or_colour_gain_map_keeps_the_original() {
 		&noisy_base(64, 48),
 		&UltraHdrOptions::default(),
 	);
+	let oversized = ultra_hdr_photo(
+		dir.path(),
+		"oversized.jpg",
+		&gain_levels(257, 192),
+		&UltraHdrOptions::default(),
+	);
 
 	let motion = run(&job(&motion), dir.path()).await;
 	let colour = run(&job(&colour), dir.path()).await;
+	let oversized = run(&job(&oversized), dir.path()).await;
 
 	let reason = kept_reason(&motion);
 	assert!(
 		reason.contains("motion photo video") && reason.contains("which converting would drop"),
 		"{reason}"
 	);
-	let reason = kept_reason(&colour);
-	assert!(reason.starts_with("its HDR gain map can't be carried"), "{reason}");
+	assert_eq!(
+		kept_reason(&colour),
+		"its HDR gain map can't be carried: it is in colour, which is not supported"
+	);
+	assert_eq!(
+		kept_reason(&oversized),
+		"its HDR gain map can't be carried: it is larger than the photo (257×192)"
+	);
 }
 
 #[tokio::test]

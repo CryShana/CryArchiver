@@ -1,9 +1,10 @@
 use std::fs;
+use std::io::Cursor;
 
 use avif_serialize::Aviffy;
 use avif_serialize::constants::{ColorPrimaries, MatrixCoefficients, TransferCharacteristics};
 use image::imageops::FilterType;
-use image::{DynamicImage, GenericImageView, GrayImage, ImageFormat};
+use image::{DynamicImage, GenericImageView, GrayImage, ImageError, ImageFormat, ImageReader};
 use rav1e::prelude::{
 	BlockSize, ChromaSamplePosition, ChromaSampling, ColorDescription, Config, Context, EncoderConfig, EncoderStatus,
 	FrameType, PartitionRange, PixelRange, PredictionModesSetting, Rational, SGRComplexityLevel, SceneDetectionSpeed,
@@ -27,16 +28,22 @@ pub const RAISED_QUALITY: f32 = 90.0;
 
 const ENCODED_FILE: &str = "gainmap.avif";
 
-pub fn decode(bytes: &[u8], source: &GainMapSource) -> Result<GrayImage, String> {
-	let jpeg = bytes
-		.get(source.jpeg.clone())
-		.ok_or("the gain map lies outside the file")?;
-	let image = image::load_from_memory_with_format(jpeg, ImageFormat::Jpeg)
-		.map_err(|err| format!("the gain map could not be decoded: {err}"))?;
+/// The source's grey gain map. One with more pixels than the photo it belongs to is refused before it is decoded.
+pub fn decode(bytes: &[u8], source: &GainMapSource, photo_pixels: u64) -> Result<GrayImage, String> {
+	let jpeg = bytes.get(source.jpeg.clone()).ok_or("it lies outside the file")?;
+	let undecodable = |err: ImageError| format!("it could not be decoded: {err}");
+	let (width, height) = ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg)
+		.into_dimensions()
+		.map_err(undecodable)?;
+	if u64::from(width) * u64::from(height) > photo_pixels {
+		return Err(format!("it is larger than the photo ({width}×{height})"));
+	}
+
+	let image = image::load_from_memory_with_format(jpeg, ImageFormat::Jpeg).map_err(undecodable)?;
 
 	match image {
 		DynamicImage::ImageLuma8(gain) => Ok(gain),
-		_ => Err("colour gain maps are not supported".into()),
+		_ => Err("it is in colour, which is not supported".into()),
 	}
 }
 

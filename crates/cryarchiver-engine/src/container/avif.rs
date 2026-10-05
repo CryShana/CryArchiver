@@ -167,12 +167,6 @@ fn gain_map_parts(
 	})
 }
 
-pub fn gain_map_av1(bytes: &[u8]) -> Result<Vec<u8>, String> {
-	let meta = isobmff::parse_meta(bytes).map_err(|err| err.to_string())?;
-	let items = meta.gain_map().ok_or("the AVIF has no gain map")?;
-	meta.item_data(bytes, items.gain_map).map_err(|err| err.to_string())
-}
-
 fn primaries(value: u8) -> ColorPrimaries {
 	match value {
 		1 => ColorPrimaries::Bt709,

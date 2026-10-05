@@ -5,7 +5,7 @@ use std::process::Command;
 
 use cryarchiver_engine::container::av1::read_sequence_header;
 use cryarchiver_engine::container::avif::{
-	AvifExpectations, AvifMetadata, GainMapInput, check, gain_map_av1, rewrite, writable_cicp,
+	AvifExpectations, AvifMetadata, GainMapInput, check, rewrite, writable_cicp,
 };
 use cryarchiver_engine::container::isobmff::{EntityGroup, Meta, Nclx, Property, brands, parse_meta};
 use cryarchiver_engine::images::avif::encode;
@@ -16,7 +16,7 @@ use cryarchiver_engine::metadata::icc::Cicp;
 use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgb, Rgba};
 use moxcms::ColorProfile;
 use support::replaced;
-use support::ultra_hdr::UltraHdrOptions;
+use support::ultra_hdr::{UltraHdrOptions, gain_map_av1};
 
 const QUICK: RavifSettings = RavifSettings {
 	quality: 80.0,

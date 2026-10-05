@@ -611,6 +611,47 @@ fn broken_gain_map_signals_are_warnings_not_panics() {
 	}
 }
 
+#[test]
+fn a_run_of_image_starts_after_the_primary_is_probed_in_bounded_time() {
+	let hdrgm = xmp_segment(
+		"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:hdrgm='http://ns.adobe.com/hdr-gain-map/1.0/' hdrgm:Version='1.0'/></rdf:RDF></x:xmpmeta>",
+	);
+	let starts = [0xFF, 0xD8].repeat(1 << 20);
+	let bytes = [jpeg(&[hdrgm], 3), starts].concat();
+
+	let started = std::time::Instant::now();
+	let metadata = extract(&bytes);
+
+	assert!(
+		started.elapsed() < std::time::Duration::from_secs(10),
+		"{:?}",
+		started.elapsed()
+	);
+	assert_eq!(metadata.gain_map, None);
+	assert!(
+		metadata
+			.warnings
+			.iter()
+			.any(|warning| warning.starts_with("the HDR gain map can't be read: ")),
+		"{:?}",
+		metadata.warnings
+	);
+}
+
+#[test]
+fn the_fallback_looks_at_no_more_than_16_embedded_images() {
+	let bytes = ultra_hdr(&UltraHdrOptions {
+		mpf: false,
+		..UltraHdrOptions::default()
+	});
+	let primary_end = image_end(&bytes).unwrap();
+	let decoys = |count| jpeg(&[], 3).repeat(count);
+	let behind = |count| [&bytes[..primary_end], &decoys(count), &bytes[primary_end..]].concat();
+
+	assert!(extract(&behind(15)).gain_map.is_some());
+	assert_eq!(extract(&behind(16)).gain_map, None);
+}
+
 fn chunk(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
 	let mut bytes = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
 	bytes.extend_from_slice(&kind);

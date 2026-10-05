@@ -1014,6 +1014,11 @@ fn help_and_doctor_mention_images() {
 	let doctor = cryarchiver(dir.path(), &["doctor"]);
 
 	assert!(stdout(&help).contains("--drop-aux"), "{}", stdout(&help));
+	assert!(
+		stdout(&help).contains("Also convert motion photos and other photos with extras, dropping the extras"),
+		"{}",
+		stdout(&help)
+	);
 	assert!(stdout(&doctor).contains("image filters"), "{}", stdout(&doctor));
 	assert!(stdout(&doctor).contains("libjxl"), "{}", stdout(&doctor));
 }

@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 
+use cryarchiver_engine::container::isobmff;
 use cryarchiver_engine::metadata::gain_map::{Channel, GainMapMetadata, Signed, Unsigned};
 use image::codecs::jpeg::JpegEncoder;
 use image::{GenericImageView, PixelWithColorType};
@@ -114,6 +115,12 @@ where
 		opts.trailer.clone().unwrap_or_default(),
 	]
 	.concat()
+}
+
+pub fn gain_map_av1(avif: &[u8]) -> Result<Vec<u8>, String> {
+	let meta = isobmff::parse_meta(avif).map_err(|err| err.to_string())?;
+	let items = meta.gain_map().ok_or("the AVIF has no gain map")?;
+	meta.item_data(avif, items.gain_map).map_err(|err| err.to_string())
 }
 
 fn gain_map_jpeg<G: GenericImageView>(gain: &G, opts: &UltraHdrOptions) -> Vec<u8>

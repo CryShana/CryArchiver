@@ -146,7 +146,7 @@ struct CompressArgs {
 	keep_metadata: bool,
 	#[arg(
 		long,
-		help = "Convert photos with motion video or other extras too, dropping them (HDR gain maps too)"
+		help = "Also convert motion photos and other photos with extras, dropping the extras"
 	)]
 	drop_aux: bool,
 	#[arg(long, help = "Keep only the main video and the audio")]

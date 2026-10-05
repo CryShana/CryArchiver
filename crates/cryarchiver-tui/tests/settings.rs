@@ -17,6 +17,7 @@ const AUDIO: usize = 3;
 const RESET_QUALITY: usize = 4;
 const MIN_SAVINGS: usize = 5;
 const LIMIT: usize = 7;
+const KEEP_AUXILIARY_IMAGES: usize = 9;
 const DELETE_ORIGINALS: usize = 10;
 const RESTART_PENDING_JOBS: usize = 12;
 
@@ -243,6 +244,15 @@ fn at_fast_the_video_row_is_disabled_and_keeps_its_value() {
 	assert_eq!(app.source().view().settings.speed, Speed::Moderate);
 	assert!(shown_row(&mut app, "Video VMAF").contains("custom · 90/85"));
 	assert!(row_text(&draw(&mut app, 120, 36), 0).contains(" MODERATE · custom · LATEST "));
+}
+
+#[test]
+fn the_motion_photo_row_says_what_turning_it_off_drops() {
+	let mut app = app();
+	open_row(&mut app, KEEP_AUXILIARY_IMAGES);
+
+	let note = "off: motion and Live Focus photos convert without the video, unblurred original, depth map";
+	assert!(find_row(&draw(&mut app, 120, 36), note).is_some(), "{note}");
 }
 
 #[test]

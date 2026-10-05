@@ -1,7 +1,7 @@
 mod support;
 
 use cryarchiver_engine::container::av1::read_sequence_header;
-use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, GainMapInput, check, gain_map_av1, rewrite};
+use cryarchiver_engine::container::avif::{AvifExpectations, AvifMetadata, GainMapInput, check, rewrite};
 use cryarchiver_engine::container::isobmff::{Meta, Nclx, Property, parse_meta};
 use cryarchiver_engine::images::avif::encode as encode_base;
 use cryarchiver_engine::images::gain_map::{TARGET, decode, encode, fit, score};
@@ -10,8 +10,10 @@ use cryarchiver_engine::metadata::extract;
 use cryarchiver_engine::metadata::icc::Cicp;
 use cryarchiver_engine::workspace::Workspace;
 use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
-use support::ultra_hdr::{UltraHdrOptions, ultra_hdr_jpeg};
+use support::ultra_hdr::{UltraHdrOptions, gain_map_av1, ultra_hdr_jpeg};
 use tokio_util::sync::CancellationToken;
+
+const PHOTO_PIXELS: u64 = 64 * 48;
 
 fn gradient(width: u32, height: u32) -> GrayImage {
 	GrayImage::from_fn(width, height, |x, y| {
@@ -139,10 +141,33 @@ fn a_grey_gain_map_decodes_and_a_colour_one_is_refused() {
 	});
 	let (colour_file, colour) = ultra_hdr_gain_map(&colour_map);
 
-	assert_eq!(decode(&grey_file, &grey).unwrap().dimensions(), (16, 12));
+	assert_eq!(decode(&grey_file, &grey, PHOTO_PIXELS).unwrap().dimensions(), (16, 12));
 	assert_eq!(
-		decode(&colour_file, &colour).unwrap_err(),
-		"colour gain maps are not supported"
+		decode(&colour_file, &colour, PHOTO_PIXELS).unwrap_err(),
+		"it is in colour, which is not supported"
+	);
+}
+
+#[test]
+fn a_gain_map_with_more_pixels_than_the_photo_is_refused_before_it_is_decoded() {
+	let (full_file, full) = ultra_hdr_gain_map(&gradient(64, 48));
+	let (wider_file, wider) = ultra_hdr_gain_map(&gradient(65, 48));
+	let sof = full.jpeg.start
+		+ full_file[full.jpeg.clone()]
+			.windows(2)
+			.position(|marker| marker == [0xFF, 0xC0])
+			.unwrap();
+	let mut declared_huge = full_file.clone();
+	declared_huge[sof + 5..sof + 9].copy_from_slice(&[0x4E, 0x20, 0x4E, 0x20]);
+
+	assert_eq!(decode(&full_file, &full, PHOTO_PIXELS).unwrap().dimensions(), (64, 48));
+	assert_eq!(
+		decode(&wider_file, &wider, PHOTO_PIXELS).unwrap_err(),
+		"it is larger than the photo (65×48)"
+	);
+	assert_eq!(
+		decode(&declared_huge, &full, PHOTO_PIXELS).unwrap_err(),
+		"it is larger than the photo (20000×20000)"
 	);
 }
 

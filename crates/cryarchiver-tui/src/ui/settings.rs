@@ -117,6 +117,9 @@ fn note(view: &ArchiveView, row: SettingsRow, editing: Option<&Input>, theme: &T
 			format!("{FAST_NEVER_MEASURES_VIDEO}; a value set here is kept for MODERATE and SLOW")
 		}
 		SettingsRow::Quality(_) => "⏎ type your own target · r back to the preset · applies to new work".to_owned(),
+		SettingsRow::KeepAuxiliaryImages => {
+			"off: motion and Live Focus photos convert without the video, unblurred original, depth map".to_owned()
+		}
 		_ => "Changes apply at once · the limit reaches running jobs where the system allows".to_owned(),
 	};
 	(text, fg(theme.dim))

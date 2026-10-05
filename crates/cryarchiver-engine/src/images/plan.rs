@@ -266,13 +266,11 @@ pub fn precheck(input: &PrecheckInput<'_>) -> Result<Vec<String>, Gate> {
 			)));
 		}
 
-		warnings.extend(depth.into_iter().filter_map(|aux| match aux {
-			AuxKind::Depth(detail) if detail.starts_with("urn:") => {
-				Some("the depth map was dropped (HEIF auxiliary image)".to_owned())
-			}
-			AuxKind::Depth(detail) => Some(format!("the depth map was dropped ({detail})")),
-			_ => None,
-		}));
+		warnings.extend(
+			depth
+				.into_iter()
+				.map(|aux| format!("the depth map was dropped ({})", aux.detail())),
+		);
 	}
 
 	if input.mode == MetadataMode::IccOnly
@@ -387,6 +385,14 @@ pub fn carry_gain_map(plan: &mut StillPlan, facts: &StillFacts, route: Option<Im
 	plan.memory_bytes = memory_estimate(facts.width, facts.height, &avif);
 	plan.candidates = avif;
 	Ok(true)
+}
+
+/// The warning when `carry_gain_map` refuses and the gain map is dropped instead.
+pub fn gain_map_not_in_avif(facts: &StillFacts) -> String {
+	format!(
+		"the HDR gain map was dropped: only AVIF keeps it, and {}",
+		not_avif(facts)
+	)
 }
 
 fn not_avif(facts: &StillFacts) -> String {
@@ -904,7 +910,7 @@ mod tests {
 		};
 
 		assert!(
-			matches!(precheck(&input(&healthy, &gain_map)), Err(Gate::Keep(KeepReason::Unsupported(reason))) if reason == "it has gain map (Ultra HDR), which converting would drop")
+			matches!(precheck(&input(&healthy, &gain_map)), Err(Gate::Keep(KeepReason::Unsupported(reason))) if reason == "it has HDR gain map (Ultra HDR), which converting would drop")
 		);
 		assert_eq!(
 			precheck(&PrecheckInput {
@@ -971,6 +977,27 @@ mod tests {
 	}
 
 	#[test]
+	fn heif_auxiliary_type_urns_read_as_words() {
+		let heic = SourceMetadata {
+			aux: vec![
+				AuxKind::GainMap("urn:com:apple:photo:2020:aux:hdrgainmap".into()),
+				AuxKind::Other("urn:com:apple:photo:2019:aux:semanticskinmatte".into()),
+				AuxKind::GainMap("tmap item".into()),
+			],
+			..SourceMetadata::default()
+		};
+
+		assert_eq!(
+			precheck(&input(&Structure::default(), &heic)),
+			Err(keep(
+				"it has HDR gain map (HEIF auxiliary image), HEIF auxiliary image, HDR gain map (tmap item), which \
+				 converting would drop"
+					.into()
+			))
+		);
+	}
+
+	#[test]
 	fn a_carried_gain_map_keeps_only_avif_candidates() {
 		let graphic = StillFacts {
 			graphic: true,
@@ -1003,6 +1030,11 @@ mod tests {
 				 than 16384 pixels on a side or 64 MP"
 					.into()
 			))
+		);
+		assert_eq!(
+			gain_map_not_in_avif(&facts(20_000, 800)),
+			"the HDR gain map was dropped: only AVIF keeps it, and this image can't be stored as AVIF: it is larger \
+			 than 16384 pixels on a side or 64 MP"
 		);
 	}
 }

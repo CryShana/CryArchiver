@@ -20,6 +20,7 @@ const SAMSUNG_MOTION_PHOTO: &[u8] = b"MotionPhoto_Data";
 const SEF_START: &[u8] = b"SEFH";
 const SEF_END: &[u8] = b"SEFT";
 const DUAL_SHOT: &[u8] = b"DualShot_";
+const MAX_SEF_NAME: usize = 64;
 const MIN_TRAILING_CONTENT: usize = 1024;
 
 struct ExtendedPart<'a> {
@@ -240,13 +241,14 @@ fn sef_record_name_at(trailer: &[u8], at: usize) -> bool {
 		.and_then(|start| trailer.get(start..at))
 		.and_then(|length| <[u8; 4]>::try_from(length).ok())
 		.and_then(|length| usize::try_from(u32::from_le_bytes(length)).ok())
+		.filter(|length| (DUAL_SHOT.len()..=MAX_SEF_NAME).contains(length))
 	else {
 		return false;
 	};
 
 	at.checked_add(length)
 		.and_then(|end| trailer.get(at..end))
-		.is_some_and(|name| name.len() >= DUAL_SHOT.len() && name.iter().all(u8::is_ascii_graphic))
+		.is_some_and(|name| name.iter().all(u8::is_ascii_graphic))
 }
 
 fn read_segment<'a>(marker: u8, payload: &'a [u8], metadata: &mut SourceMetadata, segments: &mut Segments<'a>) {
@@ -373,4 +375,23 @@ fn reassemble_extended(parts: &[ExtendedPart<'_>]) -> Option<String> {
 	}
 
 	String::from_utf8(packet).ok()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn sef_with_name(name: &[u8]) -> Vec<u8> {
+		let length = u32::try_from(name.len()).unwrap().to_le_bytes();
+		[SEF_START, &[0x42; 16], &length, name, &[0; 8], SEF_END].concat()
+	}
+
+	#[test]
+	fn a_sef_record_name_longer_than_64_bytes_is_not_live_focus() {
+		let name = |length| [DUAL_SHOT, &vec![b'x'; length - DUAL_SHOT.len()]].concat();
+
+		assert!(samsung_live_focus(&sef_with_name(b"DualShot_1")));
+		assert!(samsung_live_focus(&sef_with_name(&name(64))));
+		assert!(!samsung_live_focus(&sef_with_name(&name(65))));
+	}
 }

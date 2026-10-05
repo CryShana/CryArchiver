@@ -361,17 +361,31 @@ async fn analyse(cx: &ImageContext<'_>, input: &ImageInput) -> Result<Result<Sti
 
 	let mut gain_map = None;
 	let mut gain_map_warning = None;
-	if let Some(source) = input.metadata.gain_map.as_ref().filter(|_| !input.drop_aux) {
-		match plan::carry_gain_map(&mut plan, &facts, cx.route) {
+	if let Some(source) = &input.metadata.gain_map {
+		let mut carrying = plan.clone();
+		let refused = match plan::carry_gain_map(&mut carrying, &facts, cx.route) {
 			Ok(true) => match fitted_gain_map(cx, input, source, orientation, upright, (width, height)).await? {
-				Ok(carried) => gain_map = Some(carried),
-				Err(err) => {
-					let reason = format!("its HDR gain map can't be carried: {err}");
-					return Ok(Err(KeepReason::Unsupported(reason)));
+				Ok(carried) => {
+					plan = carrying;
+					gain_map = Some(carried);
+					None
 				}
+				Err(err) => Some((
+					KeepReason::Unsupported(format!("its HDR gain map can't be carried: {err}")),
+					format!("the HDR gain map was dropped: {err}"),
+				)),
 			},
-			Ok(false) => gain_map_warning = Some(plan::GAIN_MAP_NOT_IN_JXL.to_owned()),
-			Err(reason) => return Ok(Err(reason)),
+			Ok(false) => {
+				gain_map_warning = Some(plan::GAIN_MAP_NOT_IN_JXL.to_owned());
+				None
+			}
+			Err(reason) => Some((reason, plan::gain_map_not_in_avif(&facts))),
+		};
+
+		match refused {
+			Some((reason, _)) if !input.drop_aux => return Ok(Err(reason)),
+			Some((_, dropped)) => gain_map_warning = Some(dropped),
+			None => {}
 		}
 	}
 
@@ -407,8 +421,9 @@ async fn fitted_gain_map(
 	size: (u32, u32),
 ) -> Result<Result<CarriedGainMap, String>, JobError> {
 	let (bytes, jpeg) = (Arc::clone(&input.bytes), source.clone());
+	let photo_pixels = u64::from(upright.0) * u64::from(upright.1);
 	let fitted = blocking(cx.cancel, move || {
-		gain_map::decode(&bytes, &jpeg).map(|gain| gain_map::fit(gain, orientation, upright, size))
+		gain_map::decode(&bytes, &jpeg, photo_pixels).map(|gain| gain_map::fit(gain, orientation, upright, size))
 	})
 	.await?;
 
@@ -651,6 +666,7 @@ async fn try_candidate(
 				Err(err) => return Err(err),
 			};
 			size = checked.rebuilt.unwrap_or(size);
+
 			if checked.missed && !cx.forced {
 				return Ok(Tried::GainMapMissed {
 					size,
@@ -659,11 +675,9 @@ async fn try_candidate(
 			}
 
 			if checked.rebuilt.is_some() && (too_large(size) || beaten(size)) {
-				return Ok(Tried::TooLarge {
-					size,
-					score: last_score,
-				});
+				return Ok(Tried::TooLarge { size, score: None });
 			}
+
 			gain_map = Some(checked.score);
 		}
 

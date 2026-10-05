@@ -23,6 +23,7 @@ const TIFF_PHOTOSHOP: u16 = 34377;
 const TIFF_ICC: u16 = 34675;
 const AVIF_BRANDS: &[[u8; 4]] = &[*b"avif", *b"avis"];
 const HEIF_BRANDS: &[[u8; 4]] = &[*b"heic", *b"heix", *b"heim", *b"heis", *b"mif1", *b"msf1"];
+const HEIF_AUXILIARY_IMAGE: &str = "HEIF auxiliary image";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -45,13 +46,27 @@ pub enum AuxKind {
 	Other(String),
 }
 
+impl AuxKind {
+	/// Where the entry came from, in words: a HEIF auxiliary image's type URN reads as "HEIF auxiliary image".
+	pub fn detail(&self) -> &str {
+		let (Self::GainMap(detail) | Self::Depth(detail) | Self::MotionVideo(detail) | Self::Other(detail)) = self;
+		if detail.starts_with("urn:") {
+			HEIF_AUXILIARY_IMAGE
+		} else {
+			detail
+		}
+	}
+}
+
 impl fmt::Display for AuxKind {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let detail = self.detail();
 		match self {
-			Self::GainMap(detail) => write!(f, "gain map ({detail})"),
-			Self::Depth(detail) => write!(f, "depth map ({detail})"),
-			Self::MotionVideo(detail) => write!(f, "motion photo video ({detail})"),
-			Self::Other(detail) => write!(f, "auxiliary image ({detail})"),
+			Self::GainMap(_) => write!(f, "HDR gain map ({detail})"),
+			Self::Depth(_) => write!(f, "depth map ({detail})"),
+			Self::MotionVideo(_) => write!(f, "motion photo video ({detail})"),
+			Self::Other(_) if detail == HEIF_AUXILIARY_IMAGE => f.write_str(HEIF_AUXILIARY_IMAGE),
+			Self::Other(_) => write!(f, "auxiliary image ({detail})"),
 		}
 	}
 }

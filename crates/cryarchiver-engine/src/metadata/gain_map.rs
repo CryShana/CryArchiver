@@ -11,6 +11,10 @@ const HDR_BASE: &str = "HDR base rendition is not supported";
 const DEFAULT_OFFSET: f64 = 1.0 / 64.0;
 const MAX_FRACTION_ITERATIONS: usize = 39;
 const JPEG_START: [u8; 3] = [0xFF, 0xD8, 0xFF];
+const MAX_GAIN_MAP_CANDIDATES: usize = 16;
+/// How far into an embedded image its header is read: 16 full-size segments. A run of standalone markers would
+/// otherwise make every probe walk to the end of the file.
+const MAX_HEADER_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signed {
@@ -284,7 +288,8 @@ pub fn find(bytes: &[u8], mpf: Option<(&[u8], usize)>) -> Option<Result<GainMapS
 			.iter()
 			.filter(|entry| entry.offset != 0)
 			.filter_map(|entry| mpf_at.checked_add(usize::try_from(entry.offset).ok()?))
-			.find(|&start| image_at(bytes, start).is_some_and(|image| Header::of(image).carries_gain_map()))
+			.take(MAX_GAIN_MAP_CANDIDATES)
+			.find(|&start| carries_gain_map(bytes, start))
 	});
 	if let Some(start) = listed {
 		return Some(read(bytes, start));
@@ -362,6 +367,10 @@ impl<'a> Header<'a> {
 		header
 	}
 
+	fn of_embedded(image: &'a [u8]) -> Self {
+		Self::of(&image[..image.len().min(MAX_HEADER_BYTES)])
+	}
+
 	fn full_iso(&self) -> Option<&'a [u8]> {
 		self.iso.filter(|iso| iso.len() > 4)
 	}
@@ -379,6 +388,10 @@ fn image_at(bytes: &[u8], start: usize) -> Option<&[u8]> {
 	bytes.get(start..).filter(|image| image.starts_with(&JPEG_START))
 }
 
+fn carries_gain_map(bytes: &[u8], start: usize) -> bool {
+	image_at(bytes, start).is_some_and(|image| Header::of_embedded(image).carries_gain_map())
+}
+
 fn embedded_image(bytes: &[u8]) -> Result<usize, String> {
 	let primary_end = jpeg::image_end(bytes).map_err(|err| format!("the primary image is broken ({err})"))?;
 	let mut starts = bytes[primary_end..]
@@ -390,14 +403,15 @@ fn embedded_image(bytes: &[u8]) -> Result<usize, String> {
 	let first = *starts.peek().ok_or("no gain map image follows the primary image")?;
 
 	Ok(starts
-		.find(|&start| image_at(bytes, start).is_some_and(|image| Header::of(image).carries_gain_map()))
+		.take(MAX_GAIN_MAP_CANDIDATES)
+		.find(|&start| carries_gain_map(bytes, start))
 		.unwrap_or(first))
 }
 
 fn read(bytes: &[u8], start: usize) -> Result<GainMapSource, String> {
 	let image = image_at(bytes, start).ok_or("the gain map image is outside the file")?;
 	let end = jpeg::image_end(image).map_err(|err| format!("the gain map image is broken ({err})"))?;
-	let header = Header::of(image);
+	let header = Header::of_embedded(image);
 
 	let metadata = match (header.full_iso(), header.gain_map_xmp()) {
 		(Some(iso), _) => GainMapMetadata::parse_iso(iso)?,
