@@ -275,7 +275,7 @@ mod tests {
 			format!(
 				"-hide_banner -nostdin -y -i {} -map_metadata 0 -map_chapters 0 -map 0:0 -c:a:0 libopus -b:a:0 256k \
 				 -filter:a:0 channelmap=channel_layout=5.1,aresample=resampler=soxr:osr=48000 -mapping_family:a:0 1 \
-				 -f opus {} -map 0:0 -filter:a:0 astats@s0=measure_overall=Number_of_samples:measure_perchannel=RMS_level \
+				 -f opus {} -map 0:0 -filter:a:0 astats@s0=measure_overall=Number_of_samples:measure_perchannel=RMS_level+Peak_level \
 				 -f null -",
 				source.display(),
 				output.display()

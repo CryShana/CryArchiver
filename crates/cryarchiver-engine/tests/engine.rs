@@ -436,6 +436,72 @@ async fn text_and_rerun_are_skipped() {
 	);
 }
 
+/// A stereo tone whose first channel ends in a burst at about +84 dBFS, beyond what Opus carries, like a damaged AAC
+/// frame decodes to.
+const BURST_BEYOND_FULL_SCALE: &str =
+	"aevalsrc=if(gt(t\\,2.85)\\,15000\\,0.3)*sin(2*PI*220*t)|0.3*sin(2*PI*330*t):c=stereo:s=48000:d=3";
+
+const CLIPPED_WARNING: &str = "the source audio goes beyond full scale on channel 1, likely damaged; it was clipped";
+
+#[tokio::test]
+async fn audio_beyond_full_scale_is_clipped_with_a_warning() {
+	let dir = tempfile::tempdir().unwrap();
+	let wav = dir.path().join("burst.wav");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		BURST_BEYOND_FULL_SCALE,
+		"-c:a",
+		"pcm_f32le",
+		wav.to_str().unwrap(),
+	]);
+
+	let outcome = run(&job(&wav), dir.path()).await;
+
+	let JobOutcome::Encoded { warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(warnings, [CLIPPED_WARNING]);
+}
+
+#[tokio::test]
+async fn video_audio_beyond_full_scale_is_clipped_with_a_warning() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = dir.path().join("burst.mkv");
+	support::ffmpeg(&[
+		"-f",
+		"lavfi",
+		"-i",
+		"testsrc2=s=320x240:r=25:d=3",
+		"-f",
+		"lavfi",
+		"-i",
+		BURST_BEYOND_FULL_SCALE,
+		"-map",
+		"0:v",
+		"-map",
+		"1:a",
+		"-c:v",
+		"mpeg4",
+		"-q:v",
+		"2",
+		"-c:a",
+		"pcm_f32le",
+		clip.to_str().unwrap(),
+	]);
+
+	let outcome = run(&fast_keeping_any_saving(&clip), dir.path()).await;
+
+	let JobOutcome::Encoded { warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings.iter().any(|warning| warning == CLIPPED_WARNING),
+		"{warnings:?}"
+	);
+}
+
 #[tokio::test]
 async fn truncated_flac_is_source_damaged() {
 	let dir = tempfile::tempdir().unwrap();

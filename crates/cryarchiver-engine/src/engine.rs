@@ -1042,7 +1042,10 @@ impl Engine {
 
 		(cx.on_event)(JobEvent::Stage(Stage::Verify));
 		let output_levels = verify::measure_output(&self.tools, &output, plan, cx.cancel).await?;
-		verify::check_tracks(plan, &source_levels, &output_levels).map_err(JobError::verification)?;
+		for warning in verify::check_tracks(plan, &source_levels, &output_levels).map_err(JobError::verification)? {
+			(cx.on_event)(JobEvent::Warning(warning.clone()));
+			warnings.push(warning);
+		}
 
 		Ok(Produced::Output(Staged {
 			path: output,
@@ -2276,10 +2279,13 @@ impl Engine {
 			.video_temp(cx, video_path, video, &encoded, declared_s, &inputs.source_frames)
 			.await?;
 
+		let mut warnings: Vec<String> = warning.into_iter().collect();
 		let audio = match (&audio_plan, &source_levels) {
 			(Some(plan), Some(source_levels)) => {
-				self.verify_audio_temp(plan, source_levels, &audio_temp, cx.cancel)
-					.await?;
+				warnings.extend(
+					self.verify_audio_temp(plan, source_levels, &audio_temp, cx.cancel)
+						.await?,
+				);
 				Some(Temp {
 					info: probe_temp(&self.tools, &audio_temp, cx.cancel).await?,
 					path: audio_temp,
@@ -2292,7 +2298,7 @@ impl Engine {
 			video: video_temp,
 			audio,
 			encoded,
-			warnings: warning.into_iter().collect(),
+			warnings,
 		})
 	}
 
@@ -2302,7 +2308,7 @@ impl Engine {
 		source_levels: &[verify::Levels],
 		audio_temp: &Path,
 		cancel: &CancellationToken,
-	) -> Result<(), JobError> {
+	) -> Result<Vec<String>, JobError> {
 		let output_levels = verify::measure_output(&self.tools, audio_temp, plan, cancel).await?;
 		verify::check_tracks(plan, source_levels, &output_levels).map_err(JobError::verification)
 	}

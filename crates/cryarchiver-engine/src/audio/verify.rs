@@ -10,12 +10,14 @@ use crate::toolchain::Toolchain;
 const DURATION_TOLERANCE_S: f64 = 0.05;
 const LEVEL_TOLERANCE_DB: f64 = 1.0;
 const SILENCE_DB: f64 = -60.0;
-pub(crate) const STATS: &str = "measure_overall=Number_of_samples:measure_perchannel=RMS_level";
+const OVER_FULL_SCALE_DB: f64 = 0.5;
+pub(crate) const STATS: &str = "measure_overall=Number_of_samples:measure_perchannel=RMS_level+Peak_level";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Levels {
 	pub duration_s: f64,
 	pub rms_db: Vec<f64>,
+	pub peak_db: Vec<f64>,
 }
 
 pub fn push_stats_output(cmd: &mut ToolCommand, streams: &[String]) {
@@ -44,11 +46,14 @@ pub fn push_cut_stats_output(cmd: &mut ToolCommand, streams: &[String], cut: &st
 pub fn parse_levels(lines: &[String], track: usize, sample_rate: u32) -> Option<Levels> {
 	let prefix = format!("[astats@s{track} @ ");
 	let mut rms_db = Vec::new();
+	let mut peak_db = Vec::new();
 	let mut samples = None;
 
 	for line in lines.iter().filter(|line| line.starts_with(&prefix)) {
 		if let Some(value) = line.split("RMS level dB:").nth(1) {
 			rms_db.push(value.trim().parse().ok()?);
+		} else if let Some(value) = line.split("Peak level dB:").nth(1) {
+			peak_db.push(value.trim().parse().ok()?);
 		} else if let Some(value) = line.split("Number of samples:").nth(1) {
 			samples = value.trim().parse::<u64>().ok();
 		}
@@ -57,6 +62,7 @@ pub fn parse_levels(lines: &[String], track: usize, sample_rate: u32) -> Option<
 	Some(Levels {
 		duration_s: samples? as f64 / f64::from(sample_rate),
 		rms_db,
+		peak_db,
 	})
 }
 
@@ -89,7 +95,14 @@ pub async fn measure_output(
 	}
 }
 
-pub fn compare(source: &Levels, output: &Levels, check_levels: bool, lfe: Option<usize>) -> Result<(), String> {
+/// The warnings on success: a channel whose level doesn't match is excused with a warning when its source goes beyond
+/// full scale, which the output can't carry.
+pub fn compare(
+	source: &Levels,
+	output: &Levels,
+	check_levels: bool,
+	lfe: Option<usize>,
+) -> Result<Vec<String>, String> {
 	let drift = (source.duration_s - output.duration_s).abs();
 	if drift > DURATION_TOLERANCE_S {
 		return Err(format!(
@@ -107,44 +120,75 @@ pub fn compare(source: &Levels, output: &Levels, check_levels: bool, lfe: Option
 	}
 
 	if !check_levels {
-		return Ok(());
+		return Ok(Vec::new());
 	}
 
+	let mut over_full_scale = Vec::new();
 	for (index, (src, out)) in source.rms_db.iter().zip(&output.rms_db).enumerate() {
 		if Some(index) == lfe {
 			continue;
 		}
 
-		if src.is_nan() || out.is_nan() {
-			return Err(format!("channel {} level could not be measured", index + 1));
-		}
+		let Some(mismatch) = level_mismatch(*src, *out) else {
+			continue;
+		};
 
-		if *src < SILENCE_DB {
+		if source.peak_db.get(index).is_some_and(|&peak| peak > OVER_FULL_SCALE_DB) {
+			over_full_scale.push(index + 1);
 			continue;
 		}
-
-		let delta = (src - out).abs();
-		if delta > LEVEL_TOLERANCE_DB {
-			return Err(format!("channel {} level differs by {delta:.1} dB", index + 1));
-		}
+		return Err(format!("channel {} {mismatch}", index + 1));
 	}
-	Ok(())
+
+	if over_full_scale.is_empty() {
+		return Ok(Vec::new());
+	}
+	Ok(vec![format!(
+		"the source audio goes beyond full scale on channel {}, likely damaged; it was clipped",
+		channel_list(&over_full_scale)
+	)])
+}
+
+fn level_mismatch(src: f64, out: f64) -> Option<String> {
+	if src.is_nan() || out.is_nan() {
+		return Some("level could not be measured".to_owned());
+	}
+
+	if src < SILENCE_DB {
+		return None;
+	}
+
+	let delta = (src - out).abs();
+	(delta > LEVEL_TOLERANCE_DB).then(|| format!("level differs by {delta:.1} dB"))
+}
+
+fn channel_list(channels: &[usize]) -> String {
+	let names: Vec<String> = channels.iter().map(ToString::to_string).collect();
+	match names.split_last() {
+		Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+		_ => names.join(""),
+	}
 }
 
 pub fn lfe_index(layout: &str) -> Option<usize> {
 	matches!(layout, "5.1" | "6.1" | "7.1").then_some(3)
 }
 
-pub fn check_tracks(plan: &FilePlan, source: &[Levels], output: &[Levels]) -> Result<(), String> {
+pub fn check_tracks(plan: &FilePlan, source: &[Levels], output: &[Levels]) -> Result<Vec<String>, String> {
+	let mut warnings: Vec<String> = Vec::new();
 	for (track, (source, measured)) in plan.tracks.iter().zip(source.iter().zip(output)) {
 		let TrackPlan::Encode(encoded) = &track.plan else {
 			continue;
 		};
 
 		let check_levels = !matches!(encoded.layout, LayoutFix::Remix(_));
-		compare(source, measured, check_levels, lfe_index(encoded.layout.target()))?;
+		for warning in compare(source, measured, check_levels, lfe_index(encoded.layout.target()))? {
+			if !warnings.contains(&warning) {
+				warnings.push(warning);
+			}
+		}
 	}
-	Ok(())
+	Ok(warnings)
 }
 
 #[cfg(test)]
@@ -155,6 +199,14 @@ mod tests {
 		Levels {
 			duration_s,
 			rms_db: rms_db.to_vec(),
+			peak_db: Vec::new(),
+		}
+	}
+
+	fn peaking(levels: Levels, peak_db: &[f64]) -> Levels {
+		Levels {
+			peak_db: peak_db.to_vec(),
+			..levels
 		}
 	}
 
@@ -167,7 +219,7 @@ mod tests {
 				true,
 				None
 			),
-			Ok(())
+			Ok(Vec::new())
 		);
 	}
 
@@ -200,7 +252,7 @@ mod tests {
 		let source = levels(10.0, &[-12.0, -12.0, -12.0, -20.0, f64::NEG_INFINITY, -12.0]);
 		let output = levels(10.0, &[-12.0, -12.0, -12.0, -35.0, -80.0, -12.0]);
 
-		assert_eq!(compare(&source, &output, true, Some(3)), Ok(()));
+		assert_eq!(compare(&source, &output, true, Some(3)), Ok(Vec::new()));
 		assert_eq!(
 			compare(
 				&levels(10.0, &[-3.0, -3.0]),
@@ -208,7 +260,7 @@ mod tests {
 				false,
 				None
 			),
-			Ok(())
+			Ok(Vec::new())
 		);
 	}
 
@@ -241,7 +293,68 @@ mod tests {
 				true,
 				Some(1)
 			),
-			Ok(())
+			Ok(Vec::new())
+		);
+	}
+
+	#[test]
+	fn a_mismatched_channel_beyond_full_scale_is_warned_instead_of_failed() {
+		let source = peaking(levels(10.0, &[67.5, -12.0]), &[83.8, -9.0]);
+
+		assert_eq!(
+			compare(&source, &levels(10.0, &[-13.7, -12.2]), true, None),
+			Ok(vec![
+				"the source audio goes beyond full scale on channel 1, likely damaged; it was clipped".to_owned()
+			])
+		);
+		assert!(
+			compare(&source, &levels(10.0, &[-13.7, -30.0]), true, None)
+				.unwrap_err()
+				.contains("channel 2 level differs")
+		);
+		assert_eq!(
+			compare(
+				&peaking(levels(10.0, &[-3.0, -3.0]), &[0.5, 0.0]),
+				&levels(10.0, &[-3.0, -3.0]),
+				true,
+				None
+			),
+			Ok(Vec::new())
+		);
+	}
+
+	#[test]
+	fn a_matching_channel_beyond_full_scale_gives_no_warning() {
+		let loud = peaking(levels(10.0, &[-0.4, -3.4]), &[1.9, -0.3]);
+
+		assert_eq!(compare(&loud, &levels(10.0, &[-0.5, -3.3]), true, None), Ok(Vec::new()));
+	}
+
+	#[test]
+	fn channels_beyond_full_scale_are_listed_in_one_warning() {
+		let warning = |peak_db: &[f64]| {
+			let source_rms_db: Vec<f64> = peak_db.iter().map(|&peak| peak - 3.0).collect();
+			let output_rms_db: Vec<f64> = peak_db.iter().map(|&peak| peak.min(-6.0) - 3.0).collect();
+			compare(
+				&peaking(levels(10.0, &source_rms_db), peak_db),
+				&levels(10.0, &output_rms_db),
+				true,
+				None,
+			)
+			.unwrap()
+		};
+
+		assert_eq!(
+			warning(&[-6.0, 20.0, -6.0]),
+			["the source audio goes beyond full scale on channel 2, likely damaged; it was clipped"]
+		);
+		assert_eq!(
+			warning(&[20.0, 20.0]),
+			["the source audio goes beyond full scale on channel 1 and 2, likely damaged; it was clipped"]
+		);
+		assert_eq!(
+			warning(&[20.0, 20.0, -6.0, 20.0]),
+			["the source audio goes beyond full scale on channel 1, 2 and 4, likely damaged; it was clipped"]
 		);
 	}
 
@@ -275,6 +388,29 @@ mod tests {
 		);
 		assert_eq!(parse_levels(&lines, 1, 48_000), Some(levels(3.0, &[-16.9897])));
 		assert_eq!(parse_levels(&lines, 2, 48_000), None);
+	}
+
+	#[test]
+	fn parses_each_channel_peak() {
+		let lines = [
+			"[astats@s0 @ 0000029c1411b440] Channel: 1",
+			"[astats@s0 @ 0000029c1411b440] Peak level dB: 83.800000",
+			"[astats@s0 @ 0000029c1411b440] RMS level dB: 67.500000",
+			"[astats@s0 @ 0000029c1411b440] Channel: 2",
+			"[astats@s0 @ 0000029c1411b440] Peak level dB: -inf",
+			"[astats@s0 @ 0000029c1411b440] RMS level dB: -inf",
+			"[astats@s0 @ 0000029c1411b440] Overall",
+			"[astats@s0 @ 0000029c1411b440] Number of samples: 48000",
+		]
+		.map(str::to_owned);
+
+		assert_eq!(
+			parse_levels(&lines, 0, 48_000),
+			Some(peaking(
+				levels(1.0, &[67.5, f64::NEG_INFINITY]),
+				&[83.8, f64::NEG_INFINITY]
+			))
+		);
 	}
 
 	#[test]

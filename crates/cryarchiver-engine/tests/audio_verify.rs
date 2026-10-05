@@ -29,6 +29,7 @@ fn tone_levels(seconds: f64) -> Levels {
 	Levels {
 		duration_s: seconds,
 		rms_db: vec![TONE_RMS_DB, TONE_RMS_DB],
+		peak_db: Vec::new(),
 	}
 }
 
@@ -50,7 +51,7 @@ async fn measures_each_output_track() {
 		.unwrap();
 
 	assert_eq!(levels.len(), 1);
-	assert_eq!(compare(&tone_levels(3.0), &levels[0], true, None), Ok(()));
+	assert_eq!(compare(&tone_levels(3.0), &levels[0], true, None), Ok(Vec::new()));
 }
 
 #[tokio::test]
