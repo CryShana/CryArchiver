@@ -430,7 +430,7 @@ fn check_av1_config(properties: &[&Property], header: &SequenceHeader, item: &st
 		})
 		.ok_or_else(|| format!("the {item} has no av1C box"))?;
 	let [_, profile_level, flags, ..] = config else {
-		return Err("the av1C box is too short".into());
+		return Err(format!("the {item}'s av1C box is too short"));
 	};
 
 	let profile = profile_level >> 5;

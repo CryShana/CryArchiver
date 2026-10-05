@@ -35,8 +35,13 @@ const ENCODED_FILE: &str = "gainmap.avif";
 /// refused before it is decoded.
 pub fn decode(bytes: &[u8], source: &GainMapSource, photo_pixels: u64) -> Result<DynamicImage, String> {
 	let jpeg = bytes.get(source.jpeg.clone()).ok_or("it lies outside the file")?;
-	if jpeg::components(jpeg) == Some(CMYK_COMPONENTS) {
+	let frame = jpeg::frame_header(jpeg);
+	if frame.is_some_and(|frame| frame.components == CMYK_COMPONENTS) {
 		return Err("it is in CMYK, which is not supported".into());
+	}
+
+	if frame.is_some_and(|frame| frame.precision != 8) {
+		return Err("it is not 8-bit, which is not supported".into());
 	}
 
 	let undecodable = |err: ImageError| format!("it could not be decoded: {err}");
@@ -321,4 +326,23 @@ pub async fn score(
 	blocking(cancel, move || ssim::score(&reference, &decoded))
 		.await?
 		.map_err(JobError::verification)
+}
+
+#[cfg(test)]
+mod tests {
+	use image::{Rgb, RgbImage};
+
+	use super::ycbcr;
+
+	#[test]
+	fn colour_is_converted_with_the_full_range_bt601_matrix() {
+		let primaries = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255], [0, 0, 0]];
+		let image = RgbImage::from_fn(5, 1, |x, _| Rgb(primaries[x as usize]));
+
+		let [y, cb, cr] = ycbcr(&image);
+
+		assert_eq!(y, [76, 150, 29, 255, 0]);
+		assert_eq!(cb, [85, 44, 255, 128, 128]);
+		assert_eq!(cr, [255, 21, 107, 128, 128]);
+	}
 }

@@ -178,6 +178,23 @@ fn a_cmyk_gain_map_is_refused() {
 }
 
 #[test]
+fn a_gain_map_with_more_than_8_bits_is_refused() {
+	let (file, source) = ultra_hdr_gain_map(&gradient(16, 12));
+	let sof = source.jpeg.start
+		+ file[source.jpeg.clone()]
+			.windows(2)
+			.position(|marker| marker == [0xFF, 0xC0])
+			.unwrap();
+	let mut twelve_bit = file.clone();
+	twelve_bit[sof + 4] = 12;
+
+	assert_eq!(
+		decode(&twelve_bit, &source, PHOTO_PIXELS).unwrap_err(),
+		"it is not 8-bit, which is not supported"
+	);
+}
+
+#[test]
 fn a_colour_gain_map_is_encoded_as_4_4_4_8_bit_full_range_av1() {
 	let encoded = encode(&colour_gradient(64, 48).into(), 60.0, 10, 1).unwrap();
 

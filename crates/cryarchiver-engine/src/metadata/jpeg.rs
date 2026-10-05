@@ -143,14 +143,23 @@ fn read_gain_map(bytes: &[u8], mpf: Option<(&[u8], usize)>, trailer: Option<AuxK
 	}
 }
 
-/// The number of colour components the JPEG's frame header declares.
-pub fn components(bytes: &[u8]) -> Option<u8> {
-	SegmentWalk::new(bytes).find_map(|segment| frame_components(segment.marker, segment.payload))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHeader {
+	/// Bits per sample.
+	pub precision: u8,
+	pub components: u8,
 }
 
-fn frame_components(marker: u8, payload: &[u8]) -> Option<u8> {
-	match marker {
-		0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => payload.get(5).copied(),
+/// What the JPEG's frame header declares.
+pub fn frame_header(bytes: &[u8]) -> Option<FrameHeader> {
+	SegmentWalk::new(bytes).find_map(|segment| frame_header_of(segment.marker, segment.payload))
+}
+
+fn frame_header_of(marker: u8, payload: &[u8]) -> Option<FrameHeader> {
+	match (marker, payload) {
+		(0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF, &[precision, _, _, _, _, components, ..]) => {
+			Some(FrameHeader { precision, components })
+		}
 		_ => None,
 	}
 }
@@ -300,8 +309,8 @@ fn read_segment<'a>(marker: u8, payload: &'a [u8], metadata: &mut SourceMetadata
 			.comments
 			.push(String::from_utf8_lossy(payload).trim_end_matches('\0').to_owned()),
 		_ => {
-			if let Some(components) = frame_components(marker, payload) {
-				metadata.jpeg_components = Some(components);
+			if let Some(frame) = frame_header_of(marker, payload) {
+				metadata.jpeg_components = Some(frame.components);
 			}
 		}
 	}

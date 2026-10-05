@@ -554,6 +554,9 @@ fn check_refuses_a_gain_map_item_whose_boxes_disagree_with_its_av1() {
 
 	let other_matrix = replaced(&avif, b"colrnclx\0\x02\0\x02\0\x06", b"colrnclx\0\x02\0\x02\0\x01");
 	assert!(refusal(&other_matrix).contains("sequence header says matrix"));
+
+	let coloured_av1c = replaced(&avif, b"av1C\x81\x1f\x1c", b"av1C\x81\x1f\x0c");
+	assert!(refusal(&coloured_av1c).contains("gain map item's av1C box does not match"));
 }
 
 #[test]
