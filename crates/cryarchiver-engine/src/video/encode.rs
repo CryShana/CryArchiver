@@ -10,7 +10,8 @@ use crate::options::TrimWindow;
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason};
 use crate::probe::{MediaInfo, Stream};
 use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
-use crate::video::plan::{Encoder, Threads, VideoPlan, svt_params};
+use crate::video::analyze::ScanType;
+use crate::video::plan::{Encoder, Threads, VideoPlan, scanned_frames, svt_params};
 use crate::video::streams::{Extracted, StreamPlan};
 use crate::video::{InputStart, Seek, analyze, burn, run_ffmpeg};
 use crate::workspace::Workspace;
@@ -452,7 +453,18 @@ pub async fn encode_video(
 	})
 }
 
-/// `fps` is the video temp's declared rate.
+/// What a video temp's check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TempCheck {
+	Passed(Option<String>),
+	/// Fewer frames than the plan expects, and nothing else wrong: only the source's decoded frames tell whether it
+	/// holds packets that don't decode.
+	FewerFrames {
+		expected: u64,
+	},
+}
+
+/// `inspect_video_temp`, with fewer frames than expected as a failure.
 pub fn check_video_temp(
 	plan: &VideoPlan,
 	encoded: &EncodedVideo,
@@ -460,6 +472,20 @@ pub fn check_video_temp(
 	start_s: f64,
 	fps: Option<f64>,
 ) -> Result<Option<String>, JobError> {
+	match inspect_video_temp(plan, encoded, declared_s, start_s, fps)? {
+		TempCheck::Passed(warning) => Ok(warning),
+		TempCheck::FewerFrames { expected } => Err(frame_count_error(encoded, expected)),
+	}
+}
+
+/// `fps` is the video temp's declared rate.
+pub fn inspect_video_temp(
+	plan: &VideoPlan,
+	encoded: &EncodedVideo,
+	declared_s: Option<f64>,
+	start_s: f64,
+	fps: Option<f64>,
+) -> Result<TempCheck, JobError> {
 	if let Some(declared) = declared_s
 		&& declared - encoded.decoded_s > (declared * DAMAGE_SHARE).max(DAMAGE_FLOOR_S.max(frame_s(fps)) + ROUNDING_S)
 	{
@@ -475,15 +501,18 @@ pub fn check_video_temp(
 	}
 
 	if encoded.decode_errors > 0 {
-		return Ok(Some(format!(
+		return Ok(TempCheck::Passed(Some(format!(
 			"the source has {} decoding errors; glitches are carried over as they are",
 			encoded.decode_errors
-		)));
+		))));
 	}
 
 	match (plan.expected_frames, declared_s) {
+		(Some(expected), _) if encoded.frames + plan.frame_tolerance < expected => {
+			Ok(TempCheck::FewerFrames { expected })
+		}
 		(Some(expected), _) if encoded.frames.abs_diff(expected) > plan.frame_tolerance => {
-			Err(ErrorKind::EncodeFailed(format!("the video has {} frames, {expected} expected", encoded.frames)).into())
+			Err(frame_count_error(encoded, expected))
 		}
 		(None, Some(declared)) if !lasts(plan, encoded, (start_s, declared), fps) => {
 			Err(ErrorKind::EncodeFailed(format!(
@@ -492,8 +521,55 @@ pub fn check_video_temp(
 			))
 			.into())
 		}
-		_ => Ok(None),
+		_ => Ok(TempCheck::Passed(None)),
 	}
+}
+
+/// An encode with fewer frames than the `expected` is kept when the source's main video itself decodes to about as
+/// many: `decoded` frames, counted by decoding only, which the plan's shape turns into frames as `scan` says.
+pub fn undecodable_frames(
+	plan: &VideoPlan,
+	encoded: &EncodedVideo,
+	expected: u64,
+	decoded: u64,
+	scan: ScanType,
+) -> Result<String, JobError> {
+	let decoded = scanned_frames(decoded, scan);
+	if encoded.frames.abs_diff(decoded) > plan.frame_tolerance {
+		return Err(frame_count_error(encoded, expected));
+	}
+
+	Ok(format!(
+		"the source has {} video frames that don't decode; the {} that do were kept",
+		expected.saturating_sub(decoded),
+		encoded.frames
+	))
+}
+
+fn frame_count_error(encoded: &EncodedVideo, expected: u64) -> JobError {
+	ErrorKind::EncodeFailed(format!("the video has {} frames, {expected} expected", encoded.frames)).into()
+}
+
+/// Decodes only the main video of `plan` from `source`, on the plan's decoder and threads, to count its frames.
+pub fn decode_command(ffmpeg: &Path, source: &Path, plan: &VideoPlan) -> ToolCommand {
+	let mut cmd = ToolCommand::new(ffmpeg, STALL_TIMEOUT);
+	cmd.args(["-hide_banner", "-nostdin"])
+		.input(plan.decoder, plan.threads.map(|threads| threads.tool), source)
+		.arg("-map")
+		.arg(format!("0:{}", plan.streams[0]))
+		.args(["-fps_mode", "passthrough", "-f", "null", "-"]);
+	cmd
+}
+
+/// The frames the main video of `plan` decodes to from `source`.
+pub async fn decoded_frames(
+	ffmpeg: &Path,
+	source: &Path,
+	plan: &VideoPlan,
+	cancel: &CancellationToken,
+) -> Result<u64, JobError> {
+	let out = run_ffmpeg(&decode_command(ffmpeg, source, plan), |_| {}, cancel).await?;
+	Ok(out.last_progress.and_then(|progress| progress.frame).unwrap_or(0))
 }
 
 // A declared duration is a length in MP4 but the end timestamp in Matroska's DURATION tag, and the video temp keeps
@@ -1468,6 +1544,105 @@ mod tests {
 				.kind,
 			ErrorKind::EncodeFailed(_)
 		));
+	}
+
+	#[test]
+	fn only_an_encode_short_of_the_expected_frames_asks_for_the_source_count() {
+		let video = plan(svt(), Some(674));
+		let inspect = |encoded: EncodedVideo| inspect_video_temp(&video, &encoded, Some(11.23), 0.0, Some(60.0));
+
+		assert_eq!(
+			inspect(encoded(668, 11.1, 0)).unwrap(),
+			TempCheck::FewerFrames { expected: 674 }
+		);
+		assert_eq!(inspect(encoded(672, 11.2, 0)).unwrap(), TempCheck::Passed(None));
+		assert!(matches!(
+			inspect(encoded(680, 11.3, 0)).unwrap_err().kind,
+			ErrorKind::EncodeFailed(ref reason) if reason == "the video has 680 frames, 674 expected"
+		));
+		assert!(matches!(
+			inspect(encoded(668, 11.1, 3)).unwrap(),
+			TempCheck::Passed(Some(_))
+		));
+		assert!(matches!(
+			inspect(encoded(300, 5.0, 0)).unwrap_err().kind,
+			ErrorKind::SourceDamaged(_)
+		));
+		assert!(matches!(
+			check_video_temp(&video, &encoded(668, 11.1, 0), Some(11.23), 0.0, Some(60.0))
+				.unwrap_err()
+				.kind,
+			ErrorKind::EncodeFailed(ref reason) if reason == "the video has 668 frames, 674 expected"
+		));
+	}
+
+	#[test]
+	fn a_short_encode_is_kept_when_the_source_decodes_to_as_few_frames() {
+		let video = plan(svt(), Some(674));
+		let decide =
+			|decoded: u64| undecodable_frames(&video, &encoded(668, 11.1, 0), 674, decoded, ScanType::Progressive);
+
+		assert_eq!(
+			decide(668).unwrap(),
+			"the source has 6 video frames that don't decode; the 668 that do were kept"
+		);
+		assert_eq!(
+			decide(670).unwrap(),
+			"the source has 4 video frames that don't decode; the 668 that do were kept"
+		);
+		assert!(matches!(
+			decide(671).unwrap_err().kind,
+			ErrorKind::EncodeFailed(ref reason) if reason == "the video has 668 frames, 674 expected"
+		));
+		assert!(decide(674).is_err());
+	}
+
+	#[test]
+	fn the_source_count_is_scanned_like_the_expected_frames() {
+		let deinterlaced = VideoPlan {
+			frame_tolerance: 4,
+			..plan(svt(), Some(1348))
+		};
+		let telecined = plan(svt(), Some(674));
+
+		assert_eq!(
+			undecodable_frames(
+				&deinterlaced,
+				&encoded(1336, 11.1, 0),
+				1348,
+				668,
+				ScanType::Interlaced { top_first: true }
+			)
+			.unwrap(),
+			"the source has 12 video frames that don't decode; the 1336 that do were kept"
+		);
+		assert!(undecodable_frames(&deinterlaced, &encoded(1336, 11.1, 0), 1348, 668, ScanType::Progressive).is_err());
+		assert_eq!(
+			undecodable_frames(&telecined, &encoded(668, 11.1, 0), 674, 835, ScanType::Telecined).unwrap(),
+			"the source has 6 video frames that don't decode; the 668 that do were kept"
+		);
+	}
+
+	#[test]
+	fn the_source_count_decodes_only_the_main_video_on_the_plan_decoder_and_threads() {
+		let video = VideoPlan {
+			decoder: Some("libdav1d"),
+			threads: Some(Threads { tool: 3, svt_lp: 1 }),
+			..plan(svt(), Some(674))
+		};
+
+		let args = joined(&decode_command(Path::new("ffmpeg"), Path::new("in.mp4"), &video));
+
+		assert!(
+			args.starts_with(
+				"-hide_banner -nostdin -c:v libdav1d -threads 3 -filter_threads 3 -filter_complex_threads 3 -i "
+			),
+			"{args}"
+		);
+		assert!(
+			args.ends_with("in.mp4 -map 0:0 -fps_mode passthrough -f null -"),
+			"{args}"
+		);
 	}
 
 	#[test]

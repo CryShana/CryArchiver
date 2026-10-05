@@ -387,12 +387,16 @@ pub fn decodable_frames(main: &Stream, declared_s: Option<f64>, scan: ScanType, 
 		return None;
 	}
 
-	let packets = packets.saturating_sub(undecoded);
-	Some(match scan {
-		ScanType::Progressive => packets,
-		ScanType::Interlaced { .. } => packets * 2,
-		ScanType::Telecined => packets - packets / 5,
-	})
+	Some(scanned_frames(packets.saturating_sub(undecoded), scan))
+}
+
+/// The frames the shape makes of `frames` source frames.
+pub fn scanned_frames(frames: u64, scan: ScanType) -> u64 {
+	match scan {
+		ScanType::Progressive => frames,
+		ScanType::Interlaced { .. } => frames * 2,
+		ScanType::Telecined => frames - frames / 5,
+	}
 }
 
 fn frame_tolerance(scan: ScanType) -> u64 {

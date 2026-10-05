@@ -1320,6 +1320,23 @@ async fn garbage_in_the_middle_of_an_mp4_is_carried_over_with_a_warning() {
 }
 
 #[tokio::test]
+async fn a_video_whose_container_lists_frames_that_dont_decode_keeps_the_frames_that_do() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::undecodable_packets_clip(dir.path(), "paused.mp4");
+
+	let outcome = run(&fast_keeping_any_saving(&clip), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(
+		warnings.contains(&"the source has 8 video frames that don't decode; the 92 that do were kept".to_owned()),
+		"{warnings:?}"
+	);
+	assert_eq!(support::frame_times(&output, 0).len(), 92);
+}
+
+#[tokio::test]
 async fn interlaced_ntsc_with_surround_keeps_double_rate_and_5_1() {
 	let dir = tempfile::tempdir().unwrap();
 	let interlaced = dir.path().join("ntsc.mpg");

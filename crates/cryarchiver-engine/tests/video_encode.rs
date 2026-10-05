@@ -5,13 +5,17 @@ use std::fs;
 use std::process::Command;
 
 use cryarchiver_engine::options::SubtitlePick;
+use cryarchiver_engine::outcome::ErrorKind;
 use cryarchiver_engine::preset::Speed;
 use cryarchiver_engine::probe::{Stream, av1_film_grain, first_frames, probe};
 use cryarchiver_engine::video::VideoStarts;
-use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, analyze};
+use cryarchiver_engine::video::analyze::{DEFAULT_SEGMENTS, NoiseClass, ScanType, analyze};
 use cryarchiver_engine::video::burn::{self, FONT_DIR, SUBTITLE_FILE};
 use cryarchiver_engine::video::colour::{ColourTags, Range, alpha_conversion, output_tags};
-use cryarchiver_engine::video::encode::{check_video_temp, encode_video, extract, video_command};
+use cryarchiver_engine::video::encode::{
+	TempCheck, check_video_temp, decoded_frames, encode_video, extract, inspect_video_temp, undecodable_frames,
+	video_command,
+};
 use cryarchiver_engine::video::plan::{
 	Encoder, VideoCaps, VideoPlan, grain_level, plan_video, precheck, synthesized_grain, usable_main,
 };
@@ -218,6 +222,48 @@ async fn a_truncated_matroska_decodes_short() {
 
 	assert!(encoded.decoded_s < 4.0, "{encoded:?}");
 	assert!(check_video_temp(&video, &encoded, Some(6.0), 0.0, None).is_err());
+}
+
+#[tokio::test]
+async fn a_short_encode_is_kept_only_when_the_source_decodes_to_as_few_frames() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::undecodable_packets_clip(dir.path(), "paused.mp4");
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let whole = plan(Some(100));
+	let losing = VideoPlan {
+		shape: "select=lt(n\\,80)".into(),
+		..plan(Some(100))
+	};
+
+	let decoded = decoded_frames(&tools.ffmpeg, &clip, &whole, &cancel).await.unwrap();
+	let mut decisions = Vec::new();
+	for (name, video) in [("whole.mkv", &whole), ("losing.mkv", &losing)] {
+		let cmd = video_command(&tools.ffmpeg, &clip, &dir.path().join(name), video);
+		let encoded = encode_video(&cmd, video, Some(4.0), |_| {}, &cancel).await.unwrap();
+		let checked = inspect_video_temp(video, &encoded, Some(4.0), 0.0, Some(25.0)).unwrap();
+		let TempCheck::FewerFrames { expected } = checked else {
+			panic!("{name}: {checked:?}")
+		};
+		decisions.push(undecodable_frames(
+			video,
+			&encoded,
+			expected,
+			decoded,
+			ScanType::Progressive,
+		));
+	}
+
+	assert_eq!(decoded, 92);
+	assert_eq!(
+		decisions[0].as_deref().unwrap(),
+		"the source has 8 video frames that don't decode; the 92 that do were kept"
+	);
+	assert!(
+		matches!(&decisions[1], Err(err) if matches!(&err.kind, ErrorKind::EncodeFailed(reason) if reason == "the video has 80 frames, 100 expected")),
+		"{:?}",
+		decisions[1]
+	);
 }
 
 #[tokio::test]

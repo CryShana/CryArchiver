@@ -765,8 +765,8 @@ fn within_step_down_reach(cx: &ImageContext<'_>, size: u64) -> bool {
 
 /// A first encode that saved too little, verified and stepped down once when it cleared the target well. Only the lower
 /// encode can be kept, when it saves enough and then passes; one that saves too little isn't verified. Anything else
-/// leaves the candidate too large, at the smallest size seen that didn't miss the target, and without its score: a
-/// score would turn the keep reason into a missed quality target.
+/// leaves the candidate too large, at the smallest size seen that wasn't shown to miss the target, and without its
+/// score: a score would turn the keep reason into a missed quality target.
 async fn reached_down(
 	cx: &ImageContext<'_>,
 	input: &ImageInput,

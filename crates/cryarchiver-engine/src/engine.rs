@@ -1,8 +1,8 @@
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -41,7 +41,7 @@ use crate::toolchain::{LIBAOM, LIBVPX_VP9, MediaKind, SVT_AV1, Toolchain};
 use crate::video::analyze::{Analysis, ScanType};
 use crate::video::burn::{self, Burn};
 use crate::video::colour::FrameFormat;
-use crate::video::encode::{EncodedVideo, Sample};
+use crate::video::encode::{EncodedVideo, Sample, TempCheck};
 use crate::video::mux::{self, Attachment, CLEAN_STREAM_TAGS, ChapterSource, CueFile, MuxInputs, MuxPlan};
 use crate::video::plan::{
 	self as video_plan, Encoder, VideoCaps, VideoPlan, plan_video, precheck, threads_for, usable_main,
@@ -293,10 +293,28 @@ struct VideoInputs<'a> {
 	span: Option<TrimWindow>,
 	/// The source's size, or under a trim the window's share of it: what a predicted output is weighed against.
 	compared_bytes: u64,
+	source_frames: SourceFrames,
+}
+
+/// The source's main video frames, counted by decoding at most once per job and only when an encode comes out with
+/// fewer frames than the plan expects.
+struct SourceFrames {
+	scan: ScanType,
+	decoded: OnceLock<u64>,
+}
+
+impl SourceFrames {
+	fn new(scan: ScanType) -> Self {
+		Self {
+			scan,
+			decoded: OnceLock::new(),
+		}
+	}
 }
 
 struct AnimationJob<'a> {
 	video: &'a VideoPlan,
+	source_frames: SourceFrames,
 	span_s: Option<f64>,
 	/// The window's share of the source, which the AVIF is weighed against.
 	share: Option<u64>,
@@ -1147,6 +1165,7 @@ impl Engine {
 			declared_s: span_s,
 			span: window.or(declared_s.map(|length_s| TrimWindow { start_s: 0.0, length_s })),
 			compared_bytes,
+			source_frames: SourceFrames::new(analysis.scan),
 		};
 		let tuning = Box::pin(self.choose_crf(cx, workspace, &inputs, &analysis, &mut video, &mut quality)).await?;
 		record_choice(cx, &video, &quality);
@@ -1337,6 +1356,7 @@ impl Engine {
 
 		let job = AnimationJob {
 			video: &video,
+			source_frames: SourceFrames::new(analysis.scan),
 			span_s: span.length_s,
 			share,
 			need: frames_need.map(|need| need.saturating_add(compared)),
@@ -1446,7 +1466,9 @@ impl Engine {
 		let cmd = video_encode::frames_command(&self.tools.ffmpeg, &cx.job.source, &path, video);
 		let on_fraction = |fraction: f64| (cx.on_event)(JobEvent::Progress(fraction / 2.0));
 		let encoded = Box::pin(video_encode::encode_video(&cmd, video, span_s, on_fraction, cx.cancel)).await?;
-		let (frames, warning) = self.video_temp(path, video, &encoded, span_s, cx.cancel).await?;
+		let (frames, warning) = self
+			.video_temp(cx, path, video, &encoded, span_s, &job.source_frames)
+			.await?;
 		warnings.extend(warning);
 
 		let prepared = frames.info.streams.first();
@@ -1896,7 +1918,7 @@ impl Engine {
 
 			(cx.on_event)(JobEvent::EncodeAgain(repeat));
 			(cx.on_event)(JobEvent::Stage(Stage::Encode));
-			Box::pin(self.reencode_video(cx, workspace, inputs.declared_s, video, temps, attempt)).await?;
+			Box::pin(self.reencode_video(cx, workspace, inputs, video, temps, attempt)).await?;
 
 			if !cx.job.options.forced_video(mergeable(inputs.info))
 				&& let Some(reason) = temps_not_smaller(temps, inputs.compared_bytes, cx.job.min_savings)
@@ -1910,7 +1932,7 @@ impl Engine {
 		&self,
 		cx: &Context<'_>,
 		workspace: &Workspace,
-		declared_s: Option<f64>,
+		inputs: &VideoInputs<'_>,
 		video: &VideoPlan,
 		temps: &mut EncodedTemps,
 		attempt: u32,
@@ -1923,13 +1945,15 @@ impl Engine {
 		let encoded = Box::pin(video_encode::encode_video(
 			&cmd,
 			video,
-			declared_s,
+			inputs.declared_s,
 			on_fraction,
 			cx.cancel,
 		))
 		.await?;
 
-		let (temp, _) = self.video_temp(path, video, &encoded, declared_s, cx.cancel).await?;
+		let (temp, _) = self
+			.video_temp(cx, path, video, &encoded, inputs.declared_s, &inputs.source_frames)
+			.await?;
 		temps.video = temp;
 		temps.encoded = encoded;
 		Ok(())
@@ -1937,17 +1961,45 @@ impl Engine {
 
 	async fn video_temp(
 		&self,
+		cx: &Context<'_>,
 		path: PathBuf,
 		video: &VideoPlan,
 		encoded: &EncodedVideo,
 		declared_s: Option<f64>,
-		cancel: &CancellationToken,
+		source_frames: &SourceFrames,
 	) -> Result<(Temp, Option<String>), JobError> {
-		let info = probe_temp(&self.tools, &path, cancel).await?;
+		let info = probe_temp(&self.tools, &path, cx.cancel).await?;
 		let start_s = earliest_video_start(&info).unwrap_or(0.0);
 		let fps = info.real_video_streams().next().and_then(Stream::fps);
-		let warning = video_encode::check_video_temp(video, encoded, declared_s, start_s, fps)?;
+
+		let warning = match video_encode::inspect_video_temp(video, encoded, declared_s, start_s, fps)? {
+			TempCheck::Passed(warning) => warning,
+			TempCheck::FewerFrames { expected } => {
+				let decoded = self.decoded_source_frames(cx, video, source_frames).await?;
+				Some(video_encode::undecodable_frames(
+					video,
+					encoded,
+					expected,
+					decoded,
+					source_frames.scan,
+				)?)
+			}
+		};
 		Ok((Temp { path, info }, warning))
+	}
+
+	async fn decoded_source_frames(
+		&self,
+		cx: &Context<'_>,
+		video: &VideoPlan,
+		source_frames: &SourceFrames,
+	) -> Result<u64, JobError> {
+		if let Some(&decoded) = source_frames.decoded.get() {
+			return Ok(decoded);
+		}
+
+		let decoded = video_encode::decoded_frames(&self.tools.ffmpeg, &cx.job.source, video, cx.cancel).await?;
+		Ok(*source_frames.decoded.get_or_init(|| decoded))
 	}
 
 	async fn sample_gate(
@@ -2209,7 +2261,7 @@ impl Engine {
 		)?;
 
 		let (video_temp, warning) = self
-			.video_temp(video_path, video, &encoded, declared_s, cx.cancel)
+			.video_temp(cx, video_path, video, &encoded, declared_s, &inputs.source_frames)
 			.await?;
 
 		let audio = match (&audio_plan, &source_levels) {

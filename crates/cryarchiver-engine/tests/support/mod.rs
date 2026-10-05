@@ -462,6 +462,33 @@ pub fn subtitled_clip(dir: &Path, name: &str, picture: &Picture<'_>, subtitles: 
 	clip
 }
 
+/// A 4-second 25 fps HEVC MP4 whose MP4 lists 100 video packets but decodes to 92 frames: the leading pictures of
+/// its open GOPs were taken out, which leaves their packets holding only an access unit delimiter.
+pub fn undecodable_packets_clip(dir: &Path, name: &str) -> PathBuf {
+	let open_gops = video(
+		dir,
+		"open-gops.mp4",
+		4,
+		&[
+			"-map",
+			"0:v",
+			"-c:v",
+			"libx265",
+			"-x265-params",
+			"keyint=25:min-keyint=25:open-gop=1:bframes=3:aud=1:bitrate=4000:log-level=error",
+			"-pix_fmt",
+			"yuv420p",
+		],
+	);
+	converted(
+		dir,
+		name,
+		&[],
+		&open_gops,
+		&["-c", "copy", "-bsf:v", "filter_units=remove_types=8|9"],
+	)
+}
+
 /// `source` rewritten into `dir/name` by ffmpeg, with `before` as input options and `after` as output options.
 pub fn converted(dir: &Path, name: &str, before: &[&str], source: &Path, after: &[&str]) -> PathBuf {
 	let out = dir.join(name);
