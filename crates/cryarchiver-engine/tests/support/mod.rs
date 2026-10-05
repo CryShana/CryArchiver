@@ -2,6 +2,7 @@
 
 pub mod heif;
 pub mod tiff;
+pub mod ultra_hdr;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

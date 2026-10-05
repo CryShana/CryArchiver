@@ -279,6 +279,8 @@ pub fn values(xmp: &str, namespace: &str, local: &str) -> Vec<String> {
 	let mut reader = NsReader::from_str(xmp);
 	let mut found = Vec::new();
 	let mut text: Option<String> = None;
+	let mut depth = 0usize;
+	let mut items_below: Option<usize> = None;
 
 	loop {
 		let Ok((resolved, event)) = reader.read_resolved_event() else {
@@ -286,7 +288,8 @@ pub fn values(xmp: &str, namespace: &str, local: &str) -> Vec<String> {
 		};
 		match event {
 			Event::Start(ref start) | Event::Empty(ref start) => {
-				let matching = is(bound(&resolved, start.local_name()).as_ref(), namespace, local);
+				let name = bound(&resolved, start.local_name());
+				let matching = is(name.as_ref(), namespace, local);
 				for attribute in start.attributes().flatten() {
 					let (resolved, name) = reader.resolver().resolve_attribute(attribute.key);
 					if is(bound(&resolved, name).as_ref(), namespace, local)
@@ -295,7 +298,16 @@ pub fn values(xmp: &str, namespace: &str, local: &str) -> Vec<String> {
 						found.push(value.into_owned());
 					}
 				}
-				text = (matches!(event, Event::Start(_)) && matching).then(String::new);
+
+				let is_start = matches!(event, Event::Start(_));
+				let item = items_below.is_some() && is(name.as_ref(), RDF, "li");
+				text = (is_start && (matching || item)).then(String::new);
+				if is_start {
+					if matching && items_below.is_none() {
+						items_below = Some(depth);
+					}
+					depth += 1;
+				}
 			}
 			Event::Text(ref content) => {
 				if let Some(text) = &mut text {
@@ -314,8 +326,12 @@ pub fn values(xmp: &str, namespace: &str, local: &str) -> Vec<String> {
 				}
 			}
 			Event::End(_) => {
+				depth = depth.saturating_sub(1);
 				if let Some(text) = text.take() {
 					found.push(text.trim().to_owned());
+				}
+				if items_below == Some(depth) {
+					items_below = None;
 				}
 			}
 			Event::Eof => return found,

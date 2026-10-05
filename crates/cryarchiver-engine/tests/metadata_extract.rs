@@ -3,11 +3,13 @@ mod support;
 use std::io::Write;
 
 use cryarchiver_engine::container::jxl::{Codestream, JxlMetadata, write_container};
+use cryarchiver_engine::metadata::gain_map::{Channel, GainMapMetadata, Signed, Unsigned};
 use cryarchiver_engine::metadata::icc::Cicp;
 use cryarchiver_engine::metadata::{AuxKind, ImageFormat, extract, sniff};
 use moxcms::ColorProfile;
 use support::heif::{HeifFile, HeifItem, aux_c, colr_icc, colr_nclx, exif_item, ispe};
 use support::tiff::{Entry, tiff};
+use support::ultra_hdr::{UltraHdrOptions, ultra_hdr_jpeg};
 
 const EXTENDED_GUID: &str = "83DE3BB8A00448E560FFAD25263768DF";
 
@@ -264,6 +266,191 @@ fn videos_after_the_image_and_motion_photo_xmp_are_auxiliary() {
 		extract(&[plain, vec![0x42; 5000]].concat()).aux,
 		[AuxKind::Other("5000 bytes after the image".into())]
 	);
+}
+
+fn ultra_hdr(opts: &UltraHdrOptions) -> Vec<u8> {
+	let base = image::RgbImage::from_fn(64, 48, |x, y| {
+		image::Rgb([u8::try_from(x * 4).unwrap(), u8::try_from(y * 5).unwrap(), 90])
+	});
+	let gain = image::GrayImage::from_fn(16, 12, |x, y| image::Luma([u8::try_from(x * 15 + y).unwrap()]));
+	ultra_hdr_jpeg(&base, &gain, opts)
+}
+
+fn three_channel_metadata() -> GainMapMetadata {
+	let mut metadata = UltraHdrOptions::default().metadata;
+	let channel = metadata.channels[0];
+	metadata.channels = [2, 3, 4]
+		.map(|max| Channel {
+			max: Signed {
+				numerator: max,
+				denominator: 1,
+			},
+			..channel
+		})
+		.to_vec();
+	metadata
+}
+
+#[test]
+fn an_ultra_hdr_gain_map_is_found_with_its_metadata() {
+	let opts = UltraHdrOptions::default();
+	let bytes = ultra_hdr(&opts);
+
+	let metadata = extract(&bytes);
+	let gain_map = metadata.gain_map.expect("a gain map");
+	let decoded = image::load_from_memory_with_format(&bytes[gain_map.jpeg.clone()], image::ImageFormat::Jpeg).unwrap();
+
+	assert_eq!((decoded.width(), decoded.height()), (16, 12));
+	assert_eq!(decoded.color(), image::ColorType::L8);
+	assert_eq!(gain_map.jpeg.end, bytes.len());
+	assert_eq!(gain_map.metadata, opts.metadata);
+	assert!(metadata.warnings.is_empty(), "{:?}", metadata.warnings);
+}
+
+#[test]
+fn gain_map_metadata_comes_from_iso_or_xmp() {
+	let three = three_channel_metadata();
+	let xmp_only = UltraHdrOptions {
+		iso: false,
+		metadata: three.clone(),
+		..UltraHdrOptions::default()
+	};
+	let iso_only = UltraHdrOptions {
+		xmp: false,
+		metadata: three.clone(),
+		..UltraHdrOptions::default()
+	};
+	let common = |numerator| Signed {
+		numerator,
+		denominator: 640,
+	};
+	let legacy = UltraHdrOptions {
+		legacy_common_denominator: true,
+		metadata: GainMapMetadata {
+			use_base_colour_space: true,
+			base_headroom: Unsigned {
+				numerator: 0,
+				denominator: 640,
+			},
+			alternate_headroom: Unsigned {
+				numerator: 1472,
+				denominator: 640,
+			},
+			channels: vec![Channel {
+				min: common(0),
+				max: common(1472),
+				gamma: Unsigned {
+					numerator: 640,
+					denominator: 640,
+				},
+				base_offset: common(10),
+				alternate_offset: common(10),
+			}],
+		},
+		..UltraHdrOptions::default()
+	};
+	let disagreeing = UltraHdrOptions {
+		xmp_metadata: Some(three.clone()),
+		..UltraHdrOptions::default()
+	};
+
+	let found = |opts: &UltraHdrOptions| extract(&ultra_hdr(opts)).gain_map.expect("a gain map").metadata;
+
+	assert_eq!(found(&xmp_only), three);
+	assert_eq!(found(&iso_only), three);
+	assert_eq!(found(&legacy), legacy.metadata);
+	assert_eq!(found(&disagreeing), UltraHdrOptions::default().metadata);
+}
+
+#[test]
+fn a_gain_map_is_found_without_mpf_and_before_a_trailer() {
+	let without_mpf = ultra_hdr(&UltraHdrOptions {
+		mpf: false,
+		..UltraHdrOptions::default()
+	});
+	let trailer: Vec<u8> = [b"SEFH".as_slice(), &[0x5A; 2040], b"SEFT"].concat();
+	let with_trailer = ultra_hdr(&UltraHdrOptions {
+		trailer: Some(trailer.clone()),
+		..UltraHdrOptions::default()
+	});
+
+	let without_mpf = extract(&without_mpf).gain_map.expect("found by the second image");
+	let with_trailer_found = extract(&with_trailer).gain_map.expect("found before the trailer");
+
+	assert_eq!(without_mpf.metadata, UltraHdrOptions::default().metadata);
+	assert_eq!(with_trailer_found.jpeg.end, with_trailer.len() - trailer.len());
+	assert_eq!(&with_trailer[with_trailer_found.jpeg.start..][..3], [0xFF, 0xD8, 0xFF]);
+}
+
+#[test]
+fn a_plain_jpeg_has_no_gain_map() {
+	let mut plain = Vec::new();
+	image::codecs::jpeg::JpegEncoder::new_with_quality(&mut plain, 90)
+		.encode_image(&image::RgbImage::new(16, 16))
+		.unwrap();
+
+	let metadata = extract(&plain);
+
+	assert_eq!(metadata.gain_map, None);
+	assert!(metadata.warnings.is_empty(), "{:?}", metadata.warnings);
+	assert!(metadata.aux_without_gain_map().is_empty());
+}
+
+#[test]
+fn the_carried_gain_map_leaves_only_other_auxiliary_images() {
+	let ultra_hdr_file = extract(&ultra_hdr(&UltraHdrOptions::default()));
+	let with_depth = extract(&ultra_hdr(&UltraHdrOptions {
+		depth_item: true,
+		..UltraHdrOptions::default()
+	}));
+
+	assert_eq!(
+		ultra_hdr_file.aux,
+		[
+			AuxKind::Other("MPF image type 0x000000".into()),
+			AuxKind::GainMap("Ultra HDR".into()),
+			AuxKind::GainMap("ISO 21496-1 metadata".into()),
+		]
+	);
+	assert!(
+		ultra_hdr_file.aux_without_gain_map().is_empty(),
+		"{:?}",
+		ultra_hdr_file.aux_without_gain_map()
+	);
+	assert_eq!(
+		with_depth.aux_without_gain_map(),
+		[&AuxKind::Depth("container item".into())]
+	);
+}
+
+#[test]
+fn an_unrelated_mpf_image_of_the_same_type_is_still_reported() {
+	let mut metadata = extract(&ultra_hdr(&UltraHdrOptions::default()));
+	metadata.aux.push(AuxKind::Other("MPF image type 0x000000".into()));
+
+	assert_eq!(
+		metadata.aux_without_gain_map(),
+		[&AuxKind::Other("MPF image type 0x000000".into())]
+	);
+}
+
+#[test]
+fn a_cut_off_gain_map_is_a_warning() {
+	let mut bytes = ultra_hdr(&UltraHdrOptions::default());
+	bytes.truncate(bytes.len() - 20);
+
+	let metadata = extract(&bytes);
+
+	assert_eq!(metadata.gain_map, None);
+	assert!(
+		metadata
+			.warnings
+			.iter()
+			.any(|warning| warning.starts_with("the HDR gain map can't be read: ")),
+		"{:?}",
+		metadata.warnings
+	);
+	assert_eq!(metadata.aux_without_gain_map().len(), metadata.aux.len());
 }
 
 fn chunk(kind: [u8; 4], body: &[u8]) -> Vec<u8> {

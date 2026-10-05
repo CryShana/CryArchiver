@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 
-use crate::metadata::{AuxKind, SourceMetadata, auxiliary, xmp};
+use crate::metadata::{AuxKind, SourceMetadata, auxiliary, gain_map, xmp};
 
 const EXIF: &[u8] = b"Exif\0\0";
-const XMP: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+pub(super) const XMP: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 const EXTENDED_XMP: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
 const MAX_EXTENDED_XMP: usize = 64 << 20;
 const ICC: &[u8] = b"ICC_PROFILE\0";
 const MPF: &[u8] = b"MPF\0";
-const ISO_GAIN_MAP: &[u8] = b"urn:iso:std:iso:ts:21496:-1\0";
+pub(super) const ISO_GAIN_MAP: &[u8] = b"urn:iso:std:iso:ts:21496:-1\0";
 const PHOTOSHOP: &[u8] = b"Photoshop 3.0\0";
 const ADOBE: &[u8] = b"Adobe";
 const APP1: u8 = 0xE1;
@@ -77,7 +77,7 @@ pub(super) fn extract(bytes: &[u8]) -> SourceMetadata {
 	{
 		metadata.aux.push(trailer);
 	}
-	finish(&mut metadata, segments);
+	finish(bytes, &mut metadata, segments);
 	metadata
 }
 
@@ -198,7 +198,7 @@ fn read_segment<'a>(marker: u8, payload: &'a [u8], metadata: &mut SourceMetadata
 	}
 }
 
-fn finish(metadata: &mut SourceMetadata, segments: Segments<'_>) {
+fn finish(bytes: &[u8], metadata: &mut SourceMetadata, segments: Segments<'_>) {
 	if !segments.icc_chunks.is_empty() {
 		match reassemble_icc(segments.icc_chunks) {
 			Ok(icc) => metadata.icc = Some(icc),
@@ -241,6 +241,20 @@ fn finish(metadata: &mut SourceMetadata, segments: Segments<'_>) {
 		metadata
 			.aux
 			.push(crate::metadata::AuxKind::GainMap("ISO 21496-1 metadata".into()));
+	}
+
+	match gain_map::find(bytes, segments.mpf.map(|mpf| (mpf, segments.mpf_at))) {
+		Some(Ok(found)) => {
+			metadata.gain_map_mpf_entry = segments.mpf.and_then(|mpf| {
+				let offset = found.jpeg.start.checked_sub(segments.mpf_at)?;
+				auxiliary::mpf_entry_at(mpf, offset)
+			});
+			metadata.gain_map = Some(found);
+		}
+		Some(Err(reason)) => metadata
+			.warnings
+			.push(format!("the HDR gain map can't be read: {reason}")),
+		None => {}
 	}
 }
 

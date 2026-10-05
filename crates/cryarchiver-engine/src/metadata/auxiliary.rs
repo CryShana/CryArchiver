@@ -7,33 +7,42 @@ const MP_THUMBNAIL_CLASS: u32 = 0x01_0000;
 const MP_PANORAMA: u32 = 0x02_0001;
 const MP_DISPARITY: u32 = 0x02_0002;
 const MP_MULTI_ANGLE: u32 = 0x02_0003;
-const HDR_GAIN_MAP: &str = "http://ns.adobe.com/hdr-gain-map/1.0/";
+pub(super) const HDR_GAIN_MAP: &str = "http://ns.adobe.com/hdr-gain-map/1.0/";
 const GOOGLE_DEPTH: &str = "http://ns.google.com/photos/1.0/depthmap/";
 const GOOGLE_IMAGE: &str = "http://ns.google.com/photos/1.0/image/";
 const GOOGLE_ITEM: &str = "http://ns.google.com/photos/1.0/container/item/";
 const GOOGLE_CAMERA: &str = "http://ns.google.com/photos/1.0/camera/";
 
-struct MpEntry {
-	kind: u32,
-	size: u32,
-	offset: u32,
+pub(crate) struct MpEntry {
+	pub kind: u32,
+	pub size: u32,
+	pub offset: u32,
 }
 
 pub fn from_mpf(mpf: &[u8]) -> Result<Vec<AuxKind>, String> {
-	let mut found = Vec::new();
-	for entry in mp_entries(mpf)? {
-		let kind = entry.kind & 0x00FF_FFFF;
-		let aux = match kind {
-			MP_PRIMARY => continue,
-			_ if kind & 0xFF_FF00 == MP_THUMBNAIL_CLASS => continue,
+	Ok(mp_entries(mpf)?.iter().filter_map(MpEntry::aux).collect())
+}
+
+pub(crate) fn mpf_entry_at(mpf: &[u8], offset: usize) -> Option<AuxKind> {
+	mp_entries(mpf)
+		.ok()?
+		.iter()
+		.find(|entry| usize::try_from(entry.offset) == Ok(offset))
+		.and_then(MpEntry::aux)
+}
+
+impl MpEntry {
+	fn aux(&self) -> Option<AuxKind> {
+		let kind = self.kind & 0x00FF_FFFF;
+		Some(match kind {
+			MP_PRIMARY => return None,
+			_ if kind & 0xFF_FF00 == MP_THUMBNAIL_CLASS => return None,
 			MP_PANORAMA => AuxKind::Other("MPF panorama frame".into()),
 			MP_DISPARITY => AuxKind::Depth("MPF disparity image".into()),
 			MP_MULTI_ANGLE => AuxKind::Other("MPF multi-angle frame".into()),
 			other => AuxKind::Other(format!("MPF image type 0x{other:06X}")),
-		};
-		found.push(aux);
+		})
 	}
-	Ok(found)
 }
 
 pub fn mpf_images_end(mpf: &[u8]) -> Option<usize> {
@@ -45,7 +54,7 @@ pub fn mpf_images_end(mpf: &[u8]) -> Option<usize> {
 		.max()
 }
 
-fn mp_entries(mpf: &[u8]) -> Result<Vec<MpEntry>, String> {
+pub(crate) fn mp_entries(mpf: &[u8]) -> Result<Vec<MpEntry>, String> {
 	let little = match mpf.get(..4) {
 		Some(b"II*\0") => true,
 		Some(b"MM\0*") => false,

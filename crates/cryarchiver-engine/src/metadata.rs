@@ -1,5 +1,6 @@
 pub mod auxiliary;
 pub mod exif;
+pub mod gain_map;
 pub mod gif;
 pub mod icc;
 pub mod iptc;
@@ -12,6 +13,7 @@ pub mod xmp;
 use std::fmt;
 
 use crate::container::{isobmff, jxl};
+use crate::metadata::gain_map::GainMapSource;
 use crate::metadata::icc::Cicp;
 pub use crate::metadata::output::{MetadataMode, OutputMetadata, build_output};
 
@@ -69,7 +71,33 @@ pub struct SourceMetadata {
 	pub jpeg_components: Option<u8>,
 	pub adobe_transform: Option<u8>,
 	pub aux: Vec<AuxKind>,
+	pub gain_map: Option<GainMapSource>,
+	/// The `aux` entry that the gain map's own MPF entry produced.
+	pub gain_map_mpf_entry: Option<AuxKind>,
 	pub warnings: Vec<String>,
+}
+
+impl SourceMetadata {
+	pub fn aux_without_gain_map(&self) -> Vec<&AuxKind> {
+		if self.gain_map.is_none() {
+			return self.aux.iter().collect();
+		}
+
+		let mut mpf_entry = self.gain_map_mpf_entry.as_ref();
+		self.aux
+			.iter()
+			.filter(|aux| {
+				if matches!(aux, AuxKind::GainMap(_)) {
+					return false;
+				}
+				if mpf_entry == Some(*aux) {
+					mpf_entry = None;
+					return false;
+				}
+				true
+			})
+			.collect()
+	}
 }
 
 pub fn sniff(bytes: &[u8]) -> ImageFormat {
