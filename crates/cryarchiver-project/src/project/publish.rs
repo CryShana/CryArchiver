@@ -28,6 +28,7 @@ pub(super) struct ActiveFilter {
 	needle: String,
 	state: Option<StateFilter>,
 	hits: HashSet<FileId>,
+	issue_folders: HashSet<FolderId>,
 }
 
 #[derive(Debug)]
@@ -367,7 +368,8 @@ impl Owner {
 	}
 
 	/// Matches and their ancestors, in display order: a folder, its subfolders, then its matching files. A folder whose
-	/// name matches the query is shown too, without files of its own unless they match.
+	/// name matches the query is shown too, without files of its own unless they match. An issues filter also matches
+	/// the folders that are open issues themselves, so without a query its count equals [`Overall::open_issues`].
 	pub(super) fn set_filter(&mut self, query: String, state: Option<StateFilter>) {
 		if query.is_empty() && state.is_none() {
 			self.view.filter = None;
@@ -376,8 +378,13 @@ impl Owner {
 		}
 
 		let needle = query.to_lowercase();
+		let issue_folders = self.issue_folders(&needle, state);
 		let mut hits: HashSet<FileId> = HashSet::new();
 		let mut kept = vec![false; self.tree.folder_count()];
+		for &folder in &issue_folders {
+			kept[folder.0 as usize] = true;
+		}
+
 		for folder in self.tree.folder_ids().rev() {
 			let entry = self.tree.folder(folder);
 			for &file in &entry.files {
@@ -401,7 +408,7 @@ impl Owner {
 		let view = FilterView {
 			query: query.clone(),
 			state,
-			matching_files: hits.len(),
+			matching_files: hits.len() + issue_folders.len(),
 			rows,
 		};
 		self.view.filter = Some(ActiveFilter {
@@ -409,12 +416,14 @@ impl Owner {
 			needle,
 			state,
 			hits,
+			issue_folders,
 		});
 		self.send(Update::Filter(Some(view)));
 	}
 
-	/// A state filter follows the run: when a changed file joins or leaves it, the result is sent again. Only the files
-	/// that changed since the last publish are checked, and the result is rebuilt at most once per publish.
+	/// A state filter follows the run: when a changed file or an unreadable folder joins or leaves it, the result is
+	/// sent again. Only the files that changed since the last publish are checked, and the result is rebuilt at most
+	/// once per publish.
 	fn refilter_if_moved(&mut self) {
 		let Some(filter) = self.view.filter.as_ref().filter(|filter| filter.state.is_some()) else {
 			return;
@@ -424,7 +433,8 @@ impl Owner {
 			.view
 			.dirty_files
 			.iter()
-			.any(|&file| self.filter_passes(file, &filter.needle, filter.state) != filter.hits.contains(&file));
+			.any(|&file| self.filter_passes(file, &filter.needle, filter.state) != filter.hits.contains(&file))
+			|| self.issue_folders(&filter.needle, filter.state) != filter.issue_folders;
 		if moved {
 			let (query, state) = (filter.query.clone(), filter.state);
 			self.set_filter(query, state);
@@ -438,7 +448,22 @@ impl Owner {
 			&& (needle.is_empty() || name_matches(&entry.name, needle))
 	}
 
-	/// The same membership the outcome counts in [`Overall`] use.
+	/// The folders an issues filter matches: the unreadable ones that count in [`Overall::open_issues`] beside the files.
+	fn issue_folders(&self, needle: &str, state: Option<StateFilter>) -> HashSet<FolderId> {
+		if state != Some(StateFilter::Issues) {
+			return HashSet::new();
+		}
+
+		self.unreadable_issues()
+			.map(|(folder, _)| folder)
+			.filter(|&folder| {
+				needle.is_empty() || (folder != FolderId::ROOT && name_matches(&self.tree.folder(folder).name, needle))
+			})
+			.collect()
+	}
+
+	/// File membership as the outcome counts in [`Overall`] have it; the issues count also holds unreadable folders,
+	/// which [`Self::issue_folders`] adds.
 	fn in_state(&self, file: FileId, state: StateFilter) -> bool {
 		let output = self.tree.file(file).record.state.output();
 		match state {
@@ -930,6 +955,41 @@ mod tests {
 			[rows(&[(0, "/"), (1, "queued.txt")])],
 			"a file that leaves the project leaves the result"
 		);
+	}
+
+	#[test]
+	fn an_issues_filter_counts_what_the_issues_count_counts() {
+		let dir = tempfile::tempdir().unwrap();
+		let (mut owner, updates) = outcomes(dir.path());
+		let city = owner.tree.folder_id(&key("Photos/City")).unwrap();
+		owner.scan.unreadable.insert(city, "access denied".into());
+		let matching = |updates: &Receiver<Update>| {
+			updates
+				.try_iter()
+				.filter_map(|update| match update {
+					Update::Filter(Some(view)) => Some((view.matching_files, view.rows.len())),
+					_ => None,
+				})
+				.collect::<Vec<_>>()
+		};
+
+		owner.set_filter(String::new(), Some(StateFilter::Issues));
+		assert_eq!(owner.overall().open_issues, 2);
+		assert_eq!(
+			matching(&updates),
+			[(2, 5)],
+			"the failed file and the unreadable folder, under the root, Docs and Photos"
+		);
+
+		owner.set_filter("CITY".into(), Some(StateFilter::Issues));
+		assert_eq!(matching(&updates), [(1, 3)]);
+
+		owner.set_filter(String::new(), Some(StateFilter::Issues));
+		updates.try_iter().for_each(drop);
+		owner.acknowledge_unreadable(city);
+		owner.publish();
+		assert_eq!(owner.overall().open_issues, 1);
+		assert_eq!(matching(&updates), [(1, 3)], "an acknowledged folder leaves the result");
 	}
 
 	#[test]

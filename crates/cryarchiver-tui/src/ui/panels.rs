@@ -24,7 +24,7 @@ const MAX_GAUGE: usize = 24;
 const MAX_CODEC: usize = 4;
 const MIN_STATUS: usize = 7;
 const MAX_STATUS: usize = 18;
-/// The groups of the outcomes line, in the order they are drawn.
+/// The groups of the outcomes line, in the order they are drawn and their hits are assigned.
 const OUTCOMES: [StateFilter; 3] = [StateFilter::Issues, StateFilter::Kept, StateFilter::Duplicates];
 
 /// The Overall panel's lines and border at this terminal width. Workers and System are drawn into whatever height the
@@ -234,29 +234,17 @@ fn counts_line<'a>(overall: &Overall, cells: usize, theme: &Theme) -> Line<'a> {
 /// Library is filtered by is highlighted without changing a cell's width. When the words don't fit, the counts stand
 /// alone, so every group stays on screen.
 fn outcomes_line<'a>(overall: &Overall, cells: usize, theme: &Theme, active: Option<StateFilter>) -> Line<'a> {
-	let groups = [
-		(
-			StateFilter::Issues,
+	let groups = OUTCOMES.map(|state| match state {
+		StateFilter::Issues => (
+			state,
 			"! ",
 			bold(theme.error),
 			overall.open_issues.to_string(),
 			" issues",
 		),
-		(
-			StateFilter::Kept,
-			"= ",
-			fg(theme.warn),
-			thousands(overall.kept),
-			" kept",
-		),
-		(
-			StateFilter::Duplicates,
-			"↪ ",
-			fg(theme.search),
-			thousands(overall.duplicates),
-			" dup",
-		),
-	];
+		StateFilter::Kept => (state, "= ", fg(theme.warn), thousands(overall.kept), " kept"),
+		StateFilter::Duplicates => (state, "↪ ", fg(theme.search), thousands(overall.duplicates), " dup"),
+	});
 	let full_width: usize = groups
 		.iter()
 		.map(|(_, glyph, _, count, word)| width(glyph) + width(count) + width(word))

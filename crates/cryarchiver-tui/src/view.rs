@@ -386,7 +386,8 @@ impl Library {
 	}
 }
 
-/// Narrows the Library to files with one outcome, as the Overall panel counts them.
+/// Narrows the Library to files with one outcome, as the Overall panel counts them. The issues of folders show as
+/// their folders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateFilter {
 	Issues,
@@ -430,6 +431,7 @@ pub struct FilterResult {
 	pub query: String,
 	pub state: Option<StateFilter>,
 	pub rows: Vec<FilterRow>,
+	/// Under an issues filter, the issues of folders count too, so it equals [`Overall::open_issues`].
 	pub matching_files: usize,
 }
 

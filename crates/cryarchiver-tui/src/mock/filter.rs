@@ -7,6 +7,9 @@ use crate::view::{FileId, FileRow, FileState, Filter, FilterEntry, FilterResult,
 struct Matches {
 	kept: Vec<bool>,
 	files: BTreeMap<NodeId, Vec<usize>>,
+	/// Under an issues filter, the issues that belong to a folder rather than a file, each counted like the Overall
+	/// panel counts it.
+	folder_issues: usize,
 }
 
 impl MockSource {
@@ -45,7 +48,7 @@ impl MockSource {
 
 	fn compute_filter(&self, filter: Filter) -> FilterResult {
 		let matches = self.matches(&filter);
-		let matching_files = matches.files.values().map(Vec::len).sum();
+		let matching_files = matches.files.values().map(Vec::len).sum::<usize>() + matches.folder_issues;
 
 		let mut rows = Vec::new();
 		self.filtered_rows(self.view.library.root(), 0, &matches, &mut rows);
@@ -85,6 +88,20 @@ impl MockSource {
 		}
 
 		let mut kept = vec![false; library.len()];
+		let issue_folders: Vec<NodeId> = self
+			.view
+			.issues
+			.iter()
+			.filter(|issue| filter.state == Some(StateFilter::Issues) && issue.file.is_none())
+			.filter_map(|issue| issue.folder)
+			.filter(|&folder| {
+				filter.query.is_empty() || find_ignore_case(&library.node(folder).name, &filter.query).is_some()
+			})
+			.collect();
+		for &folder in &issue_folders {
+			kept[folder.index()] = true;
+		}
+
 		for folder in library.ids().rev() {
 			let node = library.node(folder);
 			kept[folder.index()] |=
@@ -96,7 +113,11 @@ impl MockSource {
 			}
 		}
 
-		Matches { kept, files }
+		Matches {
+			kept,
+			files,
+			folder_issues: issue_folders.len(),
+		}
 	}
 
 	fn filtered_rows(&self, folder: NodeId, depth: u16, matches: &Matches, rows: &mut Vec<FilterRow>) {

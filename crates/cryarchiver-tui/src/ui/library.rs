@@ -146,10 +146,13 @@ fn library_title(ui: &Ui) -> String {
 	}
 
 	if let Some(state) = ui.filter.state {
-		let count = match ui.tree.matching_files() {
-			Some(1) => "1 file".to_owned(),
-			Some(count) => format!("{} files", thousands(u64::try_from(count).unwrap_or(u64::MAX))),
-			None => "…".to_owned(),
+		let count = match (ui.tree.matching_files(), state) {
+			(None, _) => "…".to_owned(),
+			(Some(count), StateFilter::Issues) => {
+				format!("{} open", thousands(u64::try_from(count).unwrap_or(u64::MAX)))
+			}
+			(Some(1), _) => "1 file".to_owned(),
+			(Some(count), _) => format!("{} files", thousands(u64::try_from(count).unwrap_or(u64::MAX))),
 		};
 		title = format!("{title} · {} · {count}", state.label());
 	}

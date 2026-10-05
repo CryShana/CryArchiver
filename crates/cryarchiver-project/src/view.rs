@@ -153,10 +153,11 @@ pub enum FilterEntry {
 	File { folder: FolderId, row: FileRow },
 }
 
-/// Narrows the filter to files with one outcome. Folders then show only as the ancestors of matching files.
+/// Narrows the filter to files with one outcome. Folders then show only as the ancestors of matches, or as matches
+/// of an issues filter themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateFilter {
-	/// Files with an open issue.
+	/// Files with an open issue, and the folders that are open issues themselves.
 	Issues,
 	/// Files whose original was kept because the encode didn't save enough.
 	Kept,
@@ -170,6 +171,8 @@ pub struct FilterView {
 	pub state: Option<StateFilter>,
 	/// Matches and their ancestors in display order, each with its depth below the root.
 	pub rows: Vec<(u16, FilterEntry)>,
+	/// Under an issues filter, the folders that are open issues themselves count too, as in
+	/// [`Overall::open_issues`].
 	pub matching_files: usize,
 }
 

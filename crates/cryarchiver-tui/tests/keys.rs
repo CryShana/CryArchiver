@@ -1154,14 +1154,15 @@ fn clicking_an_outcome_filters_the_library_and_clicking_it_again_clears_it() {
 		Some(StateFilter::Issues),
 		"the glyph is part of the group"
 	);
-	let with_issues = app
-		.source()
-		.view()
-		.issues
-		.iter()
-		.filter(|issue| issue.file.is_some())
-		.count();
+	let view = app.source().view();
+	let with_issues = view.issues.iter().filter(|issue| issue.file.is_some()).count();
 	assert_eq!(shown_files(&app).len(), with_issues);
+	assert!(with_issues < view.issues.len(), "the demo also has issues of folders");
+	assert_eq!(
+		app.source().filter().unwrap().matching_files as u64,
+		view.overall.open_issues,
+		"the filter counts what the issues count counts"
+	);
 
 	draw(&mut app, 160, 45);
 	click(&mut app, issues + 2, row, Instant::now());
@@ -1247,7 +1248,7 @@ fn a_state_filter_without_files_says_so() {
 	click(&mut app, issues, row, Instant::now());
 
 	let terminal = draw(&mut app, 160, 45);
-	assert!(find_row(&terminal, "Library · issues · 0 files").is_some());
+	assert!(find_row(&terminal, "Library · issues · 0 open").is_some());
 	assert!(find_row(&terminal, "No files with an open issue").is_some());
 }
 
