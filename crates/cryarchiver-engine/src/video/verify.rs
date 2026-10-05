@@ -486,6 +486,7 @@ fn comparable(packets: &str, discontinuous: bool) -> Option<Vec<f64>> {
 			last_dts = Some(dts);
 		}
 	}
+
 	(!times.is_empty()).then_some(times)
 }
 

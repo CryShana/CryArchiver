@@ -334,7 +334,6 @@ pub async fn first_frames(
 	Ok(frames.frames)
 }
 
-/// Runs a probe to its output, failing when the tool does.
 pub async fn run_ffprobe(cmd: &ToolCommand, cancel: &CancellationToken) -> Result<ToolOutput, ProbeError> {
 	let out = process::run(cmd, StdoutMode::Capture, |_| {}, cancel).await?;
 	if !out.status.success() {

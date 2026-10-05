@@ -78,12 +78,12 @@ pub fn model_for(width: u32, height: u32) -> &'static str {
 	}
 }
 
+/// Sorts `frames` in place; the mean is summed in that order.
 #[allow(
 	clippy::cast_precision_loss,
 	clippy::cast_possible_truncation,
 	clippy::cast_sign_loss
 )]
-/// Sorts `frames` in place; the mean is summed in that order.
 pub fn pool(frames: &mut [f64]) -> Option<Score> {
 	if frames.is_empty() {
 		return None;

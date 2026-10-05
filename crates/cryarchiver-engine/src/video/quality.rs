@@ -880,6 +880,7 @@ pub async fn search_below(
 			sample_bytes: sample_bytes[index],
 		},
 	};
+
 	Ok(Search {
 		searched,
 		rate,
