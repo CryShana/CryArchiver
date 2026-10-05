@@ -12,7 +12,6 @@ use cryarchiver_engine::text::{display_name, display_path};
 use super::owner::Owner;
 use crate::issues::{IssueId, IssueKey, Problem, UNREADABLE_FOLDER_VERBS, UNREADABLE_SOURCE_VERBS, Verbs};
 use crate::record::{CopyReason, FileState, How, IssueKind, MediaClass};
-use crate::schedule::Work;
 use crate::tree::{FileId, FolderId};
 use crate::view::{
 	DecisionLine, Details, Duplicates, FileRow, FileStatus, FilterEntry, FilterView, IssueView, LogEntry, LogKind,
@@ -171,14 +170,6 @@ impl Owner {
 					file: **file,
 					folder: entry.folder,
 					work: job.work,
-					codec: match job.work {
-						Work::Encode => "encode",
-						Work::Copy => "copy",
-						Work::Hash => "hash",
-						Work::Placeholder => "dup",
-						Work::Delete => "delete",
-					}
-					.to_owned(),
 					name: display_name(&entry.name),
 					state: self.row_state(**file),
 					stage: job.stage.map(|stage| stage_label(stage).to_owned()),
@@ -693,6 +684,7 @@ mod tests {
 	use crate::project::pipeline::tests::running_job;
 	use crate::project::scanning::tests::{key, list, owner};
 	use crate::record::FileRecord;
+	use crate::schedule::Work;
 
 	#[test]
 	fn more_jobs_over_the_limit_than_workers_shown_never_panics() {

@@ -112,7 +112,6 @@ pub struct Worker {
 	pub file: FileId,
 	pub folder: FolderId,
 	pub work: Work,
-	pub codec: String,
 	pub name: String,
 	pub state: RowState,
 	/// The engine's current stage, in words.

@@ -8,7 +8,7 @@ use ratatui::widgets::{Sparkline, Widget};
 use throbber_widgets_tui::{Set, Throbber, ThrobberState};
 
 use super::widgets::{Chrome, Parts, block_gauge, bold, fg, gauge, pad_left, panel, put, put_line, to_u16, wrap};
-use crate::format::{bytes, duration, fit, fit_middle, fps, fraction, percent, round_to_u32, speed, thousands};
+use crate::format::{bytes, duration, fit, fit_middle, fps, fraction, percent, round_to_u32, speed, thousands, width};
 use crate::theme::{Theme, label};
 use crate::view::{ArchiveView, JobActivity, Overall, Parity, RunState, SystemStats, WorkKind, WorkerJob};
 
@@ -20,6 +20,9 @@ const SPINNER: Set = Set {
 const PERCENT_CELLS: usize = 6;
 const RATE_CELLS: usize = 14;
 const MAX_GAUGE: usize = 24;
+const MAX_CODEC: usize = 4;
+const MIN_STATUS: usize = 7;
+const MAX_STATUS: usize = 18;
 
 /// Returns whether the scanning spinner made it onto the screen.
 pub fn render(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Theme, spinner: &ThrobberState) -> bool {
@@ -248,12 +251,53 @@ fn render_workers(buf: &mut Buffer, area: Rect, view: &ArchiveView, theme: &Them
 		return;
 	}
 
+	let columns = columns(&workers.jobs, body.width);
 	for ((index, job), row) in workers.jobs.iter().enumerate().zip(body.y..body.bottom()) {
-		worker_line(buf, Rect::new(body.x, row, body.width, 1), index + 1, job, theme);
+		worker_line(
+			buf,
+			Rect::new(body.x, row, body.width, 1),
+			index + 1,
+			job,
+			columns,
+			theme,
+		);
 	}
 }
 
-fn worker_line(buf: &mut Buffer, area: Rect, number: usize, job: &WorkerJob, theme: &Theme) {
+#[derive(Clone, Copy)]
+struct Columns {
+	codec: usize,
+	status: usize,
+}
+
+fn columns(jobs: &[WorkerJob], cells: u16) -> Columns {
+	let room = (usize::from(cells) / 5).clamp(MIN_STATUS, MAX_STATUS);
+	Columns {
+		codec: jobs
+			.iter()
+			.map(|job| width(&job.codec))
+			.max()
+			.unwrap_or(0)
+			.min(MAX_CODEC),
+		status: jobs
+			.iter()
+			.map(|job| width(status(job)))
+			.max()
+			.unwrap_or(0)
+			.clamp(MIN_STATUS, room),
+	}
+}
+
+fn status(job: &WorkerJob) -> &str {
+	match (job.over_limit, job.work, &job.stage) {
+		(true, _, _) => "limit",
+		(false, WorkKind::Encode, Some(stage)) => stage.as_str(),
+		(false, WorkKind::Encode, None) => label(job.state),
+		(false, work, _) => work.label(),
+	}
+}
+
+fn worker_line(buf: &mut Buffer, area: Rect, number: usize, job: &WorkerJob, columns: Columns, theme: &Theme) {
 	let (y, right) = (area.y, area.right());
 	let state_color = if job.over_limit {
 		theme.warn
@@ -264,15 +308,18 @@ fn worker_line(buf: &mut Buffer, area: Rect, number: usize, job: &WorkerJob, the
 	let name_width = (usize::from(area.width) * name_share / 100).max(10);
 
 	let mut x = put(buf, area.x, y, &format!("#{number} "), fg(theme.dim), right);
-	x = put(buf, x, y, &fit(&job.codec, 5), bold(theme.accent), right);
+	if columns.codec > 0 {
+		x = put(
+			buf,
+			x,
+			y,
+			&fit(&job.codec, columns.codec + 1),
+			bold(theme.accent),
+			right,
+		);
+	}
 	x = put(buf, x, y, &fit_middle(&job.name, name_width), fg(theme.text), right);
-	let status = match (job.over_limit, job.work, &job.stage) {
-		(true, _, _) => "limit",
-		(false, WorkKind::Encode, Some(stage)) => stage.as_str(),
-		(false, WorkKind::Encode, None) => label(job.state),
-		(false, work, _) => work.label(),
-	};
-	x = put(buf, x + 1, y, &fit(status, 7), fg(state_color), right);
+	x = put(buf, x + 1, y, &fit(status(job), columns.status), fg(state_color), right);
 
 	let rest = usize::from(right.saturating_sub(x));
 	match &job.activity {
@@ -445,4 +492,66 @@ fn limit_line(limit: Option<u8>, system: &SystemStats, theme: &Theme) -> (String
 fn sparkline(buf: &mut Buffer, area: Rect, history: &[u64], color: Color) {
 	let shown = &history[history.len().saturating_sub(usize::from(area.width))..];
 	Sparkline::default().data(shown).style(fg(color)).render(area, buf);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::theme::ColorDepth;
+	use crate::view::{FileId, FileState, Library};
+
+	fn job(codec: &str, stage: &str) -> WorkerJob {
+		WorkerJob {
+			file: FileId(1),
+			folder: Library::new("root").root(),
+			work: WorkKind::Encode,
+			codec: codec.into(),
+			name: "holiday-photo-1.jpg".into(),
+			state: FileState::Encoding,
+			stage: Some(stage.into()),
+			activity: JobActivity::Progress {
+				fraction: 0.5,
+				fps: None,
+				speed: None,
+			},
+			over_limit: false,
+		}
+	}
+
+	fn rows(jobs: &[WorkerJob], width: u16) -> Vec<String> {
+		let theme = Theme::dark(ColorDepth::TrueColor);
+		let columns = columns(jobs, width);
+		let mut buf = Buffer::empty(Rect::new(0, 0, width, to_u16(jobs.len())));
+		for (index, job) in jobs.iter().enumerate() {
+			worker_line(
+				&mut buf,
+				Rect::new(0, to_u16(index), width, 1),
+				index + 1,
+				job,
+				columns,
+				&theme,
+			);
+		}
+		(0..buf.area.height)
+			.map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+			.collect()
+	}
+
+	#[test]
+	fn stages_show_whole_and_gauges_line_up_without_a_codec() {
+		let rows = rows(&[job("", "verifying"), job("", "encoding")], 80);
+
+		assert!(rows[0].starts_with("#1 holiday-photo-1.jpg"), "{rows:?}");
+		assert!(rows[0].contains("verifying"), "{rows:?}");
+		assert!(rows[1].contains("encoding"), "{rows:?}");
+		assert_eq!(rows[0].find('━'), rows[1].find('━'), "{rows:?}");
+	}
+
+	#[test]
+	fn long_stages_leave_room_for_the_gauge_on_narrow_panels() {
+		let rows = rows(&[job("AVIF", "waiting for memory")], 40);
+
+		assert!(rows[0].starts_with("#1 AVIF "), "{rows:?}");
+		assert!(rows[0].contains("50.0%"), "{rows:?}");
+	}
 }

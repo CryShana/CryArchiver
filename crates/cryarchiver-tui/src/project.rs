@@ -322,7 +322,7 @@ impl ProjectSource {
 				file: FileId(worker.file.0),
 				folder: self.node(worker.folder),
 				work: work_kind(worker.work),
-				codec: worker.codec,
+				codec: String::new(),
 				name: worker.name,
 				state: file_state(worker.state),
 				stage: worker.stage,
