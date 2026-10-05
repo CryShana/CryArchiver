@@ -52,6 +52,7 @@ fn paused_run_state_shows_in_the_header() {
 fn quitting_draws_a_stopping_frame_then_shuts_the_source_down() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('q'));
+	press(&mut app, KeyCode::Enter);
 	assert!(app.should_quit());
 
 	app.begin_shutdown();
@@ -70,6 +71,8 @@ fn q_quits_even_behind_help() {
 	assert_eq!(app.overlay(), Some(OverlayKind::Help));
 
 	press(&mut app, KeyCode::Char('q'));
+	assert_eq!(app.overlay(), Some(OverlayKind::ConfirmQuit));
+	press(&mut app, KeyCode::Enter);
 
 	assert!(app.should_quit());
 }

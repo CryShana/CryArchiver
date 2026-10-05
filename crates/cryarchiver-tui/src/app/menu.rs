@@ -1,7 +1,7 @@
 use super::tree::Selection;
 use super::{Outcome, Ui, ViewMode};
 use crate::source::{Action, ArchiveSource, Target as ActionTarget};
-use crate::view::{Duplicates, FileId, Issue, IssueId, NodeId, Verb};
+use crate::view::{Duplicates, FileId, Issue, IssueId, Library, NodeId, Verb};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuItem {
@@ -43,7 +43,8 @@ pub struct Menu {
 }
 
 impl Menu {
-	pub fn new(source: &dyn ArchiveSource, target: Target, anchor: Option<(u16, u16)>) -> Self {
+	/// Offers only what does something from where the menu opened: `ui` is the view behind it.
+	pub fn new(source: &dyn ArchiveSource, ui: &Ui, target: Target, anchor: Option<(u16, u16)>) -> Self {
 		let target = match target {
 			Target::Issue(id) => issue_by_id(source, id)
 				.and_then(|issue| issue.file.zip(issue.folder))
@@ -52,8 +53,8 @@ impl Menu {
 		};
 
 		let items = match target {
-			Target::Folder(_) => folder_items(),
-			Target::File { file, .. } => file_items(source, file),
+			Target::Folder(folder) => folder_items(source, ui, folder),
+			Target::File { file, .. } => file_items(source, ui.mode, file),
 			Target::Issue(id) => issue_items(source, id),
 		};
 
@@ -74,16 +75,54 @@ fn labelled(item: MenuItem, label: &str) -> (MenuItem, String) {
 	(item, label.to_owned())
 }
 
-fn folder_items() -> Vec<(MenuItem, String)> {
-	vec![
-		labelled(MenuItem::ExpandAll, "Expand all"),
-		labelled(MenuItem::CollapseAll, "Collapse all"),
-		labelled(MenuItem::RetryFailedIn, "Retry failed in folder"),
+fn folders_below(library: &Library, folder: NodeId) -> Vec<NodeId> {
+	let mut folders = Vec::new();
+	let mut stack = vec![folder];
+	while let Some(current) = stack.pop() {
+		folders.push(current);
+		stack.extend(&library.node(current).children);
+	}
+	folders
+}
+
+fn is_inside(library: &Library, inner: NodeId, folder: NodeId) -> bool {
+	inner == folder || library.ancestors(inner).any(|ancestor| ancestor == folder)
+}
+
+/// Folds only matter without a filter, which shows every match open.
+fn folder_items(source: &dyn ArchiveSource, ui: &Ui, folder: NodeId) -> Vec<(MenuItem, String)> {
+	let view = source.view();
+	let library = &view.library;
+	let mut items = Vec::new();
+
+	if ui.filter.is_empty() {
+		let below = folders_below(library, folder);
+		let closed_with_subfolders = below
+			.iter()
+			.any(|&current| !library.node(current).children.is_empty() && ui.tree.expansion(current).is_none());
+		if closed_with_subfolders {
+			items.push(labelled(MenuItem::ExpandAll, "Expand all"));
+		}
+
+		if below.iter().any(|&current| ui.tree.expansion(current).is_some()) {
+			items.push(labelled(MenuItem::CollapseAll, "Collapse all"));
+		}
+	}
+
+	let retryable = view.issues.iter().any(|issue| {
+		issue.verbs.retry.is_some() && issue.folder.is_some_and(|inside| is_inside(library, inside, folder))
+	});
+	if retryable {
+		items.push(labelled(MenuItem::RetryFailedIn, "Retry failed in folder"));
+	}
+
+	items.extend([
 		labelled(MenuItem::Rescan, "Re-scan source"),
 		labelled(MenuItem::OpenSourceFolder, "Open source folder"),
 		labelled(MenuItem::OpenOutputFolder, "Open output folder"),
 		labelled(MenuItem::CopyPath, "Copy path"),
-	]
+	]);
+	items
 }
 
 /// The issue's verbs, each under the label its kind gives it.
@@ -97,26 +136,31 @@ fn verb_items(issue: &Issue) -> Vec<(MenuItem, String)> {
 		.collect()
 }
 
-fn file_items(source: &dyn ArchiveSource, file: FileId) -> Vec<(MenuItem, String)> {
-	let mut items = source
-		.view()
-		.issues
-		.iter()
-		.find(|issue| issue.file == Some(file))
-		.map(verb_items)
-		.unwrap_or_default();
+/// In the details view the menu is about the file on screen, whose details and duplicates are already shown; the
+/// issues view already shows the log.
+fn file_items(source: &dyn ArchiveSource, mode: ViewMode, file: FileId) -> Vec<(MenuItem, String)> {
+	let issue = source.view().issues.iter().find(|issue| issue.file == Some(file));
+	let mut items = issue.map(verb_items).unwrap_or_default();
+
+	if mode != ViewMode::Issues && issue.is_some_and(|issue| issue.attempts > 0) {
+		items.push(labelled(MenuItem::ShowLog, "Show ffmpeg log"));
+	}
+
+	if mode != ViewMode::Details {
+		items.push(labelled(MenuItem::ShowDetails, "Show details"));
+	}
 
 	items.extend([
-		labelled(MenuItem::ShowLog, "Show ffmpeg log"),
-		labelled(MenuItem::ShowDetails, "Show details"),
 		labelled(MenuItem::OpenSourceFolder, "Open source folder"),
 		labelled(MenuItem::OpenOutputFolder, "Open output folder"),
 	]);
 
 	match source.details(file).map(|details| details.duplicates) {
 		Some(Duplicates::PlaceholderOf(_)) => items.push(labelled(MenuItem::ShowOriginal, "Show original")),
-		Some(Duplicates::CanonicalOf(_)) => items.push(labelled(MenuItem::ShowDuplicates, "Show duplicates")),
-		Some(Duplicates::None) | None => {}
+		Some(Duplicates::CanonicalOf(_)) if mode != ViewMode::Details => {
+			items.push(labelled(MenuItem::ShowDuplicates, "Show duplicates"));
+		}
+		Some(Duplicates::CanonicalOf(_) | Duplicates::None) | None => {}
 	}
 
 	items.push(labelled(MenuItem::CopyPath, "Copy path"));

@@ -190,6 +190,7 @@ fn draw_overlay(buf: &mut Buffer, screen: Rect, main: Rect, view: &ArchiveView, 
 			settings::confirm_delete(buf, screen, view, input, &ui.theme, &mut ui.hits);
 		}
 		Some(Overlay::ConfirmRestart) => settings::confirm_restart(buf, screen, view, &ui.theme, &mut ui.hits),
+		Some(Overlay::ConfirmQuit) => overlay::confirm_quit(buf, screen, &ui.theme, &mut ui.hits),
 		None => {}
 	}
 }

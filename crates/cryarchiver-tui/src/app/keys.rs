@@ -100,7 +100,7 @@ impl Ui {
 					return self.activate(source, item, target);
 				}
 				KeyCode::Esc | KeyCode::Char('m') => self.overlay = None,
-				KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
+				KeyCode::Char('q') => self.quit(source),
 				KeyCode::F(2) => self.mouse_capture = !self.mouse_capture,
 				_ => {}
 			},
@@ -111,8 +111,9 @@ impl Ui {
 			Some(Overlay::EditQuality { .. }) => return self.on_edit_quality_key(source, key),
 			Some(Overlay::ConfirmDelete(_)) => return self.on_confirm_delete_key(key),
 			Some(Overlay::ConfirmRestart) => return self.on_confirm_restart_key(key),
+			Some(Overlay::ConfirmQuit) => return self.on_confirm_quit_key(key),
 			Some(Overlay::Help) | None => match key.code {
-				KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
+				KeyCode::Char('q') => self.quit(source),
 				KeyCode::F(2) => self.mouse_capture = !self.mouse_capture,
 				KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => self.overlay = None,
 				_ => {}
@@ -121,9 +122,31 @@ impl Ui {
 		Outcome::Done
 	}
 
+	pub(super) fn quit(&mut self, source: &dyn ArchiveSource) {
+		let view = source.view();
+		let idle = matches!(
+			view.header.run_state,
+			RunState::Paused | RunState::Watching | RunState::Finished
+		);
+		if idle && view.workers.jobs.is_empty() {
+			self.lifecycle = Lifecycle::Quitting;
+		} else {
+			self.overlay = Some(Overlay::ConfirmQuit);
+		}
+	}
+
+	fn on_confirm_quit_key(&mut self, key: KeyEvent) -> Outcome {
+		match key.code {
+			KeyCode::Enter | KeyCode::Char('y') => self.lifecycle = Lifecycle::Quitting,
+			KeyCode::Esc | KeyCode::Char('n' | 'q') => self.overlay = None,
+			_ => return Outcome::Ignored,
+		}
+		Outcome::Done
+	}
+
 	fn on_global_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
 		match key.code {
-			KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
+			KeyCode::Char('q') => self.quit(source),
 			KeyCode::F(2) => self.mouse_capture = !self.mouse_capture,
 			KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
 			KeyCode::Char('s') => self.overlay = Some(Overlay::Settings(0)),

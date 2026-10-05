@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Table, Widget};
 
 use super::widgets::{Chrome, bold, fg, gauge, pad_left, panel, put, to_u16};
-use crate::app::tree::{self, Fold, RowKind};
+use crate::app::tree::{self, Fold, ProgressSort, RowKind};
 use crate::app::{Hit, Ui};
 use crate::format::{bytes, find_ignore_case, fit, fit_middle, percent, saving, short_count, thousands, width};
 use crate::source::ArchiveSource;
@@ -109,9 +109,13 @@ pub fn render(buf: &mut Buffer, area: Rect, source: &dyn ArchiveSource, ui: &mut
 		.collect();
 
 	let table = Table::new(table_rows, columns.widths())
-		.header(header_row(columns, &theme))
+		.header(header_row(columns, ui.tree.sort(), &theme))
 		.column_spacing(0);
 	Widget::render(table, inner, buf);
+
+	let progress_x = inner.x + to_u16(columns.name + STATUS);
+	ui.hits
+		.push(Rect::new(progress_x, inner.y, to_u16(PROGRESS), 1), Hit::ProgressHeader);
 
 	for (offset, index) in (start..end).enumerate() {
 		let row_area = Rect::new(body.x, body.y + to_u16(offset), body.width, 1);
@@ -154,22 +158,27 @@ fn title_extras(buf: &mut Buffer, area: Rect, title: &str, view: &ArchiveView, u
 	ui.hits.push(Rect::new(toggle_x, area.y, 3, 1), Hit::Maximize);
 }
 
-fn header_row(columns: Columns, theme: &Theme) -> Row<'static> {
-	let mut labels = vec![
-		fit("Name", columns.name),
-		fit("Status", STATUS),
-		fit("Progress", PROGRESS),
+fn header_row(columns: Columns, sort: ProgressSort, theme: &Theme) -> Row<'static> {
+	let progress = match sort {
+		ProgressSort::Off => Cell::from(fit("Progress", PROGRESS)),
+		ProgressSort::Descending => Cell::from(fit("Progress ▼", PROGRESS)).style(bold(theme.accent)),
+		ProgressSort::Ascending => Cell::from(fit("Progress ▲", PROGRESS)).style(bold(theme.accent)),
+	};
+	let mut cells = vec![
+		Cell::from(fit("Name", columns.name)),
+		Cell::from(fit("Status", STATUS)),
+		progress,
 	];
 	if columns.codec {
-		labels.push(fit("Codec", CODEC));
+		cells.push(Cell::from(fit("Codec", CODEC)));
 	}
 	if columns.size {
-		labels.push(fit("Size", SIZE));
+		cells.push(Cell::from(fit("Size", SIZE)));
 	}
 	if columns.saved {
-		labels.push(fit("Saved", SAVED));
+		cells.push(Cell::from(fit("Saved", SAVED)));
 	}
-	Row::new(labels).style(bold(theme.dim))
+	Row::new(cells).style(bold(theme.dim))
 }
 
 struct RowContext<'a> {

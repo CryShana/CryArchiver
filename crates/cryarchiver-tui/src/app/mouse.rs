@@ -16,6 +16,7 @@ pub enum Hit {
 	Footer(KeyCode),
 	Row { index: usize, arrow_x: u16 },
 	LibraryTitle,
+	ProgressHeader,
 	Maximize,
 	LogToggle,
 	LogMaximize,
@@ -133,6 +134,12 @@ impl Ui {
 					}
 				};
 			}
+			Some(Overlay::ConfirmQuit) => {
+				return match hit {
+					Some(Hit::Footer(code)) => self.on_key(source, KeyEvent::new(code, KeyModifiers::NONE), false),
+					_ => Outcome::Ignored,
+				};
+			}
 			Some(Overlay::ConfirmDelete(_) | Overlay::ConfirmRestart | Overlay::EditQuality { .. }) => {
 				return Outcome::Ignored;
 			}
@@ -155,6 +162,7 @@ impl Ui {
 			Hit::Row { index, arrow_x } => self.on_row_click(index, arrow_x, position, double),
 			Hit::LibraryTitle if double => self.layout.maximized = !self.layout.maximized,
 			Hit::Maximize => self.layout.maximized = !self.layout.maximized,
+			Hit::ProgressHeader => self.tree.cycle_sort(),
 			Hit::LogToggle => self.layout.log_open = !self.layout.log_open,
 			Hit::LogMaximize => {
 				self.layout.log_maximized = !self.layout.log_maximized;
@@ -203,7 +211,10 @@ impl Ui {
 	}
 
 	fn on_right_click(&mut self, source: &dyn ArchiveSource, position: Position) -> Outcome {
-		if matches!(self.overlay, Some(Overlay::ConfirmDelete(_) | Overlay::ConfirmRestart)) {
+		if matches!(
+			self.overlay,
+			Some(Overlay::ConfirmDelete(_) | Overlay::ConfirmRestart | Overlay::ConfirmQuit)
+		) {
 			return Outcome::Ignored;
 		}
 

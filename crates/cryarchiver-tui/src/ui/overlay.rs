@@ -2,6 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::Style;
 
+use super::footer::{draw_chips, quit_chips};
 use super::widgets::{bold, fg, modal, put, to_u16};
 use crate::app::{Hit, HitMap, Menu};
 use crate::format::{fit, width};
@@ -108,6 +109,32 @@ pub fn menu(buf: &mut Buffer, screen: Rect, menu: &Menu, default_anchor: (u16, u
 		put(buf, inner.x + 1, row, label, style, inner.right());
 		hits.push(row_area, Hit::MenuItem(index));
 	}
+}
+
+pub fn confirm_quit(buf: &mut Buffer, screen: Rect, theme: &Theme, hits: &mut HitMap) {
+	let area = screen.centered(
+		Constraint::Length(screen.width.saturating_sub(10).min(64)),
+		Constraint::Length(6),
+	);
+	let inner = modal(buf, area, screen, theme, "Quit while archiving?");
+	hits.push(area, Hit::Modal);
+
+	put(
+		buf,
+		inner.x + 2,
+		inner.y + 1,
+		"Work in progress stops and resumes next time.",
+		fg(theme.text),
+		inner.right(),
+	);
+
+	let buttons = Rect {
+		x: inner.x + 1,
+		y: inner.y + 3,
+		height: 1,
+		..inner
+	};
+	draw_chips(buf, buttons, inner.right(), quit_chips(), theme, hits, Hit::Footer);
 }
 
 pub fn stopping(buf: &mut Buffer, screen: Rect, theme: &Theme) {

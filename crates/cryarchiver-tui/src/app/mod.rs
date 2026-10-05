@@ -41,6 +41,7 @@ pub enum OverlayKind {
 	EditQuality,
 	ConfirmDelete,
 	ConfirmRestart,
+	ConfirmQuit,
 }
 
 pub(crate) enum Overlay {
@@ -54,6 +55,7 @@ pub(crate) enum Overlay {
 	},
 	ConfirmDelete(Input),
 	ConfirmRestart,
+	ConfirmQuit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +246,7 @@ impl<S: ArchiveSource> App<S> {
 		let changed = self.source.refresh();
 		if changed {
 			self.generation += 1;
+			self.ui.tree.values_changed();
 		}
 		self.take_notifications() || changed
 	}
@@ -465,6 +468,7 @@ impl<S: ArchiveSource> App<S> {
 			Overlay::EditQuality { .. } => OverlayKind::EditQuality,
 			Overlay::ConfirmDelete(_) => OverlayKind::ConfirmDelete,
 			Overlay::ConfirmRestart => OverlayKind::ConfirmRestart,
+			Overlay::ConfirmQuit => OverlayKind::ConfirmQuit,
 		})
 	}
 
@@ -527,7 +531,7 @@ impl Ui {
 			return Outcome::Ignored;
 		};
 
-		self.overlay = Some(Overlay::Menu(Menu::new(source, target, anchor)));
+		self.overlay = Some(Overlay::Menu(Menu::new(source, self, target, anchor)));
 		Outcome::Done
 	}
 

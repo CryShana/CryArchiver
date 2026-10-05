@@ -1,7 +1,8 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::source::{Action, ArchiveSource};
-use crate::view::{FileId, FileRow, FilterEntry, Library, NodeId};
+use crate::view::{FileId, FileRow, FileState, FilterEntry, Library, NodeId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expansion {
@@ -28,6 +29,26 @@ pub enum RowKind {
 	Folder(NodeId, Fold),
 	File { folder: NodeId, file: FileId, slot: Slot },
 	Loading(NodeId),
+}
+
+/// The Library's order by the Progress column. Siblings sort among themselves, folders above files, and ties keep
+/// the source's order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProgressSort {
+	#[default]
+	Off,
+	Descending,
+	Ascending,
+}
+
+impl ProgressSort {
+	pub fn next(self) -> Self {
+		match self {
+			Self::Off => Self::Descending,
+			Self::Descending => Self::Ascending,
+			Self::Ascending => Self::Off,
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,12 +110,71 @@ pub fn file_row(source: &dyn ArchiveSource, kind: RowKind) -> Option<&FileRow> {
 	}
 }
 
+/// The fraction the row's Progress column shows; `None` when it shows no gauge.
+pub fn shown_progress(source: &dyn ArchiveSource, kind: RowKind) -> Option<f64> {
+	match kind {
+		RowKind::Folder(folder, _) => {
+			let stats = source.view().library.stats(folder);
+			Some(if stats.complete { 1.0 } else { stats.progress })
+		}
+		RowKind::File { .. } => {
+			let status = &file_row(source, kind)?.status;
+			match (status.state, status.progress) {
+				(state, Some(fraction)) if state.is_active() => Some(fraction),
+				(FileState::Done, _) => Some(1.0),
+				_ => None,
+			}
+		}
+		RowKind::Loading(_) => None,
+	}
+}
+
+/// Sorts each folder's rows among themselves and keeps every folder's rows directly under it, at every depth.
+fn sort_levels(rows: &[Row], order: ProgressSort, progress: &impl Fn(Row) -> Option<f64>) -> Vec<Row> {
+	let mut blocks = Vec::new();
+	let mut start = 0;
+	while start < rows.len() {
+		let depth = rows[start].depth;
+		let end = rows[start + 1..]
+			.iter()
+			.position(|row| row.depth <= depth)
+			.map_or(rows.len(), |offset| start + 1 + offset);
+		blocks.push(&rows[start..end]);
+		start = end;
+	}
+
+	let rank = |row: Row| match row.kind {
+		RowKind::Folder(..) => 0,
+		RowKind::File { .. } => 1,
+		RowKind::Loading(_) => 2,
+	};
+	let compare = |a: Row, b: Row| {
+		let (a_value, b_value) = (progress(a).unwrap_or(-1.0), progress(b).unwrap_or(-1.0));
+		let by_progress = match order {
+			ProgressSort::Off => Ordering::Equal,
+			ProgressSort::Descending => b_value.total_cmp(&a_value),
+			ProgressSort::Ascending => a_value.total_cmp(&b_value),
+		};
+		rank(a).cmp(&rank(b)).then(by_progress)
+	};
+	blocks.sort_by(|a, b| compare(a[0], b[0]));
+
+	let mut sorted = Vec::with_capacity(rows.len());
+	for block in blocks {
+		sorted.push(block[0]);
+		sorted.extend(sort_levels(&block[1..], order, progress));
+	}
+	sorted
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RowsKey {
 	structure_version: u64,
 	rows_version: u64,
 	expansion: u64,
 	filter: String,
+	sort: ProgressSort,
+	values: u64,
 }
 
 /// The Library's visible rows. They are rebuilt only when the folder tree, the loaded file lists, the expansion or
@@ -114,6 +194,9 @@ pub struct TreeState {
 	scroll: usize,
 	page: usize,
 	outbox: Vec<Action>,
+	sort: ProgressSort,
+	/// Bumped while sorted whenever the source's values may have moved, so the order follows the progress.
+	values: u64,
 }
 
 impl TreeState {
@@ -131,6 +214,8 @@ impl TreeState {
 			scroll: 0,
 			page: 10,
 			outbox: Vec::new(),
+			sort: ProgressSort::Off,
+			values: 0,
 		}
 	}
 
@@ -160,6 +245,23 @@ impl TreeState {
 		self.scroll
 	}
 
+	pub fn sort(&self) -> ProgressSort {
+		self.sort
+	}
+
+	/// Moves to the next sort mode. The selected row stays selected and in view wherever the new order puts it.
+	pub fn cycle_sort(&mut self) {
+		self.sort = self.sort.next();
+		self.follow = true;
+	}
+
+	/// The source's statuses changed, which moves sorted rows.
+	pub fn values_changed(&mut self) {
+		if self.sort != ProgressSort::Off {
+			self.values += 1;
+		}
+	}
+
 	pub fn expansion(&self, folder: NodeId) -> Option<Expansion> {
 		self.expanded.get(&folder).copied()
 	}
@@ -176,6 +278,8 @@ impl TreeState {
 			rows_version: source.rows_version(),
 			expansion: self.expansion,
 			filter: filter.to_owned(),
+			sort: self.sort,
+			values: self.values,
 		};
 		if self.key.as_ref() == Some(&key) {
 			return;
@@ -328,6 +432,14 @@ impl TreeState {
 	}
 
 	fn rebuild(&mut self, source: &dyn ArchiveSource, filter: &str) {
+		self.list(source, filter);
+
+		if self.sort != ProgressSort::Off {
+			self.rows = sort_levels(&self.rows, self.sort, &|row: Row| shown_progress(source, row.kind));
+		}
+	}
+
+	fn list(&mut self, source: &dyn ArchiveSource, filter: &str) {
 		self.rows.clear();
 		self.matching_files = Some(0);
 
@@ -445,5 +557,177 @@ impl TreeState {
 
 	fn clamp_scroll(&mut self) {
 		self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.page));
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	struct Nested {
+		rows: Vec<Row>,
+		progress: Vec<(Selection, f64)>,
+	}
+
+	fn folder(id: NodeId, depth: u16) -> Row {
+		Row {
+			depth,
+			kind: RowKind::Folder(id, Fold::Open),
+		}
+	}
+
+	fn file(folder: NodeId, id: u64, depth: u16) -> Row {
+		Row {
+			depth,
+			kind: RowKind::File {
+				folder,
+				file: FileId(id),
+				slot: Slot::Listed(0),
+			},
+		}
+	}
+
+	/// `root` holds `low` (40 %) with `deep` (90 %) and files 1 (20 %) and 2 (80 %), then `high` (70 %), then files 3
+	/// (50 %), 4 (no gauge) and 5 (50 %).
+	fn nested() -> Nested {
+		let mut library = Library::new("root");
+		let root = library.root();
+		let low = library.add_folder(root, "low");
+		let deep = library.add_folder(low, "deep");
+		let high = library.add_folder(root, "high");
+
+		let rows = vec![
+			folder(root, 0),
+			folder(low, 1),
+			folder(deep, 2),
+			file(low, 1, 2),
+			file(low, 2, 2),
+			folder(high, 1),
+			file(root, 3, 1),
+			file(root, 4, 1),
+			file(root, 5, 1),
+		];
+		let progress = vec![
+			(Selection::Folder(root), 0.5),
+			(Selection::Folder(low), 0.4),
+			(Selection::Folder(deep), 0.9),
+			(Selection::Folder(high), 0.7),
+			(
+				Selection::File {
+					file: FileId(1),
+					folder: low,
+				},
+				0.2,
+			),
+			(
+				Selection::File {
+					file: FileId(2),
+					folder: low,
+				},
+				0.8,
+			),
+			(
+				Selection::File {
+					file: FileId(3),
+					folder: root,
+				},
+				0.5,
+			),
+			(
+				Selection::File {
+					file: FileId(5),
+					folder: root,
+				},
+				0.5,
+			),
+		];
+		Nested { rows, progress }
+	}
+
+	fn order(nested: &Nested, sort: ProgressSort) -> Vec<String> {
+		let progress = |row: Row| {
+			let selection = row.selection()?;
+			nested
+				.progress
+				.iter()
+				.find(|(id, _)| *id == selection)
+				.map(|&(_, value)| value)
+		};
+		let names = ["root", "low", "deep", "high"];
+		sort_levels(&nested.rows, sort, &progress)
+			.into_iter()
+			.map(|row| match row.kind {
+				RowKind::Folder(id, _) => format!("{}{}", "  ".repeat(usize::from(row.depth)), names[id.index()]),
+				RowKind::File { file, .. } => format!("{}file {}", "  ".repeat(usize::from(row.depth)), file.0),
+				RowKind::Loading(_) => "loading".to_owned(),
+			})
+			.collect()
+	}
+
+	#[test]
+	fn descending_sorts_every_level_and_keeps_children_under_their_folder() {
+		let nested = nested();
+
+		assert_eq!(
+			order(&nested, ProgressSort::Descending),
+			[
+				"root",
+				"  high",
+				"  low",
+				"    deep",
+				"    file 2",
+				"    file 1",
+				"  file 3",
+				"  file 5",
+				"  file 4",
+			]
+		);
+	}
+
+	#[test]
+	fn ascending_puts_the_least_progress_first_and_ties_keep_their_order() {
+		let nested = nested();
+
+		assert_eq!(
+			order(&nested, ProgressSort::Ascending),
+			[
+				"root",
+				"  low",
+				"    deep",
+				"    file 1",
+				"    file 2",
+				"  high",
+				"  file 4",
+				"  file 3",
+				"  file 5",
+			]
+		);
+	}
+
+	#[test]
+	fn off_keeps_the_original_order() {
+		let nested = nested();
+
+		assert_eq!(
+			order(&nested, ProgressSort::Off),
+			[
+				"root",
+				"  low",
+				"    deep",
+				"    file 1",
+				"    file 2",
+				"  high",
+				"  file 3",
+				"  file 4",
+				"  file 5",
+			]
+		);
+	}
+
+	#[test]
+	fn the_sort_cycles_off_descending_ascending() {
+		assert_eq!(ProgressSort::Off.next(), ProgressSort::Descending);
+		assert_eq!(ProgressSort::Descending.next(), ProgressSort::Ascending);
+		assert_eq!(ProgressSort::Ascending.next(), ProgressSort::Off);
 	}
 }

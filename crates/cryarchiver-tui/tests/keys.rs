@@ -3,7 +3,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use cryarchiver_tui::view::{IssueKind, Limit, RunState};
-use cryarchiver_tui::{ArchiveSource, OverlayKind, Selection, ViewMode};
+use cryarchiver_tui::{App, ArchiveSource, ColorDepth, MockSource, OverlayKind, Selection, ViewMode};
 use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 
 use support::{app, click, draw, find_on_row, find_row, mouse, press, press_with, release, type_text};
@@ -270,6 +270,7 @@ fn key_releases_are_ignored() {
 fn q_and_ctrl_c_quit() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('q'));
+	press(&mut app, KeyCode::Enter);
 	assert!(app.should_quit());
 
 	let mut app = support::app();
@@ -630,4 +631,220 @@ fn the_copy_confirmation_shows_over_a_recent_warning() {
 	);
 
 	assert_eq!(app.toast().map(|toast| toast.text.as_str()), Some("copied log line"));
+}
+
+#[test]
+fn q_while_archiving_asks_first() {
+	let mut app = app();
+
+	for stay in [KeyCode::Esc, KeyCode::Char('n'), KeyCode::Char('q')] {
+		press(&mut app, KeyCode::Char('q'));
+		assert_eq!(app.overlay(), Some(OverlayKind::ConfirmQuit));
+		assert!(!app.should_quit());
+
+		press(&mut app, stay);
+		assert_eq!(app.overlay(), None, "{stay:?} stays");
+		assert!(!app.should_quit());
+	}
+
+	press(&mut app, KeyCode::Char('q'));
+	press(&mut app, KeyCode::Char('y'));
+	assert!(app.should_quit());
+}
+
+#[test]
+fn q_asks_from_the_menu_and_the_settings_too() {
+	for open in ['m', 's'] {
+		let mut app = app();
+		press(&mut app, KeyCode::Char(open));
+
+		press(&mut app, KeyCode::Char('q'));
+
+		assert_eq!(app.overlay(), Some(OverlayKind::ConfirmQuit));
+		assert!(!app.should_quit());
+	}
+}
+
+#[test]
+fn q_quits_at_once_when_nothing_runs() {
+	let mut app = App::new(MockSource::completed(support::SEED), ColorDepth::TrueColor);
+
+	press(&mut app, KeyCode::Char('q'));
+
+	assert!(app.should_quit());
+}
+
+#[test]
+fn ctrl_c_quits_from_the_quit_question() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('q'));
+
+	press_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+	assert!(app.should_quit());
+}
+
+#[test]
+fn the_quit_question_buttons_are_clickable() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('q'));
+	let terminal = draw(&mut app, 120, 36);
+	let row = find_row(&terminal, "Work in progress stops").unwrap() + 2;
+	let stay = find_on_row(&terminal, row, " Esc ").unwrap();
+
+	click(&mut app, stay + 1, row, Instant::now());
+	assert_eq!(app.overlay(), None);
+	assert!(!app.should_quit());
+
+	press(&mut app, KeyCode::Char('q'));
+	let terminal = draw(&mut app, 120, 36);
+	let quit = find_on_row(&terminal, row, " ⏎ ").unwrap();
+	click(&mut app, quit + 1, row, Instant::now() + Duration::from_secs(1));
+	assert!(app.should_quit());
+}
+
+fn library_names(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, header: u16) -> Vec<String> {
+	(header + 1..header + 15)
+		.map(|row| {
+			support::row_text(terminal, row)
+				.chars()
+				.take(50)
+				.collect::<String>()
+				.trim_end()
+				.to_owned()
+		})
+		.collect()
+}
+
+#[test]
+fn clicking_progress_cycles_the_sort_and_off_restores_the_order() {
+	let mut app = app();
+	press(&mut app, KeyCode::Home);
+	let terminal = draw(&mut app, 120, 36);
+	let header = find_row(&terminal, "Status").unwrap();
+	let progress = find_on_row(&terminal, header, "Progress").unwrap();
+	let original = library_names(&terminal, header);
+	let now = Instant::now();
+
+	click(&mut app, progress + 2, header, now);
+	let terminal = draw(&mut app, 120, 36);
+	assert!(support::row_text(&terminal, header).contains("Progress ▼"));
+	let descending = library_names(&terminal, header);
+	assert_ne!(descending, original);
+
+	click(&mut app, progress + 2, header, now + Duration::from_secs(1));
+	let terminal = draw(&mut app, 120, 36);
+	assert!(support::row_text(&terminal, header).contains("Progress ▲"));
+	assert_ne!(library_names(&terminal, header), descending);
+
+	click(&mut app, progress + 2, header, now + Duration::from_secs(2));
+	let terminal = draw(&mut app, 120, 36);
+	let row = support::row_text(&terminal, header);
+	assert!(row.contains("Progress") && !row.contains('▼') && !row.contains('▲'));
+	assert_eq!(library_names(&terminal, header), original);
+}
+
+#[test]
+fn the_selection_follows_its_row_when_the_sort_changes() {
+	let mut app = app();
+	let selected = app.selected();
+	let terminal = draw(&mut app, 120, 36);
+	let header = find_row(&terminal, "Status").unwrap();
+	let progress = find_on_row(&terminal, header, "Progress").unwrap();
+	let now = Instant::now();
+
+	for step in 0..3 {
+		click(&mut app, progress + 2, header, now + Duration::from_secs(step));
+		draw(&mut app, 120, 36);
+		assert_eq!(app.selected(), selected);
+	}
+}
+
+fn has(app: &App<MockSource>, item: &str) -> bool {
+	app.menu_items().iter().any(|label| label == item)
+}
+
+#[test]
+fn the_file_menu_fits_the_view_it_opened_in() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('m'));
+	assert!(has(&app, "Show details"));
+	assert!(
+		!has(&app, "Show ffmpeg log"),
+		"a file without an issue has no log to show"
+	);
+	press(&mut app, KeyCode::Esc);
+
+	press(&mut app, KeyCode::Enter);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(!has(&app, "Show details"), "its details are already open");
+	press(&mut app, KeyCode::Esc);
+	press(&mut app, KeyCode::Esc);
+
+	press(&mut app, KeyCode::Char('i'));
+	press(&mut app, KeyCode::Down);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(has(&app, "Show details"));
+	assert!(!has(&app, "Show ffmpeg log"), "the issues view already shows it");
+	press(&mut app, KeyCode::Esc);
+
+	press(&mut app, KeyCode::Enter);
+	press(&mut app, KeyCode::Esc);
+	assert_eq!(app.mode(), ViewMode::Library);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(has(&app, "Show ffmpeg log"));
+	assert!(has(&app, "Show details"));
+}
+
+#[test]
+fn the_folder_menu_leaves_out_what_would_do_nothing() {
+	let mut app = app();
+	press(&mut app, KeyCode::Home);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(has(&app, "Expand all") && has(&app, "Collapse all"));
+	assert!(has(&app, "Retry failed in folder"));
+
+	press(&mut app, KeyCode::Enter);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(!has(&app, "Expand all"), "everything below is open");
+	assert_eq!(app.menu_items()[0], "Collapse all");
+
+	press(&mut app, KeyCode::Enter);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(has(&app, "Expand all"));
+	assert!(!has(&app, "Collapse all"), "everything below is closed");
+	press(&mut app, KeyCode::Esc);
+
+	press(&mut app, KeyCode::Char('/'));
+	type_text(&mut app, "a");
+	press(&mut app, KeyCode::Enter);
+	press(&mut app, KeyCode::Home);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(
+		!has(&app, "Expand all") && !has(&app, "Collapse all"),
+		"a filter shows every match open"
+	);
+}
+
+#[test]
+fn a_folder_without_failed_files_offers_no_retry() {
+	let mut app = app();
+	press(&mut app, KeyCode::Home);
+	press(&mut app, KeyCode::Char('m'));
+	press(&mut app, KeyCode::Enter);
+
+	let calm = (0..app.visible_rows()).find_map(|_| {
+		press(&mut app, KeyCode::Down);
+		match app.selected() {
+			Some(Selection::Folder(folder)) if app.source().view().library.stats(folder).open_issues == 0 => {
+				Some(folder)
+			}
+			_ => None,
+		}
+	});
+	assert!(calm.is_some(), "the demo has a folder without issues");
+
+	press(&mut app, KeyCode::Char('m'));
+	assert!(has(&app, "Copy path"));
+	assert!(!has(&app, "Retry failed in folder"));
 }

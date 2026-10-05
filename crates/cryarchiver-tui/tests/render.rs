@@ -83,6 +83,26 @@ fn context_menu_at_120x36() {
 }
 
 #[test]
+fn quit_confirmation_at_120x36() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('q'));
+
+	assert_snapshot!(draw(&mut app, 120, 36).backend());
+}
+
+#[test]
+fn progress_sorted_descending_at_120x36() {
+	let mut app = app();
+	press(&mut app, KeyCode::Home);
+	let terminal = draw(&mut app, 120, 36);
+	let header = find_row(&terminal, "Status").unwrap();
+	let progress = support::find_on_row(&terminal, header, "Progress").unwrap();
+	support::click(&mut app, progress, header, Instant::now());
+
+	assert_snapshot!(draw(&mut app, 120, 36).backend());
+}
+
+#[test]
 fn help_at_120x36() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('?'));

@@ -9,7 +9,7 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use super::{Lifecycle, Outcome, Overlay, Ui};
+use super::{Outcome, Overlay, Ui};
 use crate::source::{Action, ArchiveSource, SettingsChange};
 use crate::view::{ArchiveView, Settings, Speed};
 
@@ -236,7 +236,7 @@ impl Ui {
 			KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => self.adjust(source, selected, 1),
 			KeyCode::Char('r') | KeyCode::Delete => self.reset_quality(source, row),
 			KeyCode::Esc | KeyCode::Char('s') => self.overlay = None,
-			KeyCode::Char('q') => self.lifecycle = Lifecycle::Quitting,
+			KeyCode::Char('q') => self.quit(source),
 			KeyCode::F(2) => self.mouse_capture = !self.mouse_capture,
 			_ => return Outcome::Ignored,
 		}

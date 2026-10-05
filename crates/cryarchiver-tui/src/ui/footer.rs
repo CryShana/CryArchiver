@@ -158,12 +158,20 @@ fn chips(view: &ArchiveView, details: Option<&FileDetails>, ui: &Ui) -> Vec<Chip
 			chip("⏎", "restart now", Some(KeyCode::Enter)),
 			chip("Esc", "cancel", Some(KeyCode::Esc)),
 		],
+		(Some(Overlay::ConfirmQuit), _) => quit_chips(),
 		(Some(Overlay::Help), _) => vec![chip("Esc", "close", Some(KeyCode::Esc))],
 		(None, _) if ui.layout.log_maximized => log_chips(),
 		(None, ViewMode::Library) => library_chips(view, ui),
 		(None, ViewMode::Details) => details_chips(details),
 		(None, ViewMode::Issues) => issues_chips(view, ui),
 	}
+}
+
+pub fn quit_chips() -> Vec<Chip> {
+	vec![
+		chip("⏎", "quit", Some(KeyCode::Enter)),
+		chip("Esc", "stay", Some(KeyCode::Esc)),
+	]
 }
 
 /// One chip per verb the issue allows, labelled for its kind; the key stays r, c or x.
