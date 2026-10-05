@@ -882,7 +882,7 @@ impl Engine {
 	}
 
 	fn budget_threads(&self, job: &Job, video: &mut VideoPlan) {
-		video.threads = self.tool_threads(job).map(|threads| threads_for(threads, cores()));
+		video.threads = self.tool_threads(job).map(threads_for);
 	}
 
 	/// Sets the trim window and the frame count the encode must give: none under a trim, and otherwise the

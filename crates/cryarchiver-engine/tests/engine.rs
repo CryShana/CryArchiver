@@ -2811,6 +2811,38 @@ async fn measuring_side_by_side_chooses_the_same_crf_from_the_same_scores() {
 	assert_eq!(side_by_side.scan, one_at_a_time.scan);
 }
 
+#[tokio::test]
+async fn a_thread_limit_changes_how_svt_runs_but_not_one_bit_of_the_video() {
+	let dir = tempfile::tempdir().unwrap();
+	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
+	let engine = Engine::new(support::toolchain().await);
+	let video_md5 = |outcome: &JobOutcome| {
+		let JobOutcome::Encoded { output, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		let out = std::process::Command::new("ffmpeg")
+			.args(["-v", "error", "-i"])
+			.arg(output)
+			.args(["-map", "0:v", "-c", "copy", "-f", "md5", "-"])
+			.output()
+			.unwrap();
+		String::from_utf8(out.stdout).unwrap()
+	};
+	let limited = Job {
+		options: JobOptions {
+			threads: Some(6),
+			..JobOptions::default()
+		},
+		..fast_keeping_any_saving(&clip)
+	};
+
+	let (free, _) = run_recording(&engine, &fast_keeping_any_saving(&clip), &out_dir(dir.path(), "free")).await;
+	let (six, _) = run_recording(&engine, &limited, &out_dir(dir.path(), "six")).await;
+
+	assert!(video_md5(&free).starts_with("MD5="), "{free:?}");
+	assert_eq!(video_md5(&six), video_md5(&free));
+}
+
 async fn learned_group(dir: &Path, setting: f64) -> SharedMemory {
 	let first = support::mpeg4(dir, "first.mp4", 3);
 	let learned = Arc::new(SharedMemory::default());

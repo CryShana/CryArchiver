@@ -24,38 +24,23 @@ const MIN_PACKET_SLACK: f64 = 2.0;
 const SOURCE_FRAME_TOLERANCE: u64 = 2;
 const VIDEO_BASE_BYTES: u64 = 512 << 20;
 const VIDEO_BYTES_PER_PIXEL: u64 = 540;
-const SVT_MAX_LP: usize = 6;
 /// The fewest threads each SVT-AV1 level of parallelism needs. A 4 s sample at presets 3 and 5, 1080p and 4K, uses
 /// at most 1.1 cores at level 1, 3.8 at level 2, 6.8 at level 3 and 11 at level 4, decoding included. Samples that
 /// short can't show what levels 5 and 6 would use, so level 5 asks for twice level 4's threads and level 6 is left
 /// out.
-const LANE_LEVELS: [(usize, u8); 4] = [(24, 5), (12, 4), (7, 3), (4, 2)];
+const SVT_LEVELS: [(usize, u8); 4] = [(24, 5), (12, 4), (7, 3), (4, 2)];
 
+/// A tool's thread caps under a thread budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Threads {
 	pub tool: usize,
 	pub svt_lp: u8,
 }
 
-pub fn threads_for(count: usize, cores: usize) -> Threads {
-	Threads {
-		tool: count.max(1),
-		svt_lp: svt_lp(count, cores),
-	}
-}
-
-#[allow(clippy::cast_possible_truncation)]
-pub fn svt_lp(threads: usize, cores: usize) -> u8 {
-	(threads.max(1) * SVT_MAX_LP)
-		.div_ceil(cores.max(1))
-		.clamp(1, SVT_MAX_LP) as u8
-}
-
-/// The threads of one of several tools that share a budget, `threads` each, with SVT-AV1's highest level of
-/// parallelism whose CPU use fits them.
-pub fn lane_threads(threads: usize) -> Threads {
+/// The caps of a tool allowed `threads` threads, with SVT-AV1's highest level of parallelism whose CPU use fits them.
+pub fn threads_for(threads: usize) -> Threads {
 	let threads = threads.max(1);
-	let svt_lp = LANE_LEVELS
+	let svt_lp = SVT_LEVELS
 		.iter()
 		.find(|(fits, _)| threads >= *fits)
 		.map_or(1, |(_, level)| *level);
@@ -1038,21 +1023,29 @@ mod tests {
 	}
 
 	#[test]
-	fn a_lane_gets_the_highest_svt_level_whose_cpu_use_fits_it() {
-		let levels = [0, 1, 2, 3, 4, 6, 7, 11, 12, 23, 24, 64].map(|threads| lane_threads(threads).svt_lp);
+	fn a_budget_gets_the_highest_svt_level_whose_cpu_use_fits_it() {
+		let levels = [0, 1, 2, 3, 4, 6, 7, 11, 12, 23, 24, 64].map(|threads| threads_for(threads).svt_lp);
 
 		assert_eq!(levels, [1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
-		assert_eq!(lane_threads(8), Threads { tool: 8, svt_lp: 3 });
-		assert_eq!(lane_threads(0).tool, 1);
+		assert_eq!(threads_for(8), Threads { tool: 8, svt_lp: 3 });
+		assert_eq!(threads_for(0).tool, 1);
 	}
 
 	#[test]
-	fn svt_parallelism_follows_the_thread_budget() {
-		assert_eq!(svt_lp(32, 32), 6);
-		assert_eq!(svt_lp(8, 32), 2);
-		assert_eq!(svt_lp(1, 32), 1);
-		assert_eq!(svt_lp(4, 4), 6);
-		assert_eq!(threads_for(8, 32), Threads { tool: 8, svt_lp: 2 });
+	fn six_threads_of_eight_cores_run_a_level_that_fits_six() {
+		let six = threads_for(6);
+
+		assert_eq!(
+			six,
+			Threads { tool: 6, svt_lp: 2 },
+			"level 2 uses about 3.8 cores, level 3 about 6.8"
+		);
+		assert!(SVT_LEVELS.iter().all(|(fits, level)| *level <= six.svt_lp || *fits > 6));
+	}
+
+	#[test]
+	fn svt_parallelism_is_passed_only_under_a_budget() {
+		assert_eq!(svt_params(30.0, None, None, None), "tune=0:keyint=5s:crf=30");
 		assert_eq!(svt_params(30.0, None, Some(2), None), "tune=0:keyint=5s:crf=30:lp=2");
 		assert_eq!(
 			svt_params(38.0, Some(12), Some(2), None),

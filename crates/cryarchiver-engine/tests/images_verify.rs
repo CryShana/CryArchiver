@@ -208,6 +208,7 @@ async fn a_lossless_jxl_is_rendered_to_srgb_and_scores_as_identical() {
 			effort: 3,
 		},
 		pixels: JxlPixels::Rgb8,
+		threads: 4,
 	};
 	let cancel = CancellationToken::new();
 	let bytes = encode_jxl(&tools.ffmpeg, &job, &dir.path().join("c.tmp"), &metadata, &cancel)
@@ -241,6 +242,7 @@ async fn lossless_jxl(dir: &std::path::Path, name: &str, image: &DynamicImage) -
 			effort: 3,
 		},
 		pixels: JxlPixels::Rgb8,
+		threads: 4,
 	};
 	encode_jxl(
 		&tools.ffmpeg,
@@ -330,6 +332,7 @@ async fn lossless_tagged_jxl(dir: &std::path::Path, primaries: &str, transfer: &
 			effort: 3,
 		},
 		pixels: JxlPixels::Rgb16,
+		threads: 4,
 	};
 	let bytes = encode_jxl(
 		&tools.ffmpeg,

@@ -17,7 +17,7 @@ use crate::quality::vmaf::{self, Reference, Score, Scoring};
 use crate::toolchain::Toolchain;
 use crate::video::analyze::{Analysis, DEFAULT_SEGMENTS, Detail};
 use crate::video::encode::{Sample, encode_sample, median_rate};
-use crate::video::plan::{Encoder, VideoPlan, lane_threads};
+use crate::video::plan::{Encoder, VideoPlan, threads_for};
 use crate::workspace::Workspace;
 
 pub const MAX_RETRIES: u32 = 1;
@@ -643,7 +643,7 @@ impl Scorer<'_> {
 		let measured = in_lanes(samples.len(), granted.lanes, next, move |index, threads| async move {
 			let lane = (!granted.plan_caps()).then_some(threads);
 			let plan = VideoPlan {
-				threads: lane.map_or(plan.threads, |threads| Some(lane_threads(threads))),
+				threads: lane.map_or(plan.threads, |threads| Some(threads_for(threads))),
 				..plan.clone()
 			};
 

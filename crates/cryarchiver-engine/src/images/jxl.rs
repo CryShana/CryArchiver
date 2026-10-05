@@ -132,6 +132,8 @@ pub struct JxlJob<'a> {
 	pub layout: SourceLayout,
 	pub settings: JxlSettings,
 	pub pixels: JxlPixels,
+	/// libjxl's threads; without a cap it starts one for every core.
+	pub threads: usize,
 }
 
 pub fn encode_command(ffmpeg: &Path, job: &JxlJob<'_>, output: &Path) -> ToolCommand {
@@ -164,6 +166,8 @@ pub fn encode_command(ffmpeg: &Path, job: &JxlJob<'_>, output: &Path) -> ToolCom
 		.arg(job.settings.distance.to_string())
 		.arg("-effort")
 		.arg(job.settings.effort.to_string())
+		.arg("-threads")
+		.arg(job.threads.max(1).to_string())
 		.args(["-update", "1", "-frames:v", "1", "-f", "image2"])
 		.arg(output);
 	cmd
@@ -209,6 +213,24 @@ mod tests {
 	use image::{GenericImageView, RgbaImage};
 
 	use super::*;
+
+	#[test]
+	fn libjxl_runs_on_the_job_threads() {
+		let job = JxlJob {
+			source: Path::new("in.png"),
+			layout: UPRIGHT,
+			settings: JxlSettings {
+				distance: 1.0,
+				effort: 7,
+			},
+			pixels: JxlPixels::Rgb8,
+			threads: 3,
+		};
+
+		let args = crate::video::joined(&encode_command(Path::new("ffmpeg"), &job, Path::new("out.jxl")));
+
+		assert!(args.contains("-c:v libjxl -distance 1 -effort 7 -threads 3 "), "{args}");
+	}
 
 	#[test]
 	fn transfers_libjxl_cannot_code_become_the_same_curve_or_unspecified() {

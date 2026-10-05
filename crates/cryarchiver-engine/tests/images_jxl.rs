@@ -30,6 +30,7 @@ fn job(source: &Path, settings: JxlSettings, pixels: JxlPixels) -> JxlJob<'_> {
 		layout: layout(&bytes, &extract(&bytes)),
 		settings,
 		pixels,
+		threads: 4,
 	}
 }
 

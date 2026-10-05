@@ -575,7 +575,7 @@ mod tests {
 	use super::*;
 	use crate::audio::plan::{EncodePlan, LayoutFix, TrackJob};
 	use crate::video::burn::Overlay;
-	use crate::video::plan::test_plan;
+	use crate::video::plan::{test_plan, threads_for};
 	use crate::video::streams::SubtitleTrack;
 	use crate::video::{InputStart, VideoStarts, joined};
 
@@ -668,6 +668,31 @@ mod tests {
 			"{args}"
 		);
 		assert!(args.contains("-svtav1-params tune=0:keyint=5s:crf=32:lp=2"), "{args}");
+	}
+
+	#[test]
+	fn six_threads_run_svt_at_a_level_that_fits_them_and_no_budget_leaves_svt_its_own() {
+		let command = |threads: Option<Threads>| {
+			joined(&video_command(
+				Path::new("ffmpeg"),
+				Path::new("in.mp4"),
+				Path::new("v.mkv"),
+				&VideoPlan {
+					threads,
+					..plan(svt(), None)
+				},
+			))
+		};
+
+		let six = command(Some(threads_for(6)));
+		let free = command(None);
+
+		assert!(
+			six.contains("-threads 6 -filter_threads 6 -filter_complex_threads 6 -i "),
+			"{six}"
+		);
+		assert!(six.contains("-svtav1-params tune=0:keyint=5s:crf=32:lp=2 "), "{six}");
+		assert!(!free.contains("threads") && !free.contains(":lp="), "{free}");
 	}
 
 	#[test]

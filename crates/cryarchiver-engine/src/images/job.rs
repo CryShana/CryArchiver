@@ -677,7 +677,7 @@ async fn encode_candidate(
 				Some(upright) => (upright, jxl::UPRIGHT),
 				None => (cx.source, decode::layout(&input.bytes, &input.metadata)),
 			};
-			let job = jxl_job(source, layout, still, candidate);
+			let job = jxl_job(source, layout, still, candidate, cx.threads);
 			jxl::encode(
 				&cx.tools.ffmpeg,
 				&job,
@@ -690,7 +690,13 @@ async fn encode_candidate(
 	}
 }
 
-fn jxl_job<'a>(source: &'a Path, layout: SourceLayout, still: &Still, candidate: Candidate) -> JxlJob<'a> {
+fn jxl_job<'a>(
+	source: &'a Path,
+	layout: SourceLayout,
+	still: &Still,
+	candidate: Candidate,
+	threads: usize,
+) -> JxlJob<'a> {
 	let settings = match candidate {
 		Candidate::JxlLossy(settings) | Candidate::JxlLossless(settings) => settings,
 		Candidate::Ravif(_) => unreachable!("only JPEG XL candidates run through libjxl"),
@@ -700,6 +706,7 @@ fn jxl_job<'a>(source: &'a Path, layout: SourceLayout, still: &Still, candidate:
 		layout,
 		settings,
 		pixels: JxlPixels::for_source(still.effective, grey_profile(still.icc.as_deref())),
+		threads,
 	}
 }
 
