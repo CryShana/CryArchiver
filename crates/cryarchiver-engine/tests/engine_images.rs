@@ -109,10 +109,10 @@ async fn the_next_photo_of_a_group_starts_from_the_learned_quality() {
 	let dir = tempfile::tempdir().unwrap();
 	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
 	let tools = support::toolchain().await;
-	let generous = Arc::new(SharedMemory::with_entries([(
+	let leaner = Arc::new(SharedMemory::with_entries([(
 		PHOTO_GROUP_AT_FAST.to_owned(),
 		GroupStats {
-			setting: 92.0,
+			setting: 84.0,
 			slope: None,
 			bpp: None,
 			offset: None,
@@ -132,22 +132,15 @@ async fn the_next_photo_of_a_group_starts_from_the_learned_quality() {
 			)
 			.await,
 	);
-	let learned = encoded(
-		Engine::new(tools)
-			.with_image_threads(4)
-			.with_quality_memory(generous)
-			.run(
-				&job(&photo),
-				&sink(&dir.path().join("learned")),
-				&|_| {},
-				&CancellationToken::new(),
-			)
-			.await,
-	);
+	let outcome = run_with(&leaner, &job(&photo), &dir.path().join("learned")).await;
 
+	assert_eq!(chosen_quality(&outcome).0, 84.0);
+	let JobOutcome::Encoded { output: learned, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
 	assert!(
-		std::fs::metadata(&learned).unwrap().len() > std::fs::metadata(&plain).unwrap().len(),
-		"quality 92 must produce a larger AVIF than FAST's 88"
+		std::fs::metadata(&learned).unwrap().len() < std::fs::metadata(&plain).unwrap().len(),
+		"quality 84 must produce a smaller AVIF than FAST's 88"
 	);
 }
 
@@ -181,7 +174,99 @@ async fn a_group_that_learned_too_high_a_quality_falls_back_to_the_table_and_lea
 	assert_eq!(entries[0].1.observations, 6, "{entries:?}");
 }
 
+fn targeted(source: &Path, speed: Speed, target: f64) -> Job {
+	Job {
+		speed,
+		overrides: Overrides {
+			image: Some(target),
+			..Overrides::default()
+		},
+		..job(source)
+	}
+}
+
+#[tokio::test]
+async fn a_lower_image_target_gives_a_smaller_photo_and_a_higher_one_a_larger() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = dir.path().join("photo.png");
+	noisy_base(512, 512).save(&photo).unwrap();
+
+	let mut sizes = Vec::new();
+	for target in [70.0, 85.0, 92.0] {
+		let outcome = run(
+			&targeted(&photo, Speed::Moderate, target),
+			&dir.path().join(format!("target-{target}")),
+		)
+		.await;
+		let JobOutcome::Encoded { output, decision, .. } = outcome else {
+			panic!("{outcome:?}")
+		};
+		let image = decision.image.unwrap();
+
+		assert!(image.score.is_some_and(|score| score >= target), "{image:?}");
+		sizes.push(std::fs::metadata(output).unwrap().len());
+	}
+
+	assert!(sizes[0] < sizes[1] && sizes[1] < sizes[2], "{sizes:?}");
+}
+
+async fn run_counting_stages(job: &Job, out_dir: &Path) -> (JobOutcome, Vec<Stage>) {
+	let stages = Mutex::new(Vec::new());
+	let record = |event: JobEvent| {
+		if let JobEvent::Stage(stage @ (Stage::Encode | Stage::Verify)) = event {
+			stages.lock().unwrap().push(stage);
+		}
+	};
+	let outcome = Engine::new(support::toolchain().await)
+		.with_image_threads(4)
+		.run(job, &sink(out_dir), &record, &CancellationToken::new())
+		.await;
+
+	(outcome, stages.into_inner().unwrap())
+}
+
+fn chosen_quality(outcome: &JobOutcome) -> (f64, f64) {
+	let JobOutcome::Encoded { decision, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	let image = decision.image.as_ref().unwrap();
+	let quality = image
+		.setting
+		.as_deref()
+		.and_then(|setting| setting.strip_prefix("quality "))
+		.unwrap();
+
+	(quality.parse().unwrap(), image.score.unwrap())
+}
+
+#[tokio::test]
+async fn a_photo_well_above_its_target_is_encoded_once_more_lower() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
+
+	let (outcome, stages) = run_counting_stages(&targeted(&photo, Speed::Fast, 75.0), dir.path()).await;
+
+	let (quality, score) = chosen_quality(&outcome);
+	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
+	assert!(quality < 84.0, "{quality}");
+	assert!(score >= 75.0, "{score}");
+}
+
+#[tokio::test]
+async fn a_step_down_that_falls_below_the_target_keeps_the_first_pass_and_tries_nothing_more() {
+	let dir = tempfile::tempdir().unwrap();
+	let photo = support::photo_png(dir.path(), "photo.png", 320, 240);
+
+	let (outcome, stages) = run_counting_stages(&job(&photo), dir.path()).await;
+
+	let (quality, score) = chosen_quality(&outcome);
+	assert_eq!(stages, [Stage::Encode, Stage::Verify, Stage::Encode, Stage::Verify]);
+	assert_eq!(quality, 88.0);
+	assert!(score >= 82.0, "the first pass, well above the target, is kept: {score}");
+}
+
 const GRAPHIC_GROUP_AT_FAST: &str = "image/png/graphic/opaque/8bit/mp1|ravif-0.13.0|p9|t80.0";
+const STRICT_GRAPHIC_GROUP_AT_FAST: &str = "image/png/graphic/opaque/8bit/mp1|ravif-0.13.0|p9|t95.0";
 
 fn palette_png(dir: &Path, name: &str) -> PathBuf {
 	let path = dir.join(name);
@@ -1083,18 +1168,29 @@ async fn an_animated_avif_asked_for_in_any_format_fails_instead_of_being_kept() 
 #[tokio::test]
 async fn a_requested_still_below_its_target_is_written_and_learns_nothing() {
 	let dir = tempfile::tempdir().unwrap();
-	// Even raised to quality 100, ravif scores this 16×16 frame just under 95.
+	// Started at its group's lowest learned quality, 92, and raised twice, ravif scores this 24×24 frame just under 95.
 	let photo = dir.path().join("photo.png");
 	support::ffmpeg(&[
 		"-f",
 		"lavfi",
 		"-i",
-		"testsrc2=s=16x16",
+		"testsrc2=s=24x24",
 		"-frames:v",
 		"1",
 		photo.to_str().unwrap(),
 	]);
-	let memory = Arc::new(SharedMemory::default());
+	let floor = GroupStats {
+		setting: 0.0,
+		slope: None,
+		bpp: None,
+		offset: None,
+		observations: 5,
+		without_grain: false,
+	};
+	let memory = Arc::new(SharedMemory::with_entries([(
+		STRICT_GRAPHIC_GROUP_AT_FAST.to_owned(),
+		floor,
+	)]));
 	let engine = Engine::new(support::toolchain().await)
 		.with_image_threads(4)
 		.with_quality_memory(memory.clone());
@@ -1121,7 +1217,7 @@ async fn a_requested_still_below_its_target_is_written_and_learns_nothing() {
 		),
 		"{warnings:?}"
 	);
-	assert!(memory.entries().is_empty(), "{:?}", memory.entries());
+	assert_eq!(memory.entries(), [(STRICT_GRAPHIC_GROUP_AT_FAST.to_owned(), floor)]);
 }
 
 #[tokio::test]
@@ -1699,7 +1795,7 @@ async fn a_gain_map_that_misses_is_encoded_again_at_the_raised_quality() {
 	};
 	let image = decision.image.unwrap();
 	let avif = std::fs::read(output).unwrap();
-	assert_eq!(image.setting.as_deref(), Some("quality 80"));
+	assert_eq!(image.setting.as_deref(), Some("quality 56"));
 	assert!(image.gain_map.is_some_and(|score| score >= TARGET), "{image:?}");
 	checked_avif(&avif, (256, 192), Some(&UltraHdrOptions::default().metadata)).unwrap();
 	let raised = gain_map::encode(&gain, RAISED_QUALITY, 9, 4).unwrap();

@@ -18,16 +18,22 @@ pub const MAX_VERIFY_PIXELS: u64 = fast_ssim2::MAX_IMAGE_PIXELS as u64;
 pub const MAX_RETRIES: u32 = 2;
 pub const GAIN_MAP_NOT_IN_JXL: &str = "the HDR gain map was dropped: JPEG XL output can't carry it";
 
-const LEARNED_HEADROOM: f64 = 2.0;
+const LEARNED_HEADROOM: f64 = 1.0;
 const RAISE_QUALITY_MARGIN: f64 = 1.0;
 const RAISE_DISTANCE_MARGIN: f64 = 0.1;
 const MAX_QUALITY: f64 = 100.0;
+const MIN_START_QUALITY: f64 = 40.0;
 const MIN_DISTANCE: f64 = 0.1;
+const MAX_START_DISTANCE: f64 = 6.0;
 const MAX_DISTANCE: f64 = 25.0;
 pub const RAVIF_QUALITY_RANGE: RangeInclusive<f64> = 1.0..=MAX_QUALITY;
 pub const JXL_DISTANCE_RANGE: RangeInclusive<f64> = MIN_DISTANCE..=MAX_DISTANCE;
-const LEARNED_QUALITY_BELOW_TABLE: f64 = 8.0;
-const LEARNED_DISTANCE_ABOVE_TABLE: f64 = 1.0;
+const LEARNED_QUALITY_BELOW_START: f64 = 8.0;
+const LEARNED_DISTANCE_ABOVE_START: f64 = 1.0;
+const STEP_DOWN_ABOVE: f64 = 2.0;
+const STEP_DOWN_AIM: f64 = 0.75;
+const STEP_DOWN_MIN_QUALITY: f64 = 0.5;
+const STEP_DOWN_MIN_DISTANCE: f64 = 0.05;
 
 const CMYK_COMPONENTS: u8 = 4;
 const YCCK_TRANSFORM: u8 = 2;
@@ -108,21 +114,22 @@ impl Candidate {
 		}
 	}
 
+	/// This candidate at `setting`, kept near the start that `speed` and `target` plan.
 	#[must_use]
 	#[allow(clippy::cast_possible_truncation)]
-	pub fn with_setting(self, speed: Speed, setting: f64) -> Self {
+	pub fn with_setting(self, speed: Speed, target: f64, setting: f64) -> Self {
 		match self {
 			Self::Ravif(settings) => {
-				let table = f64::from(ravif_settings(speed).quality);
+				let start = f64::from(ravif_start(speed, target).quality);
 				Self::Ravif(RavifSettings {
-					quality: setting.clamp(table - LEARNED_QUALITY_BELOW_TABLE, MAX_QUALITY) as f32,
+					quality: setting.clamp(start - LEARNED_QUALITY_BELOW_START, MAX_QUALITY) as f32,
 					..settings
 				})
 			}
 			Self::JxlLossy(settings) => {
-				let table = f64::from(jxl_lossy_settings(speed).distance);
+				let start = f64::from(jxl_lossy_start(speed, target).distance);
 				Self::JxlLossy(JxlSettings {
-					distance: setting.clamp(MIN_DISTANCE, table + LEARNED_DISTANCE_ABOVE_TABLE) as f32,
+					distance: setting.clamp(MIN_DISTANCE, start + LEARNED_DISTANCE_ABOVE_START) as f32,
 					..settings
 				})
 			}
@@ -158,14 +165,39 @@ impl Candidate {
 	}
 
 	pub fn needed_setting(self, score: f64, target: f64, speed: Speed) -> Option<f64> {
-		let spare = score - target - LEARNED_HEADROOM;
-		let needed = match self {
-			Self::Ravif(settings) => f64::from(settings.quality) - spare / tables().images.ravif_points_per_quality,
-			Self::JxlLossy(settings) => f64::from(settings.distance) + spare / tables().images.jxl_points_per_distance,
-			Self::JxlLossless(_) => return None,
-		};
+		let needed = self.aimed_setting(score - target - LEARNED_HEADROOM)?;
+		self.with_setting(speed, target, needed).setting()
+	}
 
-		self.with_setting(speed, needed).setting()
+	/// The one lower encode for a pass that cleared `target` by more than `STEP_DOWN_ABOVE`, aimed `STEP_DOWN_AIM`
+	/// above it; `None` when it would hardly differ from this one.
+	pub fn stepped_down(self, score: f64, target: f64, speed: Speed) -> Option<Self> {
+		if score - target <= STEP_DOWN_ABOVE {
+			return None;
+		}
+
+		let aimed = self.aimed_setting(score - target - STEP_DOWN_AIM)?;
+		let lowered = self.with_setting(speed, target, aimed);
+		let (current, lowered_setting) = (self.setting()?, lowered.setting()?);
+		let change = match self {
+			Self::Ravif(_) => (current - lowered_setting) >= STEP_DOWN_MIN_QUALITY,
+			Self::JxlLossy(_) => (lowered_setting - current) >= STEP_DOWN_MIN_DISTANCE,
+			Self::JxlLossless(_) => false,
+		};
+		change.then_some(lowered)
+	}
+
+	/// The setting expected to score `spare` points lower than this one did.
+	fn aimed_setting(self, spare: f64) -> Option<f64> {
+		match self {
+			Self::Ravif(settings) => {
+				Some(f64::from(settings.quality) - spare / tables().images.ravif_points_per_quality)
+			}
+			Self::JxlLossy(settings) => {
+				Some(f64::from(settings.distance) + spare / tables().images.jxl_points_per_distance)
+			}
+			Self::JxlLossless(_) => None,
+		}
 	}
 
 	pub fn finer_than(self, other: Self) -> bool {
@@ -216,6 +248,28 @@ pub fn jxl_lossy_settings(speed: Speed) -> JxlSettings {
 		Speed::Slow => (0.5, 7),
 	};
 	JxlSettings { distance, effort }
+}
+
+/// The speed's table quality moved by how far `target` is from the speed's own target.
+#[allow(clippy::cast_possible_truncation)]
+pub fn ravif_start(speed: Speed, target: f64) -> RavifSettings {
+	let table = ravif_settings(speed);
+	let shift = (target - ssim_target(speed)) / tables().images.ravif_points_per_quality;
+	RavifSettings {
+		quality: (f64::from(table.quality) + shift).clamp(MIN_START_QUALITY, MAX_QUALITY) as f32,
+		..table
+	}
+}
+
+/// The speed's table distance moved by how far `target` is from the speed's own target.
+#[allow(clippy::cast_possible_truncation)]
+pub fn jxl_lossy_start(speed: Speed, target: f64) -> JxlSettings {
+	let table = jxl_lossy_settings(speed);
+	let shift = (target - ssim_target(speed)) / tables().images.jxl_points_per_distance;
+	JxlSettings {
+		distance: (f64::from(table.distance) - shift).clamp(MIN_DISTANCE, MAX_START_DISTANCE) as f32,
+		..table
+	}
 }
 
 /// Passes a source that may be converted, with the warnings for what converting it drops.
@@ -324,12 +378,14 @@ pub fn plan_still(
 		&& pixels <= MAX_AVIF_PIXELS
 		&& !facts.effective.high_depth
 		&& !facts.grey_icc;
-	let lossy_jxl = Candidate::JxlLossy(jxl_lossy_settings(speed));
+	let target = image_target(speed, overrides);
+	let avif = Candidate::Ravif(ravif_start(speed, target));
+	let lossy_jxl = Candidate::JxlLossy(jxl_lossy_start(speed, target));
 	let lossless_jxl = Candidate::JxlLossless(JXL_LOSSLESS);
 
 	let candidates = match route {
 		Some(ImageRoute::Avif) if !fits_avif => return Err(Refusal::Impossible(not_avif(facts))),
-		Some(ImageRoute::Avif) => vec![Candidate::Ravif(ravif_settings(speed))],
+		Some(ImageRoute::Avif) => vec![avif],
 		Some(ImageRoute::Jxl | ImageRoute::JxlLossless) if !libjxl => {
 			return Err(Refusal::Impossible("JPEG XL output needs ffmpeg with libjxl".into()));
 		}
@@ -339,7 +395,7 @@ pub fn plan_still(
 		None => {
 			let mut candidates = Vec::new();
 			if fits_avif {
-				candidates.push(Candidate::Ravif(ravif_settings(speed)));
+				candidates.push(avif);
 			} else if libjxl {
 				candidates.push(lossy_jxl);
 			} else {
@@ -358,7 +414,7 @@ pub fn plan_still(
 	Ok(StillPlan {
 		memory_bytes: memory_estimate(facts.width, facts.height, &candidates),
 		candidates,
-		target: image_target(speed, overrides),
+		target,
 	})
 }
 
@@ -737,23 +793,127 @@ mod tests {
 	}
 
 	#[test]
-	fn learned_settings_stay_near_the_table() {
+	fn the_start_moves_with_the_target() {
+		for speed in [Speed::Fast, Speed::Moderate, Speed::Slow] {
+			assert_eq!(ravif_start(speed, ssim_target(speed)), ravif_settings(speed));
+			assert_eq!(jxl_lossy_start(speed, ssim_target(speed)), jxl_lossy_settings(speed));
+		}
+
+		assert_eq!(
+			ravif_start(Speed::Moderate, 70.0),
+			RavifSettings {
+				quality: 80.0,
+				speed: 6
+			}
+		);
+		assert_eq!(ravif_start(Speed::Moderate, 95.0).quality, 100.0);
+		assert_eq!(ravif_start(Speed::Fast, -100.0).quality, 40.0);
+		assert_eq!(
+			jxl_lossy_start(Speed::Moderate, 70.0),
+			JxlSettings {
+				distance: 2.875,
+				effort: 7
+			}
+		);
+		assert!((jxl_lossy_start(Speed::Moderate, 95.0).distance - 0.1).abs() < 1e-6);
+		assert_eq!(jxl_lossy_start(Speed::Fast, 0.0).distance, 6.0);
+	}
+
+	#[test]
+	fn planned_candidates_start_from_the_target() {
+		let target = |image: f64| Overrides {
+			image: Some(image),
+			..Overrides::default()
+		};
+		let planned = |overrides: &Overrides, route| {
+			plan_still(&facts(800, 600), Speed::Moderate, overrides, true, route)
+				.unwrap()
+				.candidates[0]
+				.setting()
+				.unwrap()
+		};
+
+		assert_eq!(planned(&target(70.0), None), 80.0);
+		assert_eq!(planned(&target(70.0), Some(ImageRoute::Avif)), 80.0);
+		assert_eq!(planned(&Overrides::default(), None), 92.0);
+		assert_eq!(planned(&target(70.0), Some(ImageRoute::Jxl)), 2.875);
+		assert_eq!(planned(&Overrides::default(), Some(ImageRoute::Jxl)), 1.0);
+	}
+
+	#[test]
+	fn learned_settings_stay_near_the_start() {
 		let ravif = Candidate::Ravif(ravif_settings(Speed::Moderate));
 		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Moderate));
 		let lossless = Candidate::JxlLossless(JXL_LOSSLESS);
 
-		assert_eq!(ravif.with_setting(Speed::Moderate, 60.0).setting(), Some(84.0));
-		assert_eq!(ravif.with_setting(Speed::Moderate, 120.0).setting(), Some(100.0));
-		assert_eq!(ravif.with_setting(Speed::Moderate, 90.0).setting(), Some(90.0));
-		assert_eq!(jxl.with_setting(Speed::Moderate, 5.0).setting(), Some(2.0));
+		assert_eq!(ravif.with_setting(Speed::Moderate, 85.0, 60.0).setting(), Some(84.0));
+		assert_eq!(ravif.with_setting(Speed::Moderate, 85.0, 120.0).setting(), Some(100.0));
+		assert_eq!(ravif.with_setting(Speed::Moderate, 85.0, 90.0).setting(), Some(90.0));
+		assert_eq!(ravif.with_setting(Speed::Moderate, 70.0, 70.0).setting(), Some(72.0));
+		assert_eq!(ravif.with_setting(Speed::Moderate, 70.0, 75.0).setting(), Some(75.0));
+		assert_eq!(jxl.with_setting(Speed::Moderate, 85.0, 5.0).setting(), Some(2.0));
 		assert_eq!(
-			jxl.with_setting(Speed::Moderate, 0.0)
+			jxl.with_setting(Speed::Moderate, 85.0, 0.0)
 				.setting()
 				.map(|distance| (distance * 10.0).round()),
 			Some(1.0)
 		);
-		assert_eq!(lossless.with_setting(Speed::Moderate, 3.0), lossless);
+		assert_eq!(jxl.with_setting(Speed::Moderate, 70.0, 5.0).setting(), Some(3.875));
+		assert_eq!(jxl.with_setting(Speed::Moderate, 70.0, 3.5).setting(), Some(3.5));
+		assert_eq!(lossless.with_setting(Speed::Moderate, 85.0, 3.0), lossless);
 		assert_eq!(lossless.setting(), None);
+	}
+
+	#[test]
+	fn only_a_pass_well_above_the_target_steps_down_and_only_by_a_real_change() {
+		let ravif = Candidate::Ravif(ravif_settings(Speed::Moderate));
+		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Moderate));
+		let at_floor = ravif.with_setting(Speed::Moderate, 85.0, 0.0);
+		let at_ceiling = jxl.with_setting(Speed::Moderate, 85.0, 25.0);
+		let stepped = |candidate: Candidate, score: f64| {
+			candidate
+				.stepped_down(score, 85.0, Speed::Moderate)
+				.and_then(Candidate::setting)
+		};
+
+		let lowered = stepped(ravif, 89.0).unwrap();
+		assert!((lowered - 89.4).abs() < 1e-4, "{lowered}");
+		assert_eq!(stepped(ravif, 87.0), None);
+		assert_eq!(stepped(ravif, 86.0), None);
+		assert_eq!(at_floor.setting(), Some(84.0));
+		assert_eq!(stepped(at_floor, 95.0), None);
+		assert_eq!(
+			stepped(
+				Candidate::Ravif(RavifSettings {
+					quality: 84.4,
+					speed: 6
+				}),
+				95.0
+			),
+			None
+		);
+
+		let lowered = stepped(jxl, 89.0).unwrap();
+		assert!((lowered - 1.40625).abs() < 1e-6, "{lowered}");
+		assert_eq!(stepped(jxl, 87.0), None);
+		assert_eq!(at_ceiling.setting(), Some(2.0));
+		assert_eq!(stepped(at_ceiling, 95.0), None);
+		assert_eq!(
+			Candidate::JxlLossless(JXL_LOSSLESS).stepped_down(99.0, 85.0, Speed::Moderate),
+			None
+		);
+	}
+
+	#[test]
+	fn a_step_down_stays_near_the_start_of_a_custom_target() {
+		let start = Candidate::Ravif(ravif_start(Speed::Moderate, 70.0));
+
+		assert_eq!(
+			start
+				.stepped_down(95.0, 70.0, Speed::Moderate)
+				.and_then(Candidate::setting),
+			Some(72.0)
+		);
 	}
 
 	#[test]
@@ -783,14 +943,18 @@ mod tests {
 	}
 
 	#[test]
-	fn a_pass_teaches_the_setting_that_would_have_cleared_the_floor_by_two() {
+	fn a_pass_teaches_the_setting_that_would_have_cleared_the_floor_by_one() {
 		let ravif = Candidate::Ravif(ravif_settings(Speed::Moderate));
 
 		let generous = ravif.needed_setting(90.0, 85.0, Speed::Moderate).unwrap();
 		let narrow = ravif.needed_setting(85.5, 85.0, Speed::Moderate).unwrap();
+		let custom = Candidate::Ravif(ravif_start(Speed::Moderate, 70.0))
+			.needed_setting(95.0, 70.0, Speed::Moderate)
+			.unwrap();
 
-		assert!((generous - 89.6).abs() < 1e-4, "{generous}");
-		assert!((narrow - 93.2).abs() < 1e-4, "{narrow}");
+		assert!((generous - 88.8).abs() < 1e-4, "{generous}");
+		assert!((narrow - 92.4).abs() < 1e-4, "{narrow}");
+		assert!((custom - 72.0).abs() < 1e-4, "{custom}");
 		assert_eq!(
 			Candidate::JxlLossless(JXL_LOSSLESS).needed_setting(99.0, 85.0, Speed::Moderate),
 			None
@@ -816,11 +980,11 @@ mod tests {
 		let ravif = Candidate::Ravif(ravif_settings(Speed::Fast));
 		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Fast));
 
-		assert!(ravif.with_setting(Speed::Fast, 96.0).finer_than(ravif));
-		assert!(!ravif.with_setting(Speed::Fast, 84.0).finer_than(ravif));
+		assert!(ravif.with_setting(Speed::Fast, 80.0, 96.0).finer_than(ravif));
+		assert!(!ravif.with_setting(Speed::Fast, 80.0, 84.0).finer_than(ravif));
 		assert!(!ravif.finer_than(ravif));
-		assert!(jxl.with_setting(Speed::Fast, 1.0).finer_than(jxl));
-		assert!(!jxl.with_setting(Speed::Fast, 2.0).finer_than(jxl));
+		assert!(jxl.with_setting(Speed::Fast, 80.0, 1.0).finer_than(jxl));
+		assert!(!jxl.with_setting(Speed::Fast, 80.0, 2.0).finer_than(jxl));
 		assert!(!Candidate::JxlLossless(JXL_LOSSLESS).finer_than(jxl));
 	}
 

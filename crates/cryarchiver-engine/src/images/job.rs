@@ -158,6 +158,15 @@ struct Slot {
 	table: Option<Candidate>,
 }
 
+/// A candidate encode that scored at least the target, or is written short because it was requested.
+struct Pass {
+	path: PathBuf,
+	size: u64,
+	candidate: Candidate,
+	score: f64,
+	parts: Option<GainMapParts>,
+}
+
 #[derive(Debug)]
 enum Tried {
 	Passed {
@@ -523,7 +532,9 @@ async fn encode_and_choose(
 		let candidate = key
 			.as_ref()
 			.and_then(|key| cx.memory.lookup(key))
-			.map_or(planned, |stats| planned.with_setting(cx.speed, stats.setting));
+			.map_or(planned, |stats| {
+				planned.with_setting(cx.speed, still.plan.target, stats.setting)
+			});
 		let slot = Slot {
 			index,
 			best: choice.passing_size(),
@@ -615,7 +626,7 @@ async fn try_candidate(
 		let (bytes, parts) = encode_candidate(cx, input, workspace, still, env, candidate).await?;
 		fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
 
-		let mut size = bytes.len() as u64;
+		let size = bytes.len() as u64;
 		let too_large = |size| !cx.forced && !saves_enough(cx.source_bytes, size, cx.min_savings);
 		let beaten = |size| slot.best.is_some_and(|best| best <= size);
 		if too_large(size)
@@ -658,38 +669,100 @@ async fn try_candidate(
 			}
 		};
 
+		let mut pass = Pass {
+			path,
+			size,
+			candidate,
+			score,
+			parts,
+		};
+		if !short && let Some(lowered) = Box::pin(step_down(cx, input, workspace, still, env, slot, &pass)).await? {
+			pass = lowered;
+		}
+
 		let mut gain_map = None;
-		if let Some(parts) = parts {
-			let checked = match Box::pin(check_gain_map(cx, workspace, still, env, &path, parts)).await {
+		if let Some(parts) = pass.parts {
+			let checked = match Box::pin(check_gain_map(cx, workspace, still, env, &pass.path, parts)).await {
 				Ok(checked) => checked,
 				Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => return Ok(Tried::Failed(err)),
 				Err(err) => return Err(err),
 			};
-			size = checked.rebuilt.unwrap_or(size);
+			pass.size = checked.rebuilt.unwrap_or(pass.size);
 
 			if checked.missed && !cx.forced {
 				return Ok(Tried::GainMapMissed {
-					size,
+					size: pass.size,
 					score: checked.score,
 				});
 			}
 
-			if checked.rebuilt.is_some() && (too_large(size) || beaten(size)) {
-				return Ok(Tried::TooLarge { size, score: None });
+			if checked.rebuilt.is_some() && (too_large(pass.size) || beaten(pass.size)) {
+				return Ok(Tried::TooLarge {
+					size: pass.size,
+					score: None,
+				});
 			}
 
 			gain_map = Some(checked.score);
 		}
 
 		return Ok(Tried::Passed {
-			path,
-			size,
-			candidate,
-			score,
+			path: pass.path,
+			size: pass.size,
+			candidate: pass.candidate,
+			score: pass.score,
 			gain_map,
 			short,
 		});
 	}
+}
+
+/// Encodes a pass well above the target once more, aimed just above it, and returns that encode when it is smaller and
+/// still passes. Whichever of the two files is not kept is removed.
+async fn step_down(
+	cx: &ImageContext<'_>,
+	input: &ImageInput,
+	workspace: &Workspace,
+	still: &Still,
+	env: &Env<'_>,
+	slot: Slot,
+	pass: &Pass,
+) -> Result<Option<Pass>, JobError> {
+	let target = still.plan.target;
+	let Some(lowered) = pass.candidate.stepped_down(pass.score, target, cx.speed) else {
+		return Ok(None);
+	};
+
+	(cx.on_event)(JobEvent::Stage(Stage::Encode));
+	let path = workspace.file(&format!("candidate{}-lower.{}", slot.index, lowered.extension()));
+	let (bytes, parts) = encode_candidate(cx, input, workspace, still, env, lowered).await?;
+	fs::write(&path, &bytes).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
+
+	let size = bytes.len() as u64;
+	let score = if size < pass.size && slot.best.is_none_or(|best| size < best) {
+		(cx.on_event)(JobEvent::Stage(Stage::Verify));
+		match verify_candidate(cx, still, env, lowered, &path, bytes).await {
+			Ok(score) => Some(score),
+			Err(err) if matches!(err.kind, ErrorKind::EncodeFailed(_)) => None,
+			Err(err) => return Err(err),
+		}
+	} else {
+		None
+	};
+
+	if let Some(score) = score.filter(|score| *score >= target) {
+		let _ = fs::remove_file(&pass.path);
+		return Ok(Some(Pass {
+			path,
+			size,
+			candidate: lowered,
+			score,
+			parts,
+		}));
+	}
+
+	let _ = fs::remove_file(&path);
+	Ok(None)
 }
 
 async fn verify_candidate(
