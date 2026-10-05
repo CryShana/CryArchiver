@@ -14,10 +14,11 @@ mod widgets;
 pub use self::issues::AttemptLog;
 
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use crate::app::tree::file_row;
-use crate::app::{Lifecycle, Overlay, Ui, ViewMode};
+use crate::app::{Layout, Lifecycle, Overlay, Ui, ViewMode};
 use crate::source::ArchiveSource;
 use crate::view::{ArchiveView, FileDetails, Notification};
 
@@ -29,13 +30,13 @@ const LOG_HEIGHT: u16 = 6;
 struct Areas {
 	header: Rect,
 	top: Option<Rect>,
-	main: Rect,
+	main: Option<Rect>,
 	log: Option<Rect>,
 	footer: Rect,
 }
 
 impl Areas {
-	fn new(area: Rect, maximized: bool, log_open: bool) -> Self {
+	fn new(area: Rect, layout: Layout) -> Self {
 		let header = Rect { height: 1, ..area };
 		let footer = Rect {
 			y: area.bottom() - 1,
@@ -48,17 +49,27 @@ impl Areas {
 			..area
 		};
 
-		if maximized {
+		if layout.log_maximized {
 			return Self {
 				header,
 				top: None,
-				main: between,
+				main: None,
+				log: Some(between),
+				footer,
+			};
+		}
+
+		if layout.maximized {
+			return Self {
+				header,
+				top: None,
+				main: Some(between),
 				log: None,
 				footer,
 			};
 		}
 
-		let log_height = if log_open { LOG_HEIGHT } else { 1 };
+		let log_height = if layout.log_open { LOG_HEIGHT } else { 1 };
 		let top = Rect {
 			height: TOP_HEIGHT,
 			..between
@@ -77,7 +88,7 @@ impl Areas {
 		Self {
 			header,
 			top: Some(top),
-			main,
+			main: Some(main),
 			log: Some(log),
 			footer,
 		}
@@ -106,15 +117,41 @@ pub fn draw(frame: &mut Frame, source: &dyn ArchiveSource, fetched: &Fetched, ui
 		return;
 	}
 
-	let areas = Areas::new(area, ui.layout.maximized, ui.layout.log_open);
+	let areas = Areas::new(area, ui.layout);
 	header::render(buf, areas.header, view, &ui.theme);
 
 	if let Some(top) = areas.top {
 		ui.spinner_drawn = panels::render(buf, top, view, &ui.theme, &ui.spinner);
 	}
 
+	if let Some(main) = areas.main {
+		draw_main(buf, main, source, fetched, ui);
+	}
+
+	let log_shown = ui.layout.log_maximized || (ui.layout.log_open && !ui.layout.maximized);
+	if let Some(log) = areas.log {
+		log::render(buf, log, &view.log, fetched.toast.filter(|_| log_shown), ui);
+	}
+
+	footer::render(
+		buf,
+		areas.footer,
+		view,
+		details,
+		fetched.toast.filter(|_| !log_shown),
+		ui,
+	);
+	draw_overlay(buf, area, areas.main.unwrap_or(area), view, ui);
+
+	if ui.lifecycle == Lifecycle::Stopping {
+		overlay::stopping(buf, area, &ui.theme);
+	}
+}
+
+fn draw_main(buf: &mut Buffer, main: Rect, source: &dyn ArchiveSource, fetched: &Fetched, ui: &mut Ui) {
+	let view = source.view();
 	match ui.mode {
-		ViewMode::Library => library::render(buf, areas.main, source, ui),
+		ViewMode::Library => library::render(buf, main, source, ui),
 		ViewMode::Details => {
 			let name = ui
 				.tree
@@ -123,44 +160,18 @@ pub fn draw(frame: &mut Frame, source: &dyn ArchiveSource, fetched: &Fetched, ui
 				.and_then(|row| file_row(source, row.kind).map(|file| file.name.as_str()));
 			details::render(
 				buf,
-				areas.main,
+				main,
 				name.unwrap_or_default(),
-				details,
+				fetched.details,
 				&ui.theme,
 				&mut ui.hits,
 			);
 		}
-		ViewMode::Issues => issues::render(buf, areas.main, &view.issues, fetched.issue_log.as_ref(), ui),
-	}
-
-	if let Some(log) = areas.log {
-		log::render(
-			buf,
-			log,
-			&view.log,
-			fetched.toast.filter(|_| ui.layout.log_open),
-			&ui.theme,
-			&mut ui.hits,
-		);
-	}
-
-	let log_hidden = ui.layout.maximized || !ui.layout.log_open;
-	footer::render(
-		buf,
-		areas.footer,
-		view,
-		details,
-		fetched.toast.filter(|_| log_hidden),
-		ui,
-	);
-	draw_overlay(buf, area, areas.main, view, ui);
-
-	if ui.lifecycle == Lifecycle::Stopping {
-		overlay::stopping(buf, area, &ui.theme);
+		ViewMode::Issues => issues::render(buf, main, &view.issues, fetched.issue_log.as_ref(), ui),
 	}
 }
 
-fn draw_overlay(buf: &mut ratatui::buffer::Buffer, screen: Rect, main: Rect, view: &ArchiveView, ui: &mut Ui) {
+fn draw_overlay(buf: &mut Buffer, screen: Rect, main: Rect, view: &ArchiveView, ui: &mut Ui) {
 	match &ui.overlay {
 		Some(Overlay::Help) => overlay::help(buf, screen, &ui.theme),
 		Some(Overlay::Menu(menu)) => {

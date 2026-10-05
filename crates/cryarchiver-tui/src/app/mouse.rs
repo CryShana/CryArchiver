@@ -18,12 +18,25 @@ pub enum Hit {
 	LibraryTitle,
 	Maximize,
 	LogToggle,
+	LogMaximize,
+	LogNewest,
+	LogLine(u64),
+	LogPanel,
 	Issue(usize),
 	Menu,
 	MenuItem(usize),
 	Link { file: FileId, folder: NodeId },
 	Modal,
 	SettingsRow(usize),
+}
+
+impl Hit {
+	fn on_log(self) -> bool {
+		matches!(
+			self,
+			Self::LogToggle | Self::LogMaximize | Self::LogNewest | Self::LogLine(_) | Self::LogPanel
+		)
+	}
 }
 
 /// Clickable regions of the frame that is on screen. Later regions sit on top of earlier ones.
@@ -143,6 +156,11 @@ impl Ui {
 			Hit::LibraryTitle if double => self.layout.maximized = !self.layout.maximized,
 			Hit::Maximize => self.layout.maximized = !self.layout.maximized,
 			Hit::LogToggle => self.layout.log_open = !self.layout.log_open,
+			Hit::LogMaximize => {
+				self.layout.log_maximized = !self.layout.log_maximized;
+				self.layout.maximized = false;
+			}
+			Hit::LogNewest => self.log_scroll.jump_to_newest(),
 			Hit::Issue(index) => {
 				self.select_issue(index);
 				let located = source
@@ -158,7 +176,13 @@ impl Ui {
 				self.reveal_file(source, folder, file);
 				self.mode = ViewMode::Library;
 			}
-			Hit::LibraryTitle | Hit::Menu | Hit::MenuItem(_) | Hit::Modal | Hit::SettingsRow(_) => {
+			Hit::LibraryTitle
+			| Hit::Menu
+			| Hit::MenuItem(_)
+			| Hit::Modal
+			| Hit::SettingsRow(_)
+			| Hit::LogLine(_)
+			| Hit::LogPanel => {
 				return Outcome::Ignored;
 			}
 		}
@@ -185,6 +209,9 @@ impl Ui {
 
 		self.overlay = None;
 		match self.hits.at(position) {
+			Some(Hit::LogLine(number)) => return self.copy_log_line(source, number),
+			Some(hit) if hit.on_log() => return Outcome::Done,
+			_ if self.layout.log_maximized => return Outcome::Done,
 			Some(Hit::Row { index, .. }) => self.tree.select_index(index),
 			Some(Hit::Issue(index)) => self.select_issue(index),
 			_ => {}
@@ -193,9 +220,27 @@ impl Ui {
 		self.open_menu(source, Some((position.x, position.y)))
 	}
 
+	fn copy_log_line(&mut self, source: &dyn ArchiveSource, number: u64) -> Outcome {
+		let Some(line) = source.view().log.by_number(number) else {
+			return Outcome::Done;
+		};
+
+		self.copied = Some(format!("{} {}", line.time, line.message));
+		Outcome::Done
+	}
+
 	fn on_wheel(&mut self, source: &dyn ArchiveSource, position: Position, rows: isize) -> Outcome {
 		if self.overlay.is_some() {
 			return Outcome::Ignored;
+		}
+
+		if self.hits.at(position).is_some_and(Hit::on_log) {
+			if !self.layout.log_open && !self.layout.log_maximized {
+				return Outcome::Ignored;
+			}
+
+			self.log_scroll.scroll_by(&source.view().log, rows);
+			return Outcome::Done;
 		}
 
 		if self.issues_area.is_some_and(|area| area.contains(position)) {

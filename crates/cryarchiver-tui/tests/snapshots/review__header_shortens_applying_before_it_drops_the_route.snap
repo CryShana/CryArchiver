@@ -25,7 +25,7 @@ expression: terminal.backend()
 "│        ✓ comic-strip-tall.jpg                done       ━━━━━━━━  100% JXL   34.9 MB → 13.2 MB   −62% │"
 "│        ✓ city-map-large.jpg                  done       ━━━━━━━━  100% AVIF  14.5 MB → 4.08 MB   −72% │"
 "╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯"
-"╭─ Log ───────────────────────────────────────────────────────────────────────────────── l to collapse ─╮"
+"╭─ Log ───────────────────────────────────────────────────────────────────────────── l to collapse ─[⤢]─╮"
 "│ 14:02:13 → performance limit 25 % · applying… extra jobs finish first, or restart them now            │"
 "│ 14:02:13 → deleting originals is ON · each is deleted permanently after its archive is verified       │"
 "│ 14:02:08 ◌ concert_1080i.mkv: CRF 30.75 → VMAF 94.9 (4 probes) · encoding                             │"

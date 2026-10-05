@@ -388,3 +388,170 @@ fn wheel_scrolls_the_library_without_moving_the_selection() {
 	assert_ne!(support::row_text(&after, 12), first_row);
 	assert_eq!(app.selected(), selected);
 }
+
+fn log_title_row(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> u16 {
+	find_row(terminal, "─ Log ").unwrap()
+}
+
+#[test]
+fn shift_l_maximizes_the_log_exclusively_and_esc_restores() {
+	let mut app = app();
+
+	press(&mut app, KeyCode::Char('L'));
+	assert!(app.log_maximized());
+	assert!(!app.maximized());
+
+	press(&mut app, KeyCode::Char('z'));
+	assert!(app.maximized());
+	assert!(
+		!app.log_maximized(),
+		"the library and the log are never maximized together"
+	);
+
+	press(&mut app, KeyCode::Char('L'));
+	assert!(app.log_maximized());
+	assert!(!app.maximized());
+
+	press(&mut app, KeyCode::Esc);
+	assert!(!app.log_maximized());
+	assert!(app.log_open());
+}
+
+#[test]
+fn clicking_the_log_maximize_toggle() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let title_row = log_title_row(&terminal);
+	let toggle = find_on_row(&terminal, title_row, "[⤢]").unwrap();
+
+	click(&mut app, toggle + 1, title_row, Instant::now());
+	assert!(app.log_maximized());
+	assert!(app.log_open(), "the click maximizes, it doesn't collapse");
+
+	let terminal = draw(&mut app, 120, 36);
+	assert_eq!(
+		log_title_row(&terminal),
+		1,
+		"the maximized log starts right below the header"
+	);
+	let toggle = find_on_row(&terminal, 1, "[⤡]").unwrap();
+	click(&mut app, toggle + 1, 1, Instant::now() + Duration::from_secs(1));
+	assert!(!app.log_maximized());
+}
+
+#[test]
+fn wheel_over_the_log_scrolls_the_log_not_the_library() {
+	let mut app = app();
+	let before = draw(&mut app, 120, 36);
+	let title_row = log_title_row(&before);
+	let library_row = support::row_text(&before, 12);
+	let second_line = support::row_text(&before, title_row + 2);
+
+	mouse(&mut app, MouseEventKind::ScrollDown, 40, title_row + 2, Instant::now());
+	let after = draw(&mut app, 120, 36);
+
+	assert_eq!(support::row_text(&after, 12), library_row);
+	assert!(support::row_text(&after, title_row).contains("↑ 3 newer"));
+	assert_ne!(support::row_text(&after, title_row + 2), second_line);
+
+	mouse(&mut app, MouseEventKind::ScrollUp, 40, title_row + 2, Instant::now());
+	let back = draw(&mut app, 120, 36);
+	assert_eq!(support::row_text(&back, title_row + 2), second_line);
+	assert!(!support::row_text(&back, title_row).contains("newer"));
+}
+
+#[test]
+fn a_scrolled_log_keeps_its_lines_while_new_ones_arrive() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let title_row = log_title_row(&terminal);
+	mouse(&mut app, MouseEventKind::ScrollDown, 40, title_row + 1, Instant::now());
+	let scrolled = draw(&mut app, 120, 36);
+	let shown = support::row_text(&scrolled, title_row + 1);
+
+	press(&mut app, KeyCode::Char('p'));
+	let later = draw(&mut app, 120, 36);
+
+	assert_eq!(support::row_text(&later, title_row + 1), shown);
+	assert!(support::row_text(&later, title_row).contains("↑ 4 newer"));
+}
+
+#[test]
+fn clicking_the_newer_hint_returns_to_the_newest_line() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let title_row = log_title_row(&terminal);
+	let newest = support::row_text(&terminal, title_row + 1);
+	mouse(&mut app, MouseEventKind::ScrollDown, 40, title_row + 1, Instant::now());
+	let scrolled = draw(&mut app, 120, 36);
+	let hint = find_on_row(&scrolled, title_row, "↑ 3 newer").unwrap();
+
+	click(&mut app, hint + 1, title_row, Instant::now());
+	let back = draw(&mut app, 120, 36);
+
+	assert_eq!(support::row_text(&back, title_row + 1), newest);
+	assert!(app.log_open(), "the hint doesn't collapse the log");
+}
+
+#[test]
+fn keys_scroll_the_maximized_log_and_leave_the_selection_alone() {
+	let mut app = app();
+	for _ in 0..40 {
+		press(&mut app, KeyCode::Char('p'));
+	}
+	let selected = app.selected();
+	press(&mut app, KeyCode::Char('L'));
+	draw(&mut app, 120, 36);
+
+	press(&mut app, KeyCode::Down);
+	press(&mut app, KeyCode::Down);
+	let terminal = draw(&mut app, 120, 36);
+	assert!(support::row_text(&terminal, 1).contains("↑ 2 newer"));
+	assert_eq!(app.selected(), selected);
+
+	press(&mut app, KeyCode::Home);
+	let terminal = draw(&mut app, 120, 36);
+	assert!(!support::row_text(&terminal, 1).contains("newer"));
+}
+
+#[test]
+fn right_click_on_a_log_line_copies_it_and_opens_no_menu() {
+	let mut app = app();
+	let selected = app.selected();
+	let terminal = draw(&mut app, 120, 36);
+	let title_row = log_title_row(&terminal);
+	let line = app.source().view().log.newest_first().nth(1).unwrap().clone();
+
+	mouse(
+		&mut app,
+		MouseEventKind::Down(MouseButton::Right),
+		60,
+		title_row + 2,
+		Instant::now(),
+	);
+
+	assert_eq!(app.overlay(), None);
+	assert_eq!(app.selected(), selected);
+	assert_eq!(app.take_clipboard(), Some(format!("{} {}", line.time, line.message)));
+	assert!(app.toast().is_some_and(|toast| toast.text.starts_with("copied")));
+}
+
+#[test]
+fn right_click_on_empty_log_space_or_its_border_does_nothing() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('L'));
+	let terminal = draw(&mut app, 120, 36);
+	let empty_row = (2..34)
+		.find(|&row| {
+			support::row_text(&terminal, row)
+				.trim_matches(|c| c == '│' || c == ' ')
+				.is_empty()
+		})
+		.unwrap();
+
+	for (x, y) in [(60, empty_row), (60, 34), (0, 10), (10, 1)] {
+		mouse(&mut app, MouseEventKind::Down(MouseButton::Right), x, y, Instant::now());
+		assert_eq!(app.overlay(), None, "right-click at {x},{y}");
+		assert_eq!(app.take_clipboard(), None);
+	}
+}

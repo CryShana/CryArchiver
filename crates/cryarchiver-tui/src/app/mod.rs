@@ -22,7 +22,7 @@ pub use self::tree::Selection;
 use self::tree::TreeState;
 use crate::source::{Action, ArchiveSource};
 use crate::theme::{ColorDepth, Theme};
-use crate::view::{FileDetails, FileId, IssueId, Library, NodeId, Notification};
+use crate::view::{FileDetails, FileId, IssueId, Library, Log, NodeId, NoticeLevel, Notification};
 
 const TOAST_LIFETIME: Duration = Duration::from_secs(6);
 
@@ -76,6 +76,7 @@ pub struct App<S> {
 	details: Option<(FileId, u64, Option<FileDetails>)>,
 	issue_log: Option<IssueLogCache>,
 	toast: Option<(Notification, Instant)>,
+	clipboard: Option<String>,
 	last_key: Option<Instant>,
 }
 
@@ -98,6 +99,51 @@ struct IssueLogCache {
 pub(crate) struct Layout {
 	pub maximized: bool,
 	pub log_open: bool,
+	pub log_maximized: bool,
+}
+
+/// How far the Log is scrolled back from its newest line. Away from the newest line it holds on to the number of the
+/// line at the top, so lines arriving later don't move what is on screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LogScroll {
+	top: Option<u64>,
+	page: usize,
+}
+
+impl LogScroll {
+	pub fn set_page(&mut self, rows: usize) {
+		self.page = rows;
+	}
+
+	/// How many lines newer than the top one are scrolled out of view.
+	pub fn newer(&self, log: &Log) -> usize {
+		let Some(top) = self.top else { return 0 };
+		let back = log.pushed().saturating_sub(1).saturating_sub(top);
+		usize::try_from(back).unwrap_or(usize::MAX).min(self.deepest(log))
+	}
+
+	pub fn scroll_by(&mut self, log: &Log, rows: isize) {
+		let back = self.newer(log).saturating_add_signed(rows).min(self.deepest(log));
+		let back_lines = u64::try_from(back).unwrap_or(u64::MAX);
+		self.top = (back > 0).then(|| log.pushed().saturating_sub(1).saturating_sub(back_lines));
+	}
+
+	pub fn page_by(&mut self, log: &Log, pages: isize) {
+		let rows = isize::try_from(self.page.max(1)).unwrap_or(isize::MAX);
+		self.scroll_by(log, pages.saturating_mul(rows));
+	}
+
+	pub fn jump_to_newest(&mut self) {
+		self.top = None;
+	}
+
+	pub fn jump_to_oldest(&mut self, log: &Log) {
+		self.scroll_by(log, isize::MAX);
+	}
+
+	fn deepest(&self, log: &Log) -> usize {
+		log.len().saturating_sub(self.page)
+	}
 }
 
 pub(crate) struct Ui {
@@ -119,6 +165,9 @@ pub(crate) struct Ui {
 	pub spinner_drawn: bool,
 	pub duplicate_cycle: Option<DuplicateCycle>,
 	pub actions: Vec<Action>,
+	pub log_scroll: LogScroll,
+	/// A log line the user copied, until the app moves it to the clipboard.
+	pub copied: Option<String>,
 	last_click: Option<Click>,
 }
 
@@ -145,6 +194,7 @@ impl<S: ArchiveSource> App<S> {
 			layout: Layout {
 				maximized: false,
 				log_open: true,
+				log_maximized: false,
 			},
 			mode: ViewMode::Library,
 			overlay: None,
@@ -161,6 +211,8 @@ impl<S: ArchiveSource> App<S> {
 			spinner_drawn: false,
 			duplicate_cycle: None,
 			actions: Vec::new(),
+			log_scroll: LogScroll::default(),
+			copied: None,
 			last_click: None,
 		};
 		Self {
@@ -170,6 +222,7 @@ impl<S: ArchiveSource> App<S> {
 			details: None,
 			issue_log: None,
 			toast: None,
+			clipboard: None,
 			last_key: None,
 		}
 	}
@@ -234,6 +287,7 @@ impl<S: ArchiveSource> App<S> {
 		}
 
 		self.perform_pending();
+		self.take_copied();
 		self.ui.tree.sync(&self.source, &self.ui.filter);
 
 		let target = self.ui.tree.target();
@@ -260,6 +314,16 @@ impl<S: ArchiveSource> App<S> {
 		self.take_notifications();
 	}
 
+	fn take_copied(&mut self) {
+		let Some(text) = self.ui.copied.take() else { return };
+
+		self.show(Notification {
+			level: NoticeLevel::Info,
+			text: "copied log line".to_owned(),
+		});
+		self.clipboard = Some(text);
+	}
+
 	/// Shows the most severe of the new notifications; a fresh toast that is more severe stays up.
 	fn take_notifications(&mut self) -> bool {
 		let Some(worst) = self
@@ -270,13 +334,16 @@ impl<S: ArchiveSource> App<S> {
 		else {
 			return false;
 		};
+		self.show(worst)
+	}
 
+	fn show(&mut self, notice: Notification) -> bool {
 		let current = self.toast.as_ref().filter(|(_, at)| at.elapsed() < TOAST_LIFETIME);
-		if current.is_some_and(|(shown, _)| shown.level > worst.level) {
+		if current.is_some_and(|(shown, _)| shown.level > notice.level) {
 			return false;
 		}
 
-		self.toast = Some((worst, Instant::now()));
+		self.toast = Some((notice, Instant::now()));
 		true
 	}
 
@@ -377,6 +444,10 @@ impl<S: ArchiveSource> App<S> {
 		self.ui.layout.log_open
 	}
 
+	pub fn log_maximized(&self) -> bool {
+		self.ui.layout.log_maximized
+	}
+
 	pub fn mode(&self) -> ViewMode {
 		self.ui.mode
 	}
@@ -429,7 +500,7 @@ impl<S: ArchiveSource> App<S> {
 	}
 
 	pub fn take_clipboard(&mut self) -> Option<String> {
-		self.source.take_clipboard()
+		self.clipboard.take().or_else(|| self.source.take_clipboard())
 	}
 
 	pub fn toast(&self) -> Option<&Notification> {
@@ -496,6 +567,11 @@ impl Ui {
 			return Outcome::Done;
 		}
 
+		if self.layout.log_maximized {
+			self.layout.log_maximized = false;
+			return Outcome::Done;
+		}
+
 		if self.mode != ViewMode::Library {
 			self.mode = ViewMode::Library;
 		} else if !self.filter.is_empty() {
@@ -518,4 +594,69 @@ impl Ui {
 
 fn is_press(event: &Event) -> bool {
 	matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::view::{ClockTime, LogLine, LogMarker};
+
+	fn log_of(capacity: usize, lines: std::ops::Range<u32>) -> Log {
+		let mut log = Log::with_capacity(capacity);
+		for n in lines {
+			push(&mut log, n);
+		}
+		log
+	}
+
+	fn push(log: &mut Log, n: u32) {
+		log.push(LogLine {
+			time: ClockTime(n),
+			marker: LogMarker::Action,
+			message: n.to_string(),
+		});
+	}
+
+	fn top(scroll: LogScroll, log: &Log) -> String {
+		log.newest_first().nth(scroll.newer(log)).unwrap().message.clone()
+	}
+
+	#[test]
+	fn a_scrolled_log_keeps_its_top_line_while_the_oldest_ones_fall_off() {
+		let mut log = log_of(10, 0..10);
+		let mut scroll = LogScroll::default();
+		scroll.set_page(3);
+		scroll.scroll_by(&log, 4);
+		assert_eq!(top(scroll, &log), "5");
+
+		push(&mut log, 10);
+		push(&mut log, 11);
+		assert_eq!(scroll.newer(&log), 6);
+		assert_eq!(top(scroll, &log), "5");
+
+		for n in 12..20 {
+			push(&mut log, n);
+		}
+		assert_eq!(
+			top(scroll, &log),
+			"12",
+			"a line that fell off leaves the oldest page on screen"
+		);
+	}
+
+	#[test]
+	fn scrolling_stops_at_the_oldest_page_and_back_at_the_newest_follows_again() {
+		let mut log = log_of(50, 0..10);
+		let mut scroll = LogScroll::default();
+		scroll.set_page(4);
+
+		scroll.page_by(&log, 5);
+		assert_eq!(scroll.newer(&log), 6);
+		scroll.jump_to_oldest(&log);
+		assert_eq!(scroll.newer(&log), 6);
+
+		scroll.scroll_by(&log, -6);
+		push(&mut log, 10);
+		assert_eq!(scroll.newer(&log), 0, "at the newest line the log follows new lines");
+	}
 }

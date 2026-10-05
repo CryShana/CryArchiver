@@ -435,6 +435,7 @@ pub enum LogMarker {
 pub struct Log {
 	lines: VecDeque<LogLine>,
 	capacity: usize,
+	pushed: u64,
 }
 
 impl Log {
@@ -442,6 +443,7 @@ impl Log {
 		Self {
 			lines: VecDeque::with_capacity(capacity),
 			capacity: capacity.max(1),
+			pushed: 0,
 		}
 	}
 
@@ -450,6 +452,23 @@ impl Log {
 			self.lines.pop_back();
 		}
 		self.lines.push_front(line);
+		self.pushed += 1;
+	}
+
+	/// How many lines were ever pushed. Lines are numbered from 0 in the order they arrived, so the newest is
+	/// `pushed() - 1`, and a number stays with its line after older lines fall off the end.
+	pub fn pushed(&self) -> u64 {
+		self.pushed
+	}
+
+	/// Newest first, each line with its number.
+	pub fn numbered(&self) -> impl Iterator<Item = (u64, &LogLine)> {
+		(0..self.pushed).rev().zip(&self.lines)
+	}
+
+	pub fn by_number(&self, number: u64) -> Option<&LogLine> {
+		let back = self.pushed.checked_sub(number)?.checked_sub(1)?;
+		self.lines.get(usize::try_from(back).ok()?)
 	}
 
 	pub fn newest_first(&self) -> impl Iterator<Item = &LogLine> {

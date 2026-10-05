@@ -159,6 +159,7 @@ fn chips(view: &ArchiveView, details: Option<&FileDetails>, ui: &Ui) -> Vec<Chip
 			chip("Esc", "cancel", Some(KeyCode::Esc)),
 		],
 		(Some(Overlay::Help), _) => vec![chip("Esc", "close", Some(KeyCode::Esc))],
+		(None, _) if ui.layout.log_maximized => log_chips(),
 		(None, ViewMode::Library) => library_chips(view, ui),
 		(None, ViewMode::Details) => details_chips(details),
 		(None, ViewMode::Issues) => issues_chips(view, ui),
@@ -216,6 +217,18 @@ fn library_chips(view: &ArchiveView, ui: &Ui) -> Vec<Chip> {
 		chip("q", "quit", Some(KeyCode::Char('q'))),
 	]);
 	chips
+}
+
+fn log_chips() -> Vec<Chip> {
+	vec![
+		chip("↑↓", "scroll", None),
+		chip("PgUp PgDn", "page", None),
+		chip("Home", "newest", Some(KeyCode::Home)),
+		chip("End", "oldest", Some(KeyCode::End)),
+		chip("L", "restore", Some(KeyCode::Char('L'))),
+		chip("?", "help", Some(KeyCode::Char('?'))),
+		chip("q", "quit", Some(KeyCode::Char('q'))),
+	]
 }
 
 fn issues_chips(view: &ArchiveView, ui: &Ui) -> Vec<Chip> {

@@ -31,7 +31,7 @@ expression: terminal.backend()
 "│        ✓ beach_0146.jpg                                     done       ━━━━━━━━  100% AVIF  10.2 MB → 3.24 MB   −68% │"
 "│        = beach_0147.jpg                                     kept       —              AVIF  15.4 MB → 15.4 MB     0% │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
-"╭─ Log ──────────────────────────────────────────────────────────────────────────────────────────────── l to collapse ─╮"
+"╭─ Log ──────────────────────────────────────────────────────────────────────────────────────────── l to collapse ─[⤢]─╮"
 "│ 14:02:13 → performance limit 25 % · applying… extra jobs finish first, or restart them now                           │"
 "│ 14:02:13 → deleting originals is ON · each is deleted permanently after its archive is verified                      │"
 "│ 14:02:08 ◌ concert_1080i.mkv: CRF 30.75 → VMAF 94.9 (4 probes) · encoding                                            │"

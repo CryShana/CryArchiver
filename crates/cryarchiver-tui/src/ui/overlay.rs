@@ -7,7 +7,7 @@ use crate::app::{Hit, HitMap, Menu};
 use crate::format::{fit, width};
 use crate::theme::Theme;
 
-const HELP_LEFT: [(&str, &str); 8] = [
+const HELP_LEFT: [(&str, &str); 9] = [
 	("↑ ↓  j k", "move selection"),
 	("PgUp PgDn", "page"),
 	("Home End", "first / last"),
@@ -16,6 +16,7 @@ const HELP_LEFT: [(&str, &str); 8] = [
 	("/", "filter by name"),
 	("Esc", "close / back / clear"),
 	("z", "maximize library"),
+	("L", "maximize log"),
 ];
 
 const HELP_RIGHT: [(&str, &str); 10] = [
@@ -31,14 +32,15 @@ const HELP_RIGHT: [(&str, &str); 10] = [
 	("q", "quit (safe, resumable)"),
 ];
 
-const MOUSE_HELP: [&str; 2] = [
+const MOUSE_HELP: [&str; 3] = [
 	"Mouse  click selects · click ▸ folds · double-click opens details",
 	"       right-click menu · wheel scrolls · Shift+drag selects text",
+	"       right-click a log line copies it",
 ];
 
 pub fn help(buf: &mut Buffer, screen: Rect, theme: &Theme) {
 	let width = screen.width.saturating_sub(6).min(86);
-	let height = screen.height.saturating_sub(4).min(16);
+	let height = screen.height.saturating_sub(4).min(17);
 	let area = screen.centered(Constraint::Length(width), Constraint::Length(height));
 	let inner = modal(buf, area, screen, theme, "Keys");
 
@@ -65,14 +67,14 @@ pub fn help(buf: &mut Buffer, screen: Rect, theme: &Theme) {
 	);
 
 	let cells = usize::from(inner.width.saturating_sub(4));
-	let first_row = inner.bottom().saturating_sub(2);
+	let first_row = inner.bottom().saturating_sub(3);
 	for (row, text) in (first_row..inner.bottom()).zip(MOUSE_HELP) {
 		put(buf, inner.x + 2, row, &fit(text, cells), fg(theme.dim), inner.right());
 	}
 }
 
 fn help_column(buf: &mut Buffer, area: Rect, entries: &[(&str, &str)], theme: &Theme) {
-	let rows = (area.y + 1..area.bottom().saturating_sub(3)).zip(entries);
+	let rows = (area.y + 1..area.bottom().saturating_sub(4)).zip(entries);
 	for (y, (key, description)) in rows {
 		put(buf, area.x, y, &fit(key, 12), bold(theme.accent), area.right());
 		put(buf, area.x + 12, y, description, fg(theme.text), area.right());

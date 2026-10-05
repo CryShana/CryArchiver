@@ -25,7 +25,7 @@ expression: "draw(&mut app(), 100, 30).backend()"
 "│        ✓ comic-strip-tall.jpg                              done       ━━━━━━━━  100% JXL    −62% │"
 "│        ✓ city-map-large.jpg                                done       ━━━━━━━━  100% AVIF   −72% │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
-"╭─ Log ──────────────────────────────────────────────────────────────────────────── l to collapse ─╮"
+"╭─ Log ──────────────────────────────────────────────────────────────────────── l to collapse ─[⤢]─╮"
 "│ 14:02:08 ◌ concert_1080i.mkv: CRF 30.75 → VMAF 94.9 (4 probes) · encoding                        │"
 "│ 14:02:07 ✓ 02. 夜明け.mp3 → Opus 1.71 MB (−53 %) · cover + tags kept                             │" Hidden by multi-width symbols: [(18, " "), (20, " "), (22, " ")]
 "│ 14:02:00 ◷ GOPR0107.MP4 waits for GOPR0042.MP4 to finish (same size group)                       │"

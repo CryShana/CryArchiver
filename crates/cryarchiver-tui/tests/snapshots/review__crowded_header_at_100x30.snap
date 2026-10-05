@@ -25,7 +25,7 @@ expression: terminal.backend()
 "│        ✓ GOPR0289.MP4                                      done       ━━━━━━━━  100% AV1    −77% │"
 "│        ◑ GOPR0290.MP4                                      verify     ━━━━──── 50.0% AV1         ┃"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
-"╭─ Log ──────────────────────────────────────────────────────────────────────────── l to collapse ─╮"
+"╭─ Log ──────────────────────────────────────────────────────────────────────── l to collapse ─[⤢]─╮"
 "│ 14:02:47 → performance limit 25 % · applying… extra jobs finish first, or restart them now       │"
 "│ 14:02:47 → deleting originals is ON · each is deleted permanently after its archive is verified  │"
 "│ 14:02:47 → paused: low disk space on E: · resumes when space frees                               │"

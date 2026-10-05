@@ -37,6 +37,10 @@ impl Ui {
 			handled @ Outcome::Done => return handled,
 		}
 
+		if self.layout.log_maximized {
+			return self.on_log_key(source, key);
+		}
+
 		match self.mode {
 			ViewMode::Library => self.on_library_key(source, key),
 			ViewMode::Details => self.on_details_key(source, key),
@@ -128,21 +132,51 @@ impl Ui {
 				self.actions.push(if paused { Action::Start } else { Action::Pause });
 			}
 			KeyCode::Char('e') => self.toggle_limit(source),
-			KeyCode::Char('z') => self.layout.maximized = !self.layout.maximized,
+			KeyCode::Char('z') => {
+				self.layout.maximized = !self.layout.maximized;
+				self.layout.log_maximized = false;
+			}
+			KeyCode::Char('L') => {
+				self.layout.log_maximized = !self.layout.log_maximized;
+				self.layout.maximized = false;
+			}
+			KeyCode::Char('l') if self.layout.log_maximized => {
+				self.layout.log_maximized = false;
+				self.layout.log_open = false;
+			}
 			KeyCode::Char('l') => self.layout.log_open = !self.layout.log_open,
 			KeyCode::Char('/') => {
+				self.layout.log_maximized = false;
 				self.mode = ViewMode::Library;
 				self.search = Some(Input::new(self.filter.clone()));
 			}
 			KeyCode::Char('i') => {
+				self.layout.log_maximized = false;
 				self.mode = if self.mode == ViewMode::Issues {
 					ViewMode::Library
 				} else {
 					ViewMode::Issues
 				};
 			}
-			KeyCode::Char('m') => return self.open_menu(source, None),
+			KeyCode::Char('m') => {
+				self.layout.log_maximized = false;
+				return self.open_menu(source, None);
+			}
 			KeyCode::Esc => return self.escape(source),
+			_ => return Outcome::Ignored,
+		}
+		Outcome::Done
+	}
+
+	fn on_log_key(&mut self, source: &dyn ArchiveSource, key: KeyEvent) -> Outcome {
+		let log = &source.view().log;
+		match key.code {
+			KeyCode::Up => self.log_scroll.scroll_by(log, -1),
+			KeyCode::Down => self.log_scroll.scroll_by(log, 1),
+			KeyCode::PageUp => self.log_scroll.page_by(log, -1),
+			KeyCode::PageDown => self.log_scroll.page_by(log, 1),
+			KeyCode::Home => self.log_scroll.jump_to_newest(),
+			KeyCode::End => self.log_scroll.jump_to_oldest(log),
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done

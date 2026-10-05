@@ -1,9 +1,11 @@
 mod support;
 
+use std::time::Instant;
+
 use cryarchiver_tui::source::SettingsChange;
 use cryarchiver_tui::{Action, App, ArchiveSource, ColorDepth, MockSource};
 use insta::assert_snapshot;
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEventKind};
 use ratatui::style::Color;
 
 use support::{app, draw, find_row, press, type_text};
@@ -275,4 +277,41 @@ fn xterm_256_palette_uses_indexed_colours() {
 	let terminal = draw(&mut app, 100, 30);
 
 	assert_eq!(terminal.backend().buffer()[(50, 20)].bg, Color::Indexed(233));
+}
+
+#[test]
+fn maximized_log_at_120x36() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('L'));
+
+	assert_snapshot!(draw(&mut app, 120, 36).backend());
+}
+
+#[test]
+fn scrolled_log_with_the_newer_hint_at_120x36() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let title_row = find_row(&terminal, "─ Log ").unwrap();
+	support::mouse(&mut app, MouseEventKind::ScrollDown, 40, title_row + 1, Instant::now());
+
+	assert_snapshot!(draw(&mut app, 120, 36).backend());
+}
+
+#[test]
+fn right_click_on_a_log_line_at_120x36() {
+	let mut app = app();
+	let terminal = draw(&mut app, 120, 36);
+	let title_row = find_row(&terminal, "─ Log ").unwrap();
+	support::mouse(
+		&mut app,
+		MouseEventKind::Down(MouseButton::Right),
+		40,
+		title_row + 1,
+		Instant::now(),
+	);
+
+	let clipboard = app.take_clipboard().unwrap();
+	assert!(!clipboard.contains('│'));
+	assert_eq!(app.overlay(), None);
+	assert_snapshot!(draw(&mut app, 120, 36).backend());
 }
