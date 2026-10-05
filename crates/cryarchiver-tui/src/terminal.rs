@@ -50,6 +50,7 @@ pub fn run<S: ArchiveSource>(source: S) -> Result<(), RunError> {
 		return Err(RunError::NotATerminal);
 	}
 
+	priority::raise_this_thread();
 	let mut app = App::new(source, ColorDepth::detect());
 	let mut screen = match start_terminal() {
 		Ok(screen) => screen,
@@ -78,6 +79,7 @@ where
 		return Err(RunError::NotATerminal);
 	}
 
+	priority::raise_this_thread();
 	let depth = ColorDepth::detect();
 	let mut menu = StartMenu::new(store, depth);
 	let mut screen = start_terminal()?;
@@ -307,7 +309,7 @@ where
 		if let Some(project) = menu.take_request() {
 			screen.draw(|frame| menu.draw(frame))?;
 			menu.stop_checks(&project);
-			match open(&project) {
+			match priority::while_normal(|| open(&project)) {
 				Ok(source) => {
 					menu.opened(&project);
 					return Ok(Some(source));
@@ -442,6 +444,7 @@ fn apply_mouse_capture(wanted: bool, captured: bool) -> bool {
 fn spawn_input(stop: Arc<AtomicBool>) -> (Events, JoinHandle<()>) {
 	let (sender, receiver) = mpsc::channel();
 	let reader = thread::spawn(move || {
+		priority::raise_this_thread();
 		while !stop.load(Ordering::Relaxed) {
 			let next = match event::poll(INPUT_POLL) {
 				Ok(false) => continue,
@@ -456,6 +459,90 @@ fn spawn_input(stop: Arc<AtomicBool>) -> (Events, JoinHandle<()>) {
 		}
 	});
 	(receiver, reader)
+}
+
+/// The TUI's own threads, the loop that draws and the input reader, run above normal priority, so a key press gets a
+/// core at once while encoders keep every core busy. Everything else keeps its priority.
+mod priority {
+	/// Opening a project starts the run's threads, which on Linux would inherit a raised nice value.
+	pub fn while_normal<T>(work: impl FnOnce() -> T) -> T {
+		native::restore_this_thread();
+		let result = work();
+		native::raise_this_thread();
+		result
+	}
+
+	pub fn raise_this_thread() {
+		native::raise_this_thread();
+	}
+
+	#[cfg(windows)]
+	pub mod native {
+		use windows::Win32::System::Threading::{
+			GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+		};
+
+		pub fn raise_this_thread() {
+			// SAFETY: the pseudo handle of the current thread is always valid and needs no closing.
+			let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+		}
+
+		pub fn restore_this_thread() {
+			// SAFETY: as above.
+			let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+		}
+	}
+
+	/// A lower nice value needs privileges; without them the thread simply stays where it was.
+	#[cfg(target_os = "linux")]
+	pub mod native {
+		use std::sync::OnceLock;
+
+		const RAISE_BY: libc::c_int = 5;
+		const HIGHEST: libc::c_int = -20;
+
+		static ORIGINAL: OnceLock<libc::c_int> = OnceLock::new();
+
+		fn this_thread() -> libc::id_t {
+			// SAFETY: gettid has no preconditions.
+			libc::id_t::try_from(unsafe { libc::gettid() }).unwrap_or_default()
+		}
+
+		fn set(nice: libc::c_int) {
+			// SAFETY: setpriority only reads its integer arguments and affects this thread alone.
+			unsafe { libc::setpriority(libc::PRIO_PROCESS, this_thread(), nice) };
+		}
+
+		/// The nice value the TUI found, before raising anything.
+		fn original() -> libc::c_int {
+			// SAFETY: getpriority only reads this thread's own value. -1 is also a valid nice value, so errno tells an
+			// error apart; it is this thread's own.
+			*ORIGINAL.get_or_init(|| unsafe {
+				*libc::__errno_location() = 0;
+				let nice = libc::getpriority(libc::PRIO_PROCESS, this_thread());
+				if nice == -1 && *libc::__errno_location() != 0 {
+					0
+				} else {
+					nice
+				}
+			})
+		}
+
+		pub fn raise_this_thread() {
+			set((original() - RAISE_BY).max(HIGHEST));
+		}
+
+		pub fn restore_this_thread() {
+			set(original());
+		}
+	}
+
+	#[cfg(not(any(windows, target_os = "linux")))]
+	pub mod native {
+		pub fn raise_this_thread() {}
+
+		pub fn restore_this_thread() {}
+	}
 }
 
 #[cfg(test)]
@@ -769,6 +856,55 @@ mod tests {
 		);
 	}
 
+	#[cfg(windows)]
+	fn this_thread_priority() -> i32 {
+		use windows::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+
+		// SAFETY: the pseudo handle of the current thread is always valid.
+		unsafe { GetThreadPriority(GetCurrentThread()) }
+	}
+
+	#[cfg(target_os = "linux")]
+	fn this_thread_priority() -> i32 {
+		// SAFETY: getpriority only reads this thread's own nice value.
+		-unsafe { libc::getpriority(libc::PRIO_PROCESS, libc::id_t::try_from(libc::gettid()).unwrap()) }
+	}
+
+	/// On Linux raising needs privileges, so it may leave the thread where it was, never below.
+	#[cfg(any(windows, target_os = "linux"))]
+	#[test]
+	fn the_ui_thread_is_raised_and_back_to_normal_only_while_a_project_opens() {
+		thread::spawn(|| {
+			let normal = this_thread_priority();
+
+			priority::raise_this_thread();
+			let raised = this_thread_priority();
+			let during_open = priority::while_normal(this_thread_priority);
+
+			#[cfg(windows)]
+			assert!(raised > normal, "{raised} vs {normal}");
+			assert!(raised >= normal, "{raised} vs {normal}");
+			assert_eq!(during_open, normal);
+			assert_eq!(this_thread_priority(), raised);
+		})
+		.join()
+		.unwrap();
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn threads_started_by_a_raised_thread_keep_normal_priority_on_windows() {
+		thread::spawn(|| {
+			let normal = this_thread_priority();
+			priority::raise_this_thread();
+
+			let started = thread::spawn(this_thread_priority).join().unwrap();
+			assert_eq!(started, normal);
+		})
+		.join()
+		.unwrap();
+	}
+
 	mod latency {
 		use super::*;
 
@@ -776,26 +912,36 @@ mod tests {
 			duration.as_secs_f64() * 1000.0
 		}
 
-		/// From a key press entering the input channel to the first frame written after it, through the real loop.
-		#[test]
-		#[ignore = "timing benchmark; run in release with --ignored --nocapture"]
-		fn key_press_to_frame_latency() {
-			let Pumped { sent, flushes, .. } = run_pump(|sender| {
-				let mut sent = Vec::new();
-				for press in 0..40u64 {
-					thread::sleep(Duration::from_millis(40 + press * 7 % 50));
-					let code = if press.is_multiple_of(2) {
-						KeyCode::Down
-					} else {
-						KeyCode::Up
-					};
-					let at = Instant::now();
-					sender.send(Ok((key(code), at))).unwrap();
-					sent.push(at);
+		/// From each key press entering the input channel to the first frame written after it, through the real loop on
+		/// a thread of its own, with the loop and the key sender raised as the TUI raises its threads, or not.
+		fn key_latencies(presses: u64, raised: bool) -> Vec<Duration> {
+			let run = move || {
+				if raised {
+					priority::raise_this_thread();
 				}
-				thread::sleep(Duration::from_millis(100));
-				sent
-			});
+
+				run_pump(move |sender| {
+					if raised {
+						priority::raise_this_thread();
+					}
+
+					let mut sent = Vec::new();
+					for press in 0..presses {
+						thread::sleep(Duration::from_millis(40 + press * 7 % 50));
+						let code = if press.is_multiple_of(2) {
+							KeyCode::Down
+						} else {
+							KeyCode::Up
+						};
+						let at = Instant::now();
+						sender.send(Ok((key(code), at))).unwrap();
+						sent.push(at);
+					}
+					thread::sleep(Duration::from_millis(100));
+					sent
+				})
+			};
+			let Pumped { sent, flushes, .. } = thread::spawn(run).join().unwrap();
 
 			let mut latencies: Vec<Duration> = sent
 				.iter()
@@ -805,12 +951,72 @@ mod tests {
 				})
 				.collect();
 			latencies.sort();
-			println!(
-				"key press to frame: median {:.2} ms, max {:.2} ms over {} presses",
+			latencies
+		}
+
+		fn summary(latencies: &[Duration]) -> String {
+			format!(
+				"median {:6.2} ms  p95 {:6.2} ms  max {:6.2} ms  ({} presses)",
 				ms(latencies[latencies.len() / 2]),
+				ms(latencies[latencies.len() * 95 / 100]),
 				ms(latencies[latencies.len() - 1]),
 				latencies.len()
+			)
+		}
+
+		#[test]
+		#[ignore = "timing benchmark; run in release with --ignored --nocapture"]
+		fn key_press_to_frame_latency() {
+			println!("key press to frame: {}", summary(&key_latencies(40, false)));
+		}
+
+		/// `threads` spinning at normal priority until `stop`, as encoders keep every core busy.
+		fn hog(threads: usize, stop: &AtomicBool) {
+			thread::scope(|scope| {
+				for _ in 0..threads {
+					scope.spawn(|| {
+						let mut x = 0_u64;
+						while !stop.load(Ordering::Relaxed) {
+							for _ in 0..10_000 {
+								x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+							}
+						}
+					});
+				}
+			});
+		}
+
+		/// Key press to frame while every core is busy at normal priority, once as many spinning threads as cores and
+		/// once twice as many, with the TUI's threads at normal priority and raised.
+		#[test]
+		#[ignore = "timing benchmark; run in release with --ignored --nocapture"]
+		fn key_press_to_frame_beside_busy_cores() {
+			const PRESSES: u64 = 60;
+
+			let cores = thread::available_parallelism().map_or(1, usize::from);
+			println!(
+				"{:<34} {}",
+				"idle machine, UI normal",
+				summary(&key_latencies(PRESSES, false))
 			);
+
+			for (load, raised) in [(1, false), (1, true), (2, false), (2, true)] {
+				let stop = AtomicBool::new(false);
+				let latencies = thread::scope(|scope| {
+					scope.spawn(|| hog(cores * load, &stop));
+					thread::sleep(Duration::from_millis(300));
+					let latencies = key_latencies(PRESSES, raised);
+					stop.store(true, Ordering::Relaxed);
+					latencies
+				});
+
+				let ui = if raised { "raised" } else { "normal" };
+				println!(
+					"{:<34} {}",
+					format!("{load}x{cores} threads busy, UI {ui}"),
+					summary(&latencies)
+				);
+			}
 		}
 
 		/// A wheel spun for a second, an event every 4 ms, while the mouse moves: how many frames show it while it
