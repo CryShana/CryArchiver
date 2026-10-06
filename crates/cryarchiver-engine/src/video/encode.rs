@@ -454,13 +454,17 @@ pub async fn encode_video(
 }
 
 /// What a video temp's check found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TempCheck {
 	Passed(Option<String>),
 	/// Fewer frames than the plan expects, and nothing else wrong: only the source's decoded frames tell whether it
 	/// holds packets that don't decode.
 	FewerFrames {
 		expected: u64,
+	},
+	/// Shorter than the declared duration and nothing else wrong: the file may declare more than its edit list plays.
+	Shorter {
+		declared_s: f64,
 	},
 }
 
@@ -501,11 +505,14 @@ pub fn check_video_temp(
 			Err(frame_count_error(encoded, expected))
 		}
 		(None, Some(declared)) if !lasts(plan, encoded, (start_s, declared), fps) => {
-			Err(ErrorKind::EncodeFailed(format!(
-				"the video lasts {:.2} s, {declared:.2} s expected",
-				encoded.decoded_s - start_s
-			))
-			.into())
+			if readings(plan, encoded, start_s)
+				.iter()
+				.all(|&decoded| decoded < declared)
+			{
+				Ok(TempCheck::Shorter { declared_s: declared })
+			} else {
+				Err(duration_error(encoded, start_s, declared))
+			}
 		}
 		_ => Ok(TempCheck::Passed(None)),
 	}
@@ -539,6 +546,36 @@ pub fn undecodable_frames(
 		expected.saturating_sub(decoded) / per_source_frame,
 		encoded.frames.div_ceil(per_source_frame)
 	))
+}
+
+/// An encode shorter than the file's declared duration is kept when the source's main video itself decodes to about
+/// as many frames: `decoded` frames, counted by decoding only. Without a count, the shortfall stands.
+pub fn trimmed_source(
+	plan: &VideoPlan,
+	encoded: &EncodedVideo,
+	(start_s, declared_s): (f64, f64),
+	decoded: Option<u64>,
+	scan: ScanType,
+) -> Result<String, JobError> {
+	let matches = decoded
+		.map(|decoded| scanned_frames(decoded, scan))
+		.is_some_and(|decoded| encoded.frames.abs_diff(decoded) <= plan.frame_tolerance);
+	if !matches {
+		return Err(duration_error(encoded, start_s, declared_s));
+	}
+
+	Ok(format!(
+		"the source declares {declared_s:.2} s but only {:.2} s of it decodes; the part that does was kept",
+		encoded.decoded_s - start_s
+	))
+}
+
+fn duration_error(encoded: &EncodedVideo, start_s: f64, declared_s: f64) -> JobError {
+	ErrorKind::EncodeFailed(format!(
+		"the video lasts {:.2} s, {declared_s:.2} s expected",
+		encoded.decoded_s - start_s
+	))
+	.into()
 }
 
 fn frame_count_error(encoded: &EncodedVideo, expected: u64) -> JobError {
@@ -582,19 +619,24 @@ pub async fn decoded_frames(
 // from its first packet, which the whole file's `-itsoffset` moved later on the temp, and which may not decode.
 // The decoded time is the last frame's start, a frame short of the declared end.
 fn lasts(plan: &VideoPlan, encoded: &EncodedVideo, (start_s, declared_s): (f64, f64), fps: Option<f64>) -> bool {
+	let tolerance_s = DURATION_TOLERANCE_S.max(frame_s(fps)) + ROUNDING_S;
+
+	readings(plan, encoded, start_s)
+		.iter()
+		.any(|decoded| (decoded - declared_s).abs() <= tolerance_s)
+}
+
+fn readings(plan: &VideoPlan, encoded: &EncodedVideo, start_s: f64) -> [f64; 3] {
 	let offset_s = plan
 		.window
 		.map_or_else(|| plan.starts.every.offset_s(None), |_| None)
 		.unwrap_or(0.0);
-	let tolerance_s = DURATION_TOLERANCE_S.max(frame_s(fps)) + ROUNDING_S;
 
 	[
 		encoded.decoded_s - start_s,
 		encoded.decoded_s,
 		encoded.decoded_s - offset_s,
 	]
-	.iter()
-	.any(|decoded| (decoded - declared_s).abs() <= tolerance_s)
 }
 
 pub fn frame_s(fps: Option<f64>) -> f64 {
@@ -1469,7 +1511,10 @@ mod tests {
 			TempCheck::Passed(None)
 		);
 		assert!(check_video_temp(&plan(svt(), None), &encoded(152, 6.571, 0), Some(6.24), 0.491, None).is_err());
-		assert!(check_video_temp(&moved, &encoded(140, 6.1, 0), Some(6.24), 0.491, None).is_err());
+		assert_eq!(
+			check_video_temp(&moved, &encoded(140, 6.1, 0), Some(6.24), 0.491, None).unwrap(),
+			TempCheck::Shorter { declared_s: 6.24 }
+		);
 	}
 
 	#[test]
@@ -1488,9 +1533,13 @@ mod tests {
 			check_video_temp(&video, &encoded(75, 3.5, 0), Some(3.5), 0.5, None).unwrap(),
 			TempCheck::Passed(None)
 		);
-		let err = check_video_temp(&video, &encoded(100, 4.4, 0), Some(4.7), 0.0, None).unwrap_err();
+		assert_eq!(
+			check_video_temp(&video, &encoded(100, 4.4, 0), Some(4.7), 0.0, None).unwrap(),
+			TempCheck::Shorter { declared_s: 4.7 }
+		);
+		let err = check_video_temp(&video, &encoded(140, 5.2, 0), Some(4.7), 0.0, None).unwrap_err();
 		assert!(
-			matches!(err.kind, ErrorKind::EncodeFailed(ref reason) if reason == "the video lasts 4.40 s, 4.70 s expected"),
+			matches!(err.kind, ErrorKind::EncodeFailed(ref reason) if reason == "the video lasts 5.20 s, 4.70 s expected"),
 			"{err:?}"
 		);
 		assert!(matches!(
@@ -1513,8 +1562,11 @@ mod tests {
 		assert_eq!(check(1.4, 1.5, Some(10.0)).unwrap(), TempCheck::Passed(None));
 		assert_eq!(check(1.4, 1.5, None).unwrap(), TempCheck::Passed(None));
 		assert_eq!(check(3.8, 4.0, Some(5.0)).unwrap(), TempCheck::Passed(None));
-		assert!(check(3.8, 4.0, None).is_err());
-		assert!(check(3.6, 4.0, Some(5.0)).is_err());
+		assert_eq!(check(3.8, 4.0, None).unwrap(), TempCheck::Shorter { declared_s: 4.0 });
+		assert_eq!(
+			check(3.6, 4.0, Some(5.0)).unwrap(),
+			TempCheck::Shorter { declared_s: 4.0 }
+		);
 		assert_eq!(check(7.5, 8.0, Some(2.0)).unwrap(), TempCheck::Passed(None));
 	}
 
@@ -1570,6 +1622,31 @@ mod tests {
 			check(encoded(300, 5.0, 0)).unwrap_err().kind,
 			ErrorKind::SourceDamaged(_)
 		));
+	}
+
+	#[test]
+	fn a_short_duration_is_kept_when_the_source_decodes_to_as_many_frames() {
+		let video = plan(svt(), None);
+		let decide = |decoded: Option<u64>| {
+			trimmed_source(
+				&video,
+				&encoded(865, 14.46, 0),
+				(0.0, 14.56),
+				decoded,
+				ScanType::Progressive,
+			)
+		};
+
+		assert_eq!(
+			decide(Some(865)).unwrap(),
+			"the source declares 14.56 s but only 14.46 s of it decodes; the part that does was kept"
+		);
+		for refused in [Some(870), None] {
+			assert!(matches!(
+				decide(refused).unwrap_err().kind,
+				ErrorKind::EncodeFailed(ref reason) if reason == "the video lasts 14.46 s, 14.56 s expected"
+			));
+		}
 	}
 
 	#[test]

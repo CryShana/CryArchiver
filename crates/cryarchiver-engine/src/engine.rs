@@ -1988,6 +1988,18 @@ impl Engine {
 					source_frames.scan,
 				)?)
 			}
+			TempCheck::Shorter { declared_s } => {
+				let decoded = self
+					.decoded_source_frames(cx, video, encoded.frames, source_frames)
+					.await?;
+				Some(video_encode::trimmed_source(
+					video,
+					encoded,
+					(start_s, declared_s),
+					decoded,
+					source_frames.scan,
+				)?)
+			}
 		};
 		Ok((Temp { path, info }, warning))
 	}
