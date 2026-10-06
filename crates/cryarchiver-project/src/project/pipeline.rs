@@ -575,6 +575,10 @@ impl Owner {
 				if job.video_waiting() != was_waiting {
 					self.pipeline.governor.set_video_waiting(job.video_waiting());
 				}
+				if job.stage != Some(stage) {
+					job.fraction = 0.0;
+					self.tree.set_fraction(file, 0.0);
+				}
 				job.stage = Some(stage);
 				self.touch_file(file);
 			}
