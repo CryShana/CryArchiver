@@ -1173,6 +1173,37 @@ fn clicking_an_outcome_filters_the_library_and_clicking_it_again_clears_it() {
 }
 
 #[test]
+fn retrying_a_file_in_the_issues_filter_selects_the_one_that_takes_its_place() {
+	let mut app = app();
+	let terminal = draw(&mut app, 160, 45);
+	let (row, [issues, _, _]) = outcome_groups(&terminal);
+	click(&mut app, issues, row, Instant::now());
+	draw(&mut app, 160, 45);
+	let names = |app: &App<MockSource>| -> Vec<String> {
+		app.source()
+			.filter()
+			.unwrap()
+			.rows
+			.iter()
+			.filter_map(|row| match &row.entry {
+				FilterEntry::File { row, .. } => Some(row.name.clone()),
+				FilterEntry::Folder(_) => None,
+			})
+			.collect()
+	};
+	let before = names(&app);
+	assert!(before.len() > 2);
+	while app.selected_name().as_ref() != Some(&before[0]) {
+		press(&mut app, KeyCode::Down);
+	}
+
+	press(&mut app, KeyCode::Char('r'));
+	draw(&mut app, 160, 45);
+
+	assert_eq!(app.selected_name().as_ref(), Some(&before[1]));
+}
+
+#[test]
 fn clicking_an_outcome_from_another_view_shows_the_library() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('i'));

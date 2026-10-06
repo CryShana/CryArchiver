@@ -164,7 +164,10 @@ fn state_line<'a>(details: &FileDetails, theme: &Theme) -> Line<'a> {
 		Span::styled(format!("{:<9}", label(details.state)), fg(color)),
 	];
 
-	for stage in &details.stages {
+	let restated = matches!(details.stages.as_slice(), [only] if restates(&only.name, label(details.state)));
+	let stages = if restated { &[][..] } else { details.stages.as_slice() };
+
+	for stage in stages {
 		let (symbol, stage_color) = match stage.progress {
 			StageProgress::Done => ("✓", theme.done),
 			StageProgress::Current => ("●", color),
@@ -173,14 +176,16 @@ fn state_line<'a>(details: &FileDetails, theme: &Theme) -> Line<'a> {
 		spans.push(Span::styled(symbol, fg(stage_color)));
 	}
 
-	if let Some(current) = details
-		.stages
-		.iter()
-		.find(|stage| stage.progress == StageProgress::Current)
-	{
+	if let Some(current) = stages.iter().find(|stage| stage.progress == StageProgress::Current) {
 		spans.push(Span::styled(format!(" {}", current.name), fg(color)));
 	}
 	Line::from(spans)
+}
+
+/// A lone stage such as "encoding" next to the state "encode" says nothing more.
+fn restates(stage: &str, label: &str) -> bool {
+	let shared = stage.chars().zip(label.chars()).take_while(|(a, b)| a == b).count();
+	shared + 1 >= label.chars().count()
 }
 
 fn size_line<'a>(details: &FileDetails, theme: &Theme) -> Line<'a> {
@@ -304,7 +309,7 @@ mod tests {
 
 	use super::*;
 	use crate::theme::ColorDepth;
-	use crate::view::{DecisionLine, FileState, PlanLine};
+	use crate::view::{DecisionLine, FileState, PlanLine, StageMark};
 
 	fn reencoded() -> Decision {
 		Decision {
@@ -398,6 +403,28 @@ mod tests {
 			&mut HitMap::default(),
 		);
 		buffer
+	}
+
+	#[test]
+	fn a_lone_stage_is_left_out_when_it_only_restates_the_state() {
+		let stage = |name: &str| StageMark {
+			name: name.into(),
+			progress: StageProgress::Current,
+		};
+		let working = |name: &str| FileDetails {
+			state: FileState::Encoding,
+			stages: vec![stage(name)],
+			..finished(Vec::new())
+		};
+
+		let same = text(&drawn(&working("encoding")));
+		let finer = text(&drawn(&working("muxing")));
+
+		assert!(
+			same.contains("encode") && !same.contains("encoding") && same.matches('●').count() == 1,
+			"{same}"
+		);
+		assert!(finer.contains("● muxing"), "{finer}");
 	}
 
 	#[test]

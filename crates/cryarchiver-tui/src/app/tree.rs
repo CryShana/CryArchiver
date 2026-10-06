@@ -304,7 +304,7 @@ impl TreeState {
 
 		self.rebuild(source, filter);
 		self.key = Some(key);
-		let moved = self.reselect();
+		let moved = self.reselect(!filter_changed);
 		if resorted {
 			self.keep_selected_offset(selected_offset, moved);
 		} else {
@@ -550,8 +550,9 @@ impl TreeState {
 		}));
 	}
 
-	/// Returns whether the selection moved on its own: a pending reveal landed, or the selected row disappeared.
-	fn reselect(&mut self) -> bool {
+	/// Returns whether the selection moved on its own: a pending reveal landed, or the selected row disappeared. A
+	/// vanished row's place goes to the row that took it, unless a new filter starts the list over.
+	fn reselect(&mut self, keep_place: bool) -> bool {
 		if let Some(file) = self.pending
 			&& let Some(index) = self.position(|row| matches!(row.kind, RowKind::File { file: id, .. } if id == file))
 		{
@@ -574,11 +575,30 @@ impl TreeState {
 				false
 			}
 			_ => {
-				self.selected_index = 0;
-				self.selected = self.rows.first().and_then(|row| row.selection());
+				self.selected_index = if keep_place && target.is_some() {
+					self.nearest_to_selected(matches!(target, Some(Selection::File { .. })))
+				} else {
+					0
+				};
+				self.selected = self.rows.get(self.selected_index).and_then(|row| row.selection());
 				true
 			}
 		}
+	}
+
+	/// The row now at the vanished selection's place; for a file the next file, else the last one before it.
+	fn nearest_to_selected(&self, file: bool) -> usize {
+		let last = self.rows.len().saturating_sub(1);
+		let at = self.selected_index.min(last);
+		if !file {
+			return at;
+		}
+
+		let is_file = |index: &usize| matches!(self.rows.get(*index).map(|row| row.kind), Some(RowKind::File { .. }));
+		(at..=last)
+			.find(is_file)
+			.or_else(|| (0..at).rev().find(is_file))
+			.unwrap_or(at)
 	}
 
 	fn position(&self, wanted: impl Fn(&Row) -> bool) -> Option<usize> {
