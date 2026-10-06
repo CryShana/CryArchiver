@@ -1191,7 +1191,11 @@ impl Engine {
 
 		let teaches = window.is_none() && size.is_none();
 		let learned = if verify {
-			match Box::pin(self.check_quality(cx, workspace, &inputs, &mut video, &mut temps, &quality)).await? {
+			let samples = video_quality::search_samples(&analysis, inputs.span, cx.job.speed);
+			let checked =
+				Box::pin(self.check_quality(cx, workspace, &inputs, (&mut video, &mut quality), &mut temps, &samples))
+					.await?;
+			match checked {
 				Checked::Passed(observation) => teaches.then_some(Lesson::Setting(observation)),
 				Checked::NearMiss(observation) => {
 					self.forget_learned(&quality);
@@ -1828,9 +1832,9 @@ impl Engine {
 		cx: &Context<'_>,
 		workspace: &Workspace,
 		inputs: &VideoInputs<'_>,
-		video: &mut VideoPlan,
+		(video, quality): (&mut VideoPlan, &mut VideoQuality),
 		temps: &mut EncodedTemps,
-		quality: &VideoQuality,
+		samples: &[Sample],
 	) -> Result<Checked, JobError> {
 		let bounds = video_quality::bounds(&video.encoder);
 		let mut attempt = 1;
@@ -1882,10 +1886,18 @@ impl Engine {
 				return Ok(Checked::NearMiss(observation));
 			}
 
-			let lower = if attempt <= MAX_RETRIES && video.max_bitrate_kbps.is_none() {
-				retry_at(quality, crf, score, bounds)
-			} else {
-				None
+			let searched = Box::pin(self.next_crf(
+				cx,
+				workspace,
+				inputs,
+				samples,
+				(&mut *video, &mut *quality),
+				(attempt, crf, score),
+			))
+			.await?;
+			let lower = match searched {
+				Err(reason) => return Ok(Checked::Missed(reason)),
+				Ok(lower) => lower,
 			};
 			let Some(lower) = lower else {
 				if cx.job.options.forced_video(mergeable(inputs.info)) {
@@ -1930,6 +1942,61 @@ impl Engine {
 				return Ok(Checked::Missed(reason));
 			}
 		}
+	}
+
+	/// The CRF a missed check is encoded again at, if it can be. A CRF that was not searched, learned from the group's
+	/// earlier files, is not trusted again: the group forgets it, and the samples search for the CRF instead, from where
+	/// the missed score points.
+	async fn next_crf(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		inputs: &VideoInputs<'_>,
+		samples: &[Sample],
+		(video, quality): (&mut VideoPlan, &mut VideoQuality),
+		(attempt, crf, score): (u32, f64, Score),
+	) -> Result<Result<Option<f64>, KeepReason>, JobError> {
+		let bounds = video_quality::bounds(&video.encoder);
+		if attempt > MAX_RETRIES || video.max_bitrate_kbps.is_some() {
+			return Ok(Ok(None));
+		}
+
+		if quality.predicted.is_some() || samples.is_empty() || cx.job.options.forced_video(mergeable(inputs.info)) {
+			return Ok(Ok(retry_at(quality, crf, score, bounds)));
+		}
+
+		self.search_retry(cx, workspace, inputs, samples, (video, quality), (crf, score))
+			.await
+	}
+
+	async fn search_retry(
+		&self,
+		cx: &Context<'_>,
+		workspace: &Workspace,
+		inputs: &VideoInputs<'_>,
+		samples: &[Sample],
+		(video, quality): (&mut VideoPlan, &mut VideoQuality),
+		(crf, score): (f64, Score),
+	) -> Result<Result<Option<f64>, KeepReason>, JobError> {
+		self.forget_learned(quality);
+
+		let bounds = video_quality::bounds(&video.encoder);
+		let start = search::retry_crf(crf, score, quality.target, quality.slope, bounds).unwrap_or(crf);
+		quality.strategy = Strategy::Search { start };
+
+		let tuning = Box::pin(self.search_crf(cx, workspace, inputs, samples, video, quality)).await?;
+		Ok(match tuning {
+			Tuning::Keep(KeepReason::QualityUnreachable(_)) => Ok(retry_at(quality, crf, score, bounds)),
+			Tuning::Keep(reason) => Err(reason),
+			Tuning::Encode { .. } => {
+				let found = video.encoder.crf();
+				Ok(if found < crf {
+					Some(found)
+				} else {
+					retry_at(quality, crf, score, bounds)
+				})
+			}
+		})
 	}
 
 	async fn reencode_video(

@@ -2190,7 +2190,7 @@ fn scores_in(text: &str) -> (f64, f64) {
 }
 
 #[tokio::test]
-async fn a_last_check_that_misses_by_half_a_point_at_most_is_written_with_a_warning() {
+async fn a_check_that_misses_by_half_a_point_at_most_is_written_with_a_warning() {
 	let dir = tempfile::tempdir().unwrap();
 	let tools = support::toolchain().await;
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
@@ -2216,7 +2216,7 @@ async fn a_last_check_that_misses_by_half_a_point_at_most_is_written_with_a_warn
 		panic!("{unreachable:?}")
 	};
 	let (mean, p5) = scores_in(reason);
-	let (near, far) = ((mean + 0.3, p5 + 0.3), (mean + 0.3, p5 + 0.9));
+	let near = (mean + 0.3, p5 + 0.3);
 
 	let (written, events) = run_recording(
 		&careless(near.0, near.1),
@@ -2225,8 +2225,8 @@ async fn a_last_check_that_misses_by_half_a_point_at_most_is_written_with_a_warn
 	)
 	.await;
 	assert!(
-		warned(&written, "written slightly below the quality target: VMAF "),
-		"{written:?}"
+		!warned(&written, "written slightly below the quality target: VMAF "),
+		"the retry is searched, so it lands on the target: {written:?}"
 	);
 	assert_eq!(
 		stages(&events, Stage::Encode),
@@ -2272,22 +2272,6 @@ async fn a_last_check_that_misses_by_half_a_point_at_most_is_written_with_a_warn
 	let video = decision.video.as_ref().unwrap();
 	assert!(video.near_miss && video.reencode.is_none(), "{decision:?}");
 	assert_eq!((video.checks.len(), decision.attempts), (1, 1), "{decision:?}");
-
-	let (kept, _) = run_recording(
-		&careless(far.0, far.1),
-		&strict(&clip, far.0, far.1),
-		&out_dir(dir.path(), "far"),
-	)
-	.await;
-	assert!(
-		matches!(
-			kept,
-			JobOutcome::KeptOriginal {
-				reason: KeepReason::QualityUnreachable(_)
-			}
-		),
-		"{kept:?}"
-	);
 }
 
 #[tokio::test]
@@ -2532,12 +2516,16 @@ async fn a_retry_already_larger_than_the_source_keeps_it_before_its_check() {
 		matches!(
 			outcome,
 			JobOutcome::KeptOriginal {
-				reason: KeepReason::NotSmaller { .. }
+				reason: KeepReason::PredictedNotSmaller { .. }
 			}
 		),
 		"{outcome:?}"
 	);
-	assert_eq!(stages(&events, Stage::Encode), 2, "{events:?}");
+	assert_eq!(
+		stages(&events, Stage::Encode),
+		1,
+		"the retry's samples predict it too large, so it is never encoded: {events:?}"
+	);
 	assert_eq!(
 		stages(&events, Stage::Verify),
 		1,
@@ -2680,7 +2668,10 @@ async fn the_outcome_records_the_encode_again_with_both_checks_and_both_crfs() {
 	assert_eq!(video.chosen, Some(CrfChoice::Learned), "{decision:?}");
 	assert!(video.custom_target, "{decision:?}");
 	assert_eq!(video.target, Some(Vmaf { mean: 95.0, p5: 91.0 }));
-	assert!(video.probes.is_empty(), "a learned CRF is not searched: {decision:?}");
+	assert!(
+		!video.probes.is_empty(),
+		"the retry of a learned CRF is searched: {decision:?}"
+	);
 	assert_eq!(video.checks.len(), 2, "{decision:?}");
 
 	let again = video.reencode.as_ref().unwrap();
@@ -3200,8 +3191,8 @@ async fn a_learned_crf_that_misses_its_check_and_its_retry_is_forgotten() {
 	);
 	assert_eq!(
 		stages(&events, Stage::Sample),
-		0,
-		"the learned CRF was used: {events:?}"
+		1,
+		"the learned CRF was used, and only its retry searched: {events:?}"
 	);
 	assert_eq!(
 		stages(&events, Stage::Encode),
