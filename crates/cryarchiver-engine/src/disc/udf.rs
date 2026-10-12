@@ -3,7 +3,8 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-const SECTOR: u64 = 2048;
+use super::{SECTOR, array};
+
 const VRS_START: u64 = 16;
 const VRS_SCAN: u64 = 64;
 const ANCHOR: u64 = 256;
@@ -218,9 +219,7 @@ impl<T> OrBad<T> for Option<T> {
 }
 
 fn bytes<const N: usize>(buf: &[u8], at: usize) -> Parsed<[u8; N]> {
-	buf.get(at..at.checked_add(N).or_bad()?)
-		.and_then(|slice| slice.try_into().ok())
-		.or_bad()
+	array(buf, at).or_bad()
 }
 
 fn u8_at(buf: &[u8], at: usize) -> Parsed<u8> {

@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::read::{self, Built, BuiltTitle, Probed, ProbedStream, Window};
+use super::read::{self, Built, BuiltTitle, Window};
 use super::udf::DiscFiles;
+use super::{be16, be32, byte, get};
 use crate::language;
 use crate::outcome::{ErrorKind, IoSide, JobError};
-use crate::probe::{self, ProbeError};
+use crate::probe::{self, MediaInfo, ProbeError, Stream};
 use crate::process::{self, ToolCommand};
 use crate::toolchain::Toolchain;
 use crate::video::chapters::{self, Chapter};
@@ -177,25 +178,6 @@ fn seconds(ticks: u64) -> f64 {
 	ticks as f64 / TICKS_PER_SECOND
 }
 
-fn get<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N], String> {
-	at.checked_add(N)
-		.and_then(|end| bytes.get(at..end))
-		.and_then(|slice| slice.try_into().ok())
-		.ok_or_else(|| format!("it ends before byte {at}"))
-}
-
-fn byte(bytes: &[u8], at: usize) -> Result<u8, String> {
-	Ok(get::<1>(bytes, at)?[0])
-}
-
-fn be16(bytes: &[u8], at: usize) -> Result<u16, String> {
-	get(bytes, at).map(u16::from_be_bytes)
-}
-
-fn be32(bytes: &[u8], at: usize) -> Result<u32, String> {
-	get(bytes, at).map(u32::from_be_bytes)
-}
-
 /// A chapter from each entry mark to the next, the last to the end of the playlist.
 fn chapter_list(marks_s: &[f64], length_s: f64) -> Vec<Chapter> {
 	let mut starts: Vec<f64> = marks_s
@@ -218,7 +200,7 @@ fn chapter_list(marks_s: &[f64], length_s: f64) -> Vec<Chapter> {
 }
 
 /// The main feature libbluray picks on a disc: the longest of its relevant playlists.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct MainFeature {
 	pub playlist: Option<u32>,
 	/// The bytes ffmpeg reads for it.
@@ -226,20 +208,20 @@ pub struct MainFeature {
 	/// Why it has no chapters, when it hasn't.
 	pub warnings: Vec<String>,
 	url: String,
-	streams: Vec<ProbedStream>,
+	streams: Vec<Stream>,
 	chapters: Vec<Chapter>,
 	languages: Vec<(u16, String)>,
 }
 
 impl MainFeature {
-	fn streams_of<'a>(&'a self, codec_type: &'a str) -> impl Iterator<Item = &'a ProbedStream> {
+	fn streams_of<'a>(&'a self, codec_type: &'a str) -> impl Iterator<Item = &'a Stream> {
 		self.streams
 			.iter()
 			.filter(move |stream| stream.codec_type == codec_type)
 	}
 
-	fn language(&self, stream: &ProbedStream) -> Option<String> {
-		let pid = u16::try_from(stream.id()?).ok()?;
+	fn language(&self, stream: &Stream) -> Option<String> {
+		let pid = u16::try_from(stream.stream_id()?).ok()?;
 		self.languages
 			.iter()
 			.find(|(own, _)| *own == pid)
@@ -298,8 +280,7 @@ pub async fn main_feature(
 		Err(ProbeError::Failed(log)) if encrypted(&log, &echoed_paths(source, &url)) => return Ok(None),
 		Err(err) => return Err(read::unreadable(err)),
 	};
-	let probed: Probed = serde_json::from_slice(&out.stdout)
-		.map_err(|err| JobError::from(ErrorKind::Toolchain(format!("ffprobe returned unreadable JSON: {err}"))))?;
+	let probed = MediaInfo::parse(&out.stdout).map_err(|err| read::unreadable(err.into()))?;
 
 	let playlist = selected_playlist(&out.stderr_tail);
 	let mpls = playlist
@@ -313,12 +294,7 @@ pub async fn main_feature(
 		});
 	let warnings = mpls.as_ref().err().cloned().into_iter().collect();
 
-	let bytes = probed
-		.format
-		.size
-		.as_deref()
-		.and_then(|size| size.parse().ok())
-		.unwrap_or_else(|| stream_bytes(files));
+	let bytes = probed.format.size.unwrap_or_else(|| stream_bytes(files));
 	let (chapters, languages) = mpls.map_or_else(
 		|_| Default::default(),
 		|mpls| (chapter_list(&mpls.marks_s(), mpls.length_s()), mpls.languages),

@@ -2,14 +2,12 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 
-use super::ps::{self, Reader};
 use super::udf::{DiscFile, DiscFiles, Extent};
+use super::{Range, Reader, SECTOR, SECTOR_LEN, be16, be32, byte, get, ps};
 
 pub const MAX_DVD_MBITS: f64 = 10.08;
 pub const MIN_TITLE_S: f64 = 10.0;
 pub const DUPLICATE_COVERAGE: f64 = 0.9;
-
-pub const SECTOR: u64 = 2048;
 
 /// A VOBU lasts at most a second, so this is the most one can hold at the mux maximum.
 const VOBU_BYTES: f64 = MAX_DVD_MBITS * 1e6 / 8.0;
@@ -145,25 +143,20 @@ impl Dvd {
 	}
 
 	/// The `(source, offset, length)` pieces holding sectors `first_sector..=last_sector` of a title set's VOBs.
-	pub fn byte_ranges(&self, vts: u8, first_sector: u32, last_sector: u32) -> Vec<(PathBuf, u64, u64)> {
+	pub fn byte_ranges(&self, vts: u8, first_sector: u32, last_sector: u32) -> Vec<Range> {
 		let Some((_, extents)) = self.vobs.iter().find(|(number, _)| *number == vts) else {
 			return Vec::new();
 		};
 
 		let start = u64::from(first_sector) * SECTOR;
 		let end = (u64::from(last_sector) + 1) * SECTOR;
-		let mut ranges: Vec<(PathBuf, u64, u64)> = Vec::new();
+		let mut ranges = Vec::new();
 		let mut logical = 0;
 		for (source, extent) in extents {
 			let from = start.max(logical);
 			let to = end.min(logical + extent.length);
 			if from < to {
-				let offset = extent.offset + (from - logical);
-				let length = to - from;
-				match ranges.last_mut() {
-					Some((path, at, len)) if path == source && *at + *len == offset => *len += length,
-					_ => ranges.push((source.clone(), offset, length)),
-				}
+				ranges.push((source.clone(), extent.offset + (from - logical), to - from));
 			}
 
 			logical += extent.length;
@@ -175,7 +168,7 @@ impl Dvd {
 	}
 
 	/// The `(source, offset, length)` pieces holding the sectors `cell` plays.
-	pub fn cell_ranges(&self, vts: u8, cell: &Cell) -> Vec<(PathBuf, u64, u64)> {
+	pub fn cell_ranges(&self, vts: u8, cell: &Cell) -> Vec<Range> {
 		cell.ranges()
 			.into_iter()
 			.flat_map(|(first, last)| self.byte_ranges(vts, first, last))
@@ -236,7 +229,7 @@ impl Dvd {
 	fn units(&self, reader: &mut Reader, vts: u8, cell: &Cell) -> io::Result<Vec<(u32, u32)>> {
 		let mut units = Vec::new();
 		let mut at = cell.first_sector;
-		let mut sector = vec![0; ps::SECTOR];
+		let mut sector = vec![0; SECTOR_LEN];
 		for _ in 0..=cell.last_sector.saturating_sub(cell.first_sector) {
 			self.read_sector(reader, vts, at, &mut sector)?;
 			let Some(dsi) = ps::interleave(&sector, at).filter(|dsi| dsi.in_unit) else {
@@ -474,25 +467,6 @@ fn read_file(file: &DiscFile) -> Result<Vec<u8>, String> {
 	}
 
 	file.read().map_err(|error| format!("it can't be read: {error}"))
-}
-
-fn get<const N: usize>(ifo: &[u8], at: usize) -> Result<[u8; N], String> {
-	at.checked_add(N)
-		.and_then(|end| ifo.get(at..end))
-		.and_then(|slice| slice.try_into().ok())
-		.ok_or_else(|| format!("it ends before byte {at}"))
-}
-
-fn byte(ifo: &[u8], at: usize) -> Result<u8, String> {
-	Ok(get::<1>(ifo, at)?[0])
-}
-
-fn be16(ifo: &[u8], at: usize) -> Result<u16, String> {
-	Ok(u16::from_be_bytes(get(ifo, at)?))
-}
-
-fn be32(ifo: &[u8], at: usize) -> Result<u32, String> {
-	Ok(u32::from_be_bytes(get(ifo, at)?))
 }
 
 fn offset(base: usize, relative: u32) -> Result<usize, String> {

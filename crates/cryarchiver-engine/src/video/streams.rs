@@ -304,13 +304,19 @@ fn is_text(codec: &str) -> bool {
 	MKV_TEXT.contains(&codec) || TEXT_SUBTITLES.contains(&codec)
 }
 
-/// The codec a subtitle track is written to Matroska in, `copy` when it is held as it is; `None` when Matroska can't
-/// hold it.
-pub(crate) fn matroska_subtitle(codec: &str) -> Option<&'static str> {
+/// How a track is written: as it is, or converted to a codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Written {
+	Copied,
+	As(&'static str),
+}
+
+/// How a subtitle track is written to Matroska; `None` when Matroska can't hold it.
+pub(crate) fn matroska_subtitle(codec: &str) -> Option<Written> {
 	if MKV_SUBTITLES.contains(&codec) {
-		Some("copy")
+		Some(Written::Copied)
 	} else if TEXT_SUBTITLES.contains(&codec) {
-		Some("srt")
+		Some(Written::As("srt"))
 	} else {
 		None
 	}
@@ -331,7 +337,8 @@ fn subtitle_track(stream: &Stream, target: Target, forced: bool) -> Result<Optio
 
 	match target {
 		Target::Matroska => match matroska_subtitle(codec) {
-			Some(written) => track(Some(written).filter(|written| *written != "copy")),
+			Some(Written::Copied) => track(None),
+			Some(Written::As(codec)) => track(Some(codec)),
 			None if forced => Ok(None),
 			None => Err(Refusal::Keep(KeepReason::Unsupported(format!(
 				"subtitle codec {codec} can't be stored in MKV"

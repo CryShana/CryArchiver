@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::process::{self, RunError, StdoutMode, ToolCommand, ToolOutput};
 use crate::toolchain::Toolchain;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const AV1_GRAIN_TRACE: &[&str] = &[" apply_grain "];
 const ESTIMATED_DURATION: &str = "Estimating duration from bitrate";
 const JSON_ARGS: [&str; 8] = [
@@ -44,6 +44,8 @@ pub struct Format {
 	pub duration: Option<f64>,
 	#[serde(default, deserialize_with = "number")]
 	pub bit_rate: Option<u64>,
+	#[serde(default, deserialize_with = "number")]
+	pub size: Option<u64>,
 	#[serde(default)]
 	pub tags: BTreeMap<String, String>,
 	#[serde(skip)]
@@ -53,6 +55,9 @@ pub struct Format {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Stream {
 	pub index: u32,
+	/// The PS stream id or the TS PID, in hex.
+	#[serde(default)]
+	pub id: Option<String>,
 	#[serde(default)]
 	pub codec_type: String,
 	#[serde(default)]
@@ -192,6 +197,20 @@ impl Stream {
 
 	pub fn fps(&self) -> Option<f64> {
 		self.avg_frame_rate.or(self.r_frame_rate)
+	}
+
+	pub fn stream_id(&self) -> Option<u32> {
+		u32::from_str_radix(self.id.as_deref()?.strip_prefix("0x")?, 16).ok()
+	}
+
+	/// The PCM Matroska holds for DVD or Blu-ray LPCM, of its depth.
+	pub fn pcm(&self) -> Option<&'static str> {
+		if !matches!(self.codec_name.as_str(), "pcm_dvd" | "pcm_bluray") {
+			return None;
+		}
+
+		let deep = self.sample_fmt.as_deref() == Some("s32") || self.bits_per_raw_sample.is_some_and(|bits| bits > 16);
+		Some(if deep { "pcm_s24le" } else { "pcm_s16le" })
 	}
 }
 
@@ -566,6 +585,38 @@ mod tests {
 		let aspects: Vec<Option<f64>> = info.streams.iter().map(|stream| stream.sample_aspect_ratio).collect();
 
 		assert_eq!(aspects, [Some(64.0 / 45.0), None, Some(1.0), None]);
+	}
+
+	#[test]
+	fn lpcm_becomes_pcm_of_its_depth_whichever_disc_it_is_from() {
+		let pcm = |codec_name: &str, bits_per_raw_sample: Option<u32>, sample_fmt: Option<&str>| {
+			Stream {
+				codec_name: codec_name.into(),
+				bits_per_raw_sample,
+				sample_fmt: sample_fmt.map(str::to_owned),
+				..Stream::default()
+			}
+			.pcm()
+		};
+
+		assert_eq!(pcm("pcm_dvd", Some(16), Some("s16")), Some("pcm_s16le"));
+		assert_eq!(pcm("pcm_dvd", Some(20), Some("s32")), Some("pcm_s24le"));
+		assert_eq!(pcm("pcm_dvd", None, None), Some("pcm_s16le"));
+		assert_eq!(pcm("pcm_bluray", None, Some("s32")), Some("pcm_s24le"));
+		assert_eq!(pcm("ac3", Some(24), None), None);
+	}
+
+	#[test]
+	fn disc_stream_ids_are_read_from_hex() {
+		let info = MediaInfo::parse(
+			br#"{ "streams": [ { "index": 0, "id": "0x1e0", "codec_type": "video" }, { "index": 1, "codec_type": "audio" } ],
+			      "format": { "size": "2048" } }"#,
+		)
+		.unwrap();
+
+		assert_eq!(info.streams[0].stream_id(), Some(0x1E0));
+		assert_eq!(info.streams[1].stream_id(), None);
+		assert_eq!(info.format.size, Some(2048));
 	}
 
 	#[test]

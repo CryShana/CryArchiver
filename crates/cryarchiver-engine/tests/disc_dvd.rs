@@ -4,8 +4,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use cryarchiver_engine::disc::SECTOR;
 use cryarchiver_engine::disc::dvd::{
-	AudioAttr, AudioCoding, Cell, Dropped, Dvd, DvdTitle, Kept, SECTOR, Subpicture, VideoAttr, parse, select,
+	AudioAttr, AudioCoding, Cell, Dropped, Dvd, DvdTitle, Kept, Subpicture, VideoAttr, parse, select,
 };
 use cryarchiver_engine::disc::udf::{DiscFiles, read_folder, read_image};
 use support::ifo::{self, Audio, Pgc, Vts};

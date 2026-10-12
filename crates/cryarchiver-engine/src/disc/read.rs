@@ -7,18 +7,17 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use super::dvd::{Dvd, DvdTitle, Kept, MAX_DVD_MBITS, Selection};
-use super::ps::{self, Reader};
+use super::{Range, Reader, joined, ps};
 use crate::language;
 use crate::outcome::{ErrorKind, IoSide, JobError};
-use crate::probe::{self, MediaInfo, ProbeError};
+use crate::probe::{self, MediaInfo, PROBE_TIMEOUT, ProbeError, Stream};
 use crate::process::{self, Progress, ToolCommand};
 use crate::toolchain::Toolchain;
 use crate::video::chapters::{self, Chapter};
 use crate::video::run_ffmpeg;
-use crate::video::streams::matroska_subtitle;
+use crate::video::streams::{Written, matroska_subtitle};
 use crate::workspace::Workspace;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 /// ffmpeg holds what it probes in memory: a stream that starts later in its title than this isn't looked for.
 const MAX_PROBE_BYTES: u64 = 1 << 30;
 const PROBE_MARGIN: u64 = 4 << 20;
@@ -123,12 +122,7 @@ pub async fn normalise_timestamps(
 			cmd.arg("-map").arg(format!("0:{}", stream.index));
 		} else if stream.is_audio() {
 			cmd.arg("-map").arg(format!("0:{}", stream.index));
-			let pcm = pcm_target(
-				&stream.codec_name,
-				stream.bits_per_raw_sample,
-				stream.sample_fmt.as_deref(),
-			);
-			overrides.extend(pcm.map(|codec| (format!("a:{audio}"), codec)));
+			overrides.extend(stream.pcm().map(|codec| (format!("a:{audio}"), codec)));
 			audio += 1;
 		} else if stream.is_subtitle() {
 			seen += 1;
@@ -141,8 +135,8 @@ pub async fn normalise_timestamps(
 			};
 
 			cmd.arg("-map").arg(format!("0:{}", stream.index));
-			if written != "copy" {
-				overrides.push((format!("s:{subtitles}"), written));
+			if let Written::As(codec) = written {
+				overrides.push((format!("s:{subtitles}"), codec));
 			}
 			subtitles += 1;
 		}
@@ -152,16 +146,6 @@ pub async fn normalise_timestamps(
 	cmd.args(["-f", "matroska"]).arg(process::tool_path(&output));
 	run_ffmpeg(&cmd, |progress| on_fraction(written(progress, bytes)), cancel).await?;
 	Ok((output, warnings))
-}
-
-/// The PCM Matroska holds for DVD or Blu-ray LPCM, of its depth; `None` for any other codec.
-pub(super) fn pcm_target(codec: &str, bits: Option<u32>, sample_fmt: Option<&str>) -> Option<&'static str> {
-	if !matches!(codec, "pcm_dvd" | "pcm_bluray") {
-		return None;
-	}
-
-	let deep = sample_fmt == Some("s32") || bits.is_some_and(|bits| bits > 16);
-	Some(if deep { "pcm_s24le" } else { "pcm_s16le" })
 }
 
 /// `-c copy`, then each `(stream specifier, codec)` of `overrides`: ffmpeg takes the last option that matches a
@@ -184,8 +168,6 @@ struct Title<'a> {
 	warnings: Vec<String>,
 }
 
-type Range = (PathBuf, u64, u64);
-
 impl<'a> Title<'a> {
 	async fn read(
 		tools: &Toolchain,
@@ -207,9 +189,9 @@ impl<'a> Title<'a> {
 
 		let mut input = Input::of(&ranges, &workspace.file(&format!("title-{}.txt", title.number)))?;
 		let counted = kept.false_time.then_some(bytes);
-		let mut streams = probe_streams(tools, &input, counted, cancel).await?;
+		let mut found = probe_streams(tools, &input, counted, cancel).await?;
 		let mut warnings = Vec::new();
-		let lacking = missing(&streams, title);
+		let lacking = missing(&found.streams, title);
 		if !lacking.is_empty() {
 			let ids: Vec<u32> = lacking.iter().map(|(id, _)| *id).collect();
 			let firsts = first_packets(&ranges, ids, cancel).await?;
@@ -223,10 +205,10 @@ impl<'a> Title<'a> {
 					bytes: (reach + PROBE_MARGIN).max(Window::HEAD.bytes),
 					microseconds: DEEP_PROBE_MICROSECONDS,
 				};
-				streams = probe_streams(tools, &input, counted, cancel).await?;
+				found = probe_streams(tools, &input, counted, cancel).await?;
 			}
 
-			for (id, name) in missing(&streams, title) {
+			for (id, name) in missing(&found.streams, title) {
 				let why = match firsts.iter().find(|(first, _)| *first == id) {
 					None => "has no packets",
 					Some((_, at)) if *at >= MAX_PROBE_BYTES => "starts too late in the title to be read",
@@ -236,12 +218,12 @@ impl<'a> Title<'a> {
 			}
 		}
 
-		let layout = Layout::of(&streams, title)
+		let layout = Layout::of(&found, title)
 			.ok_or_else(|| ErrorKind::SourceDamaged(format!("title {} has no video", title.number)))?;
 
 		#[allow(clippy::cast_precision_loss)]
 		let length_s = if kept.false_time {
-			footage_s(&streams).unwrap_or(bytes as f64 * 8.0 / (MAX_DVD_MBITS * 1e6))
+			footage_s(&found.streams).unwrap_or(bytes as f64 * 8.0 / (MAX_DVD_MBITS * 1e6))
 		} else {
 			title.cells.iter().map(|cell| cell.time_s).sum()
 		};
@@ -298,8 +280,8 @@ impl<'a> Title<'a> {
 }
 
 /// The streams the IFO says `title` plays that `streams` lack, as `(PS id, what the track is called)`.
-fn missing(streams: &[ProbedStream], title: &DvdTitle) -> Vec<(u32, String)> {
-	let found: Vec<u32> = streams.iter().filter_map(ProbedStream::id).collect();
+fn missing(streams: &[Stream], title: &DvdTitle) -> Vec<(u32, String)> {
+	let found: Vec<u32> = streams.iter().filter_map(Stream::stream_id).collect();
 	let audio = title
 		.audio
 		.iter()
@@ -368,18 +350,6 @@ fn longest(titles: &[Title<'_>]) -> Option<usize> {
 		}
 	}
 	best
-}
-
-/// Ranges with each one that continues the one before it in the same file merged into it.
-fn joined(ranges: impl IntoIterator<Item = Range>) -> Vec<Range> {
-	let mut joined: Vec<Range> = Vec::new();
-	for (path, offset, length) in ranges {
-		match joined.last_mut() {
-			Some((last, at, len)) if *last == path && *at + *len == offset => *len += length,
-			_ => joined.push((path, offset, length)),
-		}
-	}
-	joined
 }
 
 /// How much of an input ffmpeg reads to find its streams. A PS declares none: a stream is found from its first
@@ -464,57 +434,25 @@ fn escaped(line: &str) -> String {
 	escaped
 }
 
-/// What ffprobe reports of a disc's footage, a DVD title's PS or a Blu-ray playlist's TS.
-#[derive(Debug, Default, Deserialize)]
-pub(super) struct Probed {
-	#[serde(default)]
-	pub(super) streams: Vec<ProbedStream>,
-	#[serde(default)]
-	pub(super) format: ProbedFormat,
+/// A title's streams as ffprobe finds them, and each one's frame rate and pixel shape as it writes them: the `fps`
+/// and `setsar` filters take those as given.
+#[derive(Debug)]
+struct Found {
+	streams: Vec<Stream>,
+	shapes: Vec<Shape>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub(super) struct ProbedFormat {
-	pub(super) size: Option<String>,
+#[derive(Deserialize)]
+struct Shapes {
+	#[serde(default)]
+	streams: Vec<Shape>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-pub(super) struct ProbedStream {
-	#[serde(default)]
-	id: String,
-	#[serde(default)]
-	pub(super) codec_type: String,
-	#[serde(default)]
-	pub(super) codec_name: String,
-	width: Option<u32>,
-	height: Option<u32>,
-	sample_aspect_ratio: Option<String>,
+#[derive(Debug, Deserialize)]
+struct Shape {
+	index: u32,
 	r_frame_rate: Option<String>,
-	avg_frame_rate: Option<String>,
-	field_order: Option<String>,
-	channels: Option<u32>,
-	channel_layout: Option<String>,
-	sample_rate: Option<String>,
-	pub(super) sample_fmt: Option<String>,
-	bits_per_raw_sample: Option<String>,
-	bit_rate: Option<String>,
-	nb_read_packets: Option<String>,
-}
-
-impl ProbedStream {
-	/// The PS stream id, or the TS PID.
-	pub(super) fn id(&self) -> Option<u32> {
-		u32::from_str_radix(self.id.strip_prefix("0x")?, 16).ok()
-	}
-
-	pub(super) fn bits(&self) -> Option<u32> {
-		self.bits_per_raw_sample.as_deref()?.parse().ok()
-	}
-
-	/// The PCM Matroska holds for the track, when it is DVD or Blu-ray LPCM.
-	pub(super) fn pcm(&self) -> Option<&'static str> {
-		pcm_target(&self.codec_name, self.bits(), self.sample_fmt.as_deref())
-	}
+	sample_aspect_ratio: Option<String>,
 }
 
 /// The streams ffmpeg finds in a title's probe window, or with `counted` (the title's bytes) in all of it, with their
@@ -524,7 +462,7 @@ async fn probe_streams(
 	input: &Input,
 	counted: Option<u64>,
 	cancel: &CancellationToken,
-) -> Result<Vec<ProbedStream>, JobError> {
+) -> Result<Found, JobError> {
 	let timeout = process::scaled_timeout(counted.unwrap_or(input.window.bytes)).max(PROBE_TIMEOUT);
 	let mut cmd = ToolCommand::new(&tools.ffprobe, timeout);
 	cmd.args(["-v", "error", "-hide_banner", "-print_format", "json", "-show_streams"]);
@@ -534,9 +472,13 @@ async fn probe_streams(
 	input.args(&mut cmd);
 
 	let out = probe::run_ffprobe(&cmd, cancel).await.map_err(unreadable)?;
-	let probed: Probed = serde_json::from_slice(&out.stdout)
-		.map_err(|err| JobError::from(ErrorKind::Toolchain(format!("ffprobe returned unreadable JSON: {err}"))))?;
-	Ok(probed.streams)
+	let json = String::from_utf8_lossy(&out.stdout);
+	let info: MediaInfo = serde_json::from_str(&json).map_err(|err| unreadable(err.into()))?;
+	let shapes: Shapes = serde_json::from_str(&json).map_err(|err| unreadable(err.into()))?;
+	Ok(Found {
+		streams: info.streams,
+		shapes: shapes.streams,
+	})
 }
 
 pub(super) fn unreadable(err: ProbeError) -> JobError {
@@ -546,27 +488,17 @@ pub(super) fn unreadable(err: ProbeError) -> JobError {
 			ErrorKind::SourceDamaged("ffprobe could not read the disc's footage".into()),
 			log,
 		),
-		ProbeError::Json(err) => ErrorKind::Toolchain(err.to_string()).into(),
+		err @ ProbeError::Json(_) => ErrorKind::Toolchain(err.to_string()).into(),
 	}
 }
 
 /// How long the video's counted packets last at its frame rate.
 #[allow(clippy::cast_precision_loss)]
-fn footage_s(streams: &[ProbedStream]) -> Option<f64> {
-	let video = streams.iter().find(|stream| stream.codec_type == "video")?;
-	let packets: u64 = video.nb_read_packets.as_deref()?.parse().ok()?;
-	let fps = video
-		.avg_frame_rate
-		.as_deref()
-		.and_then(ratio)
-		.or_else(|| video.r_frame_rate.as_deref().and_then(ratio))?;
+fn footage_s(streams: &[Stream]) -> Option<f64> {
+	let video = streams.iter().find(|stream| stream.is_video())?;
+	let packets = video.nb_read_packets?;
+	let fps = video.fps()?;
 	(packets > 0).then(|| packets as f64 / fps)
-}
-
-fn ratio(text: &str) -> Option<f64> {
-	let (numerator, denominator) = text.split_once(['/', ':'])?;
-	let (numerator, denominator): (f64, f64) = (numerator.parse().ok()?, denominator.parse().ok()?);
-	(numerator > 0.0 && denominator > 0.0).then(|| numerator / denominator)
 }
 
 /// A title's streams: its video, and its audio and subpictures each in the disc's logical order with their IFO
@@ -596,9 +528,10 @@ struct Track {
 	channels: Option<u32>,
 	channel_layout: Option<String>,
 	sample_rate: Option<u32>,
-	sample_fmt: Option<String>,
 	bits: Option<u32>,
 	bit_rate: Option<u64>,
+	/// The PCM the track is written as when it is LPCM, which Matroska can't hold.
+	pcm: Option<&'static str>,
 	language: Option<String>,
 }
 
@@ -609,41 +542,50 @@ struct Subtitle {
 }
 
 impl Layout {
-	fn of(streams: &[ProbedStream], title: &DvdTitle) -> Option<Self> {
-		let mut streams: Vec<&ProbedStream> = streams.iter().filter(|stream| stream.id().is_some()).collect();
-		streams.sort_by_key(|stream| stream.id());
+	fn of(found: &Found, title: &DvdTitle) -> Option<Self> {
+		let mut streams: Vec<&Stream> = found
+			.streams
+			.iter()
+			.filter(|stream| stream.stream_id().is_some())
+			.collect();
+		streams.sort_by_key(|stream| stream.stream_id());
 
-		let video = streams.iter().find(|stream| stream.codec_type == "video")?;
+		let video = streams.iter().find(|stream| stream.is_video())?;
+		let shape = found.shapes.iter().find(|shape| shape.index == video.index);
 		let video = Picture {
-			id: video.id()?,
+			id: video.stream_id()?,
 			codec: video.codec_name.clone(),
 			width: video.width?,
 			height: video.height?,
-			sar: video.sample_aspect_ratio.clone().filter(|sar| ratio(sar).is_some()),
-			rate: video.r_frame_rate.clone().filter(|rate| ratio(rate).is_some()),
+			sar: shape
+				.and_then(|shape| shape.sample_aspect_ratio.clone())
+				.filter(|_| video.sample_aspect_ratio.is_some()),
+			rate: shape
+				.and_then(|shape| shape.r_frame_rate.clone())
+				.filter(|_| video.r_frame_rate.is_some()),
 			fields: video.field_order.as_deref().and_then(fields),
 		};
 		let audio = streams
 			.iter()
-			.filter(|stream| stream.codec_type == "audio")
+			.filter(|stream| stream.is_audio())
 			.filter_map(|stream| {
 				Some(Track {
-					id: stream.id()?,
+					id: stream.stream_id()?,
 					codec: stream.codec_name.clone(),
 					channels: stream.channels,
 					channel_layout: stream.channel_layout.clone(),
-					sample_rate: stream.sample_rate.as_deref().and_then(|rate| rate.parse().ok()),
-					sample_fmt: stream.sample_fmt.clone(),
-					bits: stream.bits(),
-					bit_rate: stream.bit_rate.as_deref().and_then(|rate| rate.parse().ok()),
+					sample_rate: stream.sample_rate,
+					bits: stream.bits_per_raw_sample,
+					bit_rate: stream.bit_rate,
+					pcm: stream.pcm(),
 					language: None,
 				})
 			})
 			.collect();
 		let subtitles = streams
 			.iter()
-			.filter(|stream| stream.codec_type == "subtitle")
-			.filter_map(|stream| stream.id())
+			.filter(|stream| stream.is_subtitle())
+			.filter_map(|stream| stream.stream_id())
 			.map(|id| Subtitle { id, language: None })
 			.collect();
 
@@ -760,14 +702,12 @@ impl Track {
 			&& self.bits == other.bits
 	}
 
-	/// How the track is written: Matroska can't hold DVD LPCM, which becomes plain PCM of its depth.
-	fn copied_as(&self) -> &'static str {
-		pcm_target(&self.codec, self.bits, self.sample_fmt.as_deref()).unwrap_or("copy")
-	}
-
 	fn encoder(&self) -> &str {
+		if let Some(pcm) = self.pcm {
+			return pcm;
+		}
+
 		match self.codec.as_str() {
-			"pcm_dvd" => self.copied_as(),
 			"mp1" | "mp2" => "mp2",
 			"mp3" => "libmp3lame",
 			"dts" => "dca",
@@ -1066,7 +1006,7 @@ impl Job<'_> {
 			match feeds.get(index).unwrap_or(&Feed::Copy(track)) {
 				Feed::Copy(own) => {
 					cmd.arg("-map").arg(format!("0:i:{:#x}", own.id));
-					cmd.arg(codec).arg(own.copied_as());
+					cmd.arg(codec).arg(own.pcm.unwrap_or("copy"));
 					continue;
 				}
 				Feed::Convert(own) => {
@@ -1088,7 +1028,7 @@ impl Job<'_> {
 			if let Some(channels) = track.channels {
 				cmd.arg(format!("-ac:a:{index}")).arg(channels.to_string());
 			}
-			if let Some(bit_rate) = track.bit_rate.filter(|_| track.copied_as() == "copy") {
+			if let Some(bit_rate) = track.bit_rate.filter(|_| track.pcm.is_none()) {
 				cmd.arg(format!("-b:a:{index}")).arg(bit_rate.to_string());
 			}
 		}
@@ -1161,21 +1101,6 @@ mod tests {
 
 		assert!(rgb.starts_with("000000,ffffff,0f3fff,000000,"), "{rgb}");
 		assert_eq!(rgb.split(',').count(), 16);
-	}
-
-	#[test]
-	fn ranges_that_continue_each_other_are_merged() {
-		let a = PathBuf::from("a.vob");
-		let b = PathBuf::from("b.vob");
-
-		let merged = joined([
-			(a.clone(), 0, 2048),
-			(a.clone(), 2048, 4096),
-			(a.clone(), 10_240, 2048),
-			(b.clone(), 12_288, 2048),
-		]);
-
-		assert_eq!(merged, [(a.clone(), 0, 6144), (a, 10_240, 2048), (b, 12_288, 2048)]);
 	}
 
 	#[test]
@@ -1283,24 +1208,24 @@ mod tests {
 
 	#[test]
 	fn footage_time_comes_from_the_counted_video_packets() {
-		let streams = [ProbedStream {
+		let streams = [Stream {
 			codec_type: "video".into(),
-			avg_frame_rate: Some("25/1".into()),
-			nb_read_packets: Some("1500".into()),
-			..ProbedStream::default()
+			avg_frame_rate: Some(25.0),
+			nb_read_packets: Some(1500),
+			..Stream::default()
 		}];
 
 		assert_eq!(footage_s(&streams), Some(60.0));
 	}
 
-	fn stream(id: &str, codec_type: &str, codec_name: &str) -> ProbedStream {
-		ProbedStream {
-			id: id.into(),
+	fn stream(id: &str, codec_type: &str, codec_name: &str) -> Stream {
+		Stream {
+			id: Some(id.into()),
 			codec_type: codec_type.into(),
 			codec_name: codec_name.into(),
 			width: Some(720),
 			height: Some(576),
-			..ProbedStream::default()
+			..Stream::default()
 		}
 	}
 
@@ -1343,7 +1268,12 @@ mod tests {
 			stream("0x21", "subtitle", "dvd_subtitle"),
 		];
 
-		let layout = Layout::of(&streams, &title).unwrap();
+		let found = Found {
+			streams: streams.to_vec(),
+			shapes: Vec::new(),
+		};
+
+		let layout = Layout::of(&found, &title).unwrap();
 
 		let audio: Vec<(u32, Option<&str>)> = layout
 			.audio
@@ -1389,15 +1319,6 @@ mod tests {
 				(0x20, "subtitle track 1".to_owned())
 			]
 		);
-	}
-
-	#[test]
-	fn lpcm_becomes_pcm_of_its_depth_whichever_disc_it_is_from() {
-		assert_eq!(pcm_target("pcm_dvd", Some(16), Some("s16")), Some("pcm_s16le"));
-		assert_eq!(pcm_target("pcm_dvd", Some(20), Some("s32")), Some("pcm_s24le"));
-		assert_eq!(pcm_target("pcm_dvd", None, None), Some("pcm_s16le"));
-		assert_eq!(pcm_target("pcm_bluray", None, Some("s32")), Some("pcm_s24le"));
-		assert_eq!(pcm_target("ac3", Some(24), None), None);
 	}
 
 	#[test]

@@ -1,12 +1,6 @@
 //! The MPEG program stream packs of a DVD's VOBs, read sector by sector.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-
-pub const SECTOR: usize = 2048;
+use super::array;
 
 const PACK_START: [u8; 4] = [0, 0, 1, 0xBA];
 const PRIVATE_1: u8 = 0xBD;
@@ -16,7 +10,6 @@ const DSI_AT: usize = 1024;
 const DSI_SUBSTREAM: u8 = 1;
 /// Where the DSI's own data starts in a nav pack.
 const DSI_DATA: usize = 1031;
-const READ_CHUNK: usize = 512;
 
 /// A PES packet of a pack: its stream as ffmpeg numbers it (a private stream by its substream byte, others by
 /// `0x100` plus their start code), and whether its payload is scrambled.
@@ -70,12 +63,7 @@ pub struct Interleave {
 }
 
 pub fn interleave(sector: &[u8], lbn: u32) -> Option<Interleave> {
-	let be32 = |at: usize| {
-		sector
-			.get(at..at + 4)
-			.and_then(|bytes| bytes.try_into().ok())
-			.map(u32::from_be_bytes)
-	};
+	let be32 = |at: usize| array(sector, at).map(u32::from_be_bytes);
 
 	if sector.get(NAV_AT..NAV_AT + 4) != Some(&NAV)
 		|| sector.get(DSI_AT..DSI_AT + 4) != Some(&NAV)
@@ -85,7 +73,7 @@ pub fn interleave(sector: &[u8], lbn: u32) -> Option<Interleave> {
 		return None;
 	}
 
-	let category = u16::from_be_bytes([*sector.get(DSI_DATA + 32)?, *sector.get(DSI_DATA + 33)?]);
+	let category = array(sector, DSI_DATA + 32).map(u16::from_be_bytes)?;
 	Some(Interleave {
 		in_unit: category & 0x4000 != 0,
 		unit_end: be32(DSI_DATA + 34)?,
@@ -93,60 +81,10 @@ pub fn interleave(sector: &[u8], lbn: u32) -> Option<Interleave> {
 	})
 }
 
-/// Reads byte ranges of files, keeping each file open.
-#[derive(Default)]
-pub struct Reader {
-	files: HashMap<PathBuf, File>,
-}
-
-impl Reader {
-	pub fn read(&mut self, path: &Path, offset: u64, bytes: &mut [u8]) -> io::Result<()> {
-		let file = match self.files.entry(path.to_path_buf()) {
-			Entry::Occupied(entry) => entry.into_mut(),
-			Entry::Vacant(entry) => entry.insert(File::open(path)?),
-		};
-		file.seek(SeekFrom::Start(offset))?;
-		file.read_exact(bytes)
-	}
-
-	/// Calls `visit` with each whole sector of `ranges` read in order and its byte position in them, until it returns
-	/// `false`, or for at most `limit` sectors.
-	pub fn each_sector(
-		&mut self,
-		ranges: &[(PathBuf, u64, u64)],
-		limit: usize,
-		mut visit: impl FnMut(u64, &[u8]) -> bool,
-	) -> io::Result<()> {
-		let mut position = 0;
-		let mut left = limit;
-		let mut chunk = vec![0; READ_CHUNK * SECTOR];
-		for (path, offset, length) in ranges {
-			let mut done = 0;
-			while done + SECTOR as u64 <= *length && left > 0 {
-				let sectors = usize::try_from((length - done) / SECTOR as u64)
-					.unwrap_or(usize::MAX)
-					.min(READ_CHUNK)
-					.min(left);
-				let bytes = &mut chunk[..sectors * SECTOR];
-				self.read(path, offset + done, bytes)?;
-
-				for sector in bytes.as_chunks::<SECTOR>().0 {
-					if !visit(position, sector) {
-						return Ok(());
-					}
-					position += SECTOR as u64;
-				}
-				done += (sectors * SECTOR) as u64;
-				left -= sectors;
-			}
-		}
-		Ok(())
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::disc::SECTOR_LEN;
 
 	fn pack(packets: &[(u8, u8, Option<u8>)]) -> Vec<u8> {
 		let mut sector = vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 1, 0x89, 0xC3, 0xF8];
@@ -158,7 +96,7 @@ mod tests {
 			sector.extend(u16::try_from(body.len()).unwrap().to_be_bytes());
 			sector.extend(body);
 		}
-		sector.resize(SECTOR, 0xFF);
+		sector.resize(SECTOR_LEN, 0xFF);
 		sector
 	}
 
@@ -175,7 +113,7 @@ mod tests {
 
 		assert_eq!(ids, [0x1E0, 0x80, 0x21, 0x1C0]);
 		assert!(packets(&sector).iter().all(|packet| !packet.scrambled));
-		assert!(packets(&[0; SECTOR]).is_empty());
+		assert!(packets(&[0; SECTOR_LEN]).is_empty());
 	}
 
 	#[test]
@@ -192,7 +130,7 @@ mod tests {
 
 	#[test]
 	fn a_nav_pack_gives_its_interleaved_unit() {
-		let mut sector = vec![0; SECTOR];
+		let mut sector = vec![0; SECTOR_LEN];
 		sector[NAV_AT..NAV_AT + 4].copy_from_slice(&NAV);
 		sector[DSI_AT..DSI_AT + 4].copy_from_slice(&NAV);
 		sector[DSI_AT + 6] = DSI_SUBSTREAM;
