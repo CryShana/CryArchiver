@@ -263,6 +263,8 @@ fn the_blu_ray_row_switches_between_keeping_and_converting_a_disc() {
 	open_row(&mut app, BLU_RAY);
 	assert_eq!(app.source().view().settings.blu_ray, BluRay::Keep);
 	assert!(shown_row(&mut app, "Blu-ray discs").contains("keep as is"));
+	let note = "convert archives the main feature · kept discs convert through Retry kept · 3D stays kept";
+	assert!(find_row(&draw(&mut app, 120, 36), note).is_some(), "{note}");
 
 	press(&mut app, KeyCode::Right);
 	assert_eq!(app.source().view().settings.blu_ray, BluRay::Convert);

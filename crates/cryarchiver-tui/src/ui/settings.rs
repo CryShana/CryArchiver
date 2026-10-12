@@ -120,7 +120,9 @@ fn note(view: &ArchiveView, row: SettingsRow, editing: Option<&Input>, theme: &T
 		SettingsRow::KeepAuxiliaryImages => {
 			"off: motion and Live Focus photos convert without the video, unblurred original, depth map".to_owned()
 		}
-		SettingsRow::BluRay => "convert archives a 2D disc's main feature · 3D is always kept".to_owned(),
+		SettingsRow::BluRay => {
+			"convert archives the main feature · kept discs convert through Retry kept · 3D stays kept".to_owned()
+		}
 		_ => "Changes apply at once · the limit reaches running jobs where the system allows".to_owned(),
 	};
 	(text, fg(theme.dim))

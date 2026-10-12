@@ -6,6 +6,7 @@ Makes media files smaller without thinking about encoders. Point it at files or 
 - Video becomes AV1 in MKV; transparent video becomes VP9 with alpha.
 - Images (JPEG, PNG, WebP, TIFF, BMP, HEIC, AVIF, JPEG XL and more) become AVIF, or JPEG XL when very large or above 8 bits per channel.
 - Animated GIF, APNG and WebP become animated AVIF.
+- A DVD (an `.iso` image or a `VIDEO_TS` folder) becomes one AV1 MKV of its real titles, with a chapter per title. A Blu-ray's main feature is converted the same way, or the disc is kept as it is; 3D Blu-rays are always kept.
 
 ## Requirements
 
@@ -40,7 +41,12 @@ cryarchiver film.mkv --burn-subs=eng          # English subtitles drawn into the
 cryarchiver film.mkv --strip -f webm          # only video and audio, as WebM
 cryarchiver clip.mp4 --max-bitrate 12.5       # for sharing: at most 12.5 Mbit/s
 cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, aspect ratio kept
+cryarchiver Trip.iso                          # a DVD image: writes Trip.cry.mkv
+cryarchiver Trip/                             # a folder holding VIDEO_TS or BDMV is one disc
+cryarchiver Film.iso --bluray keep            # leave a Blu-ray as it is
 ```
+
+**Discs.** A DVD's menus, still loops, clips under 10 seconds and duplicate titles are left out; the rest is joined in disc order with its audio, subtitles and chapters, and a title of another picture shape is converted to the main one's. Only the first angle of a multi-angle title is kept. Encrypted discs are kept as they are, as are DVDs whose angles or branches can't be told apart. A Blu-ray is converted unless `--bluray keep` is given: its main feature, with every audio and subtitle track and its chapters. A loose `.VOB` is archived like any video, its timestamps rebuilt when they restart.
 
 **What it keeps.** Sources are never modified. Video is deinterlaced, rotated upright, and keeps its colour, HDR10/HLG, every audio track, subtitles, chapters and fonts; Dolby Vision keeps its HDR10/HLG base layer (profile 5 keeps the original). Images are rotated upright and keep their colour profile. Cover art and music tags are kept. Personal metadata (GPS, camera, dates, telemetry) is dropped unless you pass `--keep-metadata`, which also keeps file timestamps.
 
@@ -78,6 +84,7 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, aspect ratio k
 | `--strip` | Keep only the main video and the audio | off |
 | `--resize W:H` | Scale video and images; `-1` or an empty side keeps the aspect ratio | off |
 | `--max-bitrate MBPS` | Cap the video bitrate, 0.1–1000 (video only, plain runs only) | none |
+| `--bluray keep\|convert` | Keep Blu-ray discs as they are, or convert their main feature | convert |
 | `--min-savings PERCENT` | Keep the original unless the output is this much smaller (0–90) | 10 |
 | `--overwrite` | Replace existing outputs (never sources) | off |
 | `-j, --jobs N` | Files in parallel (videos otherwise run one at a time) | half the cores, at most 4 |
@@ -109,6 +116,7 @@ cryarchiver run E:\Archive\Photos.cryarchive        # runs it without the dashbo
 - A file still being written waits until it has been still for 30 seconds (on Windows, until no program holds it open for writing).
 - Duplicates are confirmed with a full BLAKE3 hash, then become `placeholder_<name>.txt` files pointing to the archived copy. Files under 64 KiB are always archived normally.
 - Cue sheets and playlists are copied with the new names written in; subtitles and other sidecars keep matching their video.
+- Disc images (`.iso`) are archived as in a plain run, except that Blu-ray discs are kept as they are unless the project's "Blu-ray discs" setting is set to convert; Retry kept then converts the ones already kept. A `VIDEO_TS` or `BDMV` folder is archived file by file, with a warning.
 - An unreadable folder, a missing drive, a failed file or an unknown file in the destination is an open issue until it's resolved in the dashboard (`i`). Nothing is ever deleted from the destination, and nothing is written through a link.
 - A file's details (Enter) show how it was encoded: the CRF, the scores, a second encode, grain, sizes and warnings.
 - Watch mode keeps the run going and picks up new files as they appear.
