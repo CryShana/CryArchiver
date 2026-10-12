@@ -493,20 +493,10 @@ impl FormLayout<'_> {
 		let focused = form.focus() == FormField::Speed && form.confirming().is_none();
 		self.label(buf, y, "Speed", focused);
 
-		let mut x = self.value_x;
-		for (speed, label, _) in SPEEDS {
-			let chosen = form.speed() == speed;
-			let text = format!("{} {label}", if chosen { "◉" } else { "○" });
-			let style = match (chosen, focused) {
-				(true, true) => bold(theme.background).bg(theme.accent),
-				(true, false) => bold(theme.accent),
-				(false, _) => fg(theme.text),
-			};
-			let start = x;
-			x = put(buf, x, y, &text, style, self.right);
-			hits.push(Rect::new(start, y, x - start, 1), StartHit::Speed(speed));
-			x += 3;
-		}
+		let options = SPEEDS
+			.iter()
+			.map(|&(speed, label, _)| (form.speed() == speed, label, StartHit::Speed(speed)));
+		self.radio_row(buf, y, focused, options, hits);
 
 		let explanation = SPEEDS
 			.iter()
@@ -520,10 +510,31 @@ impl FormLayout<'_> {
 		let focused = form.focus() == FormField::BluRay && form.confirming().is_none();
 		self.label(buf, y, "Blu-ray discs", focused);
 
+		let options = BLU_RAYS.map(|blu_ray| {
+			(
+				form.blu_ray() == blu_ray,
+				blu_ray_label(blu_ray),
+				StartHit::BluRay(blu_ray),
+			)
+		});
+		let x = self.radio_row(buf, y, focused, options, hits);
+
+		put(buf, x, y, &format!("· {BLU_RAY_NOTE}"), fg(theme.dim), self.right);
+	}
+
+	/// Each of `options`, `(chosen, label, hit)`, as a radio button; returns where the row ends.
+	fn radio_row<'l>(
+		&self,
+		buf: &mut Buffer,
+		y: u16,
+		focused: bool,
+		options: impl IntoIterator<Item = (bool, &'l str, StartHit)>,
+		hits: &mut HitMap<StartHit>,
+	) -> u16 {
+		let theme = self.theme;
 		let mut x = self.value_x;
-		for blu_ray in BLU_RAYS {
-			let chosen = form.blu_ray() == blu_ray;
-			let text = format!("{} {}", if chosen { "◉" } else { "○" }, blu_ray_label(blu_ray));
+		for (chosen, label, hit) in options {
+			let text = format!("{} {label}", if chosen { "◉" } else { "○" });
 			let style = match (chosen, focused) {
 				(true, true) => bold(theme.background).bg(theme.accent),
 				(true, false) => bold(theme.accent),
@@ -531,11 +542,10 @@ impl FormLayout<'_> {
 			};
 			let start = x;
 			x = put(buf, x, y, &text, style, self.right);
-			hits.push(Rect::new(start, y, x - start, 1), StartHit::BluRay(blu_ray));
+			hits.push(Rect::new(start, y, x - start, 1), hit);
 			x += 3;
 		}
-
-		put(buf, x, y, &format!("· {BLU_RAY_NOTE}"), fg(theme.dim), self.right);
+		x
 	}
 
 	/// Closed, it names what the project gets: the preset's targets, or the custom values typed below it.

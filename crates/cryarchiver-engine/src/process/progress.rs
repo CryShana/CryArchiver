@@ -4,7 +4,6 @@ use std::time::Duration;
 pub struct Progress {
 	pub out_time: Option<Duration>,
 	pub frame: Option<u64>,
-	/// The bytes written so far.
 	pub total_size: Option<u64>,
 	pub done: bool,
 }
