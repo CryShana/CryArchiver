@@ -602,6 +602,10 @@ impl ArchiveSource for ProjectSource {
 				let Some(folder) = self.folder(node) else { return };
 				Command::RetryFailedIn(folder)
 			}
+			Action::RetryKept(target) => {
+				let Some(target) = self.target(target) else { return };
+				Command::RetryKept(target)
+			}
 			Action::Expanded(node, open) => {
 				let Some(folder) = self.folder(node) else { return };
 				if !open && let Some(rows) = self.rows.remove(&node) {
@@ -735,6 +739,7 @@ fn folder_stats(stats: ProjectStats) -> FolderStats {
 		bytes_out: stats.bytes_out,
 		open_issues: stats.open_issues,
 		complete: stats.complete,
+		kept: stats.kept,
 	}
 }
 

@@ -13,8 +13,8 @@ use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How, Output
 use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
 use cryarchiver_project::view::RowState;
-use cryarchiver_project::{Command, Fault, Project, Tuning};
-use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
+use cryarchiver_project::{Command, Fault, Project, Target, Tuning};
+use support::{FakeEncoder, Rule, Snapshot, file_id, jpeg, setup, wait_for, wait_for_state, write};
 
 fn records(setup: &support::Setup) -> Vec<(String, FileRecord)> {
 	let (_, _, loaded) = Store::open(&setup.project).unwrap();
@@ -108,6 +108,106 @@ fn kept_originals_and_engine_skips_are_copied() {
 	let how = |path| record(&setup, path).state.output().unwrap().how.clone();
 	assert_eq!(how("kept.jpg"), How::Copied(CopyReason::KeptOriginal));
 	assert_eq!(how("odd.jpg"), How::Copied(CopyReason::NotMedia));
+}
+
+/// What the archive holds besides the project's own files.
+fn archived_names(setup: &support::Setup) -> Vec<String> {
+	support::names_in(&setup.destination)
+		.into_iter()
+		.filter(|name| !name.starts_with(".cryarchiver") && !name.ends_with(".cryarchive"))
+		.collect()
+}
+
+/// Archives `kept.jpg` with its original kept, then sends `retry` for it once the encoder follows `then`.
+fn retry_a_kept_file(then: Rule, retry: impl FnOnce(cryarchiver_project::tree::FileId) -> Target) -> Retried {
+	let setup = setup(|_| {});
+	write(&setup.source, "kept.jpg", &jpeg(1, 100));
+	let encoder = FakeEncoder::new();
+	encoder.rule("kept.jpg", Rule::Keep);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+	let file = file_id(&project, &mut snapshot, FolderId::ROOT, "kept.jpg");
+	assert_eq!(archived_names(&setup), ["kept.jpg"]);
+
+	encoder.rule("kept.jpg", then);
+	project.send(Command::RetryKept(retry(file)));
+	wait_for(&project, &mut snapshot, "the retry to start", |_| {
+		encoder.calls().len() == 2
+	});
+
+	Retried {
+		setup,
+		project,
+		snapshot,
+		file,
+	}
+}
+
+struct Retried {
+	setup: support::Setup,
+	project: Project,
+	snapshot: Snapshot,
+	file: cryarchiver_project::tree::FileId,
+}
+
+#[test]
+fn a_kept_file_kept_again_on_retry_keeps_one_copy_in_its_place() {
+	let Retried {
+		setup,
+		project,
+		mut snapshot,
+		file,
+	} = retry_a_kept_file(Rule::Keep, Target::File);
+
+	wait_for_state(&project, &mut snapshot, file, RowState::KeptOriginal);
+	drop(project);
+
+	assert_eq!(archived_names(&setup), ["kept.jpg"]);
+	assert_eq!(fs::read(setup.destination.join("kept.jpg")).unwrap(), jpeg(1, 100));
+	let record = record(&setup, "kept.jpg");
+	let FileState::Done(output) = &record.state else {
+		panic!("not done: {:?}", record.state)
+	};
+	assert_eq!(
+		(&output.how, output.path.display().as_str()),
+		(&How::Copied(CopyReason::KeptOriginal), "kept.jpg")
+	);
+	assert_eq!(record.replaces, None);
+	assert!(snapshot.issues.is_empty(), "{:?}", snapshot.issues);
+	assert!(
+		snapshot.logs.iter().any(|log| log.message == "kept.jpg: retry chosen"),
+		"{:?}",
+		snapshot.logs
+	);
+}
+
+#[test]
+fn a_kept_file_encoded_on_retry_leaves_only_its_new_output() {
+	let Retried {
+		setup,
+		project,
+		mut snapshot,
+		file,
+	} = retry_a_kept_file(Rule::Encode("avif"), |_| Target::Folder(FolderId::ROOT));
+
+	wait_for_state(&project, &mut snapshot, file, RowState::Done);
+	drop(project);
+
+	assert_eq!(archived_names(&setup), ["kept.avif"]);
+	assert_eq!(
+		fs::read(setup.destination.join("kept.avif")).unwrap(),
+		b"encoded kept.jpg"
+	);
+	let record = record(&setup, "kept.jpg");
+	assert!(
+		matches!(&record.state, FileState::Done(output) if output.how == How::Encoded),
+		"{:?}",
+		record.state
+	);
+	assert_eq!(record.replaces, None);
+	assert!(snapshot.logs.iter().any(|log| log.message == "retrying 1 kept file"));
 }
 
 #[test]

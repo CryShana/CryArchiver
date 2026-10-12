@@ -204,6 +204,7 @@ impl Owner {
 			Command::ShowPath(target) => self.show_path(target),
 			Command::Resolve(issue, verb) => self.resolve(issue, verb),
 			Command::RetryFailedIn(folder) => self.retry_failed_in(folder),
+			Command::RetryKept(target) => self.retry_kept(target),
 			Command::RestartPendingJobs => self.restart_pending_jobs(),
 		}
 

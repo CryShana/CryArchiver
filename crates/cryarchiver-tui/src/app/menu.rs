@@ -1,7 +1,7 @@
 use super::tree::Selection;
 use super::{Outcome, Ui, ViewMode};
 use crate::source::{Action, ArchiveSource, Target as ActionTarget};
-use crate::view::{Duplicates, FileId, Issue, IssueId, Library, NodeId, Verb};
+use crate::view::{Duplicates, FileId, FileState, Issue, IssueId, Library, NodeId, Verb};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuItem {
@@ -16,6 +16,7 @@ pub enum MenuItem {
 	ExpandAll,
 	CollapseAll,
 	RetryFailedIn,
+	RetryKept,
 	Rescan,
 }
 
@@ -54,7 +55,7 @@ impl Menu {
 
 		let items = match target {
 			Target::Folder(folder) => folder_items(source, ui, folder),
-			Target::File { file, .. } => file_items(source, ui.mode, file),
+			Target::File { file, .. } => file_items(source, ui, file),
 			Target::Issue(id) => issue_items(source, id),
 		};
 
@@ -118,6 +119,10 @@ fn folder_items(source: &dyn ArchiveSource, ui: &Ui, folder: NodeId) -> Vec<(Men
 		items.push(labelled(MenuItem::RetryFailedIn, "Retry failed in folder"));
 	}
 
+	if library.stats(folder).kept > 0 {
+		items.push(labelled(MenuItem::RetryKept, "Retry kept in folder"));
+	}
+
 	items.extend([
 		labelled(MenuItem::Rescan, "Re-scan source"),
 		labelled(MenuItem::OpenSourceFolder, "Open source folder"),
@@ -140,9 +145,14 @@ fn verb_items(issue: &Issue) -> Vec<(MenuItem, String)> {
 
 /// In the details view the menu is about the file on screen, whose details and duplicates are already shown; the
 /// issues view already shows the log.
-fn file_items(source: &dyn ArchiveSource, mode: ViewMode, file: FileId) -> Vec<(MenuItem, String)> {
+fn file_items(source: &dyn ArchiveSource, ui: &Ui, file: FileId) -> Vec<(MenuItem, String)> {
+	let mode = ui.mode;
 	let issue = source.view().issues.iter().find(|issue| issue.file == Some(file));
 	let mut items = issue.map(verb_items).unwrap_or_default();
+
+	if ui.kept(source, file) {
+		items.push(labelled(MenuItem::RetryKept, "Retry"));
+	}
 
 	if mode != ViewMode::Issues && issue.is_some_and(|issue| issue.attempts > 0) {
 		items.push(labelled(MenuItem::ShowLog, "Show ffmpeg log"));
@@ -195,6 +205,9 @@ impl Ui {
 		match (item, target) {
 			(MenuItem::Resolve(issue, verb), _) => self.actions.push(Action::Resolve(issue, verb)),
 			(MenuItem::RetryFailedIn, Target::Folder(folder)) => self.actions.push(Action::RetryFailedIn(folder)),
+			(MenuItem::RetryKept, Target::Folder(_) | Target::File { .. }) => {
+				self.actions.extend(action_target.map(Action::RetryKept));
+			}
 			(MenuItem::Rescan, _) => self.actions.push(Action::Rescan),
 			(MenuItem::ExpandAll, Target::Folder(folder)) => self.tree.expand_folders_below(library, folder),
 			(MenuItem::CollapseAll, Target::Folder(folder)) => self.tree.collapse_below(library, folder),
@@ -214,6 +227,13 @@ impl Ui {
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done
+	}
+
+	/// Whether the Library shows the file with its original kept.
+	pub(super) fn kept(&self, source: &dyn ArchiveSource, file: FileId) -> bool {
+		self.tree
+			.shown_file(source, file)
+			.is_some_and(|row| row.status.state == FileState::KeptOriginal)
 	}
 
 	fn show_log(&mut self, source: &dyn ArchiveSource, file: FileId, folder: NodeId) {

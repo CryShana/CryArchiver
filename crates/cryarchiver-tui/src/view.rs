@@ -253,6 +253,8 @@ pub struct FolderStats {
 	pub open_issues: u32,
 	/// Every descendant is done or resolved and the whole subtree has been scanned.
 	pub complete: bool,
+	/// Files below it whose original was kept: what a retry of the folder's kept files archives again.
+	pub kept: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

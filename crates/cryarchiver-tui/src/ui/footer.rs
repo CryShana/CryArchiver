@@ -11,7 +11,7 @@ use super::widgets::{VERB_KEYS, bold, fg, put, to_u16};
 use crate::app::{Hit, HitMap, Overlay, SETTINGS_ROWS, SettingsRow, Ui, ViewMode};
 use crate::format::{fit, width};
 use crate::theme::Theme;
-use crate::view::{ArchiveView, Duplicates, FileDetails, IssueVerbs, Notification, RunState};
+use crate::view::{ArchiveView, Duplicates, FileDetails, FileState, IssueVerbs, Notification, RunState};
 
 pub struct Chip {
 	key: Cow<'static, str>,
@@ -270,6 +270,10 @@ fn details_chips(details: Option<&FileDetails>) -> Vec<Chip> {
 
 	if let Some(issue) = details.and_then(|details| details.issue.as_ref()) {
 		chips.extend(verb_chips(&issue.verbs));
+	}
+
+	if details.is_some_and(|details| details.state == FileState::KeptOriginal) {
+		chips.push(chip("r", "retry", Some(KeyCode::Char('r'))));
 	}
 
 	chips.extend([

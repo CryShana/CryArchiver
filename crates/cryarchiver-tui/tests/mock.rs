@@ -1,6 +1,7 @@
-use cryarchiver_tui::source::SettingsChange;
+use cryarchiver_tui::source::{SettingsChange, Target};
 use cryarchiver_tui::view::{
-	FileState, Filter, FilterEntry, IssueKind, Limit, NodeId, RunState, StateFilter, Verb, WorkKind,
+	FileId, FileState, Filter, FilterEntry, IssueKind, Limit, NodeId, NoticeLevel, RunState, StateFilter, Verb,
+	WorkKind,
 };
 use cryarchiver_tui::{Action, ArchiveSource, MockSource};
 
@@ -387,4 +388,42 @@ fn completed_run_reports_parity() {
 	assert_eq!(parity.archive_files + parity.excluded, parity.source_files);
 	assert_eq!(parity.excluded, 2);
 	assert!(source.view().library.stats(source.view().library.root()).complete);
+}
+
+fn kept_files(source: &MockSource) -> Vec<FileId> {
+	source
+		.view()
+		.library
+		.ids()
+		.flat_map(|folder| source.files(folder).unwrap_or_default())
+		.filter(|row| row.status.state == FileState::KeptOriginal)
+		.map(|row| row.id)
+		.collect()
+}
+
+#[test]
+fn retrying_kept_files_queues_them_and_says_when_none_are_left() {
+	let mut source = MockSource::new(7);
+	expand_all(&mut source);
+	let root = source.view().library.root();
+	let kept = kept_files(&source);
+	assert!(kept.len() > 1, "the demo has kept files");
+	assert_eq!(source.view().library.stats(root).kept, kept.len() as u64);
+
+	source.perform(Action::RetryKept(Target::File(kept[0])));
+	assert_eq!(source.details(kept[0]).unwrap().state, FileState::Queued);
+	assert_eq!(kept_files(&source).len(), kept.len() - 1);
+
+	source.perform(Action::RetryKept(Target::Folder(root)));
+	assert!(kept_files(&source).is_empty());
+	assert_eq!(source.view().library.stats(root).kept, 0);
+	assert!(source.take_notifications().is_empty());
+
+	source.perform(Action::RetryKept(Target::Folder(root)));
+	let notices = source.take_notifications();
+	assert_eq!(notices.len(), 1);
+	assert_eq!(
+		(notices[0].level, notices[0].text.as_str()),
+		(NoticeLevel::Info, "nothing kept to retry here")
+	);
 }

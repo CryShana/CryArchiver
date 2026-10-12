@@ -16,6 +16,7 @@ impl MockSource {
 			Action::ChangeSettings(change) => self.change_settings(change),
 			Action::Resolve(issue, verb) => self.resolve(issue, verb),
 			Action::RetryFailedIn(folder) => self.retry_failed_in(folder),
+			Action::RetryKept(target) => self.retry_kept(target),
 			Action::Expanded(folder, open) => self.expanded(folder, open),
 			Action::SetFilter(filter) => self.set_filter(filter),
 			Action::OpenSourceFolder(target) => {
@@ -228,6 +229,40 @@ impl MockSource {
 		for issue in issues {
 			self.resolve(issue, Verb::Retry);
 		}
+	}
+
+	fn retry_kept(&mut self, target: Target) {
+		let candidates: Vec<FileId> = match target {
+			Target::File(file) => vec![file],
+			Target::Folder(folder) => self
+				.files
+				.ids()
+				.filter(|&file| self.is_inside(self.files.folder(file), folder))
+				.collect(),
+		};
+		let kept: Vec<FileId> = candidates
+			.into_iter()
+			.filter(|&file| self.files.get(file).status.state == FileState::KeptOriginal)
+			.collect();
+		if kept.is_empty() {
+			self.notify(NoticeLevel::Info, "nothing kept to retry here".to_owned());
+			return;
+		}
+
+		for &file in kept.iter().rev() {
+			self.requeue_front(file);
+		}
+
+		let files = if kept.len() == 1 { "file" } else { "files" };
+		let message = match target {
+			Target::File(file) => format!("retry · {}", self.name(file)),
+			Target::Folder(folder) => format!(
+				"retry kept · {} {files} in {}",
+				kept.len(),
+				self.view.library.node(folder).name
+			),
+		};
+		self.log_action(message);
 	}
 
 	fn is_inside(&self, inner: NodeId, folder: NodeId) -> bool {

@@ -43,6 +43,8 @@ pub struct Totals {
 	/// Source bytes of every counted file, finished or not.
 	pub size: u64,
 	pub kept: u64,
+	/// Done with the original kept: what a retry of kept files archives again.
+	pub kept_done: u64,
 	pub duplicates: u64,
 	pub originals_deleted: u64,
 }
@@ -58,6 +60,8 @@ pub struct FolderStats {
 	pub bytes_out: u64,
 	pub open_issues: u32,
 	pub complete: bool,
+	/// Done with the original kept: what a retry of kept files archives again.
+	pub kept: u64,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -71,6 +75,7 @@ struct Share {
 	counted: bool,
 	size: u64,
 	kept: bool,
+	kept_done: bool,
 	duplicate: bool,
 	deleted: bool,
 }
@@ -317,6 +322,7 @@ impl Tree {
 			bytes_out: totals.bytes_out,
 			open_issues: totals.issues,
 			complete,
+			kept: totals.kept_done,
 		}
 	}
 
@@ -344,6 +350,10 @@ impl Tree {
 				counted: true,
 				size: file.record.size,
 				kept: output.is_some_and(|output| output.how == How::Copied(CopyReason::KeptOriginal)),
+				kept_done: matches!(
+					&file.record.state,
+					FileState::Done(output) if output.how == How::Copied(CopyReason::KeptOriginal)
+				),
 				duplicate: output.is_some_and(|output| matches!(output.how, How::Placeholder { .. })),
 				deleted: matches!(file.record.state, FileState::OriginalDeleted(_)),
 			}
@@ -366,6 +376,7 @@ impl Tree {
 			totals.issues = totals.issues + u32::from(share.issue) - u32::from(old.issue);
 			totals.size = totals.size + share.size - old.size;
 			totals.kept = totals.kept + u64::from(share.kept) - u64::from(old.kept);
+			totals.kept_done = totals.kept_done + u64::from(share.kept_done) - u64::from(old.kept_done);
 			totals.duplicates = totals.duplicates + u64::from(share.duplicate) - u64::from(old.duplicate);
 			totals.originals_deleted = totals.originals_deleted + u64::from(share.deleted) - u64::from(old.deleted);
 		}
@@ -513,6 +524,30 @@ mod tests {
 		let totals = tree.totals(FolderId::ROOT);
 		assert_eq!((totals.kept, totals.duplicates, totals.originals_deleted), (1, 1, 1));
 		assert_eq!(totals.size, 210);
+	}
+
+	#[test]
+	fn only_done_kept_originals_count_as_retryable() {
+		let (mut tree, photos, a, b, c) = tree_with_two_levels();
+		let kept = Output {
+			how: How::Copied(CopyReason::KeptOriginal),
+			path: RelPath::root(),
+			size: 1,
+			hash: None,
+		};
+
+		tree.set_state(a, FileState::Done(kept.clone()));
+		tree.set_state(b, FileState::Done(kept.clone()));
+		tree.set_state(c, FileState::OriginalDeleted(kept));
+
+		assert_eq!(tree.totals(FolderId::ROOT).kept, 3);
+		assert_eq!(tree.stats(FolderId::ROOT).kept, 2);
+		assert_eq!(tree.stats(photos).kept, 1);
+
+		tree.set_state(b, FileState::Queued);
+
+		assert_eq!(tree.stats(FolderId::ROOT).kept, 1);
+		assert_eq!(tree.stats(photos).kept, 0);
 	}
 
 	#[test]

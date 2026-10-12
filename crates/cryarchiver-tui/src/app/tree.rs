@@ -235,6 +235,15 @@ impl TreeState {
 		self.rows.get(self.selected_index).and_then(|row| row.selection())
 	}
 
+	/// The file's row, while the Library shows it.
+	pub fn shown_file<'a>(&self, source: &'a dyn ArchiveSource, file: FileId) -> Option<&'a FileRow> {
+		let row = self
+			.rows
+			.iter()
+			.find(|row| matches!(row.kind, RowKind::File { file: id, .. } if id == file))?;
+		file_row(source, row.kind)
+	}
+
 	/// The selection as asked for, including a file whose row hasn't loaded yet.
 	pub fn target(&self) -> Option<Selection> {
 		self.selected

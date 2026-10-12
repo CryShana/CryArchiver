@@ -1080,6 +1080,114 @@ fn the_folder_menu_leaves_out_what_would_do_nothing() {
 	);
 }
 
+/// Narrows the Library to kept originals and selects the first one.
+fn select_a_kept_file(app: &mut App<MockSource>) -> FileId {
+	let terminal = draw(app, 160, 45);
+	let (row, [_, kept, _]) = outcome_groups(&terminal);
+	click(app, kept + 2, row, Instant::now());
+
+	let file = (0..app.visible_rows()).find_map(|_| {
+		press(app, KeyCode::Down);
+		match app.selected() {
+			Some(Selection::File { file, .. }) => Some(file),
+			_ => None,
+		}
+	});
+	file.expect("the demo has kept files")
+}
+
+#[test]
+fn a_kept_file_offers_a_retry_and_r_archives_it_again() {
+	let mut app = app();
+	let file = select_a_kept_file(&mut app);
+	assert_eq!(app.source().details(file).unwrap().state, FileState::KeptOriginal);
+
+	press(&mut app, KeyCode::Char('m'));
+	assert_eq!(app.menu_items()[0], "Retry");
+	press(&mut app, KeyCode::Esc);
+
+	press(&mut app, KeyCode::Char('r'));
+
+	let state = app.source().details(file).unwrap().state;
+	assert!(state == FileState::Queued || state.is_active(), "{state:?}");
+}
+
+#[test]
+fn the_details_of_a_kept_file_offer_r_to_archive_it_again() {
+	let mut app = app();
+	let file = select_a_kept_file(&mut app);
+	press(&mut app, KeyCode::Enter);
+	assert_eq!(app.mode(), ViewMode::Details);
+
+	let terminal = draw(&mut app, 120, 36);
+	let footer = support::row_text(&terminal, 35);
+	assert!(footer.contains(" r  retry"), "{footer}");
+
+	press(&mut app, KeyCode::Char('r'));
+
+	let state = app.source().details(file).unwrap().state;
+	assert!(state == FileState::Queued || state.is_active(), "{state:?}");
+}
+
+#[test]
+fn the_menus_retry_on_a_kept_file_archives_it_again() {
+	let mut app = app();
+	let file = select_a_kept_file(&mut app);
+
+	press(&mut app, KeyCode::Char('m'));
+	press(&mut app, KeyCode::Enter);
+
+	let state = app.source().details(file).unwrap().state;
+	assert!(state == FileState::Queued || state.is_active(), "{state:?}");
+}
+
+#[test]
+fn a_file_that_was_not_kept_offers_no_retry() {
+	let mut app = app();
+	press(&mut app, KeyCode::Char('m'));
+
+	assert!(has(&app, "Show details"));
+	assert!(!has(&app, "Retry"));
+}
+
+#[test]
+fn only_a_folder_holding_kept_files_offers_to_retry_them() {
+	let mut app = app();
+	press(&mut app, KeyCode::Home);
+	press(&mut app, KeyCode::Char('m'));
+	assert!(has(&app, "Retry kept in folder"));
+	press(&mut app, KeyCode::Esc);
+
+	let without = (0..app.visible_rows()).find_map(|_| {
+		press(&mut app, KeyCode::Down);
+		match app.selected() {
+			Some(Selection::Folder(folder)) if app.source().view().library.stats(folder).kept == 0 => Some(folder),
+			_ => None,
+		}
+	});
+	assert!(without.is_some(), "the demo has a folder without kept files");
+
+	press(&mut app, KeyCode::Char('m'));
+	assert!(has(&app, "Copy path"));
+	assert!(!has(&app, "Retry kept in folder"));
+	press(&mut app, KeyCode::Esc);
+
+	press(&mut app, KeyCode::Home);
+	press(&mut app, KeyCode::Char('m'));
+	let item = app
+		.menu_items()
+		.iter()
+		.position(|item| item == "Retry kept in folder")
+		.unwrap();
+	for _ in 0..item {
+		press(&mut app, KeyCode::Down);
+	}
+	press(&mut app, KeyCode::Enter);
+
+	let root = app.source().view().library.root();
+	assert_eq!(app.source().view().library.stats(root).kept, 0);
+}
+
 #[test]
 fn a_folder_without_failed_files_offers_no_retry() {
 	let mut app = app();

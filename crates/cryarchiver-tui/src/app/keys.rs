@@ -4,7 +4,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use super::tree::{Expansion, RowKind, Selection};
 use super::{DuplicateCycle, Lifecycle, Outcome, Overlay, Ui, ViewMode};
-use crate::source::{Action, ArchiveSource};
+use crate::source::{Action, ArchiveSource, Target};
 use crate::view::{Duplicates, FileId, IssueVerbs, RunState, Verb};
 
 impl Ui {
@@ -232,12 +232,20 @@ impl Ui {
 			(KeyCode::Enter, Some(Selection::Folder(folder))) if self.filter.is_empty() => self.tree.toggle(folder),
 			(KeyCode::Enter, Some(Selection::File { .. })) => self.mode = ViewMode::Details,
 			(KeyCode::Char('r'), Some(Selection::Folder(folder))) => self.actions.push(Action::RetryFailedIn(folder)),
-			(KeyCode::Char('r'), Some(Selection::File { file, .. })) => {
-				return self.resolve_file(source, file, Verb::Retry);
-			}
+			(KeyCode::Char('r'), Some(Selection::File { file, .. })) => return self.retry_file(source, file),
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done
+	}
+
+	/// A kept file is archived again; any other file retries its issue, if it has one.
+	fn retry_file(&mut self, source: &dyn ArchiveSource, file: FileId) -> Outcome {
+		if self.kept(source, file) {
+			self.actions.push(Action::RetryKept(Target::File(file)));
+			return Outcome::Done;
+		}
+
+		self.resolve_file(source, file, Verb::Retry)
 	}
 
 	fn resolve_file(&mut self, source: &dyn ArchiveSource, file: FileId, verb: Verb) -> Outcome {
@@ -293,7 +301,7 @@ impl Ui {
 			(KeyCode::Up | KeyCode::Char('k'), _) => self.tree.select_file_step(false),
 			(KeyCode::Down | KeyCode::Char('j'), _) => self.tree.select_file_step(true),
 			(KeyCode::Char('g'), Some(file)) => return self.jump_to_duplicate(source, file),
-			(KeyCode::Char('r'), Some(file)) => return self.resolve_file(source, file, Verb::Retry),
+			(KeyCode::Char('r'), Some(file)) => return self.retry_file(source, file),
 			(KeyCode::Char('c'), Some(file)) => return self.resolve_file(source, file, Verb::Accept),
 			(KeyCode::Char('x'), Some(file)) => return self.resolve_file(source, file, Verb::Exclude),
 			_ => return Outcome::Ignored,

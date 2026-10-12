@@ -248,7 +248,7 @@ impl Owner {
 	}
 
 	/// Out of every queue and wait, with no hash pending.
-	fn unqueue(&mut self, file: FileId) {
+	pub(super) fn unqueue(&mut self, file: FileId) {
 		for queue in self.pipeline.queues.values_mut() {
 			queue.remove(file);
 		}

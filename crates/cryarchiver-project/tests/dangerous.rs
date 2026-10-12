@@ -5,12 +5,14 @@ use std::time::{Duration, SystemTime};
 
 use cryarchiver_engine::outcome::ErrorKind;
 use cryarchiver_project::issues::{Problem, Verb};
+use cryarchiver_project::record::{CopyReason, How};
 use cryarchiver_project::record::{FileRecord, FileState, mtime_ns};
 use cryarchiver_project::settings::{DELETE_CONFIRMATION, SettingsChange};
 use cryarchiver_project::store::Store;
-use cryarchiver_project::view::NoticeLevel;
-use cryarchiver_project::{Command, Fault, Project};
-use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
+use cryarchiver_project::tree::FolderId;
+use cryarchiver_project::view::{NoticeLevel, RowState};
+use cryarchiver_project::{Command, Fault, Project, Target};
+use support::{FakeEncoder, Rule, Snapshot, file_id, jpeg, setup, wait_for, wait_for_state, write};
 
 const BIG: usize = 100_000;
 
@@ -112,6 +114,52 @@ fn turning_deletion_on_mid_project_covers_files_archived_earlier() {
 	wait_for(&project, &mut snapshot, "the delete", |s| deleted(s) == 1);
 
 	assert!(!notes.exists());
+}
+
+#[test]
+fn a_kept_file_retried_before_deleting_is_confirmed_is_deleted_like_any_archived_file() {
+	let setup = setup(|settings| settings.delete_originals = true);
+	let retried = write(&setup.source, "a.jpg", &jpeg(1, 500));
+	let left = write(&setup.source, "b.jpg", &jpeg(2, 500));
+	let encoder = FakeEncoder::new();
+	encoder.rule(".jpg", Rule::Keep);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+	wait_for(&project, &mut snapshot, "the archive", |s| {
+		s.overall.as_ref().is_some_and(|overall| overall.parity.is_some())
+	});
+	let file = file_id(&project, &mut snapshot, FolderId::ROOT, "a.jpg");
+
+	encoder.rule("a.jpg", Rule::Encode("avif"));
+	project.send(Command::RetryKept(Target::File(file)));
+	wait_for_state(&project, &mut snapshot, file, RowState::Done);
+	assert!(
+		retried.exists() && left.exists(),
+		"nothing is deleted before it is confirmed"
+	);
+
+	start_deleting(&project);
+	wait_for(&project, &mut snapshot, "both originals deleted", |s| deleted(s) == 2);
+	project.send(Command::RetryKept(Target::Folder(FolderId::ROOT)));
+	wait_for(&project, &mut snapshot, "the notice", |s| {
+		s.notices
+			.iter()
+			.any(|notice| notice.text == "nothing kept to retry here")
+	});
+	drop(project);
+
+	assert!(!retried.exists() && !left.exists());
+	assert!(!setup.destination.join("a.jpg").exists());
+	assert_eq!(fs::read(setup.destination.join("a.avif")).unwrap(), b"encoded a.jpg");
+	assert_eq!(fs::read(setup.destination.join("b.jpg")).unwrap(), jpeg(2, 500));
+	assert!(matches!(state(&setup, "a.jpg"), FileState::OriginalDeleted(output) if output.how == How::Encoded));
+	assert!(matches!(
+		state(&setup, "b.jpg"),
+		FileState::OriginalDeleted(output) if output.how == How::Copied(CopyReason::KeptOriginal)
+	));
 }
 
 #[test]

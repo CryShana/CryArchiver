@@ -60,6 +60,8 @@ pub enum Action {
 	ChangeSettings(SettingsChange),
 	Resolve(IssueId, Verb),
 	RetryFailedIn(NodeId),
+	/// Archives again the files whose original was kept: the file, or every one at any depth in the folder.
+	RetryKept(Target),
 	/// The folder was opened or closed in the Library, so its file rows can be loaded or released.
 	Expanded(NodeId, bool),
 	/// An empty filter clears it.

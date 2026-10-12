@@ -14,6 +14,7 @@ struct Tally {
 	bytes_in: u64,
 	bytes_out: u64,
 	issues: u32,
+	kept: u64,
 	unscanned: bool,
 }
 
@@ -25,6 +26,7 @@ impl Tally {
 		self.bytes_in += other.bytes_in;
 		self.bytes_out += other.bytes_out;
 		self.issues += other.issues;
+		self.kept += other.kept;
 		self.unscanned |= other.unscanned;
 	}
 
@@ -113,6 +115,7 @@ impl MockSource {
 			stats.bytes_out = tally.bytes_out;
 			stats.open_issues = tally.issues;
 			stats.complete = tally.complete();
+			stats.kept = tally.kept;
 		}
 	}
 
@@ -218,6 +221,7 @@ fn file_tally(status: &FileStatus, open_issue: bool, counts: &mut Counts) -> Tal
 		bytes_in: written.map_or(0, |_| status.bytes_in),
 		bytes_out: written.unwrap_or(0),
 		issues: 0,
+		kept: u64::from(status.state == FileState::KeptOriginal),
 		unscanned: false,
 	}
 }

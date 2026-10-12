@@ -6,6 +6,7 @@ mod dependencies;
 mod duplicates;
 mod finish;
 mod jobs;
+mod kept;
 mod live;
 mod open;
 mod owner;
@@ -141,6 +142,8 @@ pub enum Command {
 	ChangeSettings(SettingsChange),
 	Resolve(IssueId, Verb),
 	RetryFailedIn(FolderId),
+	/// Archives again the files whose original was kept: the file, or every one at any depth in the folder.
+	RetryKept(Target),
 	/// A folder was opened or closed in the front end: its rows are sent, then kept up to date, or released.
 	Watch(FolderId, bool),
 	/// Narrows the rows to files that match the name query and have the state. An empty query without a state clears

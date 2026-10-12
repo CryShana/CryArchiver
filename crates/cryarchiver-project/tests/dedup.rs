@@ -12,8 +12,8 @@ use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How};
 use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
 use cryarchiver_project::view::RowState;
-use cryarchiver_project::{Command, Fault, Project};
-use support::{FakeEncoder, Rule, Snapshot, jpeg, setup, wait_for, write};
+use cryarchiver_project::{Command, Fault, Project, Target};
+use support::{FakeEncoder, Rule, Snapshot, file_id, jpeg, setup, wait_for, wait_for_state, write};
 
 const BIG: usize = 100_000;
 
@@ -112,6 +112,44 @@ fn duplicates_become_placeholders_pointing_at_the_shallowest_copy() {
 		}
 	);
 	assert!(!setup.destination.join("Backup").join("a.avif").exists());
+}
+
+#[test]
+fn a_kept_canonical_copy_retried_keeps_its_placeholders_pointing_at_an_archived_copy() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.jpg", &jpeg(6, BIG));
+	write(&setup.source, "Backup/a.jpg", &jpeg(6, BIG));
+	let encoder = FakeEncoder::new();
+	encoder.rule("a.jpg", Rule::Keep);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+	wait_for(&project, &mut snapshot, "the run to finish", |s| {
+		s.overall.as_ref().is_some_and(|o| o.parity.is_some())
+	});
+	let placeholder = setup.destination.join("Backup").join("placeholder_a.jpg.txt");
+	assert!(fs::read_to_string(&placeholder).unwrap().contains(&native("../a.jpg")));
+	let canonical = file_id(&project, &mut snapshot, FolderId::ROOT, "a.jpg");
+	let backup = snapshot.folder_named("Backup");
+	let duplicate = file_id(&project, &mut snapshot, backup, "a.jpg");
+
+	encoder.rule("a.jpg", Rule::Encode("avif"));
+	project.send(Command::RetryKept(Target::File(canonical)));
+	wait_for_state(&project, &mut snapshot, canonical, RowState::Done);
+	wait_for_state(&project, &mut snapshot, duplicate, RowState::Duplicate);
+	drop(project);
+
+	assert_eq!(fs::read(setup.destination.join("a.avif")).unwrap(), b"encoded a.jpg");
+	assert!(!setup.destination.join("a.jpg").exists());
+	let placeholders = support::names_in(&setup.destination.join("Backup"));
+	assert_eq!(placeholders.len(), 1, "{placeholders:?}");
+	let text = fs::read_to_string(setup.destination.join("Backup").join(&placeholders[0])).unwrap();
+	assert!(text.contains(&native("../a.avif")), "{text}");
+	assert_eq!(owners(&setup, "a.avif"), 1);
+	assert_eq!(owners(&setup, "a.jpg"), 0);
+	assert!(snapshot.issues.is_empty(), "{:?}", snapshot.issues);
 }
 
 #[test]

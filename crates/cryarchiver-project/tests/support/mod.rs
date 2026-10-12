@@ -22,9 +22,10 @@ use cryarchiver_project::schedule::looks_like_video;
 use cryarchiver_project::settings::Settings;
 use cryarchiver_project::tree::{FileId, FolderId, FolderStats};
 use cryarchiver_project::view::{
-	Details, FileRow, FilterView, IssueView, LogEntry, Notice, Overall, RunState, Status, SystemView, Update, Worker,
+	Details, FileRow, FilterView, IssueView, LogEntry, Notice, Overall, RowState, RunState, Status, SystemView, Update,
+	Worker,
 };
-use cryarchiver_project::{Backend, Fault, Project, ProjectOptions, SystemSample, Tuning};
+use cryarchiver_project::{Backend, Command, Fault, Project, ProjectOptions, SystemSample, Tuning};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -579,5 +580,36 @@ pub fn wait_for(project: &Project, snapshot: &mut Snapshot, what: &str, done: im
 pub fn drain(project: &Project, snapshot: &mut Snapshot) {
 	while let Some(update) = project.try_update() {
 		snapshot.apply(update);
+	}
+}
+
+/// The id of the file `name` in `folder`, from the folder's rows.
+pub fn file_id(project: &Project, snapshot: &mut Snapshot, folder: FolderId, name: &str) -> FileId {
+	project.send(Command::Watch(folder, true));
+	wait_for(project, snapshot, "the rows", |s| {
+		s.rows
+			.get(&folder)
+			.is_some_and(|rows| rows.iter().any(|row| row.name == name))
+	});
+	snapshot.row(folder, name).id
+}
+
+/// Asks for the file's details until they show `state`. Details are made when asked, so unlike a row they are never
+/// stale.
+pub fn wait_for_state(project: &Project, snapshot: &mut Snapshot, file: FileId, state: RowState) {
+	let deadline = Instant::now() + WAIT;
+	loop {
+		snapshot.details.remove(&file);
+		project.send(Command::Details(file));
+		wait_for(project, snapshot, "the details", |s| s.details.contains_key(&file));
+
+		let now = snapshot.details[&file].state;
+		if now == state {
+			return;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"timed out waiting for {state:?}, still {now:?}"
+		);
 	}
 }
