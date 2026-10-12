@@ -1507,20 +1507,19 @@ pub fn presence(path: &Path) -> Presence {
 	match std::fs::metadata(path) {
 		Ok(meta) if meta.is_file() => Presence::File,
 		Ok(_) => Presence::NotAFile,
-		Err(err) if err.kind() == io::ErrorKind::NotFound && (parent_folder(path).is_dir() || root_reachable(path)) => {
-			Presence::Missing
-		}
+		Err(err) if err.kind() == io::ErrorKind::NotFound && drive_present(path) => Presence::Missing,
 		Err(_) => Presence::Unavailable,
 	}
 }
 
-/// Removable drives on Linux and macOS are mounted in folders that stay when the drive is unplugged, so a path below
-/// one never counts as gone.
+/// Removable drives on Linux and macOS are mounted in folders that stay when the drive is unplugged.
 const MOUNT_FOLDERS: [&str; 4] = ["/media", "/mnt", "/run/media", "/Volumes"];
 
-fn root_reachable(path: &Path) -> bool {
+/// Whether the drive or share that holds `path` is there: its root is, or below a mount folder, the folder `path` is
+/// in is.
+fn drive_present(path: &Path) -> bool {
 	if MOUNT_FOLDERS.iter().any(|folder| path.starts_with(folder)) {
-		return false;
+		return parent_folder(path).is_dir();
 	}
 
 	let root: PathBuf = path

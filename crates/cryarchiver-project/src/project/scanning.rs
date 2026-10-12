@@ -305,11 +305,10 @@ impl Owner {
 		}
 
 		let key = &self.tree.folder(folder).key;
-		let (name, shown) = if key.is_root() {
-			let source = &self.settings.source;
-			(source.file_name().unwrap_or_default(), display_path(source))
+		let name = if key.is_root() {
+			self.settings.source.file_name().unwrap_or_default()
 		} else {
-			(self.tree.folder(folder).name.as_os_str(), key.display())
+			self.tree.folder(folder).name.as_os_str()
 		};
 		let holds = |marker: &str| {
 			listing
@@ -321,6 +320,11 @@ impl Owner {
 			return;
 		};
 
+		let shown = if key.is_root() {
+			display_path(&self.settings.source)
+		} else {
+			key.display()
+		};
 		let text = format!(
 			"\"{shown}\" is a {} folder: its files are archived one by one; use the CLI or make an ISO for one MKV",
 			kind.label()
