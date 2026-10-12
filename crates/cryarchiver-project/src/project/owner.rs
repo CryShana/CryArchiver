@@ -56,6 +56,7 @@ pub(crate) enum Message {
 	DestinationListed(Vec<DestinationFile>),
 	OutputVerified(FileId, Output, bool),
 	Revealed(PathBuf, Result<(), String>),
+	ReferencesNaming(Vec<FileId>),
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -228,6 +229,7 @@ impl Owner {
 			Message::DestinationListed(files) => self.on_destination_listed(&files),
 			Message::OutputVerified(file, output, intact) => self.on_output_verified(file, output, intact),
 			Message::Revealed(folder, result) => self.on_revealed(&folder, result),
+			Message::ReferencesNaming(files) => self.on_references_naming(files),
 		}
 
 		if self.stopping || !frees {
@@ -243,6 +245,7 @@ impl Owner {
 
 	pub(super) fn tick(&mut self, now: Instant) {
 		self.relist_hinted(now);
+		self.reread_renamed_references();
 		self.safety_pass(now);
 		self.pump_listings();
 		self.sample_system(now);

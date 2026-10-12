@@ -778,7 +778,9 @@ impl Owner {
 			return;
 		}
 
+		self.follow_new_name(file, &output.path);
 		record.replaces = None;
+		record.retrying = None;
 		self.tree.set_record(file, record);
 		self.pipeline.retries.remove(&file);
 		self.pipeline.retry_threads.remove(&file);
@@ -796,6 +798,7 @@ impl Owner {
 		let (folder, name) = (entry.folder, entry.name.clone());
 		let record = FileRecord {
 			replaces: None,
+			retrying: None,
 			state: FileState::SourceGone(output),
 			..entry.record.clone()
 		};
@@ -984,6 +987,11 @@ impl Owner {
 	}
 
 	fn raise_issue(&mut self, file: FileId, attempt: u32, err: &JobError) {
+		if let Some(kept) = self.tree.file(file).record.retrying.clone() {
+			self.retry_failed(file, kept, &err.kind.to_string());
+			return;
+		}
+
 		let key = self.tree.file(file).key.clone();
 		let log = FailureLog {
 			error: err.kind.to_string(),

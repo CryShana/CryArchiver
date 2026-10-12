@@ -265,8 +265,10 @@ impl Owner {
 			self.remove_replaced_output(previous, &output.path);
 		}
 
+		self.follow_new_name(file, &output.path);
 		let mut record = self.tree.file(file).record.clone();
 		record.replaces = None;
+		record.retrying = None;
 		self.tree.set_record(file, record);
 		self.set_state(file, FileState::Done(output));
 	}

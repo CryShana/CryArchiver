@@ -211,6 +211,123 @@ fn a_kept_file_encoded_on_retry_leaves_only_its_new_output() {
 }
 
 #[test]
+fn a_kept_file_whose_retry_fails_keeps_its_kept_copy_as_its_archive() {
+	let Retried {
+		setup,
+		project,
+		mut snapshot,
+		file,
+	} = retry_a_kept_file(
+		Rule::Fail(ErrorKind::SourceDamaged("no end marker".into())),
+		Target::File,
+	);
+
+	wait_for(&project, &mut snapshot, "the failure", |s| {
+		s.logs
+			.iter()
+			.any(|log| log.message.starts_with("kept.jpg: the retry failed: "))
+	});
+	wait_for_state(&project, &mut snapshot, file, RowState::KeptOriginal);
+	drop(project);
+
+	assert_eq!(archived_names(&setup), ["kept.jpg"]);
+	assert_eq!(fs::read(setup.destination.join("kept.jpg")).unwrap(), jpeg(1, 100));
+	let record = record(&setup, "kept.jpg");
+	assert!(
+		matches!(
+			&record.state,
+			FileState::Done(output)
+				if output.how == How::Copied(CopyReason::KeptOriginal) && output.hash.is_some()
+		),
+		"{:?}",
+		record.state
+	);
+	assert_eq!((record.replaces, record.retrying), (None, None));
+	assert!(snapshot.issues.is_empty(), "{:?}", snapshot.issues);
+}
+
+#[test]
+fn a_kept_file_whose_source_vanishes_during_its_retry_keeps_its_kept_copy() {
+	let Retried {
+		setup,
+		project,
+		mut snapshot,
+		file,
+	} = retry_a_kept_file(Rule::Hold, Target::File);
+
+	fs::remove_file(setup.source.join("kept.jpg")).unwrap();
+	project.send(Command::Rescan);
+	wait_for_state(&project, &mut snapshot, file, RowState::SourceGone);
+	drop(project);
+
+	assert_eq!(archived_names(&setup), ["kept.jpg"]);
+	let record = record(&setup, "kept.jpg");
+	let FileState::SourceGone(output) = &record.state else {
+		panic!("not gone: {:?}", record.state)
+	};
+	assert_eq!(
+		(&output.how, output.path.display().as_str()),
+		(&How::Copied(CopyReason::KeptOriginal), "kept.jpg")
+	);
+	assert_eq!(output.hash.unwrap().0, *blake3::hash(&jpeg(1, 100)).as_bytes());
+	assert_eq!((record.replaces, record.retrying), (None, None));
+}
+
+#[test]
+fn a_playlist_naming_a_kept_file_follows_the_new_name_its_retry_gives_it() {
+	let setup = setup(|_| {});
+	write(&setup.source, "a.jpg", &jpeg(1, 100));
+	write(
+		&setup.source,
+		"list.m3u",
+		b"#EXTM3U
+a.jpg
+",
+	);
+	let encoder = FakeEncoder::new();
+	encoder.rule("a.jpg", Rule::Keep);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+	let playlist = setup.destination.join("list.m3u");
+	assert_eq!(
+		fs::read(&playlist).unwrap(),
+		b"#EXTM3U
+a.jpg
+"
+	);
+	let file = file_id(&project, &mut snapshot, FolderId::ROOT, "a.jpg");
+	let list = file_id(&project, &mut snapshot, FolderId::ROOT, "list.m3u");
+
+	encoder.rule("a.jpg", Rule::Encode("avif"));
+	project.send(Command::RetryKept(Target::File(file)));
+	wait_for_state(&project, &mut snapshot, file, RowState::Done);
+	wait_for(&project, &mut snapshot, "the playlist written again", |_| {
+		fs::read(&playlist).is_ok_and(|text| {
+			text == b"#EXTM3U
+a.avif
+"
+		})
+	});
+	wait_for_state(&project, &mut snapshot, list, RowState::Copied);
+	drop(project);
+
+	assert_eq!(archived_names(&setup), ["a.avif", "list.m3u"]);
+	assert!(
+		matches!(record(&setup, "list.m3u").state, FileState::Done(output) if output.how == How::Copied(CopyReason::Rewritten))
+	);
+	assert!(
+		snapshot
+			.logs
+			.iter()
+			.any(|log| log.message.starts_with("list.m3u: written again")),
+		"{:?}",
+		snapshot.logs
+	);
+}
+
+#[test]
 fn unrecoverable_failures_become_issues_with_their_log_until_retried() {
 	let setup = setup(|_| {});
 	write(&setup.source, "broken.jpg", &jpeg(1, 100));

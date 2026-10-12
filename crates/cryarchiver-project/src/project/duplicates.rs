@@ -705,6 +705,11 @@ impl Owner {
 	}
 
 	/// Whether a canonical copy's move takes the file's archived output over, planned or running.
+	#[cfg(test)]
+	pub(super) fn plan_take_over(&mut self, taker: FileId, holder: FileId) {
+		self.dedup.moves.insert(taker, holder);
+	}
+
 	pub(super) fn gives_output_to_a_take_over(&self, file: FileId) -> bool {
 		self.takers_of(file).next().is_some()
 	}

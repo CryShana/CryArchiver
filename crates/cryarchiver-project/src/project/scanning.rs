@@ -374,6 +374,7 @@ impl Owner {
 			window_hash: None,
 			full_hash: None,
 			replaces,
+			retrying: None,
 			state: FileState::Discovered,
 		};
 		self.tree.set_record(file, record);
@@ -384,6 +385,11 @@ impl Owner {
 	/// The source file is gone. An archived file keeps its output, and its size group decides again without it as a
 	/// source; anything else leaves the project.
 	pub(super) fn source_missing(&mut self, file: FileId) {
+		if let Some(kept) = self.pending_retry(file) {
+			self.retry_source_gone(file, kept);
+			return;
+		}
+
 		let state = self.tree.file(file).record.state.clone();
 		match state {
 			FileState::Done(output) => self.set_state(file, FileState::SourceGone(output)),

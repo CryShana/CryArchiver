@@ -229,11 +229,16 @@ impl Ui {
 		Outcome::Done
 	}
 
-	/// Whether the Library shows the file with its original kept.
+	/// Whether the file's original was kept, as the view on screen shows it: the details in the details view, which
+	/// its footer reads too, and the Library's row elsewhere.
 	pub(super) fn kept(&self, source: &dyn ArchiveSource, file: FileId) -> bool {
-		self.tree
-			.shown_file(source, file)
-			.is_some_and(|row| row.status.state == FileState::KeptOriginal)
+		let state = if self.mode == ViewMode::Details {
+			source.details(file).map(|details| details.state)
+		} else {
+			self.tree.shown_file(source, file).map(|row| row.status.state)
+		};
+
+		state == Some(FileState::KeptOriginal)
 	}
 
 	fn show_log(&mut self, source: &dyn ArchiveSource, file: FileId, folder: NodeId) {

@@ -1,8 +1,10 @@
-//! Files whose original was kept, archived again on the user's request: the engine may do better now.
+//! Files whose original was kept, archived again on the user's request: the engine may do better now. Until the new
+//! output is in place, the kept copy stays the file's archive: a retry that fails, or whose source vanishes first, falls
+//! back to it.
 
 use super::Target;
 use super::owner::Owner;
-use crate::record::{CopyReason, FileState, How};
+use crate::record::{CopyReason, FileState, How, Output};
 use crate::tree::{FileId, FolderId};
 use crate::view::{LogKind, NoticeLevel};
 
@@ -13,9 +15,18 @@ impl Owner {
 			Target::Folder(folder) if self.tree.has_folder(folder) => self.files_below(folder),
 			Target::File(_) | Target::Folder(_) => Vec::new(),
 		};
-		let kept: Vec<FileId> = candidates.into_iter().filter(|&file| self.retryable(file)).collect();
+		let (busy, kept): (Vec<FileId>, Vec<FileId>) = candidates
+			.into_iter()
+			.filter(|&file| self.is_kept(file))
+			.partition(|&file| self.busy(file));
+
 		if kept.is_empty() {
-			self.notice(NoticeLevel::Info, "nothing kept to retry here".into());
+			let text = match (target, busy.is_empty()) {
+				(_, true) => "nothing kept to retry here",
+				(Target::File(_), false) => "it's busy; try again once it finishes",
+				(Target::Folder(_), false) => "its kept files are busy; try again once they finish",
+			};
+			self.notice(NoticeLevel::Info, text.into());
 			return;
 		}
 
@@ -25,7 +36,7 @@ impl Owner {
 
 		let message = match target {
 			Target::File(file) => format!("{}: retry chosen", self.tree.file(file).key.display()),
-			Target::Folder(folder) => retrying(kept.len(), &self.tree.folder(folder).key.display()),
+			Target::Folder(folder) => retrying(kept.len(), busy.len(), &self.tree.folder(folder).key.display()),
 		};
 		self.log(LogKind::Action, message);
 	}
@@ -45,16 +56,19 @@ impl Owner {
 		files
 	}
 
-	/// Done with its original kept, and nothing else is under way for it: no job, and no take-over about to move its
-	/// copy.
-	fn retryable(&self, file: FileId) -> bool {
+	fn is_kept(&self, file: FileId) -> bool {
 		let entry = self.tree.file(file);
 		let kept = matches!(
 			&entry.record.state,
 			FileState::Done(output) if output.how == How::Copied(CopyReason::KeptOriginal)
 		);
 
-		kept && !entry.removed && !self.pipeline.jobs.contains_key(&file) && !self.gives_output_to_a_take_over(file)
+		kept && !entry.removed
+	}
+
+	/// A job runs for it, or a take-over is about to move its copy.
+	fn busy(&self, file: FileId) -> bool {
+		self.pipeline.jobs.contains_key(&file) || self.gives_output_to_a_take_over(file)
 	}
 
 	/// As a duplicate whose canonical copy changed is archived again: a placeholder pointing at the kept copy adopts
@@ -65,8 +79,10 @@ impl Owner {
 		};
 
 		let adopted = self.transfer_dependents(file, Some(&output));
+		self.remember_retried(file, output.path.clone());
 		let mut record = self.tree.file(file).record.clone();
-		record.replaces = (!adopted).then_some(output.path);
+		record.replaces = (!adopted).then(|| output.path.clone());
+		record.retrying = (!adopted).then_some(output);
 		self.tree.set_record(file, record);
 
 		self.pipeline.chosen_copies.remove(&file);
@@ -74,15 +90,66 @@ impl Owner {
 		self.unqueue(file);
 		self.enqueue(file);
 	}
+
+	/// The kept copy of a retry that hasn't started to commit: the file's archive still, if the retry places nothing.
+	pub(super) fn pending_retry(&self, file: FileId) -> Option<Output> {
+		let record = &self.tree.file(file).record;
+		let pending = matches!(
+			record.state,
+			FileState::Discovered | FileState::Ready | FileState::Queued | FileState::InProgress { .. }
+		);
+
+		record.retrying.clone().filter(|_| pending)
+	}
+
+	/// The source vanished before the retry placed anything: the kept copy stays its archive, as for any archived file
+	/// whose source is gone.
+	pub(super) fn retry_source_gone(&mut self, file: FileId, kept: Output) {
+		self.withdraw(file);
+		self.give_back_kept(file, &kept);
+		self.set_state(file, FileState::SourceGone(kept));
+		self.join_dedup(file);
+		self.member_changed(file);
+	}
+
+	/// A retry that fails leaves the file as it was, with a note saying why.
+	pub(super) fn retry_failed(&mut self, file: FileId, kept: Output, reason: &str) {
+		self.pipeline.retries.remove(&file);
+		self.pipeline.retry_threads.remove(&file);
+		self.give_back_kept(file, &kept);
+		self.set_state(file, FileState::Done(kept));
+		self.note(
+			file,
+			format!("the retry failed: {reason}; the kept copy stays its archive"),
+		);
+
+		self.file_settled(file);
+		self.queue_delete(file);
+	}
+
+	fn give_back_kept(&mut self, file: FileId, kept: &Output) {
+		self.forget_retried(file);
+		let mut record = self.tree.file(file).record.clone();
+		record.replaces = None;
+		record.retrying = None;
+		self.tree.set_record(file, record);
+		self.claim(file, &kept.path);
+	}
 }
 
-fn retrying(count: usize, folder: &str) -> String {
+fn retrying(count: usize, busy: usize, folder: &str) -> String {
 	let files = if count == 1 { "file" } else { "files" };
-	if folder.is_empty() {
-		format!("retrying {count} kept {files}")
+	let place = if folder.is_empty() {
+		String::new()
 	} else {
-		format!("retrying {count} kept {files} in {folder}")
-	}
+		format!(" in {folder}")
+	};
+	let left = match busy {
+		0 => String::new(),
+		1 => "; 1 busy file left as it is".to_owned(),
+		busy => format!("; {busy} busy files left as they are"),
+	};
+	format!("retrying {count} kept {files}{place}{left}")
 }
 
 #[cfg(test)]
@@ -91,6 +158,7 @@ mod tests {
 	use std::path::PathBuf;
 	use std::sync::mpsc::Receiver;
 
+	use cryarchiver_engine::outcome::ErrorKind;
 	use tokio::sync::oneshot;
 
 	use super::*;
@@ -302,7 +370,10 @@ mod tests {
 			assert_eq!(fixture.replaces(file), None);
 		}
 		let (logs, _) = fixture.messages();
-		assert!(logs.contains(&"retrying 2 kept files in Photos".to_owned()), "{logs:?}");
+		assert!(
+			logs.contains(&"retrying 2 kept files in Photos; 1 busy file left as it is".to_owned()),
+			"{logs:?}"
+		);
 	}
 
 	#[test]
@@ -394,8 +465,101 @@ mod tests {
 	}
 
 	#[test]
+	fn a_busy_kept_file_is_left_as_it_is_and_said_to_be_busy() {
+		let mut fixture = Fixture::new();
+		let running = fixture.add("Photos/a.jpg", kept("Photos/a.jpg"));
+		fixture.owner.pipeline.jobs.insert(running, running_job(Work::Delete));
+		let holder = fixture.add("Photos/b.jpg", kept("Photos/b.jpg"));
+		let taker = fixture.add("b.jpg", FileState::Ready);
+		fixture.owner.plan_take_over(taker, holder);
+		let photos = fixture.folder("Photos");
+
+		for target in [Target::File(running), Target::File(holder), Target::Folder(photos)] {
+			fixture.owner.retry_kept(target);
+		}
+
+		assert_eq!(fixture.state(running), &kept("Photos/a.jpg"));
+		assert_eq!(fixture.state(holder), &kept("Photos/b.jpg"));
+		assert_eq!(fixture.replaces(holder), None);
+		let (_, notices) = fixture.messages();
+		let busy = |text: &str| (NoticeLevel::Info, text.to_owned());
+		assert_eq!(
+			notices,
+			[
+				busy("it's busy; try again once it finishes"),
+				busy("it's busy; try again once it finishes"),
+				busy("its kept files are busy; try again once they finish"),
+			]
+		);
+	}
+
+	#[test]
+	fn a_retry_that_fails_falls_back_to_its_kept_copy() {
+		let mut fixture = Fixture::new();
+		let file = fixture.add("a.jpg", kept("a.jpg"));
+		fixture.owner.retry_kept(Target::File(file));
+		assert_eq!(
+			fixture.owner.tree.file(file).record.retrying,
+			Some(output("a.jpg", How::Copied(CopyReason::KeptOriginal)))
+		);
+
+		fixture.owner.pipeline.jobs.insert(file, running_job(Work::Encode));
+		fixture.owner.set_state(file, FileState::InProgress { attempt: 1 });
+		fixture.owner.on_job(
+			file,
+			JobMessage::Finished(Err(ErrorKind::SourceDamaged("no end marker".into()).into())),
+		);
+
+		assert_eq!(fixture.state(file), &kept("a.jpg"));
+		assert_eq!(fixture.replaces(file), None);
+		assert_eq!(fixture.owner.tree.file(file).record.retrying, None);
+		assert!(!fixture.owner.issue_files.contains(&file));
+		assert!(fixture.archived("a.jpg").exists());
+		let (logs, _) = fixture.messages();
+		assert!(
+			logs.iter().any(|log| log.starts_with("a.jpg: the retry failed: ")),
+			"{logs:?}"
+		);
+	}
+
+	#[test]
+	fn a_retry_whose_source_vanishes_before_its_commit_keeps_its_kept_copy() {
+		let mut fixture = Fixture::new();
+		let queued = fixture.add("a.jpg", kept("a.jpg"));
+		let running = fixture.add("b.jpg", kept("b.jpg"));
+		for file in [queued, running] {
+			fixture.owner.retry_kept(Target::File(file));
+		}
+		let job = running_job(Work::Encode);
+		let cancel = job.cancel.clone();
+		fixture.owner.pipeline.jobs.insert(running, job);
+		fixture.owner.set_state(running, FileState::InProgress { attempt: 1 });
+
+		for file in [queued, running] {
+			fixture.owner.source_missing(file);
+		}
+
+		for (file, path) in [(queued, "a.jpg"), (running, "b.jpg")] {
+			let FileState::Done(kept) = kept(path) else {
+				unreachable!()
+			};
+			assert_eq!(fixture.state(file), &FileState::SourceGone(kept));
+			assert!(!fixture.owner.tree.file(file).removed);
+			assert_eq!(fixture.replaces(file), None);
+			assert_eq!(fixture.owner.tree.file(file).record.retrying, None);
+			assert!(fixture.archived(path).exists());
+		}
+		assert!(cancel.is_cancelled());
+		assert!(!fixture.queued_to_encode(queued));
+	}
+
+	#[test]
 	fn the_summary_names_the_folder_and_counts_the_files() {
-		assert_eq!(retrying(1, "Photos"), "retrying 1 kept file in Photos");
-		assert_eq!(retrying(3, ""), "retrying 3 kept files");
+		assert_eq!(retrying(1, 0, "Photos"), "retrying 1 kept file in Photos");
+		assert_eq!(retrying(3, 0, ""), "retrying 3 kept files");
+		assert_eq!(
+			retrying(2, 1, "Photos"),
+			"retrying 2 kept files in Photos; 1 busy file left as it is"
+		);
 	}
 }

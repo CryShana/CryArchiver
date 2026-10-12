@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use cryarchiver_project::issues::{Problem, Verb};
 use cryarchiver_project::keys::RelPath;
-use cryarchiver_project::record::{FileRecord, FileState, How, Output};
+use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How, Output};
 use cryarchiver_project::settings::{DELETE_CONFIRMATION, SettingsChange};
 use cryarchiver_project::store::Store;
-use cryarchiver_project::{Command, Fault};
-use support::{FakeEncoder, Snapshot, jpeg, setup, wait_for, write};
+use cryarchiver_project::tree::FolderId;
+use cryarchiver_project::{Command, Fault, Target};
+use support::{FakeEncoder, Rule, Snapshot, file_id, jpeg, setup, wait_for, write};
 
 /// Above the 64 KiB dedup minimum, so copies of it are duplicates.
 const BIG: usize = 100_000;
@@ -561,4 +562,50 @@ fn an_output_accepted_without_a_hash_is_never_taken_over_even_through_a_crash() 
 	assert_eq!(fs::read(&accepted).unwrap(), b"changed");
 	assert_eq!(state(&setup, "Deep/a.jpg"), FileState::Done(held));
 	assert!(matches!(state(&setup, "a.jpg"), FileState::Done(_)));
+}
+
+#[test]
+fn a_retry_kept_again_that_crashed_after_its_intent_counts_as_placed_on_reopening() {
+	let setup = setup(|_| {});
+	write(&setup.source, "kept.jpg", &jpeg(1, 100));
+	let encoder = FakeEncoder::new();
+	encoder.rule("kept.jpg", Rule::Keep);
+	run_to_the_end(&setup, &encoder);
+
+	let project = support::open_with(&setup, &encoder, Some(Fault::AfterCommitIntent));
+	let mut snapshot = Snapshot::default();
+	project.send(Command::Start {
+		delete_confirmed: false,
+	});
+	let file = file_id(&project, &mut snapshot, FolderId::ROOT, "kept.jpg");
+	project.send(Command::RetryKept(Target::File(file)));
+	wait_for(&project, &mut snapshot, "the crash", |s| s.stopped);
+	drop(project);
+
+	let (_, crashed) = records(&setup).into_iter().find(|(key, _)| key == "kept.jpg").unwrap();
+	assert!(
+		matches!(crashed.state, FileState::Committing { .. }),
+		"{:?}",
+		crashed.state
+	);
+	assert!(crashed.retrying.is_some());
+
+	let snapshot = run_to_the_end(&setup, &encoder);
+
+	assert_eq!(
+		encoder.calls().len(),
+		2,
+		"the copy in place has the intent's hash: it counts as placed"
+	);
+	let (_, record) = records(&setup).into_iter().find(|(key, _)| key == "kept.jpg").unwrap();
+	let FileState::Done(output) = &record.state else {
+		panic!("not done: {:?}", record.state)
+	};
+	assert_eq!(
+		(&output.how, output.path.display().as_str()),
+		(&How::Copied(CopyReason::KeptOriginal), "kept.jpg")
+	);
+	assert_eq!((record.replaces, record.retrying), (None, None));
+	assert_eq!(fs::read(setup.destination.join("kept.jpg")).unwrap(), jpeg(1, 100));
+	assert!(snapshot.issues.is_empty(), "{:?}", snapshot.issues);
 }

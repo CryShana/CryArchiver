@@ -77,6 +77,9 @@ pub struct FileRecord {
 	pub full_hash: Option<Hash>,
 	/// The output of an earlier archive that a re-archive after a source change replaces.
 	pub replaces: Option<RelPath>,
+	/// While a kept original is archived again: its kept copy, still its archive until the new output is in place.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub retrying: Option<Output>,
 	pub state: FileState,
 }
 

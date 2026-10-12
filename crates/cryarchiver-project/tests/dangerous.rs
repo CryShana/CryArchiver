@@ -5,8 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use cryarchiver_engine::outcome::ErrorKind;
 use cryarchiver_project::issues::{Problem, Verb};
-use cryarchiver_project::record::{CopyReason, How};
-use cryarchiver_project::record::{FileRecord, FileState, mtime_ns};
+use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How, mtime_ns};
 use cryarchiver_project::settings::{DELETE_CONFIRMATION, SettingsChange};
 use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
