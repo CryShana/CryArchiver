@@ -126,6 +126,7 @@ const PAM: &str = "pam";
 pub const LIBJXL: &str = "libjxl";
 const AV1_DECODERS: &[&str] = &["libdav1d", "libaom-av1"];
 pub const LIBAOM: &str = "libaom-av1";
+const BLURAY_PROTOCOL: &str = "bluray";
 const LIBAOM_FILES: &str = "animated images, video larger than 16384×8704 and --video-encoder aom fail without it";
 pub const LIBVPX_VP9: &str = "libvpx-vp9";
 pub const SVT_AV1: &str = "svt-av1";
@@ -206,6 +207,10 @@ pub struct Toolchain {
 	pub opus_surround: bool,
 	#[serde(default)]
 	pub vmaf: bool,
+	#[serde(default)]
+	pub demuxers: BTreeSet<String>,
+	#[serde(default)]
+	pub protocols: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,7 +243,7 @@ impl Toolchain {
 	}
 
 	async fn probe(ffmpeg: PathBuf, ffprobe: PathBuf, cancel: &CancellationToken) -> Result<Self, ToolchainError> {
-		let (version, encoders, decoders, filters, soxr, opus_surround, svt_av1, video, vmaf) = tokio::join!(
+		let (version, encoders, decoders, filters, soxr, opus_surround, svt_av1, video, vmaf, demuxers, protocols) = tokio::join!(
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-version"], cancel),
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-encoders"], cancel),
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-decoders"], cancel),
@@ -248,6 +253,8 @@ impl Toolchain {
 			svt_version(&ffmpeg, cancel),
 			video_probes(&ffmpeg, &ffprobe, cancel),
 			vmaf_models(&ffmpeg, cancel),
+			run_ffmpeg(&ffmpeg, &["-hide_banner", "-demuxers"], cancel),
+			run_ffmpeg(&ffmpeg, &["-hide_banner", "-protocols"], cancel),
 		);
 
 		let first_line = stdout_text(&version?).lines().next().unwrap_or_default().to_owned();
@@ -258,6 +265,8 @@ impl Toolchain {
 		let encoders = parse_codecs(&stdout_text(&encoders?));
 		let decoders = parse_codecs(&stdout_text(&decoders?));
 		let filters = parse_filters(&stdout_text(&filters?));
+		let demuxers = parse_demuxers(&stdout_text(&demuxers?));
+		let protocols = parse_protocols(&stdout_text(&protocols?));
 
 		let soxr = soxr?;
 		let opus_surround = opus_surround? && encoders.contains("libopus");
@@ -291,6 +300,8 @@ impl Toolchain {
 			soxr,
 			opus_surround,
 			vmaf,
+			demuxers,
+			protocols,
 		})
 	}
 
@@ -343,6 +354,10 @@ impl Toolchain {
 
 	pub fn has_vmaf(&self) -> bool {
 		self.vmaf
+	}
+
+	pub fn has_bluray(&self) -> bool {
+		self.protocols.contains(BLURAY_PROTOCOL)
 	}
 
 	fn missing(&self, selected: impl Fn(&ReportLine) -> bool) -> Vec<String> {
@@ -478,6 +493,13 @@ impl Toolchain {
 				OPTIONAL,
 				"video quality search and checks at MODERATE and SLOW",
 			),
+			check(
+				"Blu-ray discs",
+				self.has_bluray(),
+				Status::Warn,
+				OPTIONAL,
+				"reading Blu-ray discs and folders",
+			),
 		]
 	}
 
@@ -599,6 +621,34 @@ fn parse_filters(text: &str) -> BTreeSet<String> {
 			is_row.then(|| name.to_owned())
 		})
 		.collect()
+}
+
+fn parse_demuxers(text: &str) -> BTreeSet<String> {
+	text.lines()
+		.filter_map(|line| {
+			let (flags, name) = (line.get(..5)?, line.get(5..)?);
+			let is_row = matches!(flags.as_bytes(), [b' ', b'D', b' ', b' ' | b'd', b' ']);
+			is_row.then(|| name.split_whitespace().next().map(str::to_owned))?
+		})
+		.collect()
+}
+
+fn parse_protocols(text: &str) -> BTreeSet<String> {
+	let mut listing_inputs = false;
+	let mut names = BTreeSet::new();
+
+	for line in text.lines() {
+		match line.trim() {
+			"Input:" => listing_inputs = true,
+			"Output:" => listing_inputs = false,
+			name if listing_inputs && !name.is_empty() => {
+				names.insert(name.to_owned());
+			}
+			_ => {}
+		}
+	}
+
+	names
 }
 
 fn locate(configured: Option<&Path>) -> Result<(PathBuf, PathBuf), ToolchainError> {
@@ -915,6 +965,82 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn parses_demuxer_and_protocol_lists() {
+		let demuxers = "File formats:
+ D. = Demuxing supported
+ .E = Muxing supported
+ ..d = Is a device
+ ---
+ D   dvdvideo        DVD-Video
+ D   matroska,webm   Matroska / WebM
+ D   mpeg            MPEG-PS (MPEG-2 Program Stream)
+ D d lavfi           Libavfilter virtual input device
+  E  mp4              MP4 (MPEG-4 Part 14)
+";
+		let protocols = "Supported file protocols:
+Input:
+  bluray
+  concat
+  file
+  subfile
+Output:
+  file
+  md5
+";
+
+		assert_eq!(
+			parse_demuxers(demuxers),
+			BTreeSet::from([
+				"dvdvideo".to_owned(),
+				"lavfi".to_owned(),
+				"matroska,webm".to_owned(),
+				"mpeg".to_owned()
+			])
+		);
+		assert_eq!(
+			parse_protocols(protocols),
+			BTreeSet::from([
+				"bluray".to_owned(),
+				"concat".to_owned(),
+				"file".to_owned(),
+				"subfile".to_owned()
+			])
+		);
+	}
+
+	#[test]
+	fn missing_bluray_only_warns() {
+		let mut tools = complete_toolchain();
+		assert!(tools.has_bluray());
+		tools.protocols.remove("bluray");
+
+		let line = tools
+			.report()
+			.into_iter()
+			.find(|line| line.label == "Blu-ray discs")
+			.unwrap();
+
+		assert_eq!(line.status, Status::Warn);
+		assert!(!tools.has_bluray());
+		assert!(tools.problems(MediaKind::Video).is_empty());
+		assert!(tools.problems(MediaKind::Audio).is_empty());
+		assert!(tools.problems(MediaKind::Image).is_empty());
+	}
+
+	#[test]
+	fn an_older_cached_toolchain_has_no_bluray_until_probed() {
+		let mut value = serde_json::to_value(complete_toolchain()).unwrap();
+		let fields = value.as_object_mut().unwrap();
+		fields.remove("demuxers");
+		fields.remove("protocols");
+
+		let cached: Toolchain = serde_json::from_value(value).unwrap();
+
+		assert!(cached.demuxers.is_empty());
+		assert!(!cached.has_bluray());
+	}
+
 	fn complete_toolchain() -> Toolchain {
 		Toolchain {
 			ffmpeg: PathBuf::from("ffmpeg"),
@@ -942,6 +1068,11 @@ mod tests {
 			soxr: true,
 			opus_surround: true,
 			vmaf: true,
+			demuxers: BTreeSet::from(["dvdvideo".to_owned(), "mpeg".to_owned()]),
+			protocols: ["bluray", "concat", "file", "subfile"]
+				.into_iter()
+				.map(String::from)
+				.collect(),
 		}
 	}
 

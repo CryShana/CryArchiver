@@ -863,6 +863,14 @@ impl Engine {
 		}
 	}
 
+	pub fn check_bluray(&self) -> Result<(), JobError> {
+		if self.tools.has_bluray() {
+			Ok(())
+		} else {
+			Err(ErrorKind::EncodeFailed("ffmpeg can't read Blu-ray discs (no bluray protocol)".into()).into())
+		}
+	}
+
 	/// A video slot, then the memory for decoding at the source's size and at the output's, and the job's share of the
 	/// thread budget.
 	async fn video_resources(

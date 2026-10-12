@@ -1566,6 +1566,8 @@ mod tests {
 			soxr: false,
 			opus_surround: false,
 			vmaf: false,
+			demuxers: BTreeSet::new(),
+			protocols: BTreeSet::new(),
 		}
 	}
 

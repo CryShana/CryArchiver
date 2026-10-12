@@ -22,6 +22,9 @@ async fn detects_the_installed_toolchain_every_time() {
 	assert!(tools.svt_settings && tools.colour_tags && tools.vp9_alpha, "{tools:?}");
 	assert!(tools.has_av1_decoder());
 	assert!(tools.has_vmaf(), "{tools:?}");
+	assert!(tools.demuxers.contains("matroska,webm"), "{tools:?}");
+	assert!(tools.protocols.contains("file"), "{tools:?}");
+	assert!(tools.has_bluray(), "{tools:?}");
 	assert!(
 		tools
 			.svt_av1_release
