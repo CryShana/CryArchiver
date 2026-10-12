@@ -197,6 +197,7 @@ fn disc_parts(path: &Path) -> Option<(PathBuf, PathBuf, DiscFolder)> {
 		.filter(|child| child.is_dir())
 		.collect();
 	children.sort();
+
 	DiscFolder::ALL.into_iter().find_map(|kind| {
 		let folder = children.iter().find(|child| folder_kind(child) == Some(kind))?;
 		Some((path.to_path_buf(), folder.clone(), kind))

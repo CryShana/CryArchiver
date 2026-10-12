@@ -553,6 +553,19 @@ async fn an_interleaved_block_whose_units_cannot_be_followed_is_mixed() {
 	assert!(dvd.mixed(&select(&dvd)));
 }
 
+#[tokio::test]
+async fn an_interleaved_block_that_cannot_be_read_is_an_error_not_mixed() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("disc");
+	dvd::write_folder(&root, &dvd::two_angles(dir.path(), footage(12, &[12]), true));
+	let listing = read_folder(&root).unwrap();
+	std::fs::remove_file(root.join("VIDEO_TS").join("VTS_01_1.VOB")).unwrap();
+
+	let reason = parse(&listing).unwrap_err();
+
+	assert!(reason.contains("can't be read"), "{reason}");
+}
+
 async fn rebuilt(source: &Path, workspace: &Workspace) -> (MediaInfo, Vec<String>) {
 	let tools = support::toolchain().await;
 	let info = probed(source).await;

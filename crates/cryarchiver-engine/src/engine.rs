@@ -980,8 +980,11 @@ impl Engine {
 		};
 		self.require(MediaKind::Video)?;
 
-		let dvd = match dvd::parse(&files) {
-			Ok(dvd) => dvd,
+		let parsed = tokio::task::spawn_blocking(move || dvd::parse(&files))
+			.await
+			.map_err(|err| ErrorKind::Toolchain(format!("the disc read stopped: {err}")))?;
+		let dvd = match parsed {
+			Ok(dvd) => Arc::new(dvd),
 			Err(reason) => {
 				return Ok(Resolved::Kept(KeepReason::Unsupported(format!(
 					"the DVD's titles can't be read: {reason}"
@@ -998,8 +1001,11 @@ impl Engine {
 			return Ok(Resolved::Kept(KeepReason::Unsupported(INTERLEAVED_KEPT.to_owned())));
 		}
 
-		let encrypted = dvd
-			.encrypted(&selection)
+		let sampled = Arc::clone(&dvd);
+		let sample = selection.clone();
+		let encrypted = tokio::task::spawn_blocking(move || sampled.encrypted(&sample))
+			.await
+			.map_err(|err| ErrorKind::Toolchain(format!("the disc read stopped: {err}")))?
 			.map_err(|err| JobError::io(IoSide::Source(&cx.job.source), &err))?;
 		if encrypted {
 			return Ok(Resolved::Kept(KeepReason::Unsupported(DVD_ENCRYPTED.to_owned())));

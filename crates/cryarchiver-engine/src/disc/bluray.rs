@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::read::{self, Built, BuiltTitle, PROBE_BYTES, PROBE_MICROSECONDS, Probed, ProbedStream};
+use super::read::{self, Built, BuiltTitle, Probed, ProbedStream, Window};
 use super::udf::DiscFiles;
 use crate::language;
 use crate::outcome::{ErrorKind, IoSide, JobError};
@@ -247,12 +247,27 @@ impl MainFeature {
 	}
 }
 
-/// Whether ffmpeg's log says libbluray couldn't open a disc for its AACS or BD+ encryption.
-pub fn encrypted(log: &[String]) -> bool {
+/// Whether ffmpeg's log says libbluray couldn't open a disc for its AACS or BD+ encryption. ffmpeg echoes the disc's
+/// path in its errors, so each of `paths` is cut out of a line before it is matched.
+pub fn encrypted(log: &[String], paths: &[&str]) -> bool {
+	let mut paths: Vec<String> = paths
+		.iter()
+		.filter(|path| !path.is_empty())
+		.map(|path| slashed(path))
+		.collect();
+	paths.sort_by_key(|path| std::cmp::Reverse(path.len()));
+
 	log.iter().any(|line| {
-		let line = line.to_ascii_lowercase();
+		let mut line = slashed(line);
+		for path in &paths {
+			line = line.replace(path.as_str(), "");
+		}
 		line.contains("aacs") || line.contains("bd+") || line.contains("encrypted")
 	})
+}
+
+fn slashed(text: &str) -> String {
+	text.replace('\\', "/").to_ascii_lowercase()
 }
 
 /// The main feature of the Blu-ray image or folder `source`, whose files are `files`: ffmpeg opens it through
@@ -274,13 +289,13 @@ pub async fn main_feature(
 		"json",
 		"-show_streams",
 		"-show_format",
-	])
-	.args(["-probesize", PROBE_BYTES, "-analyzeduration", PROBE_MICROSECONDS, "-i"])
-	.arg(&url);
+	]);
+	Window::HEAD.apply(&mut cmd);
+	cmd.arg("-i").arg(&url);
 
 	let out = match probe::run_ffprobe(&cmd, cancel).await {
 		Ok(out) => out,
-		Err(ProbeError::Failed(log)) if encrypted(&log) => return Ok(None),
+		Err(ProbeError::Failed(log)) if encrypted(&log, &echoed_paths(source, &url)) => return Ok(None),
 		Err(err) => return Err(read::unreadable(err)),
 	};
 	let probed: Probed = serde_json::from_slice(&out.stdout)
@@ -318,6 +333,18 @@ pub async fn main_feature(
 		chapters,
 		languages,
 	}))
+}
+
+/// The spellings of the disc's path ffmpeg may echo in a log line.
+fn echoed_paths<'a>(source: &'a Path, url: &'a str) -> Vec<&'a str> {
+	[
+		url.strip_prefix("bluray:"),
+		source.to_str(),
+		source.file_name().and_then(|name| name.to_str()),
+	]
+	.into_iter()
+	.flatten()
+	.collect()
 }
 
 /// The `bluray:` URL of the image, or of the root of the folder that holds `BDMV`.
@@ -400,8 +427,8 @@ pub async fn build_bluray(
 	if let Some(playlist) = main.playlist {
 		cmd.arg("-playlist").arg(playlist.to_string());
 	}
-	cmd.args(["-probesize", PROBE_BYTES, "-analyzeduration", PROBE_MICROSECONDS, "-i"])
-		.arg(&main.url);
+	Window::HEAD.apply(&mut cmd);
+	cmd.arg("-i").arg(&main.url);
 	if let Some(chapters) = &chapters {
 		cmd.arg("-i").arg(process::tool_path(chapters));
 	}
@@ -595,16 +622,39 @@ mod tests {
 	fn libbluray_refusing_an_encrypted_disc_is_recognised() {
 		let log = |line: &str| vec!["Input #0".to_owned(), line.to_owned()];
 
-		assert!(encrypted(&log(
-			"[bluray @ 0000020c] Media stream encrypted with AACS, install and configure libaacs"
-		)));
-		assert!(encrypted(&log(
-			"[bluray @ 0000020c] Your libaacs can't decrypt this media"
-		)));
-		assert!(encrypted(&log(
-			"[bluray @ 0000020c] Unable to decrypt BD+ encrypted media"
-		)));
-		assert!(!encrypted(&log("[bluray @ 0000020c] bd_open() failed")));
-		assert!(!encrypted(&log("bluray:F:\\Film.iso: I/O error")));
+		assert!(encrypted(
+			&log("[bluray @ 0000020c] Media stream encrypted with AACS, install and configure libaacs"),
+			&[]
+		));
+		assert!(encrypted(
+			&log("[bluray @ 0000020c] Your libaacs can't decrypt this media"),
+			&[]
+		));
+		assert!(encrypted(
+			&log("[bluray @ 0000020c] Unable to decrypt BD+ encrypted media"),
+			&[]
+		));
+		assert!(!encrypted(&log("[bluray @ 0000020c] bd_open() failed"), &[]));
+		assert!(!encrypted(&log("bluray:F:\\Film.iso: I/O error"), &[]));
+	}
+
+	#[test]
+	fn a_path_that_says_encrypted_does_not_make_a_disc_encrypted() {
+		let log = |line: &str| vec!["Input #0".to_owned(), line.to_owned()];
+		let source = r"F:\Encrypted Hearts\Disc.iso";
+		let url = r"bluray:F:\Encrypted Hearts\Disc.iso";
+
+		assert!(!encrypted(
+			&log(&format!("{url}: Invalid data found when processing input")),
+			&echoed_paths(Path::new(source), url)
+		));
+		assert!(!encrypted(
+			&log("f:/encrypted hearts/Disc.iso: I/O error"),
+			&echoed_paths(Path::new(source), url)
+		));
+		assert!(encrypted(
+			&log(&format!("{url}: Media stream encrypted with AACS")),
+			&echoed_paths(Path::new(source), url)
+		));
 	}
 }

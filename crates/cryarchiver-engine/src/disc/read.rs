@@ -19,10 +19,6 @@ use crate::video::streams::matroska_subtitle;
 use crate::workspace::Workspace;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
-/// How far into a title ffmpeg looks for its streams. A PS declares none: a stream is found from its first packet,
-/// and a subtitle track's first packet can come late.
-pub(super) const PROBE_BYTES: &str = "67108864";
-pub(super) const PROBE_MICROSECONDS: &str = "60000000";
 /// ffmpeg holds what it probes in memory: a stream that starts later in its title than this isn't looked for.
 const MAX_PROBE_BYTES: u64 = 1 << 30;
 const PROBE_MARGIN: u64 = 4 << 20;
@@ -115,9 +111,9 @@ pub async fn normalise_timestamps(
 
 	let mut cmd = ToolCommand::new(&tools.ffmpeg, process::scaled_timeout(bytes));
 	cmd.args(["-hide_banner", "-nostdin", "-y"])
-		.args(["-probesize", PROBE_BYTES, "-analyzeduration", PROBE_MICROSECONDS])
-		.args(["-fflags", "+genpts"])
-		.input(None, None, source);
+		.args(["-fflags", "+genpts"]);
+	Window::HEAD.apply(&mut cmd);
+	cmd.input(None, None, source);
 
 	let mut overrides = Vec::new();
 	let mut warnings = Vec::new();
@@ -386,18 +382,26 @@ fn joined(ranges: impl IntoIterator<Item = Range>) -> Vec<Range> {
 	joined
 }
 
-/// How much of an input ffmpeg reads to find its streams.
+/// How much of an input ffmpeg reads to find its streams. A PS declares none: a stream is found from its first
+/// packet, and a subtitle track's first packet can come late.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Window {
+pub(super) struct Window {
 	bytes: u64,
 	microseconds: u64,
 }
 
 impl Window {
-	const HEAD: Self = Self {
+	pub(super) const HEAD: Self = Self {
 		bytes: 64 << 20,
 		microseconds: 60_000_000,
 	};
+
+	pub(super) fn apply(self, cmd: &mut ToolCommand) {
+		cmd.arg("-probesize")
+			.arg(self.bytes.to_string())
+			.arg("-analyzeduration")
+			.arg(self.microseconds.to_string());
+	}
 }
 
 /// How ffmpeg reads byte ranges of files as one input.
@@ -442,13 +446,9 @@ impl Input {
 	}
 
 	fn args(&self, cmd: &mut ToolCommand) {
-		cmd.args(["-protocol_whitelist", self.whitelist])
-			.arg("-probesize")
-			.arg(self.window.bytes.to_string())
-			.arg("-analyzeduration")
-			.arg(self.window.microseconds.to_string())
-			.args(["-fflags", "+genpts", "-f", "mpeg", "-i"])
-			.arg(&self.url);
+		cmd.args(["-protocol_whitelist", self.whitelist]);
+		self.window.apply(cmd);
+		cmd.args(["-fflags", "+genpts", "-f", "mpeg", "-i"]).arg(&self.url);
 	}
 }
 
@@ -525,7 +525,7 @@ async fn probe_streams(
 	counted: Option<u64>,
 	cancel: &CancellationToken,
 ) -> Result<Vec<ProbedStream>, JobError> {
-	let timeout = counted.map_or(PROBE_TIMEOUT, process::scaled_timeout);
+	let timeout = process::scaled_timeout(counted.unwrap_or(input.window.bytes)).max(PROBE_TIMEOUT);
 	let mut cmd = ToolCommand::new(&tools.ffprobe, timeout);
 	cmd.args(["-v", "error", "-hide_banner", "-print_format", "json", "-show_streams"]);
 	if counted.is_some() {

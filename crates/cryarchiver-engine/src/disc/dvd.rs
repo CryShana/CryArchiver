@@ -232,35 +232,31 @@ impl Dvd {
 	}
 
 	/// An interleaved cell's own units, each found from the DSI of the nav pack that starts the one before it;
-	/// empty when the chain breaks or leaves the cell.
-	fn units(&self, reader: &mut Reader, vts: u8, cell: &Cell) -> Vec<(u32, u32)> {
+	/// empty when the chain breaks or leaves the cell, an error when a sector can't be read.
+	fn units(&self, reader: &mut Reader, vts: u8, cell: &Cell) -> io::Result<Vec<(u32, u32)>> {
 		let mut units = Vec::new();
 		let mut at = cell.first_sector;
 		let mut sector = vec![0; ps::SECTOR];
 		for _ in 0..=cell.last_sector.saturating_sub(cell.first_sector) {
-			let dsi = self
-				.read_sector(reader, vts, at, &mut sector)
-				.ok()
-				.and_then(|()| ps::interleave(&sector, at))
-				.filter(|dsi| dsi.in_unit);
-			let Some(dsi) = dsi else {
-				return Vec::new();
+			self.read_sector(reader, vts, at, &mut sector)?;
+			let Some(dsi) = ps::interleave(&sector, at).filter(|dsi| dsi.in_unit) else {
+				return Ok(Vec::new());
 			};
 			let Some(end) = at.checked_add(dsi.unit_end).filter(|end| *end <= cell.last_sector) else {
-				return Vec::new();
+				return Ok(Vec::new());
 			};
 
 			units.push((at, end));
 			if end == cell.last_sector {
-				return units;
+				return Ok(units);
 			}
 
 			match at.checked_add(dsi.next_unit) {
 				Some(next) if next > end && next <= cell.last_sector => at = next,
-				_ => return Vec::new(),
+				_ => return Ok(Vec::new()),
 			}
 		}
-		Vec::new()
+		Ok(Vec::new())
 	}
 
 	fn read_sector(&self, reader: &mut Reader, vts: u8, number: u32, sector: &mut [u8]) -> io::Result<()> {
@@ -429,8 +425,15 @@ pub fn parse(files: &DiscFiles) -> Result<Dvd, String> {
 	let mut titles = std::mem::take(&mut dvd.titles);
 	let mut reader = Reader::default();
 	for title in &mut titles {
-		for cell in title.cells.iter_mut().filter(|cell| cell.interleaved) {
-			cell.units = dvd.units(&mut reader, title.vts, cell);
+		let sectors = dvd.vob_sectors(title.vts);
+		for cell in title
+			.cells
+			.iter_mut()
+			.filter(|cell| cell.interleaved && u64::from(cell.last_sector) < sectors)
+		{
+			cell.units = dvd
+				.units(&mut reader, title.vts, cell)
+				.map_err(|err| format!("an interleaved cell of title {} can't be read: {err}", title.number))?;
 		}
 	}
 	dvd.titles = titles;
