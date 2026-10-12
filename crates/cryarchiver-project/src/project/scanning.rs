@@ -452,6 +452,12 @@ impl Owner {
 	pub(super) fn source_broken(&mut self, folder: FolderId, name: &OsStr, reason: &str) {
 		let key = self.tree.folder(folder).key.join(name);
 		let known = self.tree.file_id(&key).filter(|&file| !self.tree.file(file).removed);
+		if let Some(file) = known
+			&& let Some(kept) = self.pending_retry(file)
+		{
+			self.retry_source_unreadable(file, kept);
+		}
+
 		if known.is_some_and(|file| self.tree.file(file).record.state.output().is_some()) {
 			self.notice(
 				NoticeLevel::Warning,

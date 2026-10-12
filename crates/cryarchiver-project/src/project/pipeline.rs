@@ -986,12 +986,8 @@ impl Owner {
 		}
 	}
 
+	/// A retried kept original falls back to its kept copy instead.
 	fn raise_issue(&mut self, file: FileId, attempt: u32, err: &JobError) {
-		if let Some(kept) = self.tree.file(file).record.retrying.clone() {
-			self.retry_failed(file, kept, &err.kind.to_string());
-			return;
-		}
-
 		let key = self.tree.file(file).key.clone();
 		let log = FailureLog {
 			error: err.kind.to_string(),
@@ -1004,20 +1000,24 @@ impl Owner {
 		self.pipeline.retries.remove(&file);
 		self.pipeline.retry_threads.remove(&file);
 
-		self.give_up_output(file);
-		self.set_state(
-			file,
-			FileState::Issue {
-				kind: issue_kind(&err.kind),
-				attempt,
-				reason: err.kind.to_string(),
-				output: None,
-			},
-		);
-		self.log(
-			LogKind::Row(self.row_state(file)),
-			format!("{}: {}", key.display(), err.kind),
-		);
+		if let Some(kept) = self.tree.file(file).record.retrying.clone() {
+			self.retry_failed(file, kept, &err.kind.to_string());
+		} else {
+			self.give_up_output(file);
+			self.set_state(
+				file,
+				FileState::Issue {
+					kind: issue_kind(&err.kind),
+					attempt,
+					reason: err.kind.to_string(),
+					output: None,
+				},
+			);
+			self.log(
+				LogKind::Row(self.row_state(file)),
+				format!("{}: {}", key.display(), err.kind),
+			);
+		}
 
 		if let ErrorKind::UnsafeDestination(folder) = &err.kind
 			&& self.pipeline.refused_folders.insert(folder.clone())

@@ -105,17 +105,26 @@ impl Owner {
 	/// The source vanished before the retry placed anything: the kept copy stays its archive, as for any archived file
 	/// whose source is gone.
 	pub(super) fn retry_source_gone(&mut self, file: FileId, kept: Output) {
+		self.abandon_retry(file, kept, FileState::SourceGone);
+	}
+
+	/// The source can't be read before the retry placed anything: the file is Done with its kept copy again, as an
+	/// archived file whose source turns unreadable stays.
+	pub(super) fn retry_source_unreadable(&mut self, file: FileId, kept: Output) {
+		self.abandon_retry(file, kept, FileState::Done);
+		self.file_settled(file);
+	}
+
+	fn abandon_retry(&mut self, file: FileId, kept: Output, state: fn(Output) -> FileState) {
 		self.withdraw(file);
 		self.give_back_kept(file, &kept);
-		self.set_state(file, FileState::SourceGone(kept));
+		self.set_state(file, state(kept));
 		self.join_dedup(file);
 		self.member_changed(file);
 	}
 
 	/// A retry that fails leaves the file as it was, with a note saying why.
 	pub(super) fn retry_failed(&mut self, file: FileId, kept: Output, reason: &str) {
-		self.pipeline.retries.remove(&file);
-		self.pipeline.retry_threads.remove(&file);
 		self.give_back_kept(file, &kept);
 		self.set_state(file, FileState::Done(kept));
 		self.note(
@@ -520,6 +529,40 @@ mod tests {
 			logs.iter().any(|log| log.starts_with("a.jpg: the retry failed: ")),
 			"{logs:?}"
 		);
+		fixture.owner.store.flush().unwrap();
+		let stored = fixture.owner.store.read_log(&key("a.jpg"), 1).unwrap().unwrap();
+		assert_eq!(stored.error, "source damaged: no end marker");
+	}
+
+	#[test]
+	fn a_retry_whose_source_turns_unreadable_keeps_its_kept_copy() {
+		let mut fixture = Fixture::new();
+		let file = fixture.add("a.jpg", kept("a.jpg"));
+		fixture.owner.retry_kept(Target::File(file));
+		let job = running_job(Work::Encode);
+		let cancel = job.cancel.clone();
+		fixture.owner.pipeline.jobs.insert(file, job);
+		fixture.owner.set_state(file, FileState::InProgress { attempt: 1 });
+
+		fixture
+			.owner
+			.source_broken(FolderId::ROOT, std::ffi::OsStr::new("a.jpg"), "access denied");
+
+		assert_eq!(fixture.state(file), &kept("a.jpg"));
+		assert_eq!(fixture.replaces(file), None);
+		assert_eq!(fixture.owner.tree.file(file).record.retrying, None);
+		assert!(!fixture.owner.issue_files.contains(&file));
+		assert!(cancel.is_cancelled());
+		let (_, notices) = fixture.messages();
+		assert_eq!(
+			notices,
+			[(NoticeLevel::Warning, "a.jpg can't be read: access denied".to_owned())]
+		);
+
+		fixture.owner.source_missing(file);
+
+		assert!(matches!(fixture.state(file), FileState::SourceGone(_)));
+		assert!(!fixture.owner.tree.file(file).removed);
 	}
 
 	#[test]
