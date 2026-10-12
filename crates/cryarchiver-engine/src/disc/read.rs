@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::dvd::{Dvd, DvdTitle, Kept, MAX_DVD_MBITS, Selection};
 use crate::language;
 use crate::outcome::{ErrorKind, IoSide, JobError};
-use crate::probe::{self, ProbeError};
+use crate::probe::{self, MediaInfo, ProbeError};
 use crate::process::{self, Progress, ToolCommand};
 use crate::toolchain::Toolchain;
 use crate::video::chapters::{self, Chapter};
@@ -28,6 +28,7 @@ pub(super) const OUTPUT: &str = "disc.mkv";
 pub(super) const CHAPTERS: &str = "chapters.txt";
 const PIECES: &str = "pieces.txt";
 const REENCODE_QUALITY: &str = "2";
+const KEPT_SUBTITLES: &[&str] = &["dvd_subtitle", "hdmv_pgs_subtitle"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Built {
@@ -76,6 +77,51 @@ pub async fn build_dvd(
 	} else {
 		job.pieces(&titles, &on_fraction).await
 	}
+}
+
+/// `source` stream-copied into a Matroska file in the workspace on timestamps ffmpeg generates, for a PS or TS whose
+/// own timestamps restart. DVD LPCM becomes plain PCM, and data streams and subtitles Matroska can't hold are left out.
+pub async fn normalise_timestamps(
+	tools: &Toolchain,
+	source: &Path,
+	info: &MediaInfo,
+	workspace: &Workspace,
+	on_fraction: impl Fn(f64),
+	cancel: &CancellationToken,
+) -> Result<PathBuf, JobError> {
+	let bytes = fs::metadata(source)
+		.map_err(|err| JobError::io(IoSide::Source(source), &err))?
+		.len();
+	let output = workspace.file(OUTPUT);
+
+	let mut cmd = ToolCommand::new(&tools.ffmpeg, process::scaled_timeout(bytes));
+	cmd.args(["-hide_banner", "-nostdin", "-y"])
+		.args(["-probesize", PROBE_BYTES, "-analyzeduration", PROBE_MICROSECONDS])
+		.args(["-fflags", "+genpts"])
+		.input(None, None, source);
+
+	let mut audio = 0;
+	for stream in &info.streams {
+		let copied = (stream.is_video() && !stream.is_attached_pic())
+			|| stream.is_audio()
+			|| (stream.is_subtitle() && KEPT_SUBTITLES.contains(&stream.codec_name.as_str()));
+		if !copied {
+			continue;
+		}
+
+		cmd.arg("-map").arg(format!("0:{}", stream.index));
+		if stream.is_audio() {
+			if stream.codec_name == "pcm_dvd" {
+				cmd.arg(format!("-c:a:{audio}")).arg("pcm_s24le");
+			}
+			audio += 1;
+		}
+	}
+
+	cmd.args(["-c", "copy", "-f", "matroska"])
+		.arg(process::tool_path(&output));
+	run_ffmpeg(&cmd, |progress| on_fraction(written(progress, bytes)), cancel).await?;
+	Ok(output)
 }
 
 struct Title<'a> {

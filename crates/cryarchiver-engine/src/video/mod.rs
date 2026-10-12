@@ -23,6 +23,8 @@ use crate::process::{self, Progress, StdoutMode, ToolCommand, ToolOutput};
 /// streams a command reads.
 const START_FROM_READ_STREAMS: &[&str] = &["mpegts", "mpegtsraw", "mpeg"];
 
+/// The bit rate over which a TS or PS source's size and declared duration disagree.
+const MAX_PLAUSIBLE_BPS: f64 = 100e6;
 /// Shorter delays than this are no delay: no `-itsoffset` or skip is passed for them.
 const NO_DELAY_S: f64 = 1e-6;
 /// How long before a cut a TS or PS input is seeked. Their seek lands just before the cut, mid-GOP, so the video
@@ -64,6 +66,18 @@ pub fn discontinuous(info: &MediaInfo) -> bool {
 		.format_name
 		.split(',')
 		.any(|name| START_FROM_READ_STREAMS.contains(&name))
+}
+
+/// A TS or PS source whose declared duration can't hold its bytes at any real bit rate, or that declares none: its
+/// timestamps restart (as a loose VOB's do at each cell), so ffprobe saw only the last stretch.
+pub fn implausible_duration(info: &MediaInfo, bytes: u64) -> bool {
+	#[allow(clippy::cast_precision_loss)]
+	let bits = bytes as f64 * 8.0;
+	discontinuous(info)
+		&& info
+			.format
+			.duration
+			.is_none_or(|duration| duration <= 0.0 || bits / duration > MAX_PLAUSIBLE_BPS)
 }
 
 /// `delay_s`, when it is long enough to act on.
@@ -212,5 +226,28 @@ mod tests {
 		assert_eq!(InputStart::of(&m2ts, &[0, 1]).offset_arg(None), None);
 		assert_eq!(InputStart::of(&mkv, &[0]).offset_arg(None), None);
 		assert!(near(InputStart::of(&mkv, &[0]).at(0.1), 1.5));
+	}
+
+	fn declaring(format_name: &str, duration: Option<f64>) -> MediaInfo {
+		MediaInfo {
+			format: crate::probe::Format {
+				format_name: format_name.into(),
+				duration,
+				..crate::probe::Format::default()
+			},
+			..MediaInfo::default()
+		}
+	}
+
+	#[test]
+	fn a_gigabyte_in_three_seconds_is_not_a_duration_for_a_ps() {
+		assert!(implausible_duration(&declaring("mpeg", Some(2.9)), 1 << 30));
+		assert!(implausible_duration(&declaring("mpegts", None), 10_000_000));
+	}
+
+	#[test]
+	fn a_sane_ps_and_any_other_container_keep_their_duration() {
+		assert!(!implausible_duration(&declaring("mpeg", Some(10.0)), 10_000_000));
+		assert!(!implausible_duration(&declaring("matroska,webm", Some(2.9)), 1 << 30));
 	}
 }

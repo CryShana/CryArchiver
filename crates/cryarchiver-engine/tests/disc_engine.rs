@@ -414,3 +414,96 @@ async fn converting_a_blu_ray_needs_ffmpeg_with_the_bluray_protocol() {
 	);
 	assert!(stage_at(&events.into_inner().unwrap(), Stage::Disc).is_empty());
 }
+
+/// An MPEG-PS of `segments` one-second pieces joined byte for byte, each with its own timestamps from zero.
+fn loose_vob(dir: &Path, name: &str, segments: u32) -> PathBuf {
+	let mut bytes = Vec::new();
+	for index in 0..segments {
+		let picture = "testsrc2=s=320x240:r=25:d=1";
+		let tone = format!("sine=frequency={}:duration=1:sample_rate=48000", 440 + 20 * index);
+		let segment = dir.join(format!("segment-{index}.mpg"));
+		support::ffmpeg(&[
+			"-f",
+			"lavfi",
+			"-i",
+			picture,
+			"-f",
+			"lavfi",
+			"-i",
+			&tone,
+			"-c:v",
+			"mpeg2video",
+			"-b:v",
+			"16M",
+			"-minrate",
+			"16M",
+			"-maxrate",
+			"16M",
+			"-bufsize",
+			"2M",
+			"-c:a",
+			"mp2",
+			"-f",
+			"mpeg",
+			segment.to_str().unwrap(),
+		]);
+		bytes.extend(std::fs::read(&segment).unwrap());
+		std::fs::remove_file(&segment).unwrap();
+	}
+
+	std::fs::create_dir_all(dir.join("vob")).unwrap();
+	let path = dir.join("vob").join(name);
+	std::fs::write(&path, bytes).unwrap();
+	path
+}
+
+#[tokio::test]
+async fn a_vob_whose_timestamps_restart_is_rebuilt_and_archived_at_its_real_length() {
+	let dir = tempfile::tempdir().unwrap();
+	let vob = loose_vob(dir.path(), "Loose.vob", 12);
+	assert!(
+		probed(&vob).await.format.duration.unwrap() < 2.0,
+		"the fixture must declare a short duration"
+	);
+
+	let (outcome, events) = run_with_events(&job(&vob), dir.path()).await;
+
+	let JobOutcome::Encoded { output, decision, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output, dir.path().join("Loose.cry.mkv"));
+	assert!(
+		decision
+			.warnings
+			.iter()
+			.any(|warning| warning == "the source's timestamps restart; they were rebuilt"),
+		"{:?}",
+		decision.warnings
+	);
+	assert!(decision.disc.is_none());
+
+	let info = probed(&output).await;
+	assert!(near(info.format.duration.unwrap(), 12.0, 0.3), "{:?}", info.format);
+	assert_eq!(stage_at(&events, Stage::Queued).len(), 1, "{events:?}");
+	assert_eq!(stage_at(&events, Stage::Disc).len(), 1, "{events:?}");
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn a_ps_with_continuous_timestamps_is_not_rebuilt() {
+	let dir = tempfile::tempdir().unwrap();
+	let ps = support::video(
+		dir.path(),
+		"Plain.mpg",
+		4,
+		&["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpeg"],
+	);
+
+	let (outcome, events) = run_with_events(&job(&ps), dir.path()).await;
+
+	let JobOutcome::Encoded { decision, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert!(decision.warnings.is_empty(), "{:?}", decision.warnings);
+	assert!(stage_at(&events, Stage::Disc).is_empty(), "{events:?}");
+}

@@ -61,7 +61,8 @@ use crate::video::verify::{
 	earliest_video_start, probe_temp, start_offsets, sync_tolerance_s, synced_streams, undecoded_lead, verify_output,
 };
 use crate::video::{
-	InputStart, VideoStarts, analyze, chapters, colour, cues, discontinuous, encode as video_encode, titles,
+	InputStart, VideoStarts, analyze, chapters, colour, cues, discontinuous, encode as video_encode,
+	implausible_duration, titles,
 };
 use crate::workspace::Workspace;
 
@@ -83,6 +84,7 @@ const SUBTITLES_DROPPED: &str =
 	"a subtitle track was dropped: animated AVIF can't hold subtitles, but --burn-subs draws one into the picture";
 const BLU_RAY_KEPT: &str = "Blu-ray disc: kept as is";
 const NO_FOOTAGE: &str = "no real footage on the disc";
+const TIMESTAMPS_REBUILT: &str = "the source's timestamps restart; they were rebuilt";
 const MAIN_FEATURE: &str = "Main feature";
 const FRAMES_SPACE_HINT: &str = "an animated AVIF is made from lossless frames stored in the work folder: use \
                                  --ss/--to for a shorter clip or --resize for smaller frames";
@@ -252,7 +254,8 @@ enum Produced {
 	Kept(KeepReason),
 }
 
-/// A disc read into one video in its job's workspace, under the video slot the video's encode keeps.
+/// A disc, or a source whose timestamps restart, read into one video in its job's workspace, under the video slot the
+/// video's encode keeps.
 struct ReadDisc<'a> {
 	slot: SemaphorePermit<'a>,
 	workspace: Workspace,
@@ -574,28 +577,33 @@ impl Engine {
 		};
 
 		let mut disc_warnings = Vec::new();
-		let (class, probe_log, disc) = match class {
-			MediaClass::Disc(kind) => match Box::pin(self.resolve_disc(&cx, sink, &work_root, kind)).await? {
-				Resolved::Read(read) => {
-					let ReadDisc {
-						slot,
-						workspace,
-						media,
-						detection,
-						warnings,
-					} = *read;
-					disc_warnings = warnings;
-					(detection.class, detection.probe_log, Some((slot, workspace, media)))
-				}
-				Resolved::Kept(reason) => {
-					recorder.update(|decision| {
-						decision.source_bytes.get_or_insert(source_bytes);
-					});
-					on_event(JobEvent::Decision(Box::new(recorder.snapshot())));
-					return Ok(JobOutcome::KeptOriginal { reason });
-				}
-			},
-			class => (class, probe_log, None),
+		let resolved = match class {
+			MediaClass::Disc(kind) => Ok(Box::pin(self.resolve_disc(&cx, sink, &work_root, kind)).await?),
+			MediaClass::Video(info) if implausible_duration(&info, source_bytes) => {
+				Ok(Box::pin(self.resolve_timestamps(&cx, sink, &work_root, &info)).await?)
+			}
+			class => Err(class),
+		};
+		let (class, probe_log, disc) = match resolved {
+			Ok(Resolved::Read(read)) => {
+				let ReadDisc {
+					slot,
+					workspace,
+					media,
+					detection,
+					warnings,
+				} = *read;
+				disc_warnings = warnings;
+				(detection.class, detection.probe_log, Some((slot, workspace, media)))
+			}
+			Ok(Resolved::Kept(reason)) => {
+				recorder.update(|decision| {
+					decision.source_bytes.get_or_insert(source_bytes);
+				});
+				on_event(JobEvent::Decision(Box::new(recorder.snapshot())));
+				return Ok(JobOutcome::KeptOriginal { reason });
+			}
+			Err(class) => (class, probe_log, None),
 		};
 
 		let animated = matches!(class, MediaClass::AnimatedImage(_));
@@ -1061,7 +1069,32 @@ impl Engine {
 		self.detect_read(cx, slot, workspace, built.path, main.warnings).await
 	}
 
-	/// The disc read into `media`, detected again: always a video.
+	/// A video whose timestamps restart, rebuilt into a workspace opened with room for the copy, under a video slot taken
+	/// first.
+	async fn resolve_timestamps<'a>(
+		&'a self,
+		cx: &Context<'_>,
+		sink: &dyn OutputSink,
+		work_root: &Path,
+		info: &MediaInfo,
+	) -> Result<Resolved<'a>, JobError> {
+		self.require(MediaKind::Video)?;
+
+		let slot = self.video_slot(cx).await?;
+		let need = cx.source_bytes.saturating_mul(2);
+		let workspace = open_workspace(sink, work_root, &cx.job.source, need)?;
+
+		(cx.on_event)(JobEvent::Stage(Stage::Disc));
+		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
+		let media = read::normalise_timestamps(&self.tools, &cx.job.source, info, &workspace, on_fraction, cx.cancel)
+			.await
+			.map_err(|err| disk_full(err, work_root, need))?;
+
+		self.detect_read(cx, slot, workspace, media, vec![TIMESTAMPS_REBUILT.to_owned()])
+			.await
+	}
+
+	/// The footage read into `media`, detected again: always a video.
 	async fn detect_read<'a>(
 		&self,
 		cx: &Context<'_>,
@@ -1073,7 +1106,7 @@ impl Engine {
 		let detection = detect::detect(&self.tools, &media, cx.cancel).await?;
 		if !matches!(detection.class, MediaClass::Video(_)) {
 			return Err(JobError::with_log(
-				ErrorKind::SourceDamaged("the disc's footage can't be read as video".into()),
+				ErrorKind::SourceDamaged("the rebuilt footage can't be read as video".into()),
 				detection.probe_log,
 			));
 		}
