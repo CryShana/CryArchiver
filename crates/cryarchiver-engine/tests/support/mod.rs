@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod bluray;
 pub mod dvd;
 pub mod heif;
 pub mod ifo;

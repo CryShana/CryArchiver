@@ -19,7 +19,8 @@ pub enum UdfRevision {
 /// A minimal UDF image: `V102` is one physical partition with File Entries and short allocation descriptors, as on a
 /// DVD; `V250` adds a metadata partition with Extended File Entries and long allocation descriptors, as on a Blu-ray.
 /// Files over 1 MiB are split into 1 MiB extents with a free block between them, files up to 1 KiB are embedded in
-/// their entry, and the metadata file is split into 8-block pieces the same way.
+/// their entry, and the metadata file is split into 8-block pieces the same way (`write_mastered` keeps it whole, as
+/// libudfread needs).
 pub struct Image {
 	pub files: Vec<(String, Vec<u8>)>,
 	pub dirs: Vec<String>,
@@ -33,6 +34,14 @@ enum Node {
 
 impl Image {
 	pub fn write(&self, path: &Path) {
+		self.write_in(path, METADATA_PIECE);
+	}
+
+	pub fn write_mastered(&self, path: &Path) {
+		self.write_in(path, usize::MAX);
+	}
+
+	fn write_in(&self, path: &Path, metadata_piece: usize) {
 		let mut root = BTreeMap::new();
 		for dir in &self.dirs {
 			folder(&mut root, dir);
@@ -46,6 +55,7 @@ impl Image {
 			revision: self.revision,
 			tree: Space::default(),
 			data: Space::default(),
+			metadata_piece,
 		};
 		if self.revision == UdfRevision::V250 {
 			writer.data.reserve(2);
@@ -107,6 +117,7 @@ struct Writer {
 	revision: UdfRevision,
 	tree: Space,
 	data: Space,
+	metadata_piece: usize,
 }
 
 impl Writer {
@@ -242,7 +253,7 @@ impl Writer {
 		if self.extended() {
 			let tree = std::mem::take(&mut self.tree.bytes);
 			let mut descriptors = Vec::new();
-			for piece in tree.chunks(METADATA_PIECE) {
+			for piece in tree.chunks(self.metadata_piece) {
 				self.data.reserve(1);
 				descriptors.extend(short_ad(piece.len(), self.data.add(piece)));
 			}

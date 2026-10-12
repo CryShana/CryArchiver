@@ -22,8 +22,10 @@ use crate::decision::{
 	Trim, Vmaf, encoder_text,
 };
 use crate::detect::{self, Detection, DiscKind, MediaClass};
+use crate::disc::bluray;
 use crate::disc::dvd::{self, Selection};
 use crate::disc::read::{self, Built};
+use crate::disc::udf::DiscFiles;
 use crate::format::{OutputFormat, check_bitrate_cap, check_kind};
 use crate::images::animated::{self, Animation};
 use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
@@ -81,6 +83,7 @@ const SUBTITLES_DROPPED: &str =
 	"a subtitle track was dropped: animated AVIF can't hold subtitles, but --burn-subs draws one into the picture";
 const BLU_RAY_KEPT: &str = "Blu-ray disc: kept as is";
 const NO_FOOTAGE: &str = "no real footage on the disc";
+const MAIN_FEATURE: &str = "Main feature";
 const FRAMES_SPACE_HINT: &str = "an animated AVIF is made from lossless frames stored in the work folder: use \
                                  --ss/--to for a shorter clip or --resize for smaller frames";
 
@@ -256,6 +259,8 @@ struct ReadDisc<'a> {
 	media: PathBuf,
 	/// The detection of `media`, which is always a video.
 	detection: Detection,
+	/// What reading the disc fell short of, for the decision record.
+	warnings: Vec<String>,
 }
 
 enum Resolved<'a> {
@@ -568,6 +573,7 @@ impl Engine {
 			record: &recorder,
 		};
 
+		let mut disc_warnings = Vec::new();
 		let (class, probe_log, disc) = match class {
 			MediaClass::Disc(kind) => match Box::pin(self.resolve_disc(&cx, sink, &work_root, kind)).await? {
 				Resolved::Read(read) => {
@@ -576,7 +582,9 @@ impl Engine {
 						workspace,
 						media,
 						detection,
+						warnings,
 					} = *read;
+					disc_warnings = warnings;
 					(detection.class, detection.probe_log, Some((slot, workspace, media)))
 				}
 				Resolved::Kept(reason) => {
@@ -774,7 +782,7 @@ impl Engine {
 		let learned = std::mem::take(&mut staged.learned);
 
 		recorder.update(|decision| {
-			decision.warnings.clone_from(&staged.warnings);
+			decision.warnings = disc_warnings.iter().chain(&staged.warnings).cloned().collect();
 			decision.source_bytes = Some(staged.source_share.unwrap_or(cx.source_bytes));
 			decision.output_bytes = Some(staged.bytes);
 			decision.attempts = decision.attempts.max(1);
@@ -950,18 +958,8 @@ impl Engine {
 	) -> Result<Resolved<'a>, JobError> {
 		let files = match kind {
 			DiscKind::Dvd(files) => files,
-			DiscKind::BluRay { .. } => {
-				cx.record.update(|decision| {
-					decision.disc = Some(DiscDecision {
-						kind: "Blu-ray".to_owned(),
-						..DiscDecision::default()
-					});
-				});
-				let reason = match cx.job.options.blu_ray {
-					BluRay::Keep => BLU_RAY_KEPT,
-					BluRay::Convert => "Blu-ray conversion isn't available yet",
-				};
-				return Ok(Resolved::Kept(KeepReason::Unsupported(reason.to_owned())));
+			DiscKind::BluRay { files, three_d } => {
+				return Box::pin(self.resolve_bluray(cx, sink, work_root, &files, three_d)).await;
 			}
 		};
 		self.require(MediaKind::Video)?;
@@ -1001,7 +999,78 @@ impl Engine {
 		cx.record
 			.update(|decision| record_built(decision.disc.get_or_insert_default(), &built));
 
-		let detection = detect::detect(&self.tools, &built.path, cx.cancel).await?;
+		self.detect_read(cx, slot, workspace, built.path, Vec::new()).await
+	}
+
+	/// A Blu-ray's main feature read into one video, or why the disc is kept as it is: on request, and always for 3D.
+	async fn resolve_bluray<'a>(
+		&'a self,
+		cx: &Context<'_>,
+		sink: &dyn OutputSink,
+		work_root: &Path,
+		files: &DiscFiles,
+		three_d: bool,
+	) -> Result<Resolved<'a>, JobError> {
+		cx.record.update(|decision| {
+			decision.disc = Some(DiscDecision {
+				kind: "Blu-ray".to_owned(),
+				..DiscDecision::default()
+			});
+		});
+		if three_d {
+			return Ok(Resolved::Kept(KeepReason::Unsupported(detect::THREE_D_KEPT.to_owned())));
+		}
+		if cx.job.options.blu_ray == BluRay::Keep {
+			return Ok(Resolved::Kept(KeepReason::Unsupported(BLU_RAY_KEPT.to_owned())));
+		}
+
+		self.require(MediaKind::Video)?;
+		self.check_bluray()?;
+
+		let main = bluray::main_feature(&self.tools, &cx.job.source, files, cx.cancel).await?;
+		cx.record
+			.update(|decision| decision.disc.get_or_insert_default().playlist = main.playlist);
+		for warning in &main.warnings {
+			(cx.on_event)(JobEvent::Warning(warning.clone()));
+		}
+
+		let slot = self.video_slot(cx).await?;
+		let need = cx.source_bytes.saturating_add(main.bytes);
+		let workspace = open_workspace(sink, work_root, &cx.job.source, need)?;
+
+		(cx.on_event)(JobEvent::Stage(Stage::Disc));
+		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
+		let built = bluray::build_bluray(
+			&self.tools,
+			&main,
+			&disc_name(&cx.job.source),
+			&workspace,
+			on_fraction,
+			cx.cancel,
+		)
+		.await
+		.map_err(|err| disk_full(err, work_root, need))?;
+		cx.record.update(|decision| {
+			decision.disc.get_or_insert_default().kept = built
+				.titles
+				.iter()
+				.map(|title| (MAIN_FEATURE.to_owned(), title.length_s))
+				.collect();
+		});
+
+		self.detect_read(cx, slot, workspace, built.path, main.warnings).await
+	}
+
+	/// The disc read into `media`, detected again: always a video.
+	async fn detect_read<'a>(
+		&self,
+		cx: &Context<'_>,
+		slot: SemaphorePermit<'a>,
+		workspace: Workspace,
+		media: PathBuf,
+		warnings: Vec<String>,
+	) -> Result<Resolved<'a>, JobError> {
+		let detection = detect::detect(&self.tools, &media, cx.cancel).await?;
 		if !matches!(detection.class, MediaClass::Video(_)) {
 			return Err(JobError::with_log(
 				ErrorKind::SourceDamaged("the disc's footage can't be read as video".into()),
@@ -1011,8 +1080,9 @@ impl Engine {
 		Ok(Resolved::Read(Box::new(ReadDisc {
 			slot,
 			workspace,
-			media: built.path,
+			media,
 			detection,
+			warnings,
 		})))
 	}
 

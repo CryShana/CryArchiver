@@ -3,6 +3,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use cryarchiver_engine::decision::Decision;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::options::{BluRay, JobOptions};
@@ -11,6 +12,7 @@ use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe::{MediaInfo, probe};
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
+use support::bluray::{self, Playlist};
 use support::dvd::{self, Footage, footage};
 use support::udf::{Image, UdfRevision};
 use tokio_util::sync::CancellationToken;
@@ -294,4 +296,121 @@ async fn a_format_a_disc_cannot_take_fails_before_the_disc_is_read() {
 	};
 	assert!(matches!(err.kind, ErrorKind::EncodeFailed(_)), "{err:?}");
 	assert!(stage_at(&events, Stage::Disc).is_empty());
+}
+
+/// The files of a Blu-ray with eight seconds of footage whose main playlist, 00800, has entry marks at 0, 3 and 5.5 s.
+fn blu_ray_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+	let main = Playlist {
+		number: 800,
+		declared_s: 200,
+		marks_s: &[0.0, 3.0, 5.5],
+	};
+	let shorter = Playlist {
+		number: 1,
+		declared_s: 190,
+		marks_s: &[0.0],
+	};
+	bluray::bdmv(dir, 8, &[shorter, main])
+}
+
+fn assert_main_feature(decision: &Decision, info: &MediaInfo) {
+	let disc = decision.disc.as_ref().expect("a disc record");
+	assert_eq!(disc.kind, "Blu-ray");
+	assert_eq!(disc.playlist, Some(800));
+	assert_eq!(disc.kept.len(), 1, "{disc:?}");
+	assert_eq!(disc.kept[0].0, "Main feature");
+	assert!(near(disc.kept[0].1, 8.0, 0.1), "{disc:?}");
+	assert!(decision.warnings.is_empty(), "{:?}", decision.warnings);
+
+	assert_eq!(info.streams[0].codec_name, "av1");
+	assert!(near(info.format.duration.unwrap(), 8.0, 0.2), "{:?}", info.format);
+	let chapters = chapter_titles(info);
+	let titles: Vec<&str> = chapters.iter().map(|(_, title)| title.as_str()).collect();
+	assert_eq!(titles, ["Chapter 1", "Chapter 2", "Chapter 3"]);
+	assert!(near(chapters[2].0, 5.5, 0.1), "{chapters:?}");
+	let audio = info.streams.iter().find(|stream| stream.is_audio()).unwrap();
+	assert_eq!(audio.tag("language"), Some("slv"));
+}
+
+#[tokio::test]
+async fn a_blu_ray_folder_becomes_one_av1_mkv_of_its_main_feature() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("Film");
+	dvd::write_folder(&root, &blu_ray_files(dir.path()));
+
+	let (outcome, events) = run_with_events(&job(&root), dir.path()).await;
+
+	let JobOutcome::Encoded { output, decision, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output, dir.path().join("Film.cry.mkv"));
+	assert_main_feature(&decision, &probed(&output).await);
+
+	let queued = stage_at(&events, Stage::Queued);
+	let read = stage_at(&events, Stage::Disc);
+	assert_eq!((queued.len(), read.len()), (1, 1), "{events:?}");
+	assert!(queued[0] < read[0]);
+	assert!(stage_at(&events, Stage::Encode)[0] > read[0]);
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
+async fn a_blu_ray_image_is_converted_by_default() {
+	let dir = tempfile::tempdir().unwrap();
+	let iso = dir.path().join("Film.iso");
+	Image {
+		files: blu_ray_files(dir.path()),
+		dirs: vec!["CERTIFICATE".to_owned()],
+		revision: UdfRevision::V250,
+	}
+	.write_mastered(&iso);
+	let iso_bytes = std::fs::metadata(&iso).unwrap().len();
+
+	let outcome = run(&job(&iso), dir.path()).await;
+
+	let JobOutcome::Encoded {
+		output,
+		src_bytes,
+		decision,
+		..
+	} = outcome
+	else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output, dir.path().join("Film.cry.mkv"));
+	assert_eq!(src_bytes, iso_bytes);
+	assert_main_feature(&decision, &probed(&output).await);
+}
+
+#[tokio::test]
+async fn converting_a_blu_ray_needs_ffmpeg_with_the_bluray_protocol() {
+	let dir = tempfile::tempdir().unwrap();
+	let iso = blu_ray_image(&dir.path().join("film.iso"), false);
+	let mut tools = support::toolchain().await;
+	tools.protocols.remove("bluray");
+	let engine = Engine::new(tools);
+	let sink = CliSink {
+		output_dir: Some(dir.path().to_path_buf()),
+		output_file: None,
+		overwrite: false,
+	};
+	let events = Mutex::new(Vec::new());
+
+	let outcome = engine
+		.run(
+			&job(&iso),
+			&sink,
+			&|event| events.lock().unwrap().push(event),
+			&CancellationToken::new(),
+		)
+		.await;
+
+	let JobOutcome::Failed(err) = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(
+		err.kind,
+		ErrorKind::EncodeFailed("ffmpeg can't read Blu-ray discs (no bluray protocol)".into())
+	);
+	assert!(stage_at(&events.into_inner().unwrap(), Stage::Disc).is_empty());
 }

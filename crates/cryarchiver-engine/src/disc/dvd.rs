@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use super::udf::{DiscFile, DiscFiles, Extent};
@@ -322,19 +320,7 @@ fn read_file(file: &DiscFile) -> Result<Vec<u8>, String> {
 		return Err("it is too large for an IFO".to_owned());
 	}
 
-	let unreadable = |error: std::io::Error| format!("it can't be read: {error}");
-	let mut source = File::open(&file.source).map_err(unreadable)?;
-	let mut bytes = Vec::new();
-	for extent in &file.extents {
-		let start = bytes.len();
-		bytes.resize(
-			start + usize::try_from(extent.length).map_err(|_| "it is too large for an IFO")?,
-			0,
-		);
-		source.seek(SeekFrom::Start(extent.offset)).map_err(unreadable)?;
-		source.read_exact(&mut bytes[start..]).map_err(unreadable)?;
-	}
-	Ok(bytes)
+	file.read().map_err(|error| format!("it can't be read: {error}"))
 }
 
 fn get<const N: usize>(ifo: &[u8], at: usize) -> Result<[u8; N], String> {

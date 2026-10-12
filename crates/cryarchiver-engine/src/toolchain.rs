@@ -128,6 +128,7 @@ const AV1_DECODERS: &[&str] = &["libdav1d", "libaom-av1"];
 pub const LIBAOM: &str = "libaom-av1";
 const BLURAY_PROTOCOL: &str = "bluray";
 const LIBAOM_FILES: &str = "animated images, video larger than 16384×8704 and --video-encoder aom fail without it";
+const BLURAY_FILES: &str = "Blu-ray discs and folders can't be converted without it";
 pub const LIBVPX_VP9: &str = "libvpx-vp9";
 pub const SVT_AV1: &str = "svt-av1";
 const EVERY_KIND: &[MediaKind] = MediaKind::ALL;
@@ -345,7 +346,14 @@ impl Toolchain {
 
 	/// The files that fail with this ffmpeg although nothing every run needs is missing.
 	pub fn optional_failures(&self) -> Option<String> {
-		(!self.has_libaom()).then(|| format!("{LIBAOM}: {LIBAOM_FILES}"))
+		let mut failures = Vec::new();
+		if !self.has_libaom() {
+			failures.push(format!("{LIBAOM}: {LIBAOM_FILES}"));
+		}
+		if !self.has_bluray() {
+			failures.push(format!("{BLURAY_PROTOCOL}: {BLURAY_FILES}"));
+		}
+		(!failures.is_empty()).then(|| failures.join("; "))
 	}
 
 	pub fn has_libjxl(&self) -> bool {
@@ -1023,6 +1031,10 @@ Output:
 
 		assert_eq!(line.status, Status::Warn);
 		assert!(!tools.has_bluray());
+		assert_eq!(
+			tools.optional_failures().as_deref(),
+			Some("bluray: Blu-ray discs and folders can't be converted without it")
+		);
 		assert!(tools.problems(MediaKind::Video).is_empty());
 		assert!(tools.problems(MediaKind::Audio).is_empty());
 		assert!(tools.problems(MediaKind::Image).is_empty());

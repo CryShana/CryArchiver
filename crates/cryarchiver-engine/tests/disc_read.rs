@@ -4,13 +4,16 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use cryarchiver_engine::disc::bluray::{build_bluray, main_feature};
 use cryarchiver_engine::disc::dvd::{Dvd, Selection, parse, select};
 use cryarchiver_engine::disc::read::{Built, BuiltTitle, build_dvd};
-use cryarchiver_engine::disc::udf::read_folder;
+use cryarchiver_engine::disc::udf::{read_folder, read_image};
 use cryarchiver_engine::outcome::{ErrorKind, JobError};
 use cryarchiver_engine::probe::{MediaInfo, probe};
 use cryarchiver_engine::workspace::Workspace;
+use support::bluray::{self, Playlist};
 use support::dvd::{self, Footage, footage};
+use support::udf::{Image, UdfRevision};
 use tokio_util::sync::CancellationToken;
 
 const NAME: &str = "Družinski izlet";
@@ -285,4 +288,125 @@ async fn a_title_with_a_false_time_is_timed_by_its_footage() {
 		12.0,
 		0.1
 	));
+}
+
+fn main_playlist() -> Playlist {
+	Playlist {
+		number: 800,
+		declared_s: 200,
+		marks_s: &[0.0, 3.0, 5.5],
+	}
+}
+
+/// A Blu-ray folder at `root` with eight seconds of footage and two playlists: the main one and a shorter one.
+fn blu_ray_folder(dir: &Path, root: &Path) {
+	let shorter = Playlist {
+		number: 1,
+		declared_s: 190,
+		marks_s: &[0.0, 1.0],
+	};
+	dvd::write_folder(root, &bluray::bdmv(dir, 8, &[shorter, main_playlist()]));
+}
+
+#[tokio::test]
+async fn a_blu_ray_main_feature_is_copied_with_its_playlists_marks_as_chapters() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("Film");
+	blu_ray_folder(dir.path(), &root);
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let workspace = workspace(dir.path());
+	let fractions = RefCell::new(Vec::new());
+
+	let main = main_feature(&tools, &root, &read_folder(&root).unwrap(), &cancel)
+		.await
+		.unwrap();
+	let built = build_bluray(
+		&tools,
+		&main,
+		NAME,
+		&workspace,
+		|fraction| fractions.borrow_mut().push(fraction),
+		&cancel,
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(main.playlist, Some(800));
+	assert!(main.warnings.is_empty(), "{:?}", main.warnings);
+	let clip = std::fs::metadata(root.join("BDMV/STREAM/00001.m2ts")).unwrap().len();
+	assert_eq!(main.bytes, clip);
+	assert!(built.path.starts_with(workspace.dir()), "{}", built.path.display());
+	assert_eq!(built.titles.len(), 1);
+	assert!(near(built.titles[0].length_s, 8.0, 0.1), "{:?}", built.titles);
+	assert!(fractions.into_inner().last().is_some_and(|last| *last > 0.9));
+
+	let info = probed(&built.path).await;
+	assert_eq!(info.format.tags.get("title").map(String::as_str), Some(NAME));
+	let codecs: Vec<&str> = info.streams.iter().map(|stream| stream.codec_name.as_str()).collect();
+	assert_eq!(codecs, ["mpeg2video", "pcm_s24le", "hdmv_pgs_subtitle"]);
+	assert_eq!(info.streams[1].tag("language"), Some("slv"));
+	assert_eq!(info.streams[2].tag("language"), Some("eng"));
+
+	let chapters = chapter_starts(&info);
+	let titles: Vec<&str> = chapters.iter().map(|(_, title)| title.as_str()).collect();
+	assert_eq!(titles, ["Chapter 1", "Chapter 2", "Chapter 3"]);
+	for ((start, _), expected) in chapters.iter().zip([0.0, 3.0, 5.5]) {
+		assert!(near(*start, expected, 0.05), "{chapters:?}");
+	}
+}
+
+#[tokio::test]
+async fn a_blu_ray_playlist_that_cannot_be_read_leaves_the_main_feature_without_chapters() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("Film");
+	blu_ray_folder(dir.path(), &root);
+	let mut files = read_folder(&root).unwrap();
+	files.files.retain(|file| !file.path.ends_with("00800.mpls"));
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let workspace = workspace(dir.path());
+
+	let main = main_feature(&tools, &root, &files, &cancel).await.unwrap();
+	let built = build_bluray(&tools, &main, NAME, &workspace, |_| {}, &cancel)
+		.await
+		.unwrap();
+
+	assert_eq!(main.playlist, Some(800));
+	assert_eq!(
+		main.warnings,
+		["playlist 00800.mpls can't be read (it is missing), so the main feature has no chapters"]
+	);
+	let info = probed(&built.path).await;
+	assert!(info.chapters.is_empty(), "{:?}", info.chapters);
+	assert!(near(info.format.duration.unwrap(), 8.0, 0.1), "{:?}", info.format);
+}
+
+#[tokio::test]
+async fn a_blu_ray_image_under_a_non_ascii_folder_reads() {
+	let dir = tempfile::tempdir().unwrap();
+	let iso = dir.path().join("Čžš").join("Film.iso");
+	std::fs::create_dir_all(iso.parent().unwrap()).unwrap();
+	Image {
+		files: bluray::bdmv(dir.path(), 8, &[main_playlist()]),
+		dirs: vec!["CERTIFICATE".to_owned()],
+		revision: UdfRevision::V250,
+	}
+	.write_mastered(&iso);
+	let tools = support::toolchain().await;
+	let cancel = CancellationToken::new();
+	let workspace = workspace(dir.path());
+
+	let main = main_feature(&tools, &iso, &read_image(&iso).unwrap().unwrap(), &cancel)
+		.await
+		.unwrap();
+	let built = build_bluray(&tools, &main, NAME, &workspace, |_| {}, &cancel)
+		.await
+		.unwrap();
+
+	assert_eq!(main.playlist, Some(800));
+	assert!(main.warnings.is_empty(), "{:?}", main.warnings);
+	let info = probed(&built.path).await;
+	assert_eq!(chapter_starts(&info).len(), 3, "{:?}", info.chapters);
+	assert!(near(info.format.duration.unwrap(), 8.0, 0.1), "{:?}", info.format);
 }

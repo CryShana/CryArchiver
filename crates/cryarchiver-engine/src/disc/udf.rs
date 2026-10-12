@@ -49,6 +49,23 @@ pub struct DiscFile {
 	pub source: PathBuf,
 }
 
+impl DiscFile {
+	/// The file's bytes, its extents read in order.
+	pub fn read(&self) -> io::Result<Vec<u8>> {
+		let mut source = File::open(&self.source)?;
+		let mut bytes = Vec::new();
+		for extent in &self.extents {
+			let length = usize::try_from(extent.length)
+				.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the file is too large"))?;
+			let start = bytes.len();
+			bytes.resize(start + length, 0);
+			source.seek(SeekFrom::Start(extent.offset))?;
+			source.read_exact(&mut bytes[start..])?;
+		}
+		Ok(bytes)
+	}
+}
+
 /// Every file and directory of a disc, with `/`-separated paths relative to its root.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscFiles {

@@ -19,13 +19,13 @@ use crate::workspace::Workspace;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How far into a title ffmpeg looks for its streams. A PS declares none: a stream is found from its first packet,
 /// and a subtitle track's first packet can come late.
-const PROBE_BYTES: &str = "67108864";
-const PROBE_MICROSECONDS: &str = "60000000";
+pub(super) const PROBE_BYTES: &str = "67108864";
+pub(super) const PROBE_MICROSECONDS: &str = "60000000";
 /// `concat:` splits on `|` and has no escape for it, and the whole URL must fit a command line: other inputs go
 /// through a `concatf:` list.
 const MAX_URL: usize = 8192;
-const OUTPUT: &str = "disc.mkv";
-const CHAPTERS: &str = "chapters.txt";
+pub(super) const OUTPUT: &str = "disc.mkv";
+pub(super) const CHAPTERS: &str = "chapters.txt";
 const PIECES: &str = "pieces.txt";
 const REENCODE_QUALITY: &str = "2";
 
@@ -297,7 +297,7 @@ async fn probe_streams(
 	Ok(probed.streams)
 }
 
-fn unreadable(err: ProbeError) -> JobError {
+pub(super) fn unreadable(err: ProbeError) -> JobError {
 	match err {
 		ProbeError::Run(err) => err.into(),
 		ProbeError::Failed(log) => JobError::with_log(
@@ -829,7 +829,7 @@ impl Job<'_> {
 
 /// The share of `bytes` ffmpeg has written: a stream copy writes about what it reads.
 #[allow(clippy::cast_precision_loss)]
-fn written(progress: &Progress, bytes: u64) -> f64 {
+pub(super) fn written(progress: &Progress, bytes: u64) -> f64 {
 	progress
 		.total_size
 		.map_or(0.0, |size| (size as f64 / bytes.max(1) as f64).min(1.0))

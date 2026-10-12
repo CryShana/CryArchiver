@@ -1,0 +1,644 @@
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+
+use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
+
+use super::read::{self, Built, BuiltTitle, PROBE_BYTES, PROBE_MICROSECONDS};
+use super::udf::DiscFiles;
+use crate::language;
+use crate::outcome::{ErrorKind, IoSide, JobError};
+use crate::probe;
+use crate::process::{self, ToolCommand};
+use crate::toolchain::Toolchain;
+use crate::video::chapters::{self, Chapter};
+use crate::video::run_ffmpeg;
+use crate::workspace::Workspace;
+
+const TICKS_PER_SECOND: f64 = 45_000.0;
+const ENTRY_MARK: u8 = 1;
+const MAIN_PATH: u8 = 1;
+const PLAY_ITEM_BYTES: usize = 32;
+const MARK_BYTES: usize = 14;
+const MULTI_ANGLE: u8 = 0x10;
+const MAX_MPLS_BYTES: u64 = 16 << 20;
+/// libbluray reads every playlist and clip of the disc before it picks one.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
+const SELECTED: &str = "selected ";
+const EDGE_S: f64 = 0.05;
+
+/// The entry marks of a playlist (`.mpls`), in seconds from the start of the playlist.
+pub fn playlist_marks(mpls: &[u8]) -> Result<Vec<f64>, String> {
+	Mpls::parse(mpls).map(|mpls| mpls.marks_s())
+}
+
+/// The playlist libbluray picked, from ffmpeg's `selected 00800.mpls` log line.
+pub fn selected_playlist(log: &[String]) -> Option<u32> {
+	log.iter().rev().find_map(|line| {
+		let (_, picked) = line.split_once(SELECTED)?;
+		let number = picked.trim().strip_suffix(".mpls")?;
+		if number.len() == 5 && number.bytes().all(|digit| digit.is_ascii_digit()) {
+			number.parse().ok()
+		} else {
+			None
+		}
+	})
+}
+
+/// A playlist's play items, entry marks and the languages of its first play item's streams.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Mpls {
+	items: Vec<PlayItem>,
+	/// `(play item, time)`, the time in 45 kHz ticks of that item's clip.
+	marks: Vec<(usize, u32)>,
+	/// Languages of the streams in the main path, by PID.
+	languages: Vec<(u16, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PlayItem {
+	in_time: u32,
+	out_time: u32,
+}
+
+impl PlayItem {
+	fn ticks(self) -> u64 {
+		u64::from(self.out_time.saturating_sub(self.in_time))
+	}
+}
+
+impl Mpls {
+	fn parse(mpls: &[u8]) -> Result<Self, String> {
+		if mpls.get(..4) != Some(b"MPLS") {
+			return Err("it is not a playlist".to_owned());
+		}
+
+		let list = position(be32(mpls, 8)?);
+		let marks = position(be32(mpls, 12)?);
+		let count = be16(mpls, list + 6)?;
+		let mut items = Vec::with_capacity(usize::from(count));
+		let mut languages = Vec::new();
+		let mut at = list + 10;
+		for index in 0..count {
+			let length = usize::from(be16(mpls, at)?);
+			let item = at + 2;
+			if length < PLAY_ITEM_BYTES || item + length > mpls.len() {
+				return Err(format!("play item {index} is cut short"));
+			}
+
+			items.push(PlayItem {
+				in_time: be32(mpls, item + 12)?,
+				out_time: be32(mpls, item + 16)?,
+			});
+			if index == 0 {
+				languages = stream_languages(mpls, item).unwrap_or_default();
+			}
+			at = item + length;
+		}
+
+		let count = usize::from(be16(mpls, marks + 4)?);
+		let mut entry_marks = Vec::new();
+		for index in 0..count {
+			let mark = marks + 6 + MARK_BYTES * index;
+			get::<MARK_BYTES>(mpls, mark)?;
+			let item = usize::from(be16(mpls, mark + 2)?);
+			if byte(mpls, mark + 1)? == ENTRY_MARK && item < items.len() {
+				entry_marks.push((item, be32(mpls, mark + 4)?));
+			}
+		}
+
+		Ok(Self {
+			items,
+			marks: entry_marks,
+			languages,
+		})
+	}
+
+	fn marks_s(&self) -> Vec<f64> {
+		self.marks
+			.iter()
+			.map(|&(item, time)| {
+				let before: u64 = self.items[..item].iter().map(|item| item.ticks()).sum();
+				seconds(before + u64::from(time.saturating_sub(self.items[item].in_time)))
+			})
+			.collect()
+	}
+
+	fn length_s(&self) -> f64 {
+		seconds(self.items.iter().map(|item| item.ticks()).sum())
+	}
+}
+
+/// The languages of a play item's main-path video, audio and subtitle streams, from its STN table.
+fn stream_languages(mpls: &[u8], item: usize) -> Result<Vec<(u16, String)>, String> {
+	let mut stn = item + PLAY_ITEM_BYTES;
+	if byte(mpls, item + 10)? & MULTI_ANGLE != 0 {
+		let angles = usize::from(byte(mpls, stn)?);
+		stn += 2 + 10 * angles.saturating_sub(1);
+	}
+
+	let [video, audio, subtitles, _, _, _, picture_subtitles, _] = get::<8>(mpls, stn + 4)?;
+	let listed = [video, audio, subtitles, picture_subtitles]
+		.into_iter()
+		.map(usize::from)
+		.sum();
+	let mut languages = Vec::new();
+	let mut at = stn + 16;
+	for _ in 0..listed {
+		let entry = usize::from(byte(mpls, at)?);
+		let path = byte(mpls, at + 1)?;
+		let pid = be16(mpls, at + 2)?;
+		let attributes = at + 1 + entry;
+		let language = match byte(mpls, attributes + 1)? {
+			0x03 | 0x04 | 0x80..=0x86 | 0xA1 | 0xA2 | 0x92 => Some(attributes + 3),
+			0x90 | 0x91 => Some(attributes + 2),
+			_ => None,
+		};
+
+		if path == MAIN_PATH
+			&& let Some(code) = language
+		{
+			let code = get::<3>(mpls, code)?;
+			if code.iter().all(u8::is_ascii_alphabetic) {
+				languages.push((pid, String::from_utf8_lossy(&code).to_ascii_lowercase()));
+			}
+		}
+		at = attributes + 1 + usize::from(byte(mpls, attributes)?);
+	}
+	Ok(languages)
+}
+
+fn position(offset: u32) -> usize {
+	usize::try_from(offset).unwrap_or(usize::MAX)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn seconds(ticks: u64) -> f64 {
+	ticks as f64 / TICKS_PER_SECOND
+}
+
+fn get<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N], String> {
+	at.checked_add(N)
+		.and_then(|end| bytes.get(at..end))
+		.and_then(|slice| slice.try_into().ok())
+		.ok_or_else(|| format!("it ends before byte {at}"))
+}
+
+fn byte(bytes: &[u8], at: usize) -> Result<u8, String> {
+	Ok(get::<1>(bytes, at)?[0])
+}
+
+fn be16(bytes: &[u8], at: usize) -> Result<u16, String> {
+	get(bytes, at).map(u16::from_be_bytes)
+}
+
+fn be32(bytes: &[u8], at: usize) -> Result<u32, String> {
+	get(bytes, at).map(u32::from_be_bytes)
+}
+
+/// A chapter from each entry mark to the next, the last to the end of the playlist.
+fn chapter_list(marks_s: &[f64], length_s: f64) -> Vec<Chapter> {
+	let mut starts: Vec<f64> = marks_s
+		.iter()
+		.copied()
+		.filter(|start| *start < length_s - EDGE_S)
+		.collect();
+	starts.sort_by(f64::total_cmp);
+	starts.dedup_by(|later, earlier| *later - *earlier < EDGE_S);
+
+	starts
+		.iter()
+		.enumerate()
+		.map(|(index, start_s)| Chapter {
+			start_s: *start_s,
+			end_s: starts.get(index + 1).copied().unwrap_or(length_s),
+			title: Some(format!("Chapter {}", index + 1)),
+		})
+		.collect()
+}
+
+/// The main feature libbluray picks on a disc: the longest of its relevant playlists.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MainFeature {
+	pub playlist: Option<u32>,
+	/// The bytes ffmpeg reads for it.
+	pub bytes: u64,
+	/// Why it has no chapters, when it hasn't.
+	pub warnings: Vec<String>,
+	url: String,
+	streams: Vec<TsStream>,
+	chapters: Vec<Chapter>,
+	languages: Vec<(u16, String)>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Probed {
+	#[serde(default)]
+	streams: Vec<TsStream>,
+	#[serde(default)]
+	format: ProbedFormat,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProbedFormat {
+	size: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+struct TsStream {
+	#[serde(default)]
+	id: String,
+	#[serde(default)]
+	codec_type: String,
+	#[serde(default)]
+	codec_name: String,
+	sample_fmt: Option<String>,
+	bits_per_raw_sample: Option<String>,
+}
+
+impl TsStream {
+	fn pid(&self) -> Option<u16> {
+		u16::from_str_radix(self.id.strip_prefix("0x")?, 16).ok()
+	}
+
+	/// The PCM a Blu-ray LPCM track becomes: Matroska can't hold it as it is.
+	fn pcm(&self) -> Option<&'static str> {
+		if self.codec_name != "pcm_bluray" {
+			return None;
+		}
+
+		let deep = self.sample_fmt.as_deref() == Some("s32")
+			|| self
+				.bits_per_raw_sample
+				.as_deref()
+				.and_then(|bits| bits.parse::<u32>().ok())
+				.is_some_and(|bits| bits > 16);
+		Some(if deep { "pcm_s24le" } else { "pcm_s16le" })
+	}
+}
+
+impl MainFeature {
+	fn streams_of<'a>(&'a self, codec_type: &'a str) -> impl Iterator<Item = &'a TsStream> {
+		self.streams
+			.iter()
+			.filter(move |stream| stream.codec_type == codec_type)
+	}
+
+	fn language(&self, stream: &TsStream) -> Option<String> {
+		let pid = stream.pid()?;
+		self.languages
+			.iter()
+			.find(|(own, _)| *own == pid)
+			.map(|(_, code)| language::normalized(code))
+	}
+}
+
+/// The main feature of the Blu-ray image or folder `source`, whose files are `files`: ffmpeg opens it through
+/// libbluray with no playlist, and the one libbluray picks is read from its log. That playlist's entry marks become
+/// the chapters.
+pub async fn main_feature(
+	tools: &Toolchain,
+	source: &Path,
+	files: &DiscFiles,
+	cancel: &CancellationToken,
+) -> Result<MainFeature, JobError> {
+	let url = disc_url(source, files)?;
+	let mut cmd = ToolCommand::new(&tools.ffprobe, PROBE_TIMEOUT);
+	cmd.args([
+		"-v",
+		"info",
+		"-hide_banner",
+		"-print_format",
+		"json",
+		"-show_streams",
+		"-show_format",
+	])
+	.args(["-probesize", PROBE_BYTES, "-analyzeduration", PROBE_MICROSECONDS, "-i"])
+	.arg(&url);
+
+	let out = probe::run_ffprobe(&cmd, cancel).await.map_err(read::unreadable)?;
+	let probed: Probed = serde_json::from_slice(&out.stdout)
+		.map_err(|err| JobError::from(ErrorKind::Toolchain(format!("ffprobe returned unreadable JSON: {err}"))))?;
+
+	let playlist = selected_playlist(&out.stderr_tail);
+	let mpls = playlist
+		.ok_or_else(|| {
+			"ffmpeg didn't name the Blu-ray playlist it read, so the main feature has no chapters".to_owned()
+		})
+		.and_then(|number| {
+			read_mpls(files, number).map_err(|reason| {
+				format!("playlist {number:05}.mpls can't be read ({reason}), so the main feature has no chapters")
+			})
+		});
+	let warnings = mpls.as_ref().err().cloned().into_iter().collect();
+
+	let bytes = probed
+		.format
+		.size
+		.as_deref()
+		.and_then(|size| size.parse().ok())
+		.unwrap_or_else(|| stream_bytes(files));
+	let (chapters, languages) = mpls.map_or_else(
+		|_| Default::default(),
+		|mpls| (chapter_list(&mpls.marks_s(), mpls.length_s()), mpls.languages),
+	);
+
+	Ok(MainFeature {
+		playlist,
+		bytes,
+		warnings,
+		url,
+		streams: probed.streams,
+		chapters,
+		languages,
+	})
+}
+
+/// The `bluray:` URL of the image, or of the root of the folder that holds `BDMV`.
+fn disc_url(source: &Path, files: &DiscFiles) -> Result<String, JobError> {
+	let root = if source.is_dir() {
+		files
+			.find("BDMV/index.bdmv")
+			.and_then(|index| index.source.parent()?.parent())
+			.ok_or_else(|| ErrorKind::SourceDamaged("the Blu-ray folder has no BDMV/index.bdmv".into()))?
+	} else {
+		source
+	};
+
+	let root = process::tool_path(root);
+	let root = root
+		.to_str()
+		.ok_or_else(|| ErrorKind::SourceUnreadable(format!("{} is not a Unicode path", root.display())))?;
+	Ok(format!("bluray:{root}"))
+}
+
+fn read_mpls(files: &DiscFiles, number: u32) -> Result<Mpls, String> {
+	let name = format!("{number:05}.mpls");
+	let mut reasons = Vec::new();
+	for folder in ["BDMV/PLAYLIST", "BDMV/BACKUP/PLAYLIST"] {
+		let Some(file) = files.find(&format!("{folder}/{name}")) else {
+			continue;
+		};
+		if file.size > MAX_MPLS_BYTES {
+			reasons.push("it is too large for a playlist".to_owned());
+			continue;
+		}
+
+		match file
+			.read()
+			.map_err(|err| err.to_string())
+			.and_then(|bytes| Mpls::parse(&bytes))
+		{
+			Ok(mpls) => return Ok(mpls),
+			Err(reason) => reasons.push(reason),
+		}
+	}
+
+	if reasons.is_empty() {
+		reasons.push("it is missing".to_owned());
+	}
+	Err(reasons.join("; "))
+}
+
+fn stream_bytes(files: &DiscFiles) -> u64 {
+	files
+		.files
+		.iter()
+		.filter(|file| file.path.to_ascii_uppercase().starts_with("BDMV/STREAM/"))
+		.map(|file| file.size)
+		.sum()
+}
+
+/// The main feature stream-copied into one Matroska file in the workspace, with its chapters, its stream languages
+/// from the playlist and `name` as its title. Blu-ray LPCM becomes plain PCM.
+pub async fn build_bluray(
+	tools: &Toolchain,
+	main: &MainFeature,
+	name: &str,
+	workspace: &Workspace,
+	on_fraction: impl Fn(f64),
+	cancel: &CancellationToken,
+) -> Result<Built, JobError> {
+	let output = workspace.file(read::OUTPUT);
+	let chapters = if main.chapters.is_empty() {
+		None
+	} else {
+		let path = workspace.file(read::CHAPTERS);
+		fs::write(&path, chapters::ffmetadata(&main.chapters))
+			.map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
+		Some(path)
+	};
+
+	let mut cmd = ToolCommand::new(&tools.ffmpeg, process::scaled_timeout(main.bytes));
+	cmd.args(["-hide_banner", "-nostdin", "-y"]);
+	if let Some(playlist) = main.playlist {
+		cmd.arg("-playlist").arg(playlist.to_string());
+	}
+	cmd.args(["-probesize", PROBE_BYTES, "-analyzeduration", PROBE_MICROSECONDS, "-i"])
+		.arg(&main.url);
+	if let Some(chapters) = &chapters {
+		cmd.arg("-i").arg(process::tool_path(chapters));
+	}
+
+	cmd.args(["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy"]);
+	for (index, stream) in main.streams_of("audio").enumerate() {
+		if let Some(codec) = stream.pcm() {
+			cmd.arg(format!("-c:a:{index}")).arg(codec);
+		}
+		if let Some(code) = main.language(stream) {
+			cmd.arg(format!("-metadata:s:a:{index}"))
+				.arg(format!("language={code}"));
+		}
+	}
+	for (index, stream) in main.streams_of("subtitle").enumerate() {
+		if let Some(code) = main.language(stream) {
+			cmd.arg(format!("-metadata:s:s:{index}"))
+				.arg(format!("language={code}"));
+		}
+	}
+
+	if chapters.is_some() {
+		cmd.args(["-map_chapters", "1"]);
+	}
+	cmd.arg("-metadata")
+		.arg(format!("title={name}"))
+		.args(["-f", "matroska"])
+		.arg(process::tool_path(&output));
+
+	run_ffmpeg(
+		&cmd,
+		|progress| on_fraction(read::written(progress, main.bytes)),
+		cancel,
+	)
+	.await?;
+
+	let length_s = probe::probe(tools, &output, cancel)
+		.await
+		.map_err(read::unreadable)?
+		.format
+		.duration
+		.or_else(|| main.chapters.last().map(|chapter| chapter.end_s))
+		.unwrap_or_default();
+	Ok(Built {
+		path: output,
+		titles: vec![BuiltTitle {
+			title: 0,
+			start_s: 0.0,
+			length_s,
+		}],
+		reencoded: Vec::new(),
+	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const SECOND: u32 = 45_000;
+
+	/// An `.mpls` whose play items are `(in, out)` and whose marks are `(kind, item, time)`. Its first play item's
+	/// STN lists a video stream, a Slovenian audio track and an English subtitle track.
+	fn mpls(items: &[(u32, u32)], marks: &[(u8, u16, u32)]) -> Vec<u8> {
+		let mut stn = vec![0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+		stn.extend([9, 1, 0x10, 0x11, 0, 0, 0, 0, 0, 0, 5, 0x02, 0x31, 0, 0, 0]);
+		stn.extend([9, 1, 0x11, 0x00, 0, 0, 0, 0, 0, 0, 5, 0x80, 0x31]);
+		stn.extend(b"slv");
+		stn.extend([9, 1, 0x12, 0x00, 0, 0, 0, 0, 0, 0, 5, 0x90]);
+		stn.extend(b"eng");
+		stn.push(0);
+
+		let mut list = vec![0, 0];
+		list.extend(u16::try_from(items.len()).unwrap().to_be_bytes());
+		list.extend([0, 0]);
+		for (index, (in_time, out_time)) in items.iter().enumerate() {
+			let mut item = format!("{:05}M2TS", index + 1).into_bytes();
+			item.extend([0, 1, 0]);
+			item.extend(in_time.to_be_bytes());
+			item.extend(out_time.to_be_bytes());
+			item.extend([0; 12]);
+			item.extend(u16::try_from(stn.len()).unwrap().to_be_bytes());
+			item.extend(&stn);
+			list.extend(u16::try_from(item.len()).unwrap().to_be_bytes());
+			list.extend(item);
+		}
+
+		let mut mark = u16::try_from(marks.len()).unwrap().to_be_bytes().to_vec();
+		for (kind, item, time) in marks {
+			mark.extend([0, *kind]);
+			mark.extend(item.to_be_bytes());
+			mark.extend(time.to_be_bytes());
+			mark.extend([0xFF, 0xFF, 0, 0, 0, 0]);
+		}
+
+		let app_info = [0, 0, 0, 14, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+		let list_at = 40 + app_info.len();
+		let mark_at = list_at + 4 + list.len();
+		let mut bytes = b"MPLS0200".to_vec();
+		bytes.extend(u32::try_from(list_at).unwrap().to_be_bytes());
+		bytes.extend(u32::try_from(mark_at).unwrap().to_be_bytes());
+		bytes.extend([0; 24]);
+		bytes.extend(app_info);
+		bytes.extend(u32::try_from(list.len()).unwrap().to_be_bytes());
+		bytes.extend(list);
+		bytes.extend(u32::try_from(mark.len()).unwrap().to_be_bytes());
+		bytes.extend(mark);
+		bytes
+	}
+
+	#[test]
+	fn entry_marks_are_seconds_from_the_playlist_start() {
+		let bytes = mpls(
+			&[(0, 200 * SECOND)],
+			&[(1, 0, 0), (1, 0, 60 * SECOND), (1, 0, 125 * SECOND + SECOND / 2)],
+		);
+
+		assert_eq!(playlist_marks(&bytes), Ok(vec![0.0, 60.0, 125.5]));
+	}
+
+	#[test]
+	fn marks_in_later_play_items_count_from_their_clip_in_time() {
+		let bytes = mpls(
+			&[(90_000, 90_000 + 10 * SECOND), (4500, 4500 + 20 * SECOND)],
+			&[(1, 0, 90_000), (2, 1, 4500), (1, 1, 4500 + 5 * SECOND), (1, 7, 0)],
+		);
+
+		let parsed = Mpls::parse(&bytes).unwrap();
+
+		assert_eq!(parsed.marks_s(), [0.0, 15.0]);
+		assert!((parsed.length_s() - 30.0).abs() < 1e-9);
+		assert_eq!(
+			parsed.languages,
+			[(0x1100, "slv".to_owned()), (0x1200, "eng".to_owned())]
+		);
+	}
+
+	#[test]
+	fn a_truncated_playlist_is_refused() {
+		let bytes = mpls(&[(0, 200 * SECOND)], &[(1, 0, 0), (1, 0, 60 * SECOND)]);
+
+		for length in [3, 20, bytes.len() / 2, bytes.len() - 5] {
+			assert!(playlist_marks(&bytes[..length]).is_err(), "{length}");
+		}
+		assert!(playlist_marks(b"INDX0200").is_err());
+	}
+
+	#[test]
+	fn the_picked_playlist_is_read_from_the_log() {
+		let log: Vec<String> = [
+			"[bluray @ 000001ff4169e980] 2 usable playlists:",
+			"[bluray @ 000001ff4169e980] playlist 00800.mpls (0:03:20)",
+			"[bluray @ 000001ff4169e980] playlist 00001.mpls (1:52:13)",
+			"[bluray @ 000001ff4169e980] selected 00001.mpls",
+			"Input #0, mpegts, from 'bluray:C:\\Discs\\Film.iso':",
+		]
+		.into_iter()
+		.map(str::to_owned)
+		.collect();
+
+		assert_eq!(selected_playlist(&log), Some(1));
+		assert_eq!(selected_playlist(&log[..3]), None);
+		assert_eq!(
+			selected_playlist(&["[bluray @ 0] selected 00800.mpls\r".to_owned()]),
+			Some(800)
+		);
+	}
+
+	#[test]
+	fn chapters_run_from_mark_to_mark_and_to_the_end() {
+		let chapters = chapter_list(&[60.0, 0.0, 0.01, 125.5, 200.0], 200.0);
+
+		let listed: Vec<(f64, f64, &str)> = chapters
+			.iter()
+			.map(|chapter| (chapter.start_s, chapter.end_s, chapter.title.as_deref().unwrap()))
+			.collect();
+		assert_eq!(
+			listed,
+			[
+				(0.0, 60.0, "Chapter 1"),
+				(60.0, 125.5, "Chapter 2"),
+				(125.5, 200.0, "Chapter 3")
+			]
+		);
+	}
+
+	#[test]
+	fn blu_ray_lpcm_becomes_pcm_of_its_depth() {
+		let lpcm = |sample_fmt: &str| TsStream {
+			codec_name: "pcm_bluray".into(),
+			sample_fmt: Some(sample_fmt.into()),
+			..TsStream::default()
+		};
+
+		assert_eq!(lpcm("s16").pcm(), Some("pcm_s16le"));
+		assert_eq!(lpcm("s32").pcm(), Some("pcm_s24le"));
+		assert_eq!(
+			TsStream {
+				codec_name: "truehd".into(),
+				..TsStream::default()
+			}
+			.pcm(),
+			None
+		);
+	}
+}
