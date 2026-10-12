@@ -265,7 +265,7 @@ fn stage_name(stage: Stage) -> &'static str {
 		Stage::Probe => "probe",
 		Stage::Plan => "plan",
 		Stage::Queued => "queued",
-		Stage::Disc => "read disc",
+		Stage::Read => "read source",
 		Stage::WaitingForMemory => "waiting for memory",
 		Stage::Analyze => "analyse",
 		Stage::Sample => "sample",

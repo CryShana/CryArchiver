@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::{self, DirEntry, File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -81,6 +81,23 @@ impl DiscFiles {
 	pub fn dir_exists(&self, path: &str) -> bool {
 		let path = path.trim_matches('/');
 		path.is_empty() || self.dirs.iter().any(|dir| same_path(dir, path))
+	}
+
+	pub fn bytes(&self) -> u64 {
+		self.files.iter().map(|file| file.size).sum()
+	}
+
+	/// The bytes of the files under `folder`, which ends with `/`.
+	pub fn bytes_under(&self, folder: &str) -> u64 {
+		self.files
+			.iter()
+			.filter(|file| {
+				file.path
+					.get(..folder.len())
+					.is_some_and(|head| head.eq_ignore_ascii_case(folder))
+			})
+			.map(|file| file.size)
+			.sum()
 	}
 
 	fn sort(&mut self) {
@@ -168,7 +185,7 @@ fn walk_folder(dir: &Path, prefix: &str, depth: usize, listing: &mut DiscFiles) 
 		} else {
 			format!("{prefix}/{name}")
 		};
-		let metadata = fs::metadata(&source)?;
+		let metadata = entry_metadata(&entry)?;
 		if metadata.is_dir() {
 			listing.dirs.push(path.clone());
 			walk_folder(&source, &path, depth + 1, listing)?;
@@ -191,6 +208,16 @@ fn walk_folder(dir: &Path, prefix: &str, depth: usize, listing: &mut DiscFiles) 
 		}
 	}
 	Ok(())
+}
+
+/// An entry's metadata, taken from the entry itself unless it is a symbolic link, which is followed.
+pub(crate) fn entry_metadata(entry: &DirEntry) -> io::Result<Metadata> {
+	let metadata = entry.metadata()?;
+	if metadata.is_symlink() {
+		fs::metadata(entry.path())
+	} else {
+		Ok(metadata)
+	}
 }
 
 enum Fail {

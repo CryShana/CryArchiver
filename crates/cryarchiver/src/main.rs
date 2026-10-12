@@ -8,7 +8,6 @@ mod retry;
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use cryarchiver_engine::commit::{OutputSink, check_space};
-use cryarchiver_engine::disc::udf::read_folder;
+use cryarchiver_engine::detect::source_bytes;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::{OutputFormat, check_bitrate_cap};
 use cryarchiver_engine::images::plan::ImageRoute;
@@ -1035,15 +1034,6 @@ fn prepare_work_roots(files: &[PathBuf], sink: &dyn OutputSink) {
 	}
 }
 
-/// A file's size, or the size of all a disc folder's files.
-fn source_bytes(source: &Path) -> u64 {
-	if source.is_dir() {
-		read_folder(source).map_or(0, |listing| listing.files.iter().map(|file| file.size).sum())
-	} else {
-		fs::metadata(source).map_or(0, |meta| meta.len())
-	}
-}
-
 fn cancel_on_ctrl_c(cancel: &CancellationToken) {
 	let cancel = cancel.clone();
 	tokio::spawn(async move {
@@ -1128,19 +1118,6 @@ mod tests {
 	use cryarchiver_engine::toolchain::{FfmpegBuild, Version};
 
 	use super::*;
-
-	#[test]
-	fn a_disc_folder_counts_all_its_files() {
-		let dir = tempfile::tempdir().unwrap();
-		let video_ts = dir.path().join("Trip").join("VIDEO_TS");
-		fs::create_dir_all(&video_ts).unwrap();
-		fs::write(video_ts.join("VIDEO_TS.IFO"), vec![0; 2048]).unwrap();
-		fs::write(video_ts.join("VTS_01_1.VOB"), vec![0; 10_000]).unwrap();
-		fs::write(dir.path().join("clip.mp4"), vec![0; 300]).unwrap();
-
-		assert_eq!(source_bytes(&dir.path().join("Trip")), 12_048);
-		assert_eq!(source_bytes(&dir.path().join("clip.mp4")), 300);
-	}
 
 	#[test]
 	fn at_most_one_batch_of_queued_videos_is_discounted() {

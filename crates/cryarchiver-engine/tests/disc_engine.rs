@@ -149,7 +149,7 @@ async fn a_two_title_dvd_image_becomes_one_av1_mkv_with_a_chapter_per_title() {
 	assert_eq!(chapters[0].1, "Title 1");
 
 	let queued = stage_at(&events, Stage::Queued);
-	let read = stage_at(&events, Stage::Disc);
+	let read = stage_at(&events, Stage::Read);
 	assert_eq!(queued.len(), 1, "{events:?}");
 	assert_eq!(read.len(), 1, "{events:?}");
 	assert!(queued[0] < read[0]);
@@ -283,7 +283,7 @@ async fn a_format_a_disc_cannot_take_fails_before_the_disc_is_read() {
 		panic!("{outcome:?}")
 	};
 	assert!(matches!(err.kind, ErrorKind::EncodeFailed(_)), "{err:?}");
-	assert!(stage_at(&events, Stage::Disc).is_empty());
+	assert!(stage_at(&events, Stage::Read).is_empty());
 }
 
 /// The files of a Blu-ray with eight seconds of footage whose main playlist, 00800, has entry marks at 0, 3 and 5.5 s.
@@ -335,7 +335,7 @@ async fn a_blu_ray_folder_becomes_one_av1_mkv_of_its_main_feature() {
 	assert_main_feature(&decision, &probed(&output).await);
 
 	let queued = stage_at(&events, Stage::Queued);
-	let read = stage_at(&events, Stage::Disc);
+	let read = stage_at(&events, Stage::Read);
 	assert_eq!((queued.len(), read.len()), (1, 1), "{events:?}");
 	assert!(queued[0] < read[0]);
 	assert!(stage_at(&events, Stage::Encode)[0] > read[0]);
@@ -400,7 +400,7 @@ async fn converting_a_blu_ray_needs_ffmpeg_with_the_bluray_protocol() {
 		err.kind,
 		ErrorKind::EncodeFailed("ffmpeg can't read Blu-ray discs (no bluray protocol)".into())
 	);
-	assert!(stage_at(&events.into_inner().unwrap(), Stage::Disc).is_empty());
+	assert!(stage_at(&events.into_inner().unwrap(), Stage::Read).is_empty());
 }
 
 /// A DVD-like PS of `segments` one-second pieces with LPCM audio joined byte for byte, each with its own
@@ -452,19 +452,23 @@ async fn a_vob_whose_timestamps_restart_is_rebuilt_and_archived_at_its_real_leng
 	};
 	assert_eq!(output, dir.path().join("Loose.cry.mkv"));
 	let rebuilt = "the source's timestamps restart; they were rebuilt";
-	assert!(
-		decision.warnings.iter().any(|warning| warning == rebuilt),
-		"{:?}",
-		decision.warnings
-	);
-	assert!(warnings.iter().any(|warning| warning == rebuilt), "{warnings:?}");
-	assert!(events.contains(&JobEvent::Warning(rebuilt.to_owned())), "{events:?}");
+	let once = |warnings: &[String]| warnings.iter().filter(|warning| *warning == rebuilt).count() == 1;
+	assert!(once(&decision.warnings), "{:?}", decision.warnings);
+	assert!(once(&warnings), "{warnings:?}");
+	let emitted: Vec<String> = events
+		.iter()
+		.filter_map(|event| match event {
+			JobEvent::Warning(warning) => Some(warning.clone()),
+			_ => None,
+		})
+		.collect();
+	assert!(once(&emitted), "{events:?}");
 	assert!(decision.disc.is_none());
 
 	let info = probed(&output).await;
 	assert!(near(info.format.duration.unwrap(), 12.0, 0.3), "{:?}", info.format);
 	assert_eq!(stage_at(&events, Stage::Queued).len(), 1, "{events:?}");
-	assert_eq!(stage_at(&events, Stage::Disc).len(), 1, "{events:?}");
+	assert_eq!(stage_at(&events, Stage::Read).len(), 1, "{events:?}");
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());
 }
 
@@ -484,7 +488,7 @@ async fn a_ps_with_continuous_timestamps_is_not_rebuilt() {
 		panic!("{outcome:?}")
 	};
 	assert!(decision.warnings.is_empty(), "{:?}", decision.warnings);
-	assert!(stage_at(&events, Stage::Disc).is_empty(), "{events:?}");
+	assert!(stage_at(&events, Stage::Read).is_empty(), "{events:?}");
 }
 
 #[tokio::test]
@@ -501,7 +505,7 @@ async fn an_encrypted_dvd_image_is_kept_as_it_is() {
 	let (outcome, events) = run_with_events(&job(&iso), dir.path()).await;
 
 	assert_eq!(kept_reason(&outcome), "the DVD is encrypted");
-	assert!(stage_at(&events, Stage::Disc).is_empty(), "{events:?}");
+	assert!(stage_at(&events, Stage::Read).is_empty(), "{events:?}");
 }
 
 #[tokio::test]
@@ -530,7 +534,7 @@ async fn an_encrypted_blu_ray_is_kept_as_it_is() {
 	let (outcome, events) = run_with_events(&job(&root), dir.path()).await;
 
 	assert_eq!(kept_reason(&outcome), "the Blu-ray is encrypted");
-	assert!(stage_at(&events, Stage::Disc).is_empty(), "{events:?}");
+	assert!(stage_at(&events, Stage::Read).is_empty(), "{events:?}");
 }
 
 #[tokio::test]
@@ -550,7 +554,7 @@ async fn a_disc_job_cancelled_while_the_disc_is_read_leaves_no_workspace() {
 			&job(&iso),
 			&sink,
 			&|event| {
-				if event == JobEvent::Stage(Stage::Disc) {
+				if event == JobEvent::Stage(Stage::Read) {
 					cancel.cancel();
 				}
 			},

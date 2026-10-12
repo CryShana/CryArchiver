@@ -7,7 +7,7 @@ use super::read::{self, Built, BuiltTitle, Window};
 use super::udf::DiscFiles;
 use super::{Reader, be16, be32, byte, get};
 use crate::language;
-use crate::outcome::{ErrorKind, JobError};
+use crate::outcome::JobError;
 use crate::probe::{self, MediaInfo, ProbeError, Stream};
 use crate::process::{self, ToolCommand};
 use crate::toolchain::Toolchain;
@@ -242,16 +242,16 @@ fn slashed(text: &str) -> String {
 	text.replace('\\', "/").to_ascii_lowercase()
 }
 
-/// The main feature of the Blu-ray image or folder `source`, whose files are `files`: ffmpeg opens it through
-/// libbluray with no playlist, and the one libbluray picks is read from its log. That playlist's entry marks become
-/// the chapters. `None` when the disc is encrypted.
+/// The main feature of the Blu-ray image, or folder holding `BDMV`, `root`, whose files are `files`: ffmpeg opens it
+/// through libbluray with no playlist, and the one libbluray picks is read from its log. That playlist's entry marks
+/// become the chapters. `None` when the disc is encrypted.
 pub async fn main_feature(
 	tools: &Toolchain,
-	source: &Path,
+	root: &Path,
 	files: &DiscFiles,
 	cancel: &CancellationToken,
 ) -> Result<Option<MainFeature>, JobError> {
-	let url = disc_url(source, files)?;
+	let url = format!("bluray:{}", process::unicode_tool_path(root)?);
 	let mut cmd = ToolCommand::new(&tools.ffprobe, PROBE_TIMEOUT);
 	cmd.args([
 		"-v",
@@ -267,7 +267,7 @@ pub async fn main_feature(
 
 	let out = match probe::run_ffprobe(&cmd, cancel).await {
 		Ok(out) => out,
-		Err(ProbeError::Failed(log)) if encrypted(&log, &echoed_paths(source, &url)) => return Ok(None),
+		Err(ProbeError::Failed(log)) if encrypted(&log, &echoed_paths(root, &url)) => return Ok(None),
 		Err(err) => return Err(read::unreadable(err)),
 	};
 	let probed = MediaInfo::parse(&out.stdout).map_err(|err| read::unreadable(err.into()))?;
@@ -284,7 +284,7 @@ pub async fn main_feature(
 		});
 	let warnings = mpls.as_ref().err().cloned().into_iter().collect();
 
-	let bytes = probed.format.size.unwrap_or_else(|| stream_bytes(files));
+	let bytes = probed.format.size.unwrap_or_else(|| files.bytes_under("BDMV/STREAM/"));
 	let (chapters, languages) = mpls.map_or_else(
 		|_| Default::default(),
 		|mpls| (chapter_list(&mpls.marks_s(), mpls.length_s()), mpls.languages),
@@ -313,20 +313,6 @@ fn echoed_paths<'a>(source: &'a Path, url: &'a str) -> Vec<&'a str> {
 	.collect()
 }
 
-/// The `bluray:` URL of the image, or of the root of the folder that holds `BDMV`.
-fn disc_url(source: &Path, files: &DiscFiles) -> Result<String, JobError> {
-	let root = if source.is_dir() {
-		files
-			.find("BDMV/index.bdmv")
-			.and_then(|index| index.source.parent()?.parent())
-			.ok_or_else(|| ErrorKind::SourceDamaged("the Blu-ray folder has no BDMV/index.bdmv".into()))?
-	} else {
-		source
-	};
-
-	Ok(format!("bluray:{}", process::unicode_tool_path(root)?))
-}
-
 fn read_mpls(files: &DiscFiles, number: u32) -> Result<Mpls, String> {
 	let name = format!("{number:05}.mpls");
 	let mut reasons = Vec::new();
@@ -353,15 +339,6 @@ fn read_mpls(files: &DiscFiles, number: u32) -> Result<Mpls, String> {
 		reasons.push("it is missing".to_owned());
 	}
 	Err(reasons.join("; "))
-}
-
-fn stream_bytes(files: &DiscFiles) -> u64 {
-	files
-		.files
-		.iter()
-		.filter(|file| file.path.to_ascii_uppercase().starts_with("BDMV/STREAM/"))
-		.map(|file| file.size)
-		.sum()
 }
 
 /// The main feature stream-copied into one Matroska file in the workspace, with its chapters, its stream languages
@@ -427,22 +404,22 @@ pub async fn build_bluray(
 	)
 	.await?;
 
-	let length_s = probe::probe(tools, &output, cancel)
-		.await
-		.map_err(read::unreadable)?
+	let info = read::built_info(tools, &output, cancel).await?;
+	let length_s = info
 		.format
 		.duration
 		.or_else(|| main.chapters.last().map(|chapter| chapter.end_s))
 		.unwrap_or_default();
 	Ok(Built {
 		path: output,
+		info,
 		titles: vec![BuiltTitle {
 			title: 0,
 			start_s: 0.0,
 			length_s,
 		}],
 		reencoded: Vec::new(),
-		warnings: Vec::new(),
+		warnings: main.warnings.clone(),
 	})
 }
 

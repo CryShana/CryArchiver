@@ -21,17 +21,18 @@ use crate::decision::{
 	AudioDecision, AudioTrack, CrfChoice, Decision, DiscDecision, Measured, Recorder, Reencode, Scan, SkippedRetry,
 	Trim, Vmaf, encoder_text,
 };
-use crate::detect::{self, Detection, DiscKind, MediaClass};
-use crate::disc::dvd::{self, Selection};
+use crate::detect::{self, Detected, Detection, Disc, DiscFolder, MediaClass};
+use crate::disc::Reader;
+use crate::disc::bluray::{self, MainFeature};
+use crate::disc::dvd::{self, Dvd, Selection};
 use crate::disc::read::{self, Built};
-use crate::disc::udf::DiscFiles;
-use crate::disc::{Reader, bluray};
 use crate::format::{OutputFormat, check_bitrate_cap, check_kind};
 use crate::images::animated::{self, Animation};
 use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
+use crate::naming::source_name;
 use crate::options::{
 	BluRay, JobOptions, Resize, TrimWindow, WrittenBy, kept_as_requested, kept_as_requested_part, upscaled,
 };
@@ -85,6 +86,7 @@ const SUBTITLES_DROPPED: &str =
 	"a subtitle track was dropped: animated AVIF can't hold subtitles, but --burn-subs draws one into the picture";
 const BLU_RAY_KEPT: &str = "Blu-ray disc: kept as is";
 const NO_FOOTAGE: &str = "no real footage on the disc";
+const THREE_D_KEPT: &str = "3D disc: the second view can't be encoded; kept so 3D survives";
 const TIMESTAMPS_REBUILT: &str = "the source's timestamps restart; they were rebuilt";
 const INTERLEAVED_KEPT: &str = "multi-angle or branching titles aren't read yet";
 const DVD_ENCRYPTED: &str = "the DVD is encrypted";
@@ -110,8 +112,8 @@ pub enum Stage {
 	Probe,
 	Plan,
 	Queued,
-	/// Reading a disc's titles into one video.
-	Disc,
+	/// Reading a disc, or a source whose timestamps restart, into one video.
+	Read,
 	WaitingForMemory,
 	Analyze,
 	Sample,
@@ -241,6 +243,8 @@ struct Context<'a> {
 	on_event: &'a (dyn Fn(JobEvent) + Sync),
 	cancel: &'a CancellationToken,
 	record: &'a Recorder,
+	/// What reading the source into `media` fell short of: the first of the output's warnings.
+	read_warnings: &'a [String],
 }
 
 struct Staged {
@@ -260,18 +264,46 @@ enum Produced {
 
 /// A disc, or a source whose timestamps restart, read into one video in its job's workspace, under the video slot the
 /// video's encode keeps.
-struct ReadDisc<'a> {
+struct ReadSource<'a> {
 	slot: SemaphorePermit<'a>,
 	workspace: Workspace,
 	media: PathBuf,
-	/// The detection of `media`, which is always a video.
-	detection: Detection,
-	/// What reading the disc fell short of, for the decision record.
+	/// What reading the source fell short of.
 	warnings: Vec<String>,
 }
 
+/// What a disc, or a source whose timestamps restart, is read from.
+enum Reading<'r> {
+	Dvd(&'r Dvd, &'r Selection),
+	BluRay(&'r MainFeature),
+	Timestamps(&'r MediaInfo),
+}
+
+impl Reading<'_> {
+	/// The free space reading takes: the source's size, and room for the video read from it.
+	fn need(&self, source_bytes: u64) -> u64 {
+		match self {
+			Self::Dvd(dvd, selection) => source_bytes.saturating_add(dvd.footage_bytes(selection)),
+			Self::BluRay(main) => source_bytes.saturating_add(main.bytes),
+			Self::Timestamps(_) => source_bytes.saturating_mul(2),
+		}
+	}
+
+	/// What the decision record calls a title read from a disc.
+	fn title(&self, number: u16) -> String {
+		match self {
+			Self::BluRay(_) => MAIN_FEATURE.to_owned(),
+			Self::Dvd(..) | Self::Timestamps(_) => title_name(number),
+		}
+	}
+}
+
 enum Resolved<'a> {
-	Read(Box<ReadDisc<'a>>),
+	Media(MediaClass),
+	Read {
+		info: Box<MediaInfo>,
+		read: Box<ReadSource<'a>>,
+	},
 	Kept(KeepReason),
 }
 
@@ -562,13 +594,17 @@ impl Engine {
 
 		on_event(JobEvent::Stage(Stage::Detect));
 		let Detection { meta, class, probe_log } = detect::detect(&self.tools, &job.source, cancel).await?;
-		if let (Some(format), Some(kind)) = (job.options.format, media_kind(&class)) {
+		let kind = match &class {
+			Detected::Media(class) => media_kind(class),
+			Detected::Disc(_) => Some(MediaKind::Video),
+		};
+		if let (Some(format), Some(kind)) = (job.options.format, kind) {
 			check_kind(format, kind).map_err(ErrorKind::EncodeFailed)?;
 		}
 
 		let source_bytes = match &class {
-			MediaClass::Disc(kind) if meta.is_dir() => kind.files().files.iter().map(|file| file.size).sum(),
-			_ => meta.len(),
+			Detected::Media(_) => meta.len(),
+			Detected::Disc(disc) => disc.bytes,
 		};
 		let work_root = sink.work_root(&job.source);
 		let cx = Context {
@@ -578,40 +614,29 @@ impl Engine {
 			on_event,
 			cancel,
 			record: &recorder,
+			read_warnings: &[],
 		};
 
-		let mut disc_warnings = Vec::new();
 		let resolved = match class {
-			MediaClass::Disc(kind) => Ok(Box::pin(self.resolve_disc(&cx, sink, &work_root, kind)).await?),
-			MediaClass::Video(info) if implausible_duration(&info, source_bytes) => {
-				Ok(Box::pin(self.resolve_timestamps(&cx, sink, &work_root, &info)).await?)
+			Detected::Disc(disc) => Box::pin(self.resolve_disc(&cx, sink, &work_root, disc)).await?,
+			Detected::Media(MediaClass::Video(info)) if implausible_duration(&info, source_bytes) => {
+				self.require(MediaKind::Video)?;
+				Box::pin(self.read_into(&cx, sink, &work_root, Reading::Timestamps(&info))).await?
 			}
-			class => Err(class),
+			Detected::Media(class) => Resolved::Media(class),
 		};
-		let (class, probe_log, disc) = match resolved {
-			Ok(Resolved::Read(read)) => {
-				let ReadDisc {
-					slot,
-					workspace,
-					media,
-					detection,
-					warnings,
-				} = *read;
-				for warning in &warnings {
-					on_event(JobEvent::Warning(warning.clone()));
-				}
-				disc_warnings = warnings;
-				(detection.class, detection.probe_log, Some((slot, workspace, media)))
-			}
-			Ok(Resolved::Kept(reason)) => {
+		let (class, read) = match resolved {
+			Resolved::Media(class) => (class, None),
+			Resolved::Read { info, read } => (MediaClass::Video(*info), Some(read)),
+			Resolved::Kept(reason) => {
 				recorder.update(|decision| {
 					decision.source_bytes.get_or_insert(source_bytes);
 				});
 				on_event(JobEvent::Decision(Box::new(recorder.snapshot())));
 				return Ok(JobOutcome::KeptOriginal { reason });
 			}
-			Err(class) => (class, probe_log, None),
 		};
+		let media = read.as_ref().map_or(job.source.as_path(), |read| read.media.as_path());
 
 		let animated = matches!(class, MediaClass::AnimatedImage(_));
 		let planned = match class {
@@ -651,7 +676,7 @@ impl Engine {
 					.is_some_and(|format| format.kind() == MediaKind::Audio) =>
 			{
 				self.require(MediaKind::Audio)?;
-				check_damage(&job.source)?;
+				check_damage(media)?;
 
 				on_event(JobEvent::Stage(Stage::Plan));
 				let rules = AudioRules {
@@ -685,7 +710,7 @@ impl Engine {
 			}
 			MediaClass::Video(info) if job.options.format == Some(OutputFormat::Avif) => {
 				self.check_animation(job, OutputFormat::Avif)?;
-				check_damage(&job.source)?;
+				check_damage(media)?;
 
 				on_event(JobEvent::Stage(Stage::Plan));
 				let burn = burn_pick(job, &info)?;
@@ -697,7 +722,7 @@ impl Engine {
 			}
 			MediaClass::Video(info) => {
 				self.require(MediaKind::Video)?;
-				check_damage(&job.source)?;
+				check_damage(media)?;
 
 				on_event(JobEvent::Stage(Stage::Plan));
 				let rules = stream_rules(job, &info)?;
@@ -744,7 +769,6 @@ impl Engine {
 			}
 			MediaClass::Damaged(reason) => return Err(JobError::with_log(ErrorKind::SourceDamaged(reason), probe_log)),
 			MediaClass::Other(reason) => return Ok(JobOutcome::Skipped { reason }),
-			MediaClass::Disc(_) => unreachable!("a disc is read into a video before it is planned"),
 		};
 
 		let _memory = match &planned {
@@ -755,16 +779,29 @@ impl Engine {
 		let before =
 			SourceTimes::from_metadata(&meta).map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
 		// The workspace must outlive `finish`: dropping it deletes the staged output.
-		let (workspace, media, mut held) = match disc {
-			Some((slot, workspace, media)) => (workspace, media, Some(slot)),
+		let (workspace, media, mut held, read_warnings) = match read {
+			Some(read) => {
+				let ReadSource {
+					slot,
+					workspace,
+					media,
+					warnings,
+				} = *read;
+				(workspace, media, Some(slot), warnings)
+			}
 			None => (
 				open_workspace(sink, &work_root, &job.source, source_bytes)?,
 				job.source.clone(),
 				None,
+				Vec::new(),
 			),
 		};
 
-		let cx = Context { media: &media, ..cx };
+		let cx = Context {
+			media: &media,
+			read_warnings: &read_warnings,
+			..cx
+		};
 		let produced = match &planned {
 			Planned::Audio {
 				info,
@@ -795,8 +832,6 @@ impl Engine {
 			}
 		};
 		let learned = std::mem::take(&mut staged.learned);
-		disc_warnings.append(&mut staged.warnings);
-		staged.warnings = disc_warnings;
 
 		recorder.update(|decision| {
 			decision.warnings.clone_from(&staged.warnings);
@@ -956,23 +991,20 @@ impl Engine {
 		}
 	}
 
-	/// A disc read into one video, or why it is kept as it is. A DVD's real titles are joined in a workspace opened with
-	/// room for them, under a video slot taken first.
+	/// A disc read into one video, or why it is kept as it is. A DVD's real titles are joined.
 	async fn resolve_disc<'a>(
 		&'a self,
 		cx: &Context<'_>,
 		sink: &dyn OutputSink,
 		work_root: &Path,
-		kind: DiscKind,
+		disc: Disc,
 	) -> Result<Resolved<'a>, JobError> {
-		let files = match kind {
-			DiscKind::Dvd(files) => files,
-			DiscKind::BluRay { files, three_d } => {
-				return Box::pin(self.resolve_bluray(cx, sink, work_root, &files, three_d)).await;
-			}
-		};
+		if disc.folder == DiscFolder::BluRay {
+			return Box::pin(self.resolve_bluray(cx, sink, work_root, &disc)).await;
+		}
 		self.require(MediaKind::Video)?;
 
+		let files = disc.files;
 		let read = blocking(cx.cancel, move || {
 			let mut reader = Reader::default();
 			let dvd = dvd::parse(&files, &mut reader)?;
@@ -984,49 +1016,26 @@ impl Engine {
 		.await?;
 		let (dvd, selection, encrypted) = match read {
 			Ok(read) => read,
-			Err(reason) => {
-				return Ok(Resolved::Kept(KeepReason::Unsupported(format!(
-					"the DVD's titles can't be read: {reason}"
-				))));
-			}
+			Err(reason) => return Ok(kept(&format!("the DVD's titles can't be read: {reason}"))),
 		};
 		cx.record
 			.update(|decision| decision.disc = Some(dvd_decision(&selection)));
 		if selection.kept.is_empty() {
-			return Ok(Resolved::Kept(KeepReason::Unsupported(NO_FOOTAGE.to_owned())));
+			return Ok(kept(NO_FOOTAGE));
 		}
 		if dvd.mixed(&selection) {
-			return Ok(Resolved::Kept(KeepReason::Unsupported(INTERLEAVED_KEPT.to_owned())));
+			return Ok(kept(INTERLEAVED_KEPT));
 		}
 		if encrypted
 			.transpose()
 			.map_err(|err| JobError::io(IoSide::Source(&cx.job.source), &err))?
 			.unwrap_or_default()
 		{
-			return Ok(Resolved::Kept(KeepReason::Unsupported(DVD_ENCRYPTED.to_owned())));
+			return Ok(kept(DVD_ENCRYPTED));
 		}
 
-		let slot = self.video_slot(cx).await?;
-		let need = cx.source_bytes.saturating_add(dvd.footage_bytes(&selection));
-		let workspace = open_workspace(sink, work_root, &cx.job.source, need)?;
-
-		(cx.on_event)(JobEvent::Stage(Stage::Disc));
-		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
-		let built = read::build_dvd(
-			&self.tools,
-			&dvd,
-			&selection,
-			&disc_name(&cx.job.source),
-			&workspace,
-			on_fraction,
-			cx.cancel,
-		)
-		.await
-		.map_err(|err| disk_full(err, work_root, need))?;
-		cx.record
-			.update(|decision| record_built(decision.disc.get_or_insert_default(), &built));
-
-		self.detect_read(cx, slot, workspace, built.path, built.warnings).await
+		self.read_into(cx, sink, work_root, Reading::Dvd(&dvd, &selection))
+			.await
 	}
 
 	/// A Blu-ray's main feature read into one video, or why the disc is kept as it is: on request, and always for 3D.
@@ -1035,20 +1044,19 @@ impl Engine {
 		cx: &Context<'_>,
 		sink: &dyn OutputSink,
 		work_root: &Path,
-		files: &DiscFiles,
-		three_d: bool,
+		disc: &Disc,
 	) -> Result<Resolved<'a>, JobError> {
 		cx.record.update(|decision| {
 			decision.disc = Some(DiscDecision {
-				kind: "Blu-ray".to_owned(),
+				kind: disc.folder.label().to_owned(),
 				..DiscDecision::default()
 			});
 		});
-		if three_d {
-			return Ok(Resolved::Kept(KeepReason::Unsupported(detect::THREE_D_KEPT.to_owned())));
+		if disc.three_d() {
+			return Ok(kept(THREE_D_KEPT));
 		}
 		if cx.job.options.blu_ray == BluRay::Keep {
-			return Ok(Resolved::Kept(KeepReason::Unsupported(BLU_RAY_KEPT.to_owned())));
+			return Ok(kept(BLU_RAY_KEPT));
 		}
 
 		self.require(MediaKind::Video)?;
@@ -1056,88 +1064,60 @@ impl Engine {
 			return Err(ErrorKind::EncodeFailed("ffmpeg can't read Blu-ray discs (no bluray protocol)".into()).into());
 		}
 
-		let Some(main) = bluray::main_feature(&self.tools, &cx.job.source, files, cx.cancel).await? else {
-			return Ok(Resolved::Kept(KeepReason::Unsupported(BLU_RAY_ENCRYPTED.to_owned())));
+		let Some(main) = bluray::main_feature(&self.tools, &disc.root, &disc.files, cx.cancel).await? else {
+			return Ok(kept(BLU_RAY_ENCRYPTED));
 		};
 		cx.record
 			.update(|decision| decision.disc.get_or_insert_default().playlist = main.playlist);
 
-		let slot = self.video_slot(cx).await?;
-		let need = cx.source_bytes.saturating_add(main.bytes);
-		let workspace = open_workspace(sink, work_root, &cx.job.source, need)?;
-
-		(cx.on_event)(JobEvent::Stage(Stage::Disc));
-		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
-		let built = bluray::build_bluray(
-			&self.tools,
-			&main,
-			&disc_name(&cx.job.source),
-			&workspace,
-			on_fraction,
-			cx.cancel,
-		)
-		.await
-		.map_err(|err| disk_full(err, work_root, need))?;
-		cx.record.update(|decision| {
-			decision.disc.get_or_insert_default().kept = built
-				.titles
-				.iter()
-				.map(|title| (MAIN_FEATURE.to_owned(), title.length_s))
-				.collect();
-		});
-
-		self.detect_read(cx, slot, workspace, built.path, main.warnings).await
+		self.read_into(cx, sink, work_root, Reading::BluRay(&main)).await
 	}
 
-	/// A video whose timestamps restart, rebuilt into a workspace opened with room for the copy, under a video slot taken
-	/// first.
-	async fn resolve_timestamps<'a>(
+	/// The video `reading` reads in a workspace opened with room for it, under a video slot taken first that the
+	/// video's encode keeps.
+	async fn read_into<'a>(
 		&'a self,
 		cx: &Context<'_>,
 		sink: &dyn OutputSink,
 		work_root: &Path,
-		info: &MediaInfo,
+		reading: Reading<'_>,
 	) -> Result<Resolved<'a>, JobError> {
-		self.require(MediaKind::Video)?;
-
 		let slot = self.video_slot(cx).await?;
-		let need = cx.source_bytes.saturating_mul(2);
+		let need = reading.need(cx.source_bytes);
 		let workspace = open_workspace(sink, work_root, &cx.job.source, need)?;
 
-		(cx.on_event)(JobEvent::Stage(Stage::Disc));
+		(cx.on_event)(JobEvent::Stage(Stage::Read));
 		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
-		let (media, left_out) =
-			read::normalise_timestamps(&self.tools, &cx.job.source, info, &workspace, on_fraction, cx.cancel)
-				.await
-				.map_err(|err| disk_full(err, work_root, need))?;
+		let name = source_name(&cx.job.source).to_string_lossy();
+		let built = match reading {
+			Reading::Dvd(dvd, selection) => {
+				read::build_dvd(&self.tools, dvd, selection, &name, &workspace, on_fraction, cx.cancel).await
+			}
+			Reading::BluRay(main) => {
+				bluray::build_bluray(&self.tools, main, &name, &workspace, on_fraction, cx.cancel).await
+			}
+			Reading::Timestamps(info) => {
+				read::normalise_timestamps(&self.tools, &cx.job.source, info, &workspace, on_fraction, cx.cancel).await
+			}
+		};
+		let mut built = built.map_err(|err| disk_full(err, work_root, need))?;
 
-		let warnings = std::iter::once(TIMESTAMPS_REBUILT.to_owned()).chain(left_out).collect();
-		self.detect_read(cx, slot, workspace, media, warnings).await
-	}
-
-	/// The footage read into `media`, detected again: always a video.
-	async fn detect_read<'a>(
-		&self,
-		cx: &Context<'_>,
-		slot: SemaphorePermit<'a>,
-		workspace: Workspace,
-		media: PathBuf,
-		warnings: Vec<String>,
-	) -> Result<Resolved<'a>, JobError> {
-		let detection = detect::detect(&self.tools, &media, cx.cancel).await?;
-		if !matches!(detection.class, MediaClass::Video(_)) {
-			return Err(JobError::with_log(
-				ErrorKind::SourceDamaged("the rebuilt footage can't be read as video".into()),
-				detection.probe_log,
-			));
+		match reading {
+			Reading::Timestamps(_) => built.warnings.insert(0, TIMESTAMPS_REBUILT.to_owned()),
+			Reading::Dvd(..) | Reading::BluRay(_) => cx
+				.record
+				.update(|decision| record_built(decision.disc.get_or_insert_default(), &built, &reading)),
 		}
-		Ok(Resolved::Read(Box::new(ReadDisc {
-			slot,
-			workspace,
-			media,
-			detection,
-			warnings,
-		})))
+
+		Ok(Resolved::Read {
+			info: Box::new(built.info),
+			read: Box::new(ReadSource {
+				slot,
+				workspace,
+				media: built.path,
+				warnings: built.warnings,
+			}),
+		})
 	}
 
 	/// A video slot, reported `Queued` before it is waited for.
@@ -1284,8 +1264,8 @@ impl Engine {
 		}
 
 		(cx.on_event)(JobEvent::Stage(Stage::Metadata));
-		let mut warnings = skipped.to_vec();
-		for warning in skipped {
+		let mut warnings: Vec<String> = cx.read_warnings.iter().chain(skipped).cloned().collect();
+		for warning in &warnings {
 			(cx.on_event)(JobEvent::Warning(warning.clone()));
 		}
 
@@ -1631,7 +1611,8 @@ impl Engine {
 		}
 		record_picture(cx, analysis.scan, size, span.window, burn.is_some());
 
-		let mut warnings = dropped_streams(&info, burn);
+		let mut warnings = cx.read_warnings.to_vec();
+		warnings.extend(dropped_streams(&info, burn));
 		warnings.extend(ignored_flags(cx.job));
 		warnings.extend(video.warnings.iter().cloned());
 		warnings.extend(size.and_then(|size| upscaled(shown, size)));
@@ -2474,10 +2455,10 @@ impl Engine {
 		temps: EncodedTemps,
 	) -> Result<Produced, JobError> {
 		let source = cx.media;
-		let mut warnings: Vec<String> = job
-			.video
-			.warnings
+		let mut warnings: Vec<String> = cx
+			.read_warnings
 			.iter()
+			.chain(&job.video.warnings)
 			.chain(&job.streams.warnings)
 			.cloned()
 			.collect();
@@ -2735,10 +2716,6 @@ fn metadata_mode(job: &Job) -> MetadataMode {
 }
 
 fn check_damage(source: &Path) -> Result<(), JobError> {
-	if source.is_dir() {
-		return Ok(());
-	}
-
 	let damage = integrity::find_damage(source).map_err(|err| JobError::io(IoSide::Source(source), &err))?;
 	match damage {
 		Some(reason) => Err(ErrorKind::SourceDamaged(reason).into()),
@@ -2749,29 +2726,23 @@ fn check_damage(source: &Path) -> Result<(), JobError> {
 fn media_kind(class: &MediaClass) -> Option<MediaKind> {
 	match class {
 		MediaClass::Audio(_) => Some(MediaKind::Audio),
-		MediaClass::Video(_) | MediaClass::Disc(_) => Some(MediaKind::Video),
+		MediaClass::Video(_) => Some(MediaKind::Video),
 		MediaClass::StillImage(_) | MediaClass::AnimatedImage(_) => Some(MediaKind::Image),
 		MediaClass::Kept(_) | MediaClass::Damaged(_) | MediaClass::Other(_) => None,
 	}
-}
-
-/// An image's name without its extension, or a disc folder's whole name.
-fn disc_name(source: &Path) -> String {
-	let name = if source.is_dir() {
-		source.file_name()
-	} else {
-		source.file_stem()
-	};
-	name.map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 fn title_name(number: u16) -> String {
 	format!("Title {number}")
 }
 
+fn kept<'a>(reason: &str) -> Resolved<'a> {
+	Resolved::Kept(KeepReason::Unsupported(reason.to_owned()))
+}
+
 fn dvd_decision(selection: &Selection) -> DiscDecision {
 	DiscDecision {
-		kind: "DVD".to_owned(),
+		kind: DiscFolder::Dvd.label().to_owned(),
 		dropped: selection
 			.dropped
 			.iter()
@@ -2787,13 +2758,13 @@ fn dvd_decision(selection: &Selection) -> DiscDecision {
 	}
 }
 
-fn record_built(disc: &mut DiscDecision, built: &Built) {
+fn record_built(disc: &mut DiscDecision, built: &Built, reading: &Reading<'_>) {
 	disc.kept = built
 		.titles
 		.iter()
-		.map(|title| (title_name(title.title), title.length_s))
+		.map(|title| (reading.title(title.title), title.length_s))
 		.collect();
-	disc.reencoded = built.reencoded.iter().copied().map(title_name).collect();
+	disc.reencoded = built.reencoded.iter().map(|number| reading.title(*number)).collect();
 }
 
 fn video_container(job: &Job) -> Container {

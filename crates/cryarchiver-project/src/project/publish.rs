@@ -7,6 +7,7 @@ use std::ffi::OsStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cryarchiver_engine::engine::Stage;
+use cryarchiver_engine::naming::is_disc_image;
 use cryarchiver_engine::text::{display_name, display_path};
 
 use super::owner::Owner;
@@ -335,7 +336,7 @@ impl Owner {
 			progress: self.pipeline.jobs.get(&file).map(|job| job.fraction),
 			codec: output
 				.map(|output| codec_label(&output.how, &output.path.name()))
-				.or_else(|| is_disc_image(&entry.name).then(|| DISC_CODEC.to_owned())),
+				.or_else(|| is_disc_image(std::path::Path::new(&entry.name)).then(|| DISC_CODEC.to_owned())),
 			bytes_in: record.size,
 			bytes_out: output.map(|output| output.size),
 		}
@@ -733,7 +734,7 @@ pub(super) fn stage_label(stage: Stage) -> &'static str {
 		Stage::Probe => "probing",
 		Stage::Plan => "planning",
 		Stage::Queued => "queued",
-		Stage::Disc => "reading disc",
+		Stage::Read => "reading source",
 		Stage::WaitingForMemory => "waiting for memory",
 		Stage::Analyze => "analysing",
 		Stage::Sample => "sampling",
@@ -743,12 +744,6 @@ pub(super) fn stage_label(stage: Stage) -> &'static str {
 		Stage::Verify => "verifying",
 		Stage::Commit => "saving",
 	}
-}
-
-fn is_disc_image(name: &OsStr) -> bool {
-	std::path::Path::new(name)
-		.extension()
-		.is_some_and(|extension| extension.eq_ignore_ascii_case("iso"))
 }
 
 pub(super) fn codec_label(how: &How, output_name: &OsStr) -> String {

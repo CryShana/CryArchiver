@@ -571,10 +571,10 @@ async fn an_interleaved_block_that_cannot_be_read_is_an_error_not_mixed() {
 async fn rebuilt(source: &Path, workspace: &Workspace) -> (MediaInfo, Vec<String>) {
 	let tools = support::toolchain().await;
 	let info = probed(source).await;
-	let (path, warnings) = normalise_timestamps(&tools, source, &info, workspace, |_| {}, &CancellationToken::new())
+	let built = normalise_timestamps(&tools, source, &info, workspace, |_| {}, &CancellationToken::new())
 		.await
 		.unwrap();
-	(probed(&path).await, warnings)
+	(probed(&built.path).await, built.warnings)
 }
 
 #[tokio::test]

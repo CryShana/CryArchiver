@@ -27,8 +27,8 @@ pub fn expand(args: &[PathBuf]) -> Inputs {
 	for arg in args {
 		if arg.is_file() {
 			inputs.files.push(arg.clone());
-		} else if let Some(root) = disc_root(arg) {
-			if named_folder(arg).as_ref() == Some(&root) {
+		} else if let Some((named, root)) = disc_root(arg) {
+			if named == root {
 				note_beside_disc(&mut inputs, &root);
 			}
 			inputs.files.push(root);
@@ -55,13 +55,12 @@ pub fn expand(args: &[PathBuf]) -> Inputs {
 
 const LISTED_BESIDE_DISC: usize = 5;
 
-/// The folder a disc sits in when `dir` is its `VIDEO_TS` or `BDMV` folder or directly holds one.
-fn disc_root(dir: &Path) -> Option<PathBuf> {
-	if !dir.is_dir() {
-		return None;
-	}
-
-	detect::disc_root(&named_folder(dir)?)
+/// `dir` named as `named_folder` names it, and the folder a disc sits in when `dir` is its `VIDEO_TS` or `BDMV` folder
+/// or directly holds one.
+fn disc_root(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+	let named = named_folder(dir)?;
+	let root = detect::disc_root(&named)?;
+	Some((named, root))
 }
 
 /// A note naming the files beside the disc in `root`, which aren't part of it and aren't archived.

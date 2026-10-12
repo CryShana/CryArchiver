@@ -1,6 +1,6 @@
 mod support;
 
-use cryarchiver_engine::detect::{MediaClass, detect};
+use cryarchiver_engine::detect::{Detected, MediaClass, detect};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -12,7 +12,7 @@ async fn raw_camera_files_are_kept_without_probing() {
 
 	let detection = detect(&tools, &path, &CancellationToken::new()).await.unwrap();
 
-	assert!(matches!(detection.class, MediaClass::Kept(reason) if reason.contains("RAW")));
+	assert!(matches!(detection.class, Detected::Media(MediaClass::Kept(reason)) if reason.contains("RAW")));
 }
 
 #[tokio::test]
@@ -33,7 +33,7 @@ async fn animated_png_is_an_animated_image() {
 	let detection = detect(&tools, &path, &CancellationToken::new()).await.unwrap();
 
 	assert!(
-		matches!(detection.class, MediaClass::AnimatedImage(_)),
+		matches!(detection.class, Detected::Media(MediaClass::AnimatedImage(_))),
 		"{:?}",
 		detection.class
 	);
@@ -48,7 +48,7 @@ async fn plain_text_named_mp3_is_other() {
 
 	let detection = detect(&tools, &path, &CancellationToken::new()).await.unwrap();
 
-	assert!(matches!(detection.class, MediaClass::Other(_)));
+	assert!(matches!(detection.class, Detected::Media(MediaClass::Other(_))));
 }
 
 #[tokio::test]
@@ -79,7 +79,7 @@ async fn files_named_as_images_are_judged_by_their_content() {
 	for path in [&without_soi, &empty, &html] {
 		let detection = detect(&tools, path, &CancellationToken::new()).await.unwrap();
 		assert!(
-			matches!(detection.class, MediaClass::Other(_)),
+			matches!(detection.class, Detected::Media(MediaClass::Other(_))),
 			"{}: {:?}",
 			path.display(),
 			detection.class
@@ -111,8 +111,16 @@ async fn a_video_named_mp3_and_an_mp3_behind_junk_are_classified_by_their_stream
 	let video = detect(&tools, &named_mp3, &CancellationToken::new()).await.unwrap();
 	let audio = detect(&tools, &prefixed, &CancellationToken::new()).await.unwrap();
 
-	assert!(matches!(video.class, MediaClass::Video(_)), "{:?}", video.class);
-	assert!(matches!(audio.class, MediaClass::Audio(_)), "{:?}", audio.class);
+	assert!(
+		matches!(video.class, Detected::Media(MediaClass::Video(_))),
+		"{:?}",
+		video.class
+	);
+	assert!(
+		matches!(audio.class, Detected::Media(MediaClass::Audio(_))),
+		"{:?}",
+		audio.class
+	);
 }
 
 #[tokio::test]
@@ -126,7 +134,7 @@ async fn flac_signature_with_junk_is_damaged() {
 
 	let detection = detect(&tools, &path, &CancellationToken::new()).await.unwrap();
 
-	assert!(matches!(detection.class, MediaClass::Damaged(_)));
+	assert!(matches!(detection.class, Detected::Media(MediaClass::Damaged(_))));
 	assert!(!detection.probe_log.is_empty());
 }
 
@@ -138,6 +146,6 @@ async fn generated_flac_tone_is_audio() {
 
 	let detection = detect(&tools, &path, &CancellationToken::new()).await.unwrap();
 
-	assert!(matches!(detection.class, MediaClass::Audio(_)));
+	assert!(matches!(detection.class, Detected::Media(MediaClass::Audio(_))));
 	assert_eq!(detection.meta.len(), std::fs::metadata(&path).unwrap().len());
 }

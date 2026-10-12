@@ -121,14 +121,24 @@ pub fn cli_output_dir(source: &Path, output_dir: Option<&Path>) -> PathBuf {
 	}
 }
 
-/// The CLI output for `source`, named after its stem, or after its whole name when it is a disc folder.
-pub fn cli_output_path(source: &Path, output_dir: Option<&Path>, extension: impl AsRef<OsStr>) -> PathBuf {
-	let stem = if source.is_dir() {
+/// A file's name without its extension, or a folder's whole name.
+pub fn source_name(source: &Path) -> &OsStr {
+	let name = if source.is_dir() {
 		source.file_name()
 	} else {
 		source.file_stem()
 	};
-	let mut name = OsString::from(stem.unwrap_or_default());
+	name.unwrap_or_default()
+}
+
+pub fn is_disc_image(path: &Path) -> bool {
+	path.extension()
+		.is_some_and(|extension| extension.eq_ignore_ascii_case("iso"))
+}
+
+/// The CLI output for `source`, named after its stem, or after its whole name when it is a disc folder.
+pub fn cli_output_path(source: &Path, output_dir: Option<&Path>, extension: impl AsRef<OsStr>) -> PathBuf {
+	let mut name = source_name(source).to_os_string();
 	name.push(format!(".{CLI_MARKER}."));
 	name.push(extension);
 

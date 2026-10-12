@@ -32,12 +32,14 @@ const REENCODE_QUALITY: &str = "2";
 const JOIN_SLACK_S: f64 = 0.5;
 pub const ANGLES_LEFT_OUT: &str = "angles beyond the first were left out";
 
-#[derive(Debug, Clone, PartialEq)]
+/// A video read from a disc or rebuilt from a source.
+#[derive(Debug, Clone)]
 pub struct Built {
 	pub path: PathBuf,
+	pub info: MediaInfo,
 	pub titles: Vec<BuiltTitle>,
 	pub reencoded: Vec<u16>,
-	/// What reading the disc fell short of.
+	/// What reading the source fell short of.
 	pub warnings: Vec<String>,
 }
 
@@ -102,7 +104,7 @@ pub async fn normalise_timestamps(
 	workspace: &Workspace,
 	on_fraction: impl Fn(f64),
 	cancel: &CancellationToken,
-) -> Result<(PathBuf, Vec<String>), JobError> {
+) -> Result<Built, JobError> {
 	let bytes = fs::metadata(source)
 		.map_err(|err| JobError::io(IoSide::Source(source), &err))?
 		.len();
@@ -145,7 +147,41 @@ pub async fn normalise_timestamps(
 	copy_with(&mut cmd, overrides);
 	cmd.args(["-f", "matroska"]).arg(process::tool_path(&output));
 	run_ffmpeg(&cmd, |progress| on_fraction(written(progress, bytes)), cancel).await?;
-	Ok((output, warnings))
+	Ok(Built {
+		info: built_info(tools, &output, cancel).await?,
+		path: output,
+		titles: Vec::new(),
+		reencoded: Vec::new(),
+		warnings,
+	})
+}
+
+/// The video written to `output`, probed.
+pub(super) async fn built_info(
+	tools: &Toolchain,
+	output: &Path,
+	cancel: &CancellationToken,
+) -> Result<MediaInfo, JobError> {
+	let unusable = |log| {
+		JobError::with_log(
+			ErrorKind::SourceDamaged("the rebuilt footage can't be read as video".into()),
+			log,
+		)
+	};
+	let info = probe::probe(tools, output, cancel).await.map_err(|err| match err {
+		ProbeError::Failed(log) => unusable(log),
+		err => unreadable(err),
+	})?;
+
+	if info
+		.streams
+		.iter()
+		.any(|stream| stream.is_video() && !stream.is_attached_pic())
+	{
+		Ok(info)
+	} else {
+		Err(unusable(Vec::new()))
+	}
 }
 
 /// `-c copy`, then each `(stream specifier, codec)` of `overrides`: ffmpeg takes the last option that matches a
@@ -810,17 +846,16 @@ impl Job<'_> {
 		self.finish(&mut cmd, &output);
 
 		run_ffmpeg(&cmd, |progress| on_fraction(written(progress, self.total)), self.cancel).await?;
-		let read_s = probe::probe(self.tools, &output, self.cancel)
-			.await
-			.map_err(unreadable)?
+		let info = built_info(self.tools, &output, self.cancel).await?;
+		let warnings = info
 			.format
-			.duration;
-		let warnings = read_s
+			.duration
 			.and_then(|read_s| join_gap(read_s, start_s, titles.len().saturating_sub(1)))
 			.into_iter()
 			.collect();
 		Ok(Built {
 			path: output,
+			info,
 			titles: built,
 			reencoded: Vec::new(),
 			warnings,
@@ -907,6 +942,7 @@ impl Job<'_> {
 		}
 
 		Ok(Built {
+			info: built_info(self.tools, &output, self.cancel).await?,
 			path: output,
 			titles: built,
 			reencoded,

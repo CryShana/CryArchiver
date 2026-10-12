@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use cryarchiver_engine::budget::Lanes;
 use cryarchiver_engine::calibration::{Tables, parse, tables};
-use cryarchiver_engine::detect::{self, Detection, MediaClass};
+use cryarchiver_engine::detect::{self, Detected, Detection, MediaClass};
 use cryarchiver_engine::options::TrimWindow;
 use cryarchiver_engine::preset::{Overrides, Speed};
 use cryarchiver_engine::probe;
@@ -235,7 +235,7 @@ async fn measure_video(
 	let Detection { class, .. } = detect::detect(tools, source, cancel)
 		.await
 		.map_err(|err| err.to_string())?;
-	let MediaClass::Video(_) = class else {
+	let Detected::Media(MediaClass::Video(_)) = class else {
 		return Ok(false);
 	};
 
