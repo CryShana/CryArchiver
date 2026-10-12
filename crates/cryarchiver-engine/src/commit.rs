@@ -59,11 +59,15 @@ pub struct SourceTimes {
 }
 
 impl SourceTimes {
+	/// A file copied or downloaded is created at the copy, after its content was last modified; the modified time is
+	/// then the earliest date the file is known to have, and stands in for its creation.
 	pub fn from_metadata(meta: &Metadata) -> io::Result<Self> {
+		let modified = meta.modified()?;
+
 		Ok(Self {
 			accessed: meta.accessed()?,
-			modified: meta.modified()?,
-			created: meta.created().ok(),
+			modified,
+			created: meta.created().ok().map(|created| created.min(modified)),
 		})
 	}
 

@@ -99,6 +99,9 @@ fn commit_file_applies_the_source_times() {
 	commit_file(&artifact, &target, Replace::Never).unwrap();
 
 	assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), old);
+	if cfg!(windows) {
+		assert_eq!(fs::metadata(&target).unwrap().created().unwrap(), old);
+	}
 }
 
 #[test]
