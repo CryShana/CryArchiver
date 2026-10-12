@@ -630,11 +630,16 @@ impl StartMenu {
 
 	fn clear_missing(&mut self) {
 		let before = self.entries.len();
+		let unavailable = self.entries.iter().any(|entry| entry.state == EntryState::Unavailable);
 		match self.store.clear_missing() {
 			Ok(recents) => {
 				self.set_entries(recents);
 				let removed = before.saturating_sub(self.entries.len());
 				let text = match removed {
+					0 if unavailable => {
+						"no project in the list is missing; unavailable ones stay until their drive is back · x removes one"
+							.to_owned()
+					}
 					0 => "no project in the list is missing".to_owned(),
 					1 => "removed 1 missing project from the list".to_owned(),
 					count => format!("removed {count} missing projects from the list"),

@@ -184,7 +184,7 @@ fn opening_a_project_stops_the_checks_for_the_whole_session() {
 #[test]
 fn a_project_out_of_reach_is_unavailable_and_kept_by_clear_missing() {
 	let setup = Setup::new();
-	let offline = setup.path("unplugged/archive/Old.cryarchive");
+	let offline = unreachable().join("archive").join("Old.cryarchive");
 	let folder = setup.path("Folder.cryarchive");
 	fs::create_dir(&folder).unwrap();
 	setup.store.record(&offline, 1).unwrap();
@@ -203,6 +203,46 @@ fn a_project_out_of_reach_is_unavailable_and_kept_by_clear_missing() {
 	let names: Vec<&str> = menu.entries().iter().map(|entry| entry.name.as_str()).collect();
 	assert_eq!(names, ["Folder", "Old"]);
 	assert!(menu.notice().unwrap().text.contains("removed 1 missing project"));
+
+	press(&mut menu, KeyCode::Char('c'));
+	settled(&mut menu);
+
+	assert!(
+		menu.notice()
+			.unwrap()
+			.text
+			.contains("unavailable ones stay until their drive is back")
+	);
+}
+
+#[test]
+fn a_project_whose_folder_was_deleted_is_missing() {
+	let setup = Setup::new();
+	setup
+		.store
+		.record(&setup.path("deleted/archive/Old.cryarchive"), 1)
+		.unwrap();
+	let mut menu = setup.menu();
+	settled(&mut menu);
+
+	assert_eq!(menu.entries()[0].state, EntryState::Missing);
+
+	press(&mut menu, KeyCode::Char('c'));
+	settled(&mut menu);
+
+	assert!(menu.entries().is_empty());
+}
+
+fn unreachable() -> PathBuf {
+	if cfg!(windows) {
+		let letter = ('D'..='Z')
+			.rev()
+			.find(|letter| !Path::new(&format!("{letter}:\\")).exists())
+			.unwrap();
+		PathBuf::from(format!("{letter}:\\"))
+	} else {
+		PathBuf::from("/media/cryarchiver-unplugged")
+	}
 }
 
 #[test]

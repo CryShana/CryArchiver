@@ -88,8 +88,8 @@ impl RecentStore {
 		self.update(|entries| entries.retain(|entry| !same_path(&entry.path, project)))
 	}
 
-	/// Drops only the projects whose file is gone from a folder that is still there. A project on a drive or share
-	/// that is offline, or behind a folder that can't be reached, stays.
+	/// Drops only the projects whose file is gone from a drive or share that is still there. A project on a drive or
+	/// share that is offline stays.
 	pub fn clear_missing(&self) -> io::Result<Vec<Recent>> {
 		self.update(|entries| entries.retain(|entry| presence(&entry.path) != Presence::Missing))
 	}
@@ -369,25 +369,37 @@ mod tests {
 		assert_eq!(paths(&store.load().entries), [kept_file]);
 	}
 
+	fn unreachable() -> PathBuf {
+		if cfg!(windows) {
+			let letter = ('D'..='Z')
+				.rev()
+				.find(|letter| !Path::new(&format!("{letter}:\\")).exists())
+				.unwrap();
+			PathBuf::from(format!("{letter}:\\"))
+		} else {
+			PathBuf::from("/media/cryarchiver-unplugged")
+		}
+	}
+
 	#[test]
 	fn clear_missing_keeps_projects_that_are_only_out_of_reach() {
 		let dir = tempfile::tempdir().unwrap();
 		let store = store(dir.path());
-		let offline = dir.path().join("unplugged").join("a.cryarchive");
+		let offline = unreachable().join("a.cryarchive");
 		let folder = dir.path().join("folder.cryarchive");
 		fs::create_dir(&folder).unwrap();
 		store.record(&offline, 1).unwrap();
 		store.record(&folder, 2).unwrap();
 		store.record(&dir.path().join("gone.cryarchive"), 3).unwrap();
+		store
+			.record(&dir.path().join("deleted").join("a.cryarchive"), 4)
+			.unwrap();
 
 		let left = store.clear_missing().unwrap();
 
 		assert_eq!(
 			paths(&left),
-			[
-				kept(dir.path(), "folder.cryarchive"),
-				kept(dir.path(), "unplugged").join("a.cryarchive")
-			]
+			[kept(dir.path(), "folder.cryarchive"), plain_path(offline)]
 		);
 	}
 

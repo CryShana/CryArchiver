@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1497,9 +1497,9 @@ pub enum Presence {
 	File,
 	/// Something other than a file, such as a folder, is at the path.
 	NotAFile,
-	/// The file is gone from a folder that is still there.
+	/// The file, or a folder above it, is gone from a drive or share that is still there.
 	Missing,
-	/// The folder, drive or share that holds the file can't be reached now.
+	/// The drive or share that holds the file can't be reached now.
 	Unavailable,
 }
 
@@ -1507,9 +1507,27 @@ pub fn presence(path: &Path) -> Presence {
 	match std::fs::metadata(path) {
 		Ok(meta) if meta.is_file() => Presence::File,
 		Ok(_) => Presence::NotAFile,
-		Err(err) if err.kind() == io::ErrorKind::NotFound && parent_folder(path).is_dir() => Presence::Missing,
+		Err(err) if err.kind() == io::ErrorKind::NotFound && (parent_folder(path).is_dir() || root_reachable(path)) => {
+			Presence::Missing
+		}
 		Err(_) => Presence::Unavailable,
 	}
+}
+
+/// Removable drives on Linux and macOS are mounted in folders that stay when the drive is unplugged, so a path below
+/// one never counts as gone.
+const MOUNT_FOLDERS: [&str; 4] = ["/media", "/mnt", "/run/media", "/Volumes"];
+
+fn root_reachable(path: &Path) -> bool {
+	if MOUNT_FOLDERS.iter().any(|folder| path.starts_with(folder)) {
+		return false;
+	}
+
+	let root: PathBuf = path
+		.components()
+		.take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+		.collect();
+	root.as_os_str().is_empty() || root.is_dir()
 }
 
 fn parent_folder(path: &Path) -> &Path {
@@ -1982,13 +2000,29 @@ pub(crate) mod tests {
 		));
 	}
 
+	fn unreachable() -> PathBuf {
+		if cfg!(windows) {
+			let letter = ('D'..='Z')
+				.rev()
+				.find(|letter| !Path::new(&format!("{letter}:\\")).exists())
+				.unwrap();
+			PathBuf::from(format!("{letter}:\\"))
+		} else {
+			PathBuf::from("/media/cryarchiver-unplugged")
+		}
+	}
+
 	#[test]
-	fn a_file_is_missing_only_while_its_folder_is_there() {
+	fn a_file_is_missing_only_while_its_drive_is_there() {
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::create_dir(dir.path().join("folder.cryarchive")).unwrap();
-		let offline = dir.path().join("gone").join("a.cryarchive");
+		let offline = unreachable().join("a.cryarchive");
 
 		assert_eq!(presence(&dir.path().join("a.cryarchive")), Presence::Missing);
+		assert_eq!(
+			presence(&dir.path().join("gone").join("a.cryarchive")),
+			Presence::Missing
+		);
 		assert_eq!(presence(&offline), Presence::Unavailable);
 		assert_eq!(presence(&dir.path().join("folder.cryarchive")), Presence::NotAFile);
 		assert!(matches!(peek(&offline), Err(StoreError::Unavailable)));
