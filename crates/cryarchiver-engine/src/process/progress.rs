@@ -4,6 +4,8 @@ use std::time::Duration;
 pub struct Progress {
 	pub out_time: Option<Duration>,
 	pub frame: Option<u64>,
+	/// The bytes written so far.
+	pub total_size: Option<u64>,
 	pub done: bool,
 }
 
@@ -20,6 +22,7 @@ impl ProgressParser {
 		match key.trim() {
 			"out_time_us" => self.current.out_time = value.parse().ok().map(Duration::from_micros),
 			"frame" => self.current.frame = value.parse().ok(),
+			"total_size" => self.current.total_size = value.parse().ok(),
 			"progress" => {
 				self.current.done = value == "end";
 				return Some(std::mem::take(&mut self.current));
@@ -55,6 +58,7 @@ mod tests {
 		let block = [
 			"frame=120",
 			"fps=59.9",
+			"total_size=65536",
 			"out_time_us=2000000",
 			"speed=1.5x",
 			"progress=continue",
@@ -67,6 +71,7 @@ mod tests {
 			vec![Progress {
 				out_time: Some(Duration::from_secs(2)),
 				frame: Some(120),
+				total_size: Some(65_536),
 				done: false
 			}]
 		);
@@ -89,7 +94,7 @@ mod tests {
 		let first = Progress {
 			out_time: Some(Duration::from_secs(1)),
 			frame: Some(10),
-			done: false,
+			..Progress::default()
 		};
 
 		assert!(high_water.advance(&first));
@@ -98,21 +103,21 @@ mod tests {
 		let regressed = Progress {
 			out_time: None,
 			frame: None,
-			done: false,
+			..Progress::default()
 		};
 		assert!(!high_water.advance(&regressed));
 
 		let later_time = Progress {
 			out_time: Some(Duration::from_secs(2)),
 			frame: Some(10),
-			done: false,
+			..Progress::default()
 		};
 		assert!(high_water.advance(&later_time));
 
 		let later_frame = Progress {
 			out_time: Some(Duration::from_secs(2)),
 			frame: Some(20),
-			done: false,
+			..Progress::default()
 		};
 		assert!(high_water.advance(&later_frame));
 	}
