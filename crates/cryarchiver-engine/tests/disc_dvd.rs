@@ -130,13 +130,13 @@ fn expected_titles() -> Vec<DvdTitle> {
 		AudioAttr {
 			coding: AudioCoding::Ac3,
 			channels: 6,
-			language: Some("en".to_owned()),
+			language: Some("eng".to_owned()),
 			id: Some(0x80),
 		},
 		AudioAttr {
 			coding: AudioCoding::Lpcm { bits: 16 },
 			channels: 2,
-			language: Some("sl".to_owned()),
+			language: Some("slv".to_owned()),
 			id: Some(0xA1),
 		},
 	];
@@ -147,7 +147,7 @@ fn expected_titles() -> Vec<DvdTitle> {
 		..Cell::default()
 	};
 	let subpictures = vec![Subpicture {
-		language: Some("sl".to_owned()),
+		language: Some("slv".to_owned()),
 		id: Some(0x20),
 	}];
 

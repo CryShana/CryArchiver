@@ -14,13 +14,13 @@ use rav1e::prelude::{
 use tokio_util::sync::CancellationToken;
 
 use crate::container::av1;
-use crate::images::blocking;
 use crate::images::decode::{self, PamRequest, pam_command, run_pam};
 use crate::images::plan::CMYK_COMPONENTS;
 use crate::images::ssim;
 use crate::metadata::gain_map::GainMapSource;
 use crate::metadata::jpeg;
 use crate::outcome::{IoSide, JobError};
+use crate::process::blocking;
 use crate::toolchain::Toolchain;
 use crate::workspace::Workspace;
 

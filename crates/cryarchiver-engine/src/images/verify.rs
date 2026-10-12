@@ -7,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::container::avif::{self, AvifExpectations, AvifMetadata};
 use crate::container::jxl;
-use crate::images::blocking;
 use crate::images::decode::{PamRequest, pam_command, run_pam};
 use crate::images::jxl::libjxl_cicp;
 use crate::images::ssim;
@@ -15,6 +14,7 @@ use crate::metadata::OutputMetadata;
 use crate::metadata::gain_map::GainMapMetadata;
 use crate::metadata::icc::Cicp;
 use crate::outcome::JobError;
+use crate::process::blocking;
 use crate::toolchain::Toolchain;
 
 #[derive(Debug, Clone, Copy)]

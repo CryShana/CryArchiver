@@ -17,7 +17,7 @@ use crate::images::jxl::{self, JxlJob, JxlPixels};
 use crate::images::plan::{self, Candidate, Gate, ImageRoute, PrecheckInput, StillFacts, StillPlan};
 use crate::images::props::{self, Effective};
 use crate::images::verify::{self, Expected};
-use crate::images::{blocking, gain_map, structure};
+use crate::images::{gain_map, structure};
 use crate::metadata::gain_map::{GainMapMetadata, GainMapSource};
 use crate::metadata::icc::{self, Cicp};
 use crate::metadata::{self, ImageFormat, MetadataMode, OutputMetadata, SourceMetadata, exif, sniff};
@@ -25,6 +25,7 @@ use crate::options::{Resize, WrittenBy, kept_as_requested, kept_as_requested_par
 use crate::outcome::{ErrorKind, IoSide, JobError, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::MediaInfo;
+use crate::process::blocking;
 use crate::quality::keys::{CacheKey, Group, ImageGroup};
 use crate::quality::memory::{Observation, QualityMemory};
 use crate::toolchain::Toolchain;

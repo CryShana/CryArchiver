@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -8,7 +7,7 @@ use super::read::{self, Built, BuiltTitle, Window};
 use super::udf::DiscFiles;
 use super::{be16, be32, byte, get};
 use crate::language;
-use crate::outcome::{ErrorKind, IoSide, JobError};
+use crate::outcome::{ErrorKind, JobError};
 use crate::probe::{self, MediaInfo, ProbeError, Stream};
 use crate::process::{self, ToolCommand};
 use crate::toolchain::Toolchain;
@@ -26,15 +25,9 @@ const MAX_MPLS_BYTES: u64 = 16 << 20;
 /// libbluray reads every playlist and clip of the disc before it picks one.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 const SELECTED: &str = "selected ";
-const EDGE_S: f64 = 0.05;
-
-/// The entry marks of a playlist (`.mpls`), in seconds from the start of the playlist.
-pub fn playlist_marks(mpls: &[u8]) -> Result<Vec<f64>, String> {
-	Mpls::parse(mpls).map(|mpls| mpls.marks_s())
-}
 
 /// The playlist libbluray picked, from ffmpeg's `selected 00800.mpls` log line.
-pub fn selected_playlist(log: &[String]) -> Option<u32> {
+fn selected_playlist(log: &[String]) -> Option<u32> {
 	log.iter().rev().find_map(|line| {
 		let (_, picked) = line.split_once(SELECTED)?;
 		let number = picked.trim().strip_suffix(".mpls")?;
@@ -161,7 +154,7 @@ fn stream_languages(mpls: &[u8], item: usize) -> Result<Vec<(u16, String)>, Stri
 		{
 			let code = get::<3>(mpls, code)?;
 			if code.iter().all(u8::is_ascii_alphabetic) {
-				languages.push((pid, String::from_utf8_lossy(&code).to_ascii_lowercase()));
+				languages.push((pid, language::normalized(&String::from_utf8_lossy(&code))));
 			}
 		}
 		at = attributes + 1 + usize::from(byte(mpls, attributes)?);
@@ -183,20 +176,17 @@ fn chapter_list(marks_s: &[f64], length_s: f64) -> Vec<Chapter> {
 	let mut starts: Vec<f64> = marks_s
 		.iter()
 		.copied()
-		.filter(|start| *start < length_s - EDGE_S)
+		.filter(|start| *start < length_s - chapters::EDGE_S)
 		.collect();
 	starts.sort_by(f64::total_cmp);
-	starts.dedup_by(|later, earlier| *later - *earlier < EDGE_S);
+	starts.dedup_by(|later, earlier| *later - *earlier < chapters::EDGE_S);
 
-	starts
-		.iter()
+	let named = starts
+		.into_iter()
 		.enumerate()
-		.map(|(index, start_s)| Chapter {
-			start_s: *start_s,
-			end_s: starts.get(index + 1).copied().unwrap_or(length_s),
-			title: Some(format!("Chapter {}", index + 1)),
-		})
-		.collect()
+		.map(|(index, start_s)| (start_s, format!("Chapter {}", index + 1)))
+		.collect();
+	chapters::from_starts(named, length_s)
 }
 
 /// The main feature libbluray picks on a disc: the longest of its relevant playlists.
@@ -220,18 +210,18 @@ impl MainFeature {
 			.filter(move |stream| stream.codec_type == codec_type)
 	}
 
-	fn language(&self, stream: &Stream) -> Option<String> {
+	fn language(&self, stream: &Stream) -> Option<&str> {
 		let pid = u16::try_from(stream.stream_id()?).ok()?;
 		self.languages
 			.iter()
 			.find(|(own, _)| *own == pid)
-			.map(|(_, code)| language::normalized(code))
+			.map(|(_, code)| code.as_str())
 	}
 }
 
 /// Whether ffmpeg's log says libbluray couldn't open a disc for its AACS or BD+ encryption. ffmpeg echoes the disc's
 /// path in its errors, so each of `paths` is cut out of a line before it is matched.
-pub fn encrypted(log: &[String], paths: &[&str]) -> bool {
+fn encrypted(log: &[String], paths: &[&str]) -> bool {
 	let mut paths: Vec<String> = paths
 		.iter()
 		.filter(|path| !path.is_empty())
@@ -334,11 +324,7 @@ fn disc_url(source: &Path, files: &DiscFiles) -> Result<String, JobError> {
 		source
 	};
 
-	let root = process::tool_path(root);
-	let root = root
-		.to_str()
-		.ok_or_else(|| ErrorKind::SourceUnreadable(format!("{} is not a Unicode path", root.display())))?;
-	Ok(format!("bluray:{root}"))
+	Ok(format!("bluray:{}", process::unicode_tool_path(root)?))
 }
 
 fn read_mpls(files: &DiscFiles, number: u32) -> Result<Mpls, String> {
@@ -393,8 +379,7 @@ pub async fn build_bluray(
 		None
 	} else {
 		let path = workspace.file(read::CHAPTERS);
-		fs::write(&path, chapters::ffmetadata(&main.chapters))
-			.map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
+		chapters::write(&path, &main.chapters)?;
 		Some(path)
 	};
 
@@ -416,18 +401,16 @@ pub async fn build_bluray(
 			.enumerate()
 			.filter_map(|(index, stream)| Some((format!("a:{index}"), stream.pcm()?))),
 	);
-	for (index, stream) in main.streams_of("audio").enumerate() {
-		if let Some(code) = main.language(stream) {
-			cmd.arg(format!("-metadata:s:a:{index}"))
-				.arg(format!("language={code}"));
-		}
-	}
-	for (index, stream) in main.streams_of("subtitle").enumerate() {
-		if let Some(code) = main.language(stream) {
-			cmd.arg(format!("-metadata:s:s:{index}"))
-				.arg(format!("language={code}"));
-		}
-	}
+	read::language_tags(
+		&mut cmd,
+		'a',
+		main.streams_of("audio").map(|stream| main.language(stream)),
+	);
+	read::language_tags(
+		&mut cmd,
+		's',
+		main.streams_of("subtitle").map(|stream| main.language(stream)),
+	);
 
 	if chapters.is_some() {
 		cmd.args(["-map_chapters", "1"]);
@@ -525,7 +508,7 @@ mod tests {
 			&[(1, 0, 0), (1, 0, 60 * SECOND), (1, 0, 125 * SECOND + SECOND / 2)],
 		);
 
-		assert_eq!(playlist_marks(&bytes), Ok(vec![0.0, 60.0, 125.5]));
+		assert_eq!(Mpls::parse(&bytes).unwrap().marks_s(), [0.0, 60.0, 125.5]);
 	}
 
 	#[test]
@@ -550,9 +533,9 @@ mod tests {
 		let bytes = mpls(&[(0, 200 * SECOND)], &[(1, 0, 0), (1, 0, 60 * SECOND)]);
 
 		for length in [3, 20, bytes.len() / 2, bytes.len() - 5] {
-			assert!(playlist_marks(&bytes[..length]).is_err(), "{length}");
+			assert!(Mpls::parse(&bytes[..length]).is_err(), "{length}");
 		}
-		assert!(playlist_marks(b"INDX0200").is_err());
+		assert!(Mpls::parse(b"INDX0200").is_err());
 	}
 
 	#[test]

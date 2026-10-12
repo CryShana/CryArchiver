@@ -4,10 +4,11 @@ use std::path::PathBuf;
 
 use super::udf::{DiscFile, DiscFiles, Extent};
 use super::{Range, Reader, SECTOR, SECTOR_LEN, be16, be32, byte, get, ps};
+use crate::language;
 
 pub const MAX_DVD_MBITS: f64 = 10.08;
-pub const MIN_TITLE_S: f64 = 10.0;
-pub const DUPLICATE_COVERAGE: f64 = 0.9;
+const MIN_TITLE_S: f64 = 10.0;
+const DUPLICATE_COVERAGE: f64 = 0.9;
 
 /// A VOBU lasts at most a second, so this is the most one can hold at the mux maximum.
 const VOBU_BYTES: f64 = MAX_DVD_MBITS * 1e6 / 8.0;
@@ -214,12 +215,16 @@ impl Dvd {
 		Ok(false)
 	}
 
+	/// Whether `cell` lies inside its title set's VOBs.
+	fn holds(&self, vts: u8, cell: &Cell) -> bool {
+		cell.first_sector <= cell.last_sector && u64::from(cell.last_sector) < self.vob_sectors(vts)
+	}
+
 	fn readable(&self, title: &DvdTitle) -> Vec<Cell> {
-		let sectors = self.vob_sectors(title.vts);
 		title
 			.cells
 			.iter()
-			.filter(|cell| cell.first_sector <= cell.last_sector && u64::from(cell.last_sector) < sectors)
+			.filter(|cell| self.holds(title.vts, cell))
 			.cloned()
 			.collect()
 	}
@@ -282,13 +287,13 @@ pub enum Dropped {
 }
 
 impl Dropped {
-	pub fn reason(self) -> &'static str {
+	pub fn reason(self) -> String {
 		match self {
-			Self::Menu => "menu",
-			Self::Still => "still picture",
-			Self::Short => "under 10 s",
-			Self::Duplicate => "duplicate",
-			Self::Unreadable => "unreadable",
+			Self::Menu => "menu".to_owned(),
+			Self::Still => "still picture".to_owned(),
+			Self::Short => format!("under {MIN_TITLE_S} s"),
+			Self::Duplicate => "duplicate".to_owned(),
+			Self::Unreadable => "unreadable".to_owned(),
 		}
 	}
 }
@@ -400,35 +405,28 @@ pub fn parse(files: &DiscFiles) -> Result<Dvd, String> {
 		sets.insert(vts, set);
 	}
 
+	let mut reader = Reader::default();
+	let mut titles = Vec::with_capacity(entries.len());
 	for (index, &(vts, vts_title)) in entries.iter().enumerate() {
 		let number = u16::try_from(index + 1).map_err(|_| "the disc lists too many titles".to_owned())?;
-		let sectors = dvd.vob_sectors(vts);
-		let title = sets
+		let mut title = sets
 			.get(&vts)
 			.and_then(Option::as_ref)
-			.and_then(|set| set.title(number, vts, vts_title, sectors))
+			.and_then(|set| set.title(number, vts, vts_title, |cell| dvd.holds(vts, cell)))
 			.unwrap_or(DvdTitle {
 				number,
 				vts,
 				..DvdTitle::default()
 			});
-		dvd.titles.push(title);
+
+		for cell in title.cells.iter_mut().filter(|cell| cell.interleaved) {
+			cell.units = dvd
+				.units(&mut reader, vts, cell)
+				.map_err(|err| format!("an interleaved cell of title {number} can't be read: {err}"))?;
+		}
+		titles.push(title);
 	}
 
-	let mut titles = std::mem::take(&mut dvd.titles);
-	let mut reader = Reader::default();
-	for title in &mut titles {
-		let sectors = dvd.vob_sectors(title.vts);
-		for cell in title
-			.cells
-			.iter_mut()
-			.filter(|cell| cell.interleaved && u64::from(cell.last_sector) < sectors)
-		{
-			cell.units = dvd
-				.units(&mut reader, title.vts, cell)
-				.map_err(|err| format!("an interleaved cell of title {} can't be read: {err}", title.number))?;
-		}
-	}
 	dvd.titles = titles;
 	Ok(dvd)
 }
@@ -629,7 +627,8 @@ fn audio_attr(attr: [u8; 8]) -> AudioAttr {
 }
 
 fn language(kind: u8, code: [u8; 2]) -> Option<String> {
-	(kind == 1 && code.iter().all(u8::is_ascii_alphabetic)).then(|| String::from_utf8_lossy(&code).to_ascii_lowercase())
+	(kind == 1 && code.iter().all(u8::is_ascii_alphabetic))
+		.then(|| language::normalized(&String::from_utf8_lossy(&code)))
 }
 
 /// Each VTS title's parts of title as `(PGC number, program number)`.
@@ -744,8 +743,8 @@ fn playback_time(time: [u8; 4]) -> f64 {
 
 impl TitleSet {
 	/// VMG title `number`: the cells of the PGCs its parts of title name, in order, with a chapter at each part's
-	/// program. Cells past `sectors` are left out.
-	fn title(&self, number: u16, vts: u8, vts_title: u8, sectors: u64) -> Option<DvdTitle> {
+	/// program. Cells the title set doesn't `hold` are left out.
+	fn title(&self, number: u16, vts: u8, vts_title: u8, holds: impl Fn(&Cell) -> bool) -> Option<DvdTitle> {
 		let parts = self.ptts.get(usize::from(vts_title).checked_sub(1)?)?;
 		let mut pgc_numbers: Vec<u16> = Vec::new();
 		for &(pgcn, _) in parts {
@@ -768,7 +767,7 @@ impl TitleSet {
 				cell_starts.push(elapsed);
 				angles |= entry.block_type == ANGLE_BLOCK;
 				let cell = &entry.cell;
-				if entry.plays() && cell.first_sector <= cell.last_sector && u64::from(cell.last_sector) < sectors {
+				if entry.plays() && holds(cell) {
 					elapsed += cell.time_s;
 					cells.push(cell.clone());
 				}

@@ -10,12 +10,11 @@ use jxl_oxide::JxlImage;
 use tokio_util::sync::CancellationToken;
 
 use crate::container::isobmff;
-use crate::images::blocking;
 use crate::images::plan::BOMB_PIXELS;
 use crate::metadata::icc::Cicp;
 use crate::metadata::{ImageFormat, SourceMetadata, exif, sniff};
 use crate::outcome::{ErrorKind, JobError, KeepReason};
-use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
+use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand, blocking};
 use crate::toolchain::Toolchain;
 
 pub const IMAGE_DECODE_ERRORS: &[&str] = &[

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use crate::commit::{OutputSink, retry_transient};
+use crate::outcome::{IoSide, JobError};
 use crate::text::display_path;
 
 pub const CLI_WORK_DIR: &str = ".cry-work";
@@ -132,6 +133,11 @@ impl Workspace {
 }
 
 /// Nothing is removed through a link: the removal would land wherever it leads.
+/// A file the job writes for its tools, such as a list or a chapter file.
+pub fn write_work_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), JobError> {
+	fs::write(path, contents).map_err(|err| JobError::io(IoSide::Destination(path), &err))
+}
+
 impl Drop for Workspace {
 	fn drop(&mut self) {
 		drop(self.lock.take());

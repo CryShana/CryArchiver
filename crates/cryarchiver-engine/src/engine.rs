@@ -38,6 +38,7 @@ use crate::options::{
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
+use crate::process::blocking;
 use crate::quality::keys::{CacheKey, Group, VideoGroup};
 use crate::quality::memory::{GroupStats, Observation, Offset, QualityMemory, SharedMemory};
 use crate::quality::search::{self, Bounds, MAX_PROBES, Probe, Target};
@@ -955,14 +956,6 @@ impl Engine {
 		}
 	}
 
-	pub fn check_bluray(&self) -> Result<(), JobError> {
-		if self.tools.has_bluray() {
-			Ok(())
-		} else {
-			Err(ErrorKind::EncodeFailed("ffmpeg can't read Blu-ray discs (no bluray protocol)".into()).into())
-		}
-	}
-
 	/// A disc read into one video, or why it is kept as it is. A DVD's real titles are joined in a workspace opened with
 	/// room for them, under a video slot taken first.
 	async fn resolve_disc<'a>(
@@ -980,9 +973,7 @@ impl Engine {
 		};
 		self.require(MediaKind::Video)?;
 
-		let parsed = tokio::task::spawn_blocking(move || dvd::parse(&files))
-			.await
-			.map_err(|err| ErrorKind::Toolchain(format!("the disc read stopped: {err}")))?;
+		let parsed = blocking(cx.cancel, move || dvd::parse(&files)).await?;
 		let dvd = match parsed {
 			Ok(dvd) => Arc::new(dvd),
 			Err(reason) => {
@@ -1003,9 +994,8 @@ impl Engine {
 
 		let sampled = Arc::clone(&dvd);
 		let sample = selection.clone();
-		let encrypted = tokio::task::spawn_blocking(move || sampled.encrypted(&sample))
-			.await
-			.map_err(|err| ErrorKind::Toolchain(format!("the disc read stopped: {err}")))?
+		let encrypted = blocking(cx.cancel, move || sampled.encrypted(&sample))
+			.await?
 			.map_err(|err| JobError::io(IoSide::Source(&cx.job.source), &err))?;
 		if encrypted {
 			return Ok(Resolved::Kept(KeepReason::Unsupported(DVD_ENCRYPTED.to_owned())));
@@ -1057,7 +1047,9 @@ impl Engine {
 		}
 
 		self.require(MediaKind::Video)?;
-		self.check_bluray()?;
+		if !self.tools.has_bluray() {
+			return Err(ErrorKind::EncodeFailed("ffmpeg can't read Blu-ray discs (no bluray protocol)".into()).into());
+		}
 
 		let Some(main) = bluray::main_feature(&self.tools, &cx.job.source, files, cx.cancel).await? else {
 			return Ok(Resolved::Kept(KeepReason::Unsupported(BLU_RAY_ENCRYPTED.to_owned())));
@@ -2778,7 +2770,7 @@ fn dvd_decision(selection: &Selection) -> DiscDecision {
 		dropped: selection
 			.dropped
 			.iter()
-			.map(|(title, dropped)| (title_name(*title), dropped.reason().to_owned()))
+			.map(|(title, dropped)| (title_name(*title), dropped.reason()))
 			.collect(),
 		false_time: selection
 			.kept
@@ -3000,7 +2992,7 @@ fn with_clipped_chapters(plan: &FilePlan, info: &MediaInfo, workspace: &Workspac
 	if let Some(window) = plan.options.window.filter(|_| !plan.options.strip) {
 		let path = workspace.file(CHAPTER_FILE);
 		let clipped = chapters::clip(&info.chapters, window.on_source(info.format.start_time));
-		write_chapter_file(&path, &clipped)?;
+		chapters::write(&path, &clipped)?;
 		plan.options.chapters = Some(path);
 	}
 	Ok(plan)
@@ -3023,12 +3015,8 @@ fn video_chapters(
 		return Ok((ChapterSource::Dropped, 0));
 	}
 
-	write_chapter_file(path, &clipped)?;
+	chapters::write(path, &clipped)?;
 	Ok((ChapterSource::File, clipped.len()))
-}
-
-fn write_chapter_file(path: &Path, clipped: &[chapters::Chapter]) -> Result<(), JobError> {
-	fs::write(path, chapters::ffmetadata(clipped)).map_err(|err| JobError::io(IoSide::Destination(path), &err))
 }
 
 /// The packet count only gives the frames an untrimmed encode must have (`plan_window`); a trim reads its window alone.

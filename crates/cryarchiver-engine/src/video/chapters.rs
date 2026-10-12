@@ -1,8 +1,14 @@
 use std::fmt::Write;
+use std::path::Path;
 
 use serde_json::Value;
 
 use crate::options::TrimWindow;
+use crate::outcome::JobError;
+use crate::workspace::write_work_file;
+
+/// How near a chapter may start to its title's edges, or to another chapter, and still be one.
+pub const EDGE_S: f64 = 0.05;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chapter {
@@ -23,6 +29,29 @@ pub fn clip(chapters: &[Value], window: TrimWindow) -> Vec<Chapter> {
 			})
 		})
 		.collect()
+}
+
+/// A chapter from each of `starts`, named, to the next, the last to `end_s`.
+pub fn from_starts(starts: Vec<(f64, String)>, end_s: f64) -> Vec<Chapter> {
+	let stops: Vec<f64> = starts
+		.iter()
+		.skip(1)
+		.map(|(start_s, _)| *start_s)
+		.chain([end_s])
+		.collect();
+	starts
+		.into_iter()
+		.zip(stops)
+		.map(|((start_s, title), end_s)| Chapter {
+			start_s,
+			end_s,
+			title: Some(title),
+		})
+		.collect()
+}
+
+pub fn write(path: &Path, chapters: &[Chapter]) -> Result<(), JobError> {
+	write_work_file(path, ffmetadata(chapters))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

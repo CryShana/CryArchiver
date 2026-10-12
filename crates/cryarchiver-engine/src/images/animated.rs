@@ -10,14 +10,13 @@ use image::{AnimationDecoder, DynamicImage, Frames};
 use tokio_util::sync::CancellationToken;
 
 use crate::container::isobmff;
-use crate::images::blocking;
 use crate::images::decode::IMAGE_DECODE_ERRORS;
 use crate::images::ssim;
 use crate::metadata::{ImageFormat, gif, sniff};
 use crate::outcome::{ErrorKind, JobError};
 use crate::preset::Speed;
 use crate::probe::{self, MediaInfo};
-use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand};
+use crate::process::{self, STALL_TIMEOUT, StdoutMode, ToolCommand, blocking};
 use crate::toolchain::Toolchain;
 use crate::video::run_ffmpeg;
 

@@ -19,6 +19,8 @@ use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 #[cfg(target_os = "linux")]
 use limits::Priority;
 use lines::{LineSplitter, RingBuffer};
+
+use crate::outcome::{ErrorKind, JobError};
 pub use progress::Progress;
 use progress::{HighWater, ProgressParser};
 
@@ -325,6 +327,25 @@ pub fn scaled_timeout(bytes: u64) -> Duration {
 
 pub fn tool_path(path: &Path) -> PathBuf {
 	std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `tool_path` as text, for a tool that takes the path inside a URL.
+pub fn unicode_tool_path(path: &Path) -> Result<String, JobError> {
+	tool_path(path).into_os_string().into_string().map_err(|path| {
+		ErrorKind::SourceUnreadable(format!("{} is not a Unicode path", Path::new(&path).display())).into()
+	})
+}
+
+/// `work` run on a blocking thread; when `cancel` fires first, the job stops waiting for it.
+pub async fn blocking<T: Send + 'static>(
+	cancel: &CancellationToken,
+	work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, JobError> {
+	let handle = tokio::task::spawn_blocking(work);
+	tokio::select! {
+		joined = handle => joined.map_err(|err| ErrorKind::EncodeFailed(format!("a worker thread failed: {err}")).into()),
+		() = cancel.cancelled() => Err(ErrorKind::Cancelled.into()),
+	}
 }
 
 fn spawn(cmd: &ToolCommand, mode: StdoutMode) -> io::Result<Box<dyn ChildWrapper>> {

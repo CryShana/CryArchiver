@@ -8,7 +8,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::dvd::{Dvd, DvdTitle, Kept, MAX_DVD_MBITS, Selection};
 use super::{Range, Reader, joined, ps};
-use crate::language;
 use crate::outcome::{ErrorKind, IoSide, JobError};
 use crate::probe::{self, MediaInfo, PROBE_TIMEOUT, ProbeError, Stream};
 use crate::process::{self, Progress, ToolCommand};
@@ -16,7 +15,7 @@ use crate::toolchain::Toolchain;
 use crate::video::chapters::{self, Chapter};
 use crate::video::run_ffmpeg;
 use crate::video::streams::{Written, matroska_subtitle};
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, write_work_file};
 
 /// ffmpeg holds what it probes in memory: a stream that starts later in its title than this isn't looked for.
 const MAX_PROBE_BYTES: u64 = 1 << 30;
@@ -67,12 +66,13 @@ pub async fn build_dvd(
 	}
 
 	let main = longest(&titles).ok_or_else(|| ErrorKind::SourceDamaged("the disc has no title to read".into()))?;
-	let total: u64 = titles.iter().map(|title| title.bytes).sum();
+	let total = titles.iter().map(|title| title.bytes).sum();
 	let job = Job {
 		tools,
 		workspace,
 		main: &titles[main],
 		name,
+		total,
 		timeout: process::scaled_timeout(total),
 		cancel,
 	};
@@ -303,7 +303,7 @@ async fn first_packets(
 ) -> Result<Vec<(u32, u64)>, JobError> {
 	let ranges = ranges.to_vec();
 	let stop = cancel.clone();
-	let scan = tokio::task::spawn_blocking(move || {
+	let found = process::blocking(cancel, move || {
 		let mut left = ids;
 		let mut found = Vec::new();
 		let read = Reader::default().each_sector(&ranges, usize::MAX, |position, sector| {
@@ -316,12 +316,9 @@ async fn first_packets(
 		});
 		read.map(|()| found)
 			.map_err(|err| (ranges.first().map(|(path, _, _)| path.clone()), err))
-	});
-
-	let found = scan
-		.await
-		.map_err(|err| ErrorKind::Toolchain(format!("the disc scan stopped: {err}")))?
-		.map_err(|(path, err)| JobError::io(IoSide::Source(path.as_deref().unwrap_or(Path::new(""))), &err))?;
+	})
+	.await?
+	.map_err(|(path, err)| JobError::io(IoSide::Source(path.as_deref().unwrap_or(Path::new(""))), &err))?;
 	if cancel.is_cancelled() {
 		return Err(ErrorKind::Cancelled.into());
 	}
@@ -389,10 +386,7 @@ impl Input {
 		let parts = ranges
 			.iter()
 			.map(|(path, offset, length)| {
-				let path = process::tool_path(path);
-				let path = path
-					.to_str()
-					.ok_or_else(|| ErrorKind::SourceUnreadable(format!("{} is not a Unicode path", path.display())))?;
+				let path = process::unicode_tool_path(path)?;
 				Ok(format!("subfile,,start,{offset},end,{},,:{path}", offset + length))
 			})
 			.collect::<Result<Vec<_>, JobError>>()?;
@@ -407,7 +401,7 @@ impl Input {
 		}
 
 		let lines: String = parts.iter().map(|part| escaped(part) + "\n").collect();
-		fs::write(list, lines).map_err(|err| JobError::io(IoSide::Destination(list), &err))?;
+		write_work_file(list, lines)?;
 		Ok(Self {
 			url: format!("concatf:{}", process::tool_path(list).display()),
 			whitelist: "file,subfile,concatf",
@@ -754,31 +748,21 @@ fn rgb(y: u8, cr: u8, cb: u8) -> [u8; 3] {
 /// A chapter per title, named after its disc number, with the disc's own chapters after its first inside it. A title
 /// whose IFO time is false gets only its title chapter.
 fn chapter_list(titles: &[(&DvdTitle, bool, BuiltTitle)]) -> Vec<Chapter> {
-	const EDGE_S: f64 = 0.05;
-
-	let mut chapters = Vec::new();
+	let mut list = Vec::new();
 	for (dvd, false_time, built) in titles {
-		let end_s = built.start_s + built.length_s;
 		let mut starts = vec![(built.start_s, format!("Title {}", dvd.number))];
 		if !false_time {
 			starts.extend(
 				dvd.chapter_starts_s
 					.iter()
 					.enumerate()
-					.filter(|(_, start)| **start > EDGE_S && **start < built.length_s - EDGE_S)
+					.filter(|(_, start)| **start > chapters::EDGE_S && **start < built.length_s - chapters::EDGE_S)
 					.map(|(index, start)| (built.start_s + start, format!("Chapter {}", index + 1))),
 			);
 		}
-
-		for (index, (start_s, title)) in starts.iter().enumerate() {
-			chapters.push(Chapter {
-				start_s: *start_s,
-				end_s: starts.get(index + 1).map_or(end_s, |(next, _)| *next),
-				title: Some(title.clone()),
-			});
-		}
+		list.extend(chapters::from_starts(starts, built.start_s + built.length_s));
 	}
-	chapters
+	list
 }
 
 /// How each of the main layout's audio tracks is fed from a title.
@@ -793,6 +777,8 @@ struct Job<'a> {
 	workspace: &'a Workspace,
 	main: &'a Title<'a>,
 	name: &'a str,
+	/// The bytes of the titles' footage.
+	total: u64,
 	timeout: Duration,
 	cancel: &'a CancellationToken,
 }
@@ -811,7 +797,6 @@ impl Job<'_> {
 		}
 
 		let ranges = joined(titles.iter().flat_map(|title| title.ranges.iter().cloned()));
-		let total: u64 = titles.iter().map(|title| title.bytes).sum();
 		let mut input = Input::of(&ranges, &self.workspace.file("disc.txt"))?;
 		input.window = titles.first().map_or(Window::HEAD, |first| first.input.window);
 		let chapters = self.chapters(titles, &built)?;
@@ -827,7 +812,7 @@ impl Job<'_> {
 		self.map(&mut cmd, self.main, &[]);
 		self.finish(&mut cmd, &output);
 
-		run_ffmpeg(&cmd, |progress| on_fraction(written(progress, total)), self.cancel).await?;
+		run_ffmpeg(&cmd, |progress| on_fraction(written(progress, self.total)), self.cancel).await?;
 		let read_s = probe::probe(self.tools, &output, self.cancel)
 			.await
 			.map_err(unreadable)?
@@ -846,9 +831,8 @@ impl Job<'_> {
 	}
 
 	async fn pieces(&self, titles: &[Title<'_>], on_fraction: &impl Fn(f64)) -> Result<Built, JobError> {
-		let total: u64 = titles.iter().map(|title| title.bytes).sum();
 		#[allow(clippy::cast_precision_loss)]
-		let work = 2.0 * total as f64;
+		let work = 2.0 * self.total as f64;
 		let mut done = 0;
 		let mut pieces = Vec::with_capacity(titles.len());
 		let mut built = Vec::with_capacity(titles.len());
@@ -900,7 +884,7 @@ impl Job<'_> {
 			let path = process::tool_path(piece).display().to_string();
 			let _ = writeln!(lines, "file '{}'", path.replace('\'', r"'\''"));
 		}
-		fs::write(&list, lines).map_err(|err| JobError::io(IoSide::Destination(&list), &err))?;
+		write_work_file(&list, lines)?;
 		let chapters = self.chapters(titles, &built)?;
 		let output = self.workspace.file(OUTPUT);
 		let piece_bytes: u64 = pieces
@@ -918,7 +902,7 @@ impl Job<'_> {
 
 		#[allow(clippy::cast_precision_loss)]
 		let report = |progress: &Progress| {
-			on_fraction((total as f64 + written(progress, piece_bytes) * total as f64) / work);
+			on_fraction((self.total as f64 + written(progress, piece_bytes) * self.total as f64) / work);
 		};
 		run_ffmpeg(&cmd, report, self.cancel).await?;
 		for piece in &pieces {
@@ -1049,18 +1033,12 @@ impl Job<'_> {
 			.arg(format!("title={}", self.name));
 
 		let main = &self.main.layout;
-		for (index, track) in main.audio.iter().enumerate() {
-			if let Some(code) = &track.language {
-				cmd.arg(format!("-metadata:s:a:{index}"))
-					.arg(format!("language={}", language::normalized(code)));
-			}
-		}
-		for (index, subtitle) in main.subtitles.iter().enumerate() {
-			if let Some(code) = &subtitle.language {
-				cmd.arg(format!("-metadata:s:s:{index}"))
-					.arg(format!("language={}", language::normalized(code)));
-			}
-		}
+		language_tags(cmd, 'a', main.audio.iter().map(|track| track.language.as_deref()));
+		language_tags(
+			cmd,
+			's',
+			main.subtitles.iter().map(|subtitle| subtitle.language.as_deref()),
+		);
 
 		cmd.args(["-f", "matroska"]).arg(process::tool_path(output));
 	}
@@ -1072,9 +1050,22 @@ impl Job<'_> {
 			.map(|(title, built)| (title.dvd, title.false_time, *built))
 			.collect();
 		let path = self.workspace.file(CHAPTERS);
-		fs::write(&path, chapters::ffmetadata(&chapter_list(&listed)))
-			.map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;
+		chapters::write(&path, &chapter_list(&listed))?;
 		Ok(path)
+	}
+}
+
+/// A language tag for each written track of `kind` (`a` or `s`) whose language is known, in order.
+pub(super) fn language_tags<'a>(
+	cmd: &mut ToolCommand,
+	kind: char,
+	languages: impl IntoIterator<Item = Option<&'a str>>,
+) {
+	for (index, code) in languages.into_iter().enumerate() {
+		if let Some(code) = code {
+			cmd.arg(format!("-metadata:s:{kind}:{index}"))
+				.arg(format!("language={code}"));
+		}
 	}
 }
 
