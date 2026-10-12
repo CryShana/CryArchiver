@@ -18,8 +18,8 @@ use self::rng::Rng;
 use self::store::FileStore;
 use crate::source::{Action, ArchiveSource};
 use crate::view::{
-	ArchiveView, FileDetails, FileId, FileRow, FilterResult, Header, IssueId, Log, NodeId, Notification, Overall,
-	Overrides, RunState, Settings, Speed, SystemStats, WorkKind, Workers,
+	ArchiveView, BluRay, FileDetails, FileId, FileRow, FilterResult, Header, IssueId, Log, NodeId, Notification,
+	Overall, Overrides, RunState, Settings, Speed, SystemStats, WorkKind, Workers,
 };
 
 const TICK: Duration = Duration::from_millis(500);
@@ -127,6 +127,7 @@ impl MockSource {
 					performance_limit: None,
 					stability_window: Duration::from_secs(30),
 					keep_auxiliary_images: true,
+					blu_ray: BluRay::Keep,
 					delete_originals: false,
 				},
 				overall: initial_overall(&mut rng),

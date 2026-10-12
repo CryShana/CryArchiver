@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+pub use cryarchiver_engine::options::BluRay;
 pub use cryarchiver_engine::preset::Overrides;
 use cryarchiver_engine::preset::Speed as PresetSpeed;
 
@@ -77,6 +78,7 @@ pub struct Settings {
 	pub performance_limit: Option<u8>,
 	pub stability_window: Duration,
 	pub keep_auxiliary_images: bool,
+	pub blu_ray: BluRay,
 	pub delete_originals: bool,
 }
 

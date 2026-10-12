@@ -9,6 +9,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use cryarchiver_engine::options::BluRay;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_project::settings::Speed;
 use cryarchiver_project::store::StoreError;
@@ -20,7 +21,7 @@ use tui_input::InputRequest;
 use tui_input::backend::crossterm::EventHandler;
 
 use self::form::{FormField, NewProjectForm};
-use crate::app::{DOUBLE_CLICK, HitMap, burst_flags};
+use crate::app::{DOUBLE_CLICK, HitMap, burst_flags, other_blu_ray};
 use crate::recent::{Recent, RecentStore, now_unix_ms};
 use crate::theme::{ColorDepth, Theme};
 use crate::view::{NoticeLevel, Notification};
@@ -70,6 +71,7 @@ pub enum StartHit {
 	NewProject,
 	Field(FormField),
 	Speed(Speed),
+	BluRay(BluRay),
 	Modal,
 }
 
@@ -439,7 +441,12 @@ impl StartMenu {
 			KeyCode::BackTab | KeyCode::Up => form.move_focus(-1),
 			KeyCode::Left if focus == FormField::Speed => form.set_speed(next_speed(form.speed(), -1)),
 			KeyCode::Right if focus == FormField::Speed => form.set_speed(next_speed(form.speed(), 1)),
-			KeyCode::Enter if focus.is_text() || focus == FormField::Speed => form.move_focus(1),
+			KeyCode::Left | KeyCode::Right if focus == FormField::BluRay => {
+				form.set_blu_ray(other_blu_ray(form.blu_ray()));
+			}
+			KeyCode::Enter if focus.is_text() || matches!(focus, FormField::Speed | FormField::BluRay) => {
+				form.move_focus(1);
+			}
 			KeyCode::Enter | KeyCode::Char(' ') if !focus.is_text() => self.activate(focus),
 			KeyCode::Char('q') if !focus.is_text() => self.quit = true,
 			_ if focus.is_text() => form.edit(focus, |input| {
@@ -463,6 +470,7 @@ impl StartMenu {
 
 		match field {
 			FormField::Speed => form.set_speed(next_speed(form.speed(), 1)),
+			FormField::BluRay => form.set_blu_ray(other_blu_ray(form.blu_ray())),
 			FormField::CustomQuality => form.toggle_custom_quality(),
 			FormField::DeleteOriginals => form.toggle_delete(),
 			FormField::Create => self.create(),
@@ -554,7 +562,7 @@ impl StartMenu {
 					form.set_focus(field);
 				}
 
-				if !field.is_text() && field != FormField::Speed {
+				if !field.is_text() && !matches!(field, FormField::Speed | FormField::BluRay) {
 					self.activate(field);
 				}
 			}
@@ -562,6 +570,12 @@ impl StartMenu {
 				if let Some(form) = self.form.as_mut() {
 					form.set_focus(FormField::Speed);
 					form.set_speed(speed);
+				}
+			}
+			Some(StartHit::BluRay(blu_ray)) => {
+				if let Some(form) = self.form.as_mut() {
+					form.set_focus(FormField::BluRay);
+					form.set_blu_ray(blu_ray);
 				}
 			}
 			Some(StartHit::Modal) | None => {}

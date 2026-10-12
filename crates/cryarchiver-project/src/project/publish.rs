@@ -20,6 +20,7 @@ use crate::view::{
 	decision_lines, size_text,
 };
 
+const DISC_CODEC: &str = "disc";
 const THROUGHPUT_WINDOW: Duration = Duration::from_mins(5);
 
 #[derive(Debug)]
@@ -325,13 +326,16 @@ impl Owner {
 	}
 
 	pub(super) fn file_status(&self, file: FileId) -> FileStatus {
-		let record = &self.tree.file(file).record;
+		let entry = self.tree.file(file);
+		let record = &entry.record;
 		let output = record.state.output();
 
 		FileStatus {
 			state: self.row_state(file),
 			progress: self.pipeline.jobs.get(&file).map(|job| job.fraction),
-			codec: output.map(|output| codec_label(&output.how, &output.path.name())),
+			codec: output
+				.map(|output| codec_label(&output.how, &output.path.name()))
+				.or_else(|| is_disc_image(&entry.name).then(|| DISC_CODEC.to_owned())),
 			bytes_in: record.size,
 			bytes_out: output.map(|output| output.size),
 		}
@@ -543,8 +547,8 @@ impl Owner {
 			}
 			.to_owned(),
 		)];
-		if let Some(codec) = &status.codec {
-			plan.push(("Output".to_owned(), codec.clone()));
+		if let Some(output) = output {
+			plan.push(("Output".to_owned(), codec_label(&output.how, &output.path.name())));
 		}
 
 		Details {
@@ -741,6 +745,12 @@ pub(super) fn stage_label(stage: Stage) -> &'static str {
 	}
 }
 
+fn is_disc_image(name: &OsStr) -> bool {
+	std::path::Path::new(name)
+		.extension()
+		.is_some_and(|extension| extension.eq_ignore_ascii_case("iso"))
+}
+
 pub(super) fn codec_label(how: &How, output_name: &OsStr) -> String {
 	match how {
 		How::Copied(_) => "copy".into(),
@@ -857,6 +867,35 @@ mod tests {
 
 	fn rows(shape: &[(u16, &str)]) -> Vec<(u16, String)> {
 		shape.iter().map(|&(depth, name)| (depth, name.to_owned())).collect()
+	}
+
+	#[test]
+	fn a_disc_image_reads_as_a_disc_until_its_output_names_the_codec() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		for name in ["Film.ISO", "Film.mkv"] {
+			fs::write(source.join(name), b"x").unwrap();
+		}
+		let (mut owner, _updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		list_queued(&mut owner);
+		let codec = |owner: &Owner, name: &str| owner.file_status(file(owner, name)).codec;
+
+		assert_eq!(codec(&owner, "Film.ISO").as_deref(), Some("disc"));
+		assert_eq!(codec(&owner, "Film.mkv"), None);
+
+		let encoded = FileState::Done(Output {
+			how: How::Encoded,
+			path: key("Film.ISO.mkv"),
+			size: 1,
+			hash: None,
+		});
+		owner.set_state(file(&owner, "Film.ISO"), encoded);
+		assert_eq!(codec(&owner, "Film.ISO").as_deref(), Some("AV1"));
+
+		owner.set_state(file(&owner, "Film.mkv"), done(How::Copied(CopyReason::KeptOriginal)));
+		assert_eq!(codec(&owner, "Film.mkv").as_deref(), Some("copy"));
 	}
 
 	#[test]

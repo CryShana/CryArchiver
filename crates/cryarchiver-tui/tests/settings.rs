@@ -2,6 +2,7 @@ mod support;
 
 use std::time::Instant;
 
+use cryarchiver_engine::options::BluRay;
 use cryarchiver_engine::preset::{Overrides, VmafOverride};
 use cryarchiver_tui::view::{Limit, Speed};
 use cryarchiver_tui::{App, ArchiveSource, MockSource, OverlayKind, ViewMode};
@@ -18,8 +19,9 @@ const RESET_QUALITY: usize = 4;
 const MIN_SAVINGS: usize = 5;
 const LIMIT: usize = 7;
 const KEEP_AUXILIARY_IMAGES: usize = 9;
-const DELETE_ORIGINALS: usize = 10;
-const RESTART_PENDING_JOBS: usize = 12;
+const BLU_RAY: usize = 10;
+const DELETE_ORIGINALS: usize = 11;
+const RESTART_PENDING_JOBS: usize = 13;
 
 fn open_row(app: &mut App<MockSource>, row: usize) {
 	press(app, KeyCode::Char('s'));
@@ -253,6 +255,24 @@ fn the_motion_photo_row_says_what_turning_it_off_drops() {
 
 	let note = "off: motion and Live Focus photos convert without the video, unblurred original, depth map";
 	assert!(find_row(&draw(&mut app, 120, 36), note).is_some(), "{note}");
+}
+
+#[test]
+fn the_blu_ray_row_switches_between_keeping_and_converting_a_disc() {
+	let mut app = app();
+	open_row(&mut app, BLU_RAY);
+	assert_eq!(app.source().view().settings.blu_ray, BluRay::Keep);
+	assert!(shown_row(&mut app, "Blu-ray discs").contains("keep as is"));
+
+	press(&mut app, KeyCode::Right);
+	assert_eq!(app.source().view().settings.blu_ray, BluRay::Convert);
+	assert!(shown_row(&mut app, "Blu-ray discs").contains("convert main feature"));
+
+	press(&mut app, KeyCode::Left);
+	assert_eq!(app.source().view().settings.blu_ray, BluRay::Keep);
+
+	press(&mut app, KeyCode::Enter);
+	assert_eq!(app.source().view().settings.blu_ray, BluRay::Convert);
 }
 
 #[test]

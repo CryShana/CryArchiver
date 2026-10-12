@@ -427,6 +427,7 @@ impl ProjectSource {
 			SettingsChange::PerformanceLimit(cap) => ProjectChange::PerformanceLimit(cap),
 			SettingsChange::StabilityWindow(window) => ProjectChange::StabilityWindow(window),
 			SettingsChange::KeepAuxiliaryImages(keep) => ProjectChange::KeepAuxiliaryImages(keep),
+			SettingsChange::BluRay(blu_ray) => ProjectChange::BluRay(blu_ray),
 			SettingsChange::DeleteOriginals { enabled, confirmation } => {
 				ProjectChange::DeleteOriginals { enabled, confirmation }
 			}
@@ -677,6 +678,7 @@ fn settings_view(settings: &ProjectSettings) -> Settings {
 		performance_limit: settings.performance_limit,
 		stability_window: settings.stability_window,
 		keep_auxiliary_images: settings.keep_auxiliary_images,
+		blu_ray: settings.blu_ray,
 		delete_originals: settings.delete_originals,
 	}
 }

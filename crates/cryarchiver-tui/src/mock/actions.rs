@@ -115,6 +115,7 @@ impl MockSource {
 			SettingsChange::Watch(on) => settings.watch = on,
 			SettingsChange::StabilityWindow(window) => settings.stability_window = window,
 			SettingsChange::KeepAuxiliaryImages(keep) => settings.keep_auxiliary_images = keep,
+			SettingsChange::BluRay(blu_ray) => settings.blu_ray = blu_ray,
 			SettingsChange::PerformanceLimit(cap) => return self.set_limit(cap),
 			SettingsChange::DeleteOriginals { enabled, confirmation } => {
 				return self.set_delete_originals(enabled, &confirmation);

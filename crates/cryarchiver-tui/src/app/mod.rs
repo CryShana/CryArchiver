@@ -17,7 +17,9 @@ pub(crate) use self::burst::{BURST_GAP, burst_flags};
 pub(crate) use self::menu::Menu;
 pub(crate) use self::mouse::{Bar, DOUBLE_CLICK, Hit, HitMap};
 use self::mouse::{Click, ScrollDrag};
-pub(crate) use self::settings::{FAST_NEVER_MEASURES_VIDEO, QUALITY_FIELDS, QualityField, SETTINGS_ROWS, SettingsRow};
+pub(crate) use self::settings::{
+	FAST_NEVER_MEASURES_VIDEO, QUALITY_FIELDS, QualityField, SETTINGS_ROWS, SettingsRow, blu_ray_label, other_blu_ray,
+};
 pub use self::tree::Selection;
 use self::tree::TreeState;
 use crate::source::{Action, ArchiveSource};

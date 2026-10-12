@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use cryarchiver_engine::options::BluRay;
 use cryarchiver_tui::recent::{FILE_NAME, RecentStore};
 use cryarchiver_tui::start::form::FormField;
 use cryarchiver_tui::start::{Dialog, EntryState};
@@ -330,7 +331,7 @@ fn create_checks_again_and_creates_nothing_once_the_source_is_gone() {
 	fill(&mut menu, &source, &setup.path("archive"));
 	fs::remove_dir(&source).unwrap();
 
-	for _ in 0..5 {
+	for _ in 0..6 {
 		press(&mut menu, KeyCode::Tab);
 	}
 	press(&mut menu, KeyCode::Enter);
@@ -391,7 +392,7 @@ fn the_form_creates_the_project_opens_it_and_lists_it() {
 	assert!(form.can_create(), "{:?}", form.validation());
 	assert!(shows(&mut menu, "Holiday.cryarchive"));
 
-	for _ in 0..5 {
+	for _ in 0..6 {
 		press(&mut menu, KeyCode::Tab);
 	}
 	assert_eq!(menu.form().unwrap().focus(), FormField::Create);
@@ -402,6 +403,41 @@ fn the_form_creates_the_project_opens_it_and_lists_it() {
 	assert!(menu.form().is_none());
 	assert_eq!(menu.take_request(), Some(project.clone()));
 	assert_eq!(setup.store.load().entries[0].path, project);
+}
+
+#[test]
+fn the_blu_ray_choice_is_made_with_the_keys_or_the_mouse_and_reaches_the_project() {
+	let setup = Setup::new();
+	let source = setup.path("Holiday");
+	fs::create_dir(&source).unwrap();
+	let destination = setup.path("archive");
+	let mut menu = setup.menu();
+	fill(&mut menu, &source, &destination);
+	assert!(shows(&mut menu, "◉ keep as is"));
+	assert!(shows(&mut menu, "○ convert main feature"));
+	assert_eq!(menu.form().unwrap().blu_ray(), BluRay::Keep);
+
+	while menu.form().unwrap().focus() != FormField::BluRay {
+		press(&mut menu, KeyCode::Tab);
+	}
+	press(&mut menu, KeyCode::Right);
+	assert_eq!(menu.form().unwrap().blu_ray(), BluRay::Convert);
+	assert!(shows(&mut menu, "◉ convert main feature"));
+	press(&mut menu, KeyCode::Left);
+	assert_eq!(menu.form().unwrap().blu_ray(), BluRay::Keep);
+
+	let convert = position(&mut menu, "convert main feature");
+	click(&mut menu, convert, Instant::now());
+	assert_eq!(menu.form().unwrap().blu_ray(), BluRay::Convert);
+
+	while menu.form().unwrap().focus() != FormField::Create {
+		press(&mut menu, KeyCode::Tab);
+	}
+	press(&mut menu, KeyCode::Enter);
+
+	let project = menu.take_request().expect("the form created the project");
+	let settings = cryarchiver_project::store::peek(&project).unwrap().meta.settings;
+	assert_eq!(settings.blu_ray, BluRay::Convert);
 }
 
 #[test]
@@ -424,7 +460,7 @@ fn create_stays_disabled_while_a_check_fails() {
 fn turning_deletion_on_asks_for_delete_and_shows_the_warning() {
 	let setup = Setup::new();
 	let mut menu = setup.menu();
-	for _ in 0..5 {
+	for _ in 0..6 {
 		press(&mut menu, KeyCode::Tab);
 	}
 	assert_eq!(menu.form().unwrap().focus(), FormField::DeleteOriginals);
@@ -512,7 +548,7 @@ fn escape_in_an_edited_form_asks_before_discarding() {
 fn the_delete_prompt_chips_work_with_the_mouse() {
 	let setup = Setup::new();
 	let mut menu = setup.menu();
-	for _ in 0..5 {
+	for _ in 0..6 {
 		press(&mut menu, KeyCode::Tab);
 	}
 

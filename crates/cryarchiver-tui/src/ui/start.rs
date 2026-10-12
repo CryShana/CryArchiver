@@ -1,3 +1,4 @@
+use cryarchiver_engine::options::BluRay;
 use cryarchiver_engine::text::display_path;
 use cryarchiver_project::settings::Speed;
 use ratatui::Frame;
@@ -11,7 +12,7 @@ use super::footer::{Chip, chip, draw_chips, render_toast};
 use super::settings::delete_prompt;
 use super::widgets::{Chrome, bold, fg, modal, panel, put, to_u16, wrap};
 use super::{MIN_HEIGHT, MIN_WIDTH, small};
-use crate::app::{FAST_NEVER_MEASURES_VIDEO, HitMap};
+use crate::app::{FAST_NEVER_MEASURES_VIDEO, HitMap, blu_ray_label};
 use crate::format::{bytes, fit, fit_middle, width};
 use crate::recent::{CAPACITY, now_unix_ms};
 use crate::start::form::{FormField, NewProjectForm, QualityCheck};
@@ -33,6 +34,8 @@ const SPEEDS: [(Speed, &str, &str); 3] = [
 	(Speed::Moderate, "MODERATE", "a balance of size, quality and time"),
 	(Speed::Fast, "FAST", "the quickest; files come out somewhat larger"),
 ];
+const BLU_RAYS: [BluRay; 2] = [BluRay::Keep, BluRay::Convert];
+const BLU_RAY_NOTE: &str = "3D discs are always kept";
 const QUALITY_ROWS: [(FormField, &str); 3] = [
 	(FormField::VideoVmaf, "  Video VMAF"),
 	(FormField::ImageTarget, "  Image SSIMULACRA2"),
@@ -189,6 +192,7 @@ fn chips(form: Option<&NewProjectForm>) -> Vec<Chip> {
 		| FormField::Destination
 		| FormField::Name
 		| FormField::Speed
+		| FormField::BluRay
 		| FormField::VideoVmaf
 		| FormField::ImageTarget
 		| FormField::AudioKbps => "next field",
@@ -198,8 +202,10 @@ fn chips(form: Option<&NewProjectForm>) -> Vec<Chip> {
 		chip("⇧Tab", "previous", Some(KeyCode::BackTab)),
 		chip("⏎", enter, Some(KeyCode::Enter)),
 	];
-	if form.focus() == FormField::Speed {
-		chips.push(chip("←→", "speed", None));
+	match form.focus() {
+		FormField::Speed => chips.push(chip("←→", "speed", None)),
+		FormField::BluRay => chips.push(chip("←→", "choice", None)),
+		_ => {}
 	}
 	chips.extend([chip("Esc", "back", Some(KeyCode::Esc)), chip("Ctrl+C", "quit", None)]);
 	chips
@@ -406,6 +412,9 @@ fn render_form(buf: &mut Buffer, body: Rect, form: &NewProjectForm, theme: &Them
 	}
 	y += 2;
 
+	layout.blu_ray_row(buf, y, form, hits);
+	y += 2;
+
 	layout.delete_row(buf, y, form, hits);
 	y += 3;
 
@@ -504,6 +513,29 @@ impl FormLayout<'_> {
 			.find(|(speed, ..)| *speed == form.speed())
 			.map_or("", |(.., explanation)| explanation);
 		put(buf, self.value_x, y + 1, explanation, fg(theme.dim), self.right);
+	}
+
+	fn blu_ray_row(&self, buf: &mut Buffer, y: u16, form: &NewProjectForm, hits: &mut HitMap<StartHit>) {
+		let theme = self.theme;
+		let focused = form.focus() == FormField::BluRay && form.confirming().is_none();
+		self.label(buf, y, "Blu-ray discs", focused);
+
+		let mut x = self.value_x;
+		for blu_ray in BLU_RAYS {
+			let chosen = form.blu_ray() == blu_ray;
+			let text = format!("{} {}", if chosen { "◉" } else { "○" }, blu_ray_label(blu_ray));
+			let style = match (chosen, focused) {
+				(true, true) => bold(theme.background).bg(theme.accent),
+				(true, false) => bold(theme.accent),
+				(false, _) => fg(theme.text),
+			};
+			let start = x;
+			x = put(buf, x, y, &text, style, self.right);
+			hits.push(Rect::new(start, y, x - start, 1), StartHit::BluRay(blu_ray));
+			x += 3;
+		}
+
+		put(buf, x, y, &format!("· {BLU_RAY_NOTE}"), fg(theme.dim), self.right);
 	}
 
 	/// Closed, it names what the project gets: the preset's targets, or the custom values typed below it.

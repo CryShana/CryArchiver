@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crate::view::{
-	ArchiveView, FileDetails, FileId, FileRow, Filter, FilterResult, IssueId, NodeId, Notification, Overrides, Speed,
-	Verb,
+	ArchiveView, BluRay, FileDetails, FileId, FileRow, Filter, FilterResult, IssueId, NodeId, Notification, Overrides,
+	Speed, Verb,
 };
 
 /// Everything the TUI reads from an archive run and every command it sends back (project layer spec §11.3).
@@ -87,6 +87,7 @@ pub enum SettingsChange {
 	PerformanceLimit(Option<u8>),
 	StabilityWindow(Duration),
 	KeepAuxiliaryImages(bool),
+	BluRay(BluRay),
 	/// Turning deletion on carries the text the user typed; the source refuses it unless it reads `DELETE`.
 	DeleteOriginals {
 		enabled: bool,

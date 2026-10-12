@@ -11,7 +11,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use super::{Outcome, Overlay, Ui};
 use crate::source::{Action, ArchiveSource, SettingsChange};
-use crate::view::{ArchiveView, Settings, Speed};
+use crate::view::{ArchiveView, BluRay, Settings, Speed};
 
 pub const FAST_NEVER_MEASURES_VIDEO: &str = "FAST never measures video quality";
 
@@ -25,12 +25,13 @@ pub enum SettingsRow {
 	Limit,
 	StabilityWindow,
 	KeepAuxiliaryImages,
+	BluRay,
 	DeleteOriginals,
 	Rescan,
 	RestartPendingJobs,
 }
 
-pub const SETTINGS_ROWS: [SettingsRow; 13] = [
+pub const SETTINGS_ROWS: [SettingsRow; 14] = [
 	SettingsRow::Speed,
 	SettingsRow::Quality(QualityField::Video),
 	SettingsRow::Quality(QualityField::Image),
@@ -41,6 +42,7 @@ pub const SETTINGS_ROWS: [SettingsRow; 13] = [
 	SettingsRow::Limit,
 	SettingsRow::StabilityWindow,
 	SettingsRow::KeepAuxiliaryImages,
+	SettingsRow::BluRay,
 	SettingsRow::DeleteOriginals,
 	SettingsRow::Rescan,
 	SettingsRow::RestartPendingJobs,
@@ -143,6 +145,7 @@ impl SettingsRow {
 			Self::Limit => "Performance limit",
 			Self::StabilityWindow => "Stability window",
 			Self::KeepAuxiliaryImages => "Keep motion photos as they are",
+			Self::BluRay => "Blu-ray discs",
 			Self::DeleteOriginals => "Delete originals",
 			Self::Rescan => "Re-scan source now",
 			Self::RestartPendingJobs => "Restart jobs over the limit",
@@ -164,6 +167,7 @@ impl SettingsRow {
 				.map_or_else(|| "off".to_owned(), |cap| format!("{cap} % CPU · one job at a time")),
 			Self::StabilityWindow => format!("{} s", settings.stability_window.as_secs()),
 			Self::KeepAuxiliaryImages => on_off(settings.keep_auxiliary_images),
+			Self::BluRay => blu_ray_label(settings.blu_ray).to_owned(),
 			Self::DeleteOriginals => {
 				if settings.delete_originals && view.header.deleting_paused {
 					"ON · paused this session: ⏎ type DELETE to allow · ← off".to_owned()
@@ -274,6 +278,7 @@ impl Ui {
 				SettingsChange::StabilityWindow(Duration::from_secs(seconds.clamp(5, 300)))
 			}
 			SettingsRow::KeepAuxiliaryImages => SettingsChange::KeepAuxiliaryImages(!settings.keep_auxiliary_images),
+			SettingsRow::BluRay => SettingsChange::BluRay(other_blu_ray(settings.blu_ray)),
 			SettingsRow::DeleteOriginals if !settings.delete_originals || (view.header.deleting_paused && step > 0) => {
 				self.overlay = Some(Overlay::ConfirmDelete(Input::default()));
 				return;
@@ -379,6 +384,20 @@ impl Ui {
 			_ => return Outcome::Ignored,
 		}
 		Outcome::Done
+	}
+}
+
+pub const fn blu_ray_label(blu_ray: BluRay) -> &'static str {
+	match blu_ray {
+		BluRay::Keep => "keep as is",
+		BluRay::Convert => "convert main feature",
+	}
+}
+
+pub const fn other_blu_ray(blu_ray: BluRay) -> BluRay {
+	match blu_ray {
+		BluRay::Keep => BluRay::Convert,
+		BluRay::Convert => BluRay::Keep,
 	}
 }
 

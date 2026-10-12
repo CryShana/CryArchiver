@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use cryarchiver_engine::decision::{AudioTrack, CrfChoice, Decision, Scan, VideoDecision};
+use cryarchiver_engine::decision::{AudioTrack, CrfChoice, Decision, DiscDecision, Scan, VideoDecision};
 use cryarchiver_engine::text::display_name;
 
 use crate::issues::{IssueId, Problem, Verbs};
@@ -328,6 +328,10 @@ pub fn decision_lines(decision: &Decision) -> Vec<DecisionLine> {
 		lines.push(plain(KEPT_LABEL, reason.clone()));
 	}
 
+	if let Some(disc) = &decision.disc {
+		disc_lines(disc, &mut lines);
+	}
+
 	if let Some(video) = &decision.video {
 		video_lines(video, &mut lines);
 	}
@@ -370,6 +374,49 @@ pub fn decision_lines(decision: &Decision) -> Vec<DecisionLine> {
 	}
 
 	lines
+}
+
+fn disc_lines(disc: &DiscDecision, lines: &mut Vec<DecisionLine>) {
+	let mut summary = disc.kind.clone();
+	if !disc.kept.is_empty() {
+		let lengths: Vec<String> = disc.kept.iter().map(|(_, length_s)| clock_text(*length_s)).collect();
+		let noun = if lengths.len() == 1 { "title" } else { "titles" };
+		let _ = write!(summary, " · {} {noun} kept ({})", lengths.len(), lengths.join(", "));
+	}
+	lines.push(plain("Disc", summary));
+
+	if !disc.dropped.is_empty() {
+		let mut counted: Vec<(&str, usize)> = Vec::new();
+		for (_, reason) in &disc.dropped {
+			match counted.iter_mut().find(|(seen, _)| seen == reason) {
+				Some((_, count)) => *count += 1,
+				None => counted.push((reason, 1)),
+			}
+		}
+		let dropped: Vec<String> = counted
+			.iter()
+			.map(|(reason, count)| format!("{count} {reason}"))
+			.collect();
+		lines.push(plain("Dropped", dropped.join(", ")));
+	}
+
+	if !disc.false_time.is_empty() {
+		lines.push(plain(
+			"Rebuilt",
+			format!("{}: the disc's time was wrong", disc.false_time.join(", ")),
+		));
+	}
+
+	if !disc.reencoded.is_empty() {
+		lines.push(plain(
+			"Converted",
+			format!("{} to the main picture shape", disc.reencoded.join(", ")),
+		));
+	}
+
+	if let Some(playlist) = disc.playlist {
+		lines.push(plain("Playlist", format!("{playlist:05}")));
+	}
 }
 
 fn video_lines(video: &VideoDecision, lines: &mut Vec<DecisionLine>) {
@@ -751,6 +798,72 @@ mod tests {
 			[line("Audio", "Opus 128 kbps, 2 ch · copied", false)]
 		);
 		assert!(decision_lines(&Decision::default()).is_empty());
+	}
+
+	#[test]
+	fn a_dvd_record_reads_as_its_titles_what_was_left_out_and_what_was_fixed() {
+		let decision = Decision {
+			disc: Some(DiscDecision {
+				kind: "DVD".into(),
+				kept: vec![("Title 1".into(), 3733.4), ("Title 4".into(), 250.0)],
+				dropped: vec![
+					("Title 2".into(), "menu".into()),
+					("Title 3".into(), "under 10 s".into()),
+					("Title 5".into(), "duplicate".into()),
+					("Title 6".into(), "under 10 s".into()),
+				],
+				false_time: vec!["Title 4".into()],
+				reencoded: vec!["Title 4".into()],
+				playlist: None,
+			}),
+			..Decision::default()
+		};
+
+		assert_eq!(
+			labelled(&decision_lines(&decision)),
+			[
+				line("Disc", "DVD · 2 titles kept (1:02:13, 4:10)", false),
+				line("Dropped", "1 menu, 2 under 10 s, 1 duplicate", false),
+				line("Rebuilt", "Title 4: the disc's time was wrong", false),
+				line("Converted", "Title 4 to the main picture shape", false),
+			]
+		);
+	}
+
+	#[test]
+	fn a_blu_ray_record_names_its_playlist_and_a_kept_disc_only_its_kind() {
+		let converted = Decision {
+			disc: Some(DiscDecision {
+				kind: "Blu-ray".into(),
+				kept: vec![("Main feature".into(), 6720.0)],
+				playlist: Some(800),
+				..DiscDecision::default()
+			}),
+			..Decision::default()
+		};
+		let kept = Decision {
+			kept: Some("Blu-ray disc: kept as is".into()),
+			disc: Some(DiscDecision {
+				kind: "Blu-ray".into(),
+				..DiscDecision::default()
+			}),
+			..Decision::default()
+		};
+
+		assert_eq!(
+			labelled(&decision_lines(&converted)),
+			[
+				line("Disc", "Blu-ray · 1 title kept (1:52:00)", false),
+				line("Playlist", "00800", false),
+			]
+		);
+		assert_eq!(
+			labelled(&decision_lines(&kept)),
+			[
+				line(KEPT_LABEL, "Blu-ray disc: kept as is", false),
+				line("Disc", "Blu-ray", false),
+			]
+		);
 	}
 
 	#[test]

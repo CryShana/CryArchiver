@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use cryarchiver_engine::commit::OutputSink;
 use cryarchiver_engine::decision::{CrfChoice, Decision, VideoDecision};
 use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate};
+use cryarchiver_engine::options::BluRay;
 use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, VmafOverride};
 use cryarchiver_engine::quality::memory::QualityMemory;
@@ -348,7 +349,7 @@ fn a_deleting_project_archives_but_deletes_nothing_until_delete_is_typed_this_se
 	let mut app = App::new(source, ColorDepth::TrueColor);
 	assert!(screen(&mut app).contains("deleting paused: type DELETE to allow"));
 	press(&mut app, KeyCode::Char('s'));
-	for _ in 0..10 {
+	for _ in 0..11 {
 		press(&mut app, KeyCode::Down);
 	}
 	press(&mut app, KeyCode::Enter);
@@ -385,7 +386,7 @@ fn the_delete_typed_when_creating_in_the_start_menu_does_not_confirm_the_session
 	menu.handle_event(&Event::Paste(display_path(&source)), Instant::now());
 	key(&mut menu, KeyCode::Tab);
 	menu.handle_event(&Event::Paste(display_path(&dir.path().join("archive"))), Instant::now());
-	for _ in 0..4 {
+	for _ in 0..5 {
 		key(&mut menu, KeyCode::Tab);
 	}
 	key(&mut menu, KeyCode::Enter);
@@ -489,6 +490,27 @@ fn quality_overrides_reach_the_project_and_come_back_normalized() {
 
 	let mut source = open(&setup.project);
 	assert_eq!(source.view().settings.overrides, custom);
+	refresh_until(&mut source, "the finish", finished);
+}
+
+#[test]
+fn the_blu_ray_setting_reaches_the_project_and_is_stored() {
+	let setup = setup(&[("a.txt", b"a")]);
+	let mut source = open(&setup.project);
+	assert_eq!(source.view().settings.blu_ray, BluRay::Keep);
+
+	source.perform(Action::ChangeSettings(SettingsChange::BluRay(BluRay::Convert)));
+	refresh_until(&mut source, "the setting", |s| {
+		s.view().settings.blu_ray == BluRay::Convert
+	});
+
+	let mut app = App::new(source, ColorDepth::TrueColor);
+	press(&mut app, KeyCode::Char('s'));
+	assert!(screen(&mut app).contains("convert main feature"));
+	drop(app);
+
+	let mut source = open(&setup.project);
+	assert_eq!(source.view().settings.blu_ray, BluRay::Convert);
 	refresh_until(&mut source, "the finish", finished);
 }
 

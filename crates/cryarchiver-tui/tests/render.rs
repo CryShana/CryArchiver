@@ -154,7 +154,7 @@ fn settings_at_120x36() {
 fn delete_confirmation_at_120x36() {
 	let mut app = app();
 	press(&mut app, KeyCode::Char('s'));
-	for _ in 0..10 {
+	for _ in 0..11 {
 		press(&mut app, KeyCode::Down);
 	}
 	press(&mut app, KeyCode::Enter);

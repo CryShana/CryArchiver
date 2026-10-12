@@ -4,6 +4,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use cryarchiver_engine::options::BluRay;
 use cryarchiver_engine::preset::{Overrides, Speed as PresetSpeed};
 use cryarchiver_project::settings::{DELETE_CONFIRMATION, SettingsChange, Speed};
 use tui_input::Input;
@@ -22,12 +23,13 @@ pub enum FormField {
 	VideoVmaf,
 	ImageTarget,
 	AudioKbps,
+	BluRay,
 	DeleteOriginals,
 	Create,
 	Cancel,
 }
 
-pub const FORM_FIELDS: [FormField; 11] = [
+pub const FORM_FIELDS: [FormField; 12] = [
 	FormField::Source,
 	FormField::Destination,
 	FormField::Name,
@@ -36,6 +38,7 @@ pub const FORM_FIELDS: [FormField; 11] = [
 	FormField::VideoVmaf,
 	FormField::ImageTarget,
 	FormField::AudioKbps,
+	FormField::BluRay,
 	FormField::DeleteOriginals,
 	FormField::Create,
 	FormField::Cancel,
@@ -80,6 +83,7 @@ pub struct NewProjectForm {
 	/// In the order of [`QUALITY_FIELDS`].
 	quality: [Input; QUALITY_FIELDS.len()],
 	custom_quality_open: bool,
+	blu_ray: BluRay,
 	/// The typed confirmation that turned deleting originals on.
 	delete_confirmation: Option<String>,
 	/// The `DELETE` prompt while it is open.
@@ -104,6 +108,7 @@ impl NewProjectForm {
 			speed: Speed::default(),
 			quality: Default::default(),
 			custom_quality_open: false,
+			blu_ray: BluRay::Keep,
 			delete_confirmation: None,
 			confirming: None,
 			focus: FormField::Source,
@@ -250,6 +255,15 @@ impl NewProjectForm {
 		self.speed = speed;
 	}
 
+	pub fn blu_ray(&self) -> BluRay {
+		self.blu_ray
+	}
+
+	pub fn set_blu_ray(&mut self, blu_ray: BluRay) {
+		self.edited |= blu_ray != self.blu_ray;
+		self.blu_ray = blu_ray;
+	}
+
 	pub fn delete_originals(&self) -> bool {
 		self.delete_confirmation.is_some()
 	}
@@ -318,11 +332,12 @@ impl NewProjectForm {
 			}
 		}
 
-		let (speed, confirmation) = (self.speed, self.delete_confirmation.clone());
+		let (speed, blu_ray, confirmation) = (self.speed, self.blu_ray, self.delete_confirmation.clone());
 		let overrides = self.overrides().unwrap_or_default();
 		let created = cryarchiver_project::create(source, destination, OsStr::new(self.name.value()), |settings| {
 			settings.speed = speed;
 			settings.overrides = overrides;
+			settings.blu_ray = blu_ray;
 			if let Some(confirmation) = confirmation {
 				settings
 					.apply(SettingsChange::DeleteOriginals {
@@ -487,6 +502,28 @@ mod tests {
 		assert_eq!(meta.settings.speed, Speed::Fast);
 		assert!(meta.settings.delete_originals);
 		assert!(form.error().is_none());
+	}
+
+	#[test]
+	fn create_writes_the_chosen_blu_ray_choice_and_defaults_to_keep() {
+		let setup = setup();
+		assert!(!NewProjectForm::new().edited());
+		let mut form = filled(&setup);
+		assert_eq!(form.blu_ray(), BluRay::Keep);
+
+		form.set_blu_ray(BluRay::Convert);
+		let path = form.create().unwrap();
+
+		let meta = cryarchiver_project::store::peek(&path).unwrap().meta;
+		assert_eq!(meta.settings.blu_ray, BluRay::Convert);
+
+		let untouched = Setup {
+			destination: setup.dir.path().join("second").display().to_string(),
+			..setup
+		};
+		let path = filled(&untouched).create().unwrap();
+		let meta = cryarchiver_project::store::peek(&path).unwrap().meta;
+		assert_eq!(meta.settings.blu_ray, BluRay::Keep);
 	}
 
 	#[test]
@@ -683,14 +720,14 @@ mod tests {
 		form.set_focus(FormField::CustomQuality);
 
 		form.move_focus(1);
-		assert_eq!(form.focus(), FormField::DeleteOriginals);
+		assert_eq!(form.focus(), FormField::BluRay);
 
 		form.toggle_custom_quality();
 		form.set_focus(FormField::CustomQuality);
 		form.move_focus(1);
 		assert_eq!(form.focus(), FormField::VideoVmaf);
 		form.move_focus(3);
-		assert_eq!(form.focus(), FormField::DeleteOriginals);
+		assert_eq!(form.focus(), FormField::BluRay);
 		form.move_focus(-1);
 		assert_eq!(form.focus(), FormField::AudioKbps);
 
