@@ -1,15 +1,18 @@
-use std::fs::{File, Metadata};
+use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
 use std::path::Path;
 
 use infer::MatcherType;
 use tokio_util::sync::CancellationToken;
 
+use crate::disc::udf::{self, DiscFiles};
 use crate::outcome::{ErrorKind, IoSide, JobError};
 use crate::probe::{self, MediaInfo, ProbeError};
 use crate::toolchain::Toolchain;
 
 const HEADER_BYTES: u64 = 8192;
+pub const THREE_D_KEPT: &str = "3D disc: the second view can't be encoded; kept so 3D survives";
+const DISC_ROOTS: [&str; 2] = ["VIDEO_TS", "BDMV"];
 const TEXT_LIKE_FORMATS: &[&str] = &[
 	"lrc",
 	"srt",
@@ -58,6 +61,21 @@ pub enum MediaClass {
 	Kept(String),
 	Damaged(String),
 	Other(String),
+	Disc(DiscKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscKind {
+	Dvd(DiscFiles),
+	BluRay { files: DiscFiles, three_d: bool },
+}
+
+impl DiscKind {
+	pub fn files(&self) -> &DiscFiles {
+		match self {
+			Self::Dvd(files) | Self::BluRay { files, .. } => files,
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -68,7 +86,10 @@ pub struct Detection {
 }
 
 pub async fn detect(tools: &Toolchain, path: &Path, cancel: &CancellationToken) -> Result<Detection, JobError> {
-	let (meta, header) = read_header(path).map_err(|err| JobError::io(IoSide::Source(path), &err))?;
+	let (meta, header) = match read_header(path) {
+		Ok(read) => read,
+		Err(err) => return detect_folder(path).unwrap_or_else(|| Err(JobError::io(IoSide::Source(path), &err))),
+	};
 
 	if meta.len() > 0
 		&& let Some(reason) = never_transcoded(path, &header)
@@ -76,6 +97,18 @@ pub async fn detect(tools: &Toolchain, path: &Path, cancel: &CancellationToken) 
 		return Ok(Detection {
 			meta,
 			class: MediaClass::Kept(reason),
+			probe_log: Vec::new(),
+		});
+	}
+
+	if meta.len() > 0 && is_iso(path) {
+		let files = udf::read_image(path).map_err(|err| JobError::io(IoSide::Source(path), &err))?;
+		return Ok(Detection {
+			meta,
+			class: files.map_or_else(
+				|| MediaClass::Other(not_a_disc("image")),
+				|files| disc_class(files, "image"),
+			),
 			probe_log: Vec::new(),
 		});
 	}
@@ -99,6 +132,68 @@ pub async fn detect(tools: &Toolchain, path: &Path, cancel: &CancellationToken) 
 		meta,
 		probe_log,
 	})
+}
+
+fn is_iso(path: &Path) -> bool {
+	path.extension()
+		.is_some_and(|extension| extension.eq_ignore_ascii_case("iso"))
+}
+
+/// A folder that is, or directly holds, `VIDEO_TS` or `BDMV`, as a disc; `None` for anything else.
+fn detect_folder(path: &Path) -> Option<Result<Detection, JobError>> {
+	let meta = fs::metadata(path).ok().filter(Metadata::is_dir)?;
+	let files = match disc_folder(path) {
+		Ok(files) => files?,
+		Err(err) => return Some(Err(JobError::io(IoSide::Source(path), &err))),
+	};
+
+	Some(Ok(Detection {
+		meta,
+		class: disc_class(files, "folder"),
+		probe_log: Vec::new(),
+	}))
+}
+
+/// The files of the `VIDEO_TS` or `BDMV` folder that `path` is or holds, with paths from the disc root.
+fn disc_folder(path: &Path) -> io::Result<Option<DiscFiles>> {
+	for root in DISC_ROOTS {
+		let named = path.file_name().is_some_and(|name| name.eq_ignore_ascii_case(root));
+		let dir = if named { path.to_path_buf() } else { path.join(root) };
+		if !dir.is_dir() {
+			continue;
+		}
+
+		let mut files = udf::read_folder(&dir)?;
+		for file in &mut files.files {
+			file.path = format!("{root}/{}", file.path);
+		}
+		for sub in &mut files.dirs {
+			*sub = format!("{root}/{sub}");
+		}
+		files.dirs.push(root.to_owned());
+		return Ok(Some(files));
+	}
+	Ok(None)
+}
+
+fn disc_class(files: DiscFiles, what: &str) -> MediaClass {
+	if files.find("VIDEO_TS/VIDEO_TS.IFO").is_some() {
+		return MediaClass::Disc(DiscKind::Dvd(files));
+	}
+	if files.find("BDMV/index.bdmv").is_none() {
+		return MediaClass::Other(not_a_disc(what));
+	}
+
+	let three_d = files.dir_exists("BDMV/STREAM/SSIF");
+	if three_d {
+		MediaClass::Kept(THREE_D_KEPT.to_owned())
+	} else {
+		MediaClass::Disc(DiscKind::BluRay { files, three_d })
+	}
+}
+
+fn not_a_disc(what: &str) -> String {
+	format!("not a DVD or Blu-ray {what}")
 }
 
 pub fn read_header(path: &Path) -> io::Result<(Metadata, Vec<u8>)> {
@@ -440,6 +535,43 @@ mod tests {
 		);
 		assert_eq!(never("photo.tif", tiff), None);
 		assert_eq!(never("photo.png", PNG), None);
+	}
+
+	fn folder_class(path: &Path) -> MediaClass {
+		disc_class(disc_folder(path).unwrap().expect("a disc folder"), "folder")
+	}
+
+	#[test]
+	fn a_folder_that_is_or_holds_video_ts_is_a_dvd_with_paths_from_the_disc_root() {
+		let dir = tempfile::tempdir().unwrap();
+		let video_ts = dir.path().join("Izlet").join("VIDEO_TS");
+		std::fs::create_dir_all(&video_ts).unwrap();
+		std::fs::write(video_ts.join("VIDEO_TS.IFO"), b"DVDVIDEO-VMG").unwrap();
+
+		for path in [dir.path().join("Izlet"), video_ts] {
+			let MediaClass::Disc(DiscKind::Dvd(files)) = folder_class(&path) else {
+				panic!("{}", path.display())
+			};
+			assert!(files.find("VIDEO_TS/VIDEO_TS.IFO").is_some(), "{files:?}");
+			assert!(files.dir_exists("VIDEO_TS"));
+		}
+		assert!(disc_folder(dir.path()).unwrap().is_none());
+	}
+
+	#[test]
+	fn a_blu_ray_folder_is_kept_when_it_holds_a_second_view() {
+		let dir = tempfile::tempdir().unwrap();
+		let bdmv = dir.path().join("BDMV");
+		std::fs::create_dir_all(bdmv.join("STREAM")).unwrap();
+		std::fs::write(bdmv.join("index.bdmv"), b"INDX0200").unwrap();
+
+		assert!(matches!(
+			folder_class(dir.path()),
+			MediaClass::Disc(DiscKind::BluRay { three_d: false, .. })
+		));
+
+		std::fs::create_dir(bdmv.join("STREAM").join("SSIF")).unwrap();
+		assert!(matches!(folder_class(dir.path()), MediaClass::Kept(reason) if reason == THREE_D_KEPT));
 	}
 
 	#[test]

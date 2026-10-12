@@ -18,17 +18,21 @@ use crate::calibration::tables;
 use crate::commit::{Artifact, CommitError, OutputSink, SourceTimes, check_space, free_space};
 use crate::container::{Container, Cover, MATROSKA_VIDEO, MP4_VIDEO};
 use crate::decision::{
-	AudioDecision, AudioTrack, CrfChoice, Decision, Measured, Recorder, Reencode, Scan, SkippedRetry, Trim, Vmaf,
-	encoder_text,
+	AudioDecision, AudioTrack, CrfChoice, Decision, DiscDecision, Measured, Recorder, Reencode, Scan, SkippedRetry,
+	Trim, Vmaf, encoder_text,
 };
-use crate::detect::{self, Detection, MediaClass};
+use crate::detect::{self, Detection, DiscKind, MediaClass};
+use crate::disc::dvd::{self, Selection};
+use crate::disc::read::{self, Built};
 use crate::format::{OutputFormat, check_bitrate_cap, check_kind};
 use crate::images::animated::{self, Animation};
 use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
 use crate::images::plan::ImageRoute;
 use crate::integrity;
 use crate::metadata::MetadataMode;
-use crate::options::{JobOptions, Resize, TrimWindow, WrittenBy, kept_as_requested, kept_as_requested_part, upscaled};
+use crate::options::{
+	BluRay, JobOptions, Resize, TrimWindow, WrittenBy, kept_as_requested, kept_as_requested_part, upscaled,
+};
 use crate::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason, Refusal};
 use crate::preset::{Overrides, Speed};
 use crate::probe::{self, Frame, MediaInfo, ProbeError, Stream};
@@ -75,6 +79,8 @@ const SQUARE_PIXEL_SLACK: f64 = 1e-3;
 const AUDIO_DROPPED: &str = "an audio track was dropped: animated AVIF has no sound";
 const SUBTITLES_DROPPED: &str =
 	"a subtitle track was dropped: animated AVIF can't hold subtitles, but --burn-subs draws one into the picture";
+const BLU_RAY_KEPT: &str = "Blu-ray disc: kept as is";
+const NO_FOOTAGE: &str = "no real footage on the disc";
 const FRAMES_SPACE_HINT: &str = "an animated AVIF is made from lossless frames stored in the work folder: use \
                                  --ss/--to for a shorter clip or --resize for smaller frames";
 
@@ -95,6 +101,8 @@ pub enum Stage {
 	Probe,
 	Plan,
 	Queued,
+	/// Reading a disc's titles into one video.
+	Disc,
 	WaitingForMemory,
 	Analyze,
 	Sample,
@@ -238,6 +246,20 @@ struct Staged {
 
 enum Produced {
 	Output(Staged),
+	Kept(KeepReason),
+}
+
+/// A disc read into one video in its job's workspace, under the video slot the video's encode keeps.
+struct ReadDisc<'a> {
+	slot: SemaphorePermit<'a>,
+	workspace: Workspace,
+	media: PathBuf,
+	/// The detection of `media`, which is always a video.
+	detection: Detection,
+}
+
+enum Resolved<'a> {
+	Read(Box<ReadDisc<'a>>),
 	Kept(KeepReason),
 }
 
@@ -532,6 +554,42 @@ impl Engine {
 			check_kind(format, kind).map_err(ErrorKind::EncodeFailed)?;
 		}
 
+		let source_bytes = match &class {
+			MediaClass::Disc(kind) if meta.is_dir() => kind.files().files.iter().map(|file| file.size).sum(),
+			_ => meta.len(),
+		};
+		let work_root = sink.work_root(&job.source);
+		let cx = Context {
+			job,
+			media: &job.source,
+			source_bytes,
+			on_event,
+			cancel,
+			record: &recorder,
+		};
+
+		let (class, probe_log, disc) = match class {
+			MediaClass::Disc(kind) => match Box::pin(self.resolve_disc(&cx, sink, &work_root, kind)).await? {
+				Resolved::Read(read) => {
+					let ReadDisc {
+						slot,
+						workspace,
+						media,
+						detection,
+					} = *read;
+					(detection.class, detection.probe_log, Some((slot, workspace, media)))
+				}
+				Resolved::Kept(reason) => {
+					recorder.update(|decision| {
+						decision.source_bytes.get_or_insert(source_bytes);
+					});
+					on_event(JobEvent::Decision(Box::new(recorder.snapshot())));
+					return Ok(JobOutcome::KeptOriginal { reason });
+				}
+			},
+			class => (class, probe_log, None),
+		};
+
 		let animated = matches!(class, MediaClass::AnimatedImage(_));
 		let planned = match class {
 			MediaClass::Audio(info) => {
@@ -663,6 +721,7 @@ impl Engine {
 			}
 			MediaClass::Damaged(reason) => return Err(JobError::with_log(ErrorKind::SourceDamaged(reason), probe_log)),
 			MediaClass::Other(reason) => return Ok(JobOutcome::Skipped { reason }),
+			MediaClass::Disc(_) => unreachable!("a disc is read into a video before it is planned"),
 		};
 
 		let _memory = match &planned {
@@ -672,18 +731,17 @@ impl Engine {
 
 		let before =
 			SourceTimes::from_metadata(&meta).map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
-		let work_root = sink.work_root(&job.source);
-		// Must outlive `finish`: dropping the workspace deletes the staged output.
-		let workspace = open_workspace(sink, &work_root, &job.source, meta.len())?;
-
-		let cx = Context {
-			job,
-			media: &job.source,
-			source_bytes: meta.len(),
-			on_event,
-			cancel,
-			record: &recorder,
+		// The workspace must outlive `finish`: dropping it deletes the staged output.
+		let (workspace, media, mut held) = match disc {
+			Some((slot, workspace, media)) => (workspace, media, Some(slot)),
+			None => (
+				open_workspace(sink, &work_root, &job.source, source_bytes)?,
+				job.source.clone(),
+				None,
+			),
 		};
+
+		let cx = Context { media: &media, ..cx };
 		let produced = match &planned {
 			Planned::Audio {
 				info,
@@ -694,8 +752,10 @@ impl Engine {
 				self.produce_audio(&cx, info, plan, (*from_video, skipped), &workspace)
 					.await
 			}
-			Planned::Video(rules) => Box::pin(self.produce_video(&cx, &workspace, *rules)).await,
-			Planned::Animation(burn) => Box::pin(self.produce_video_animation(&cx, &workspace, *burn)).await,
+			Planned::Video(rules) => Box::pin(self.produce_video(&cx, &workspace, *rules, held.take())).await,
+			Planned::Animation(burn) => {
+				Box::pin(self.produce_video_animation(&cx, &workspace, *burn, held.take())).await
+			}
 			Planned::Image(input) => Box::pin(self.produce_image(&cx, input, &workspace)).await,
 		};
 		let image = matches!(planned, Planned::Image(_) | Planned::Animation(_));
@@ -723,7 +783,15 @@ impl Engine {
 		on_event(JobEvent::Decision(decision.clone()));
 
 		on_event(JobEvent::Stage(Stage::Commit));
-		let outcome = finish(job, sink, &work_root, &meta, before, staged, decision)?;
+		let outcome = finish(
+			job,
+			sink,
+			&work_root,
+			(&meta, cx.source_bytes),
+			before,
+			staged,
+			decision,
+		)?;
 
 		if matches!(outcome, JobOutcome::Encoded { .. }) {
 			for (key, lesson) in &learned {
@@ -871,18 +939,104 @@ impl Engine {
 		}
 	}
 
-	/// A video slot, then the memory for decoding at the source's size and at the output's, and the job's share of the
-	/// thread budget.
-	async fn video_resources(
-		&self,
+	/// A disc read into one video, or why it is kept as it is. A DVD's real titles are joined in a workspace opened with
+	/// room for them, under a video slot taken first.
+	async fn resolve_disc<'a>(
+		&'a self,
+		cx: &Context<'_>,
+		sink: &dyn OutputSink,
+		work_root: &Path,
+		kind: DiscKind,
+	) -> Result<Resolved<'a>, JobError> {
+		let files = match kind {
+			DiscKind::Dvd(files) => files,
+			DiscKind::BluRay { .. } => {
+				cx.record.update(|decision| {
+					decision.disc = Some(DiscDecision {
+						kind: "Blu-ray".to_owned(),
+						..DiscDecision::default()
+					});
+				});
+				let reason = match cx.job.options.blu_ray {
+					BluRay::Keep => BLU_RAY_KEPT,
+					BluRay::Convert => "Blu-ray conversion isn't available yet",
+				};
+				return Ok(Resolved::Kept(KeepReason::Unsupported(reason.to_owned())));
+			}
+		};
+		self.require(MediaKind::Video)?;
+
+		let dvd = match dvd::parse(&files) {
+			Ok(dvd) => dvd,
+			Err(reason) => {
+				return Ok(Resolved::Kept(KeepReason::Unsupported(format!(
+					"the DVD's titles can't be read: {reason}"
+				))));
+			}
+		};
+		let selection = dvd::select(&dvd);
+		cx.record
+			.update(|decision| decision.disc = Some(dvd_decision(&selection)));
+		if selection.kept.is_empty() {
+			return Ok(Resolved::Kept(KeepReason::Unsupported(NO_FOOTAGE.to_owned())));
+		}
+
+		let slot = self.video_slot(cx).await?;
+		let need = cx.source_bytes.saturating_add(dvd.footage_bytes(&selection));
+		let workspace = open_workspace(sink, work_root, &cx.job.source, need)?;
+
+		(cx.on_event)(JobEvent::Stage(Stage::Disc));
+		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
+		let built = read::build_dvd(
+			&self.tools,
+			&dvd,
+			&selection,
+			&disc_name(&cx.job.source),
+			&workspace,
+			on_fraction,
+			cx.cancel,
+		)
+		.await
+		.map_err(|err| disk_full(err, work_root, need))?;
+		cx.record
+			.update(|decision| record_built(decision.disc.get_or_insert_default(), &built));
+
+		let detection = detect::detect(&self.tools, &built.path, cx.cancel).await?;
+		if !matches!(detection.class, MediaClass::Video(_)) {
+			return Err(JobError::with_log(
+				ErrorKind::SourceDamaged("the disc's footage can't be read as video".into()),
+				detection.probe_log,
+			));
+		}
+		Ok(Resolved::Read(Box::new(ReadDisc {
+			slot,
+			workspace,
+			media: built.path,
+			detection,
+		})))
+	}
+
+	/// A video slot, reported `Queued` before it is waited for.
+	async fn video_slot(&self, cx: &Context<'_>) -> Result<SemaphorePermit<'_>, JobError> {
+		(cx.on_event)(JobEvent::Stage(Stage::Queued));
+		tokio::select! {
+			slot = self.video_slots.semaphore.acquire() => Ok(slot.expect("the semaphore is never closed")),
+			() = cx.cancel.cancelled() => Err(ErrorKind::Cancelled.into()),
+		}
+	}
+
+	/// A video slot (`held`, or one taken now), then the memory for decoding at the source's size and at the output's,
+	/// and the job's share of the thread budget.
+	async fn video_resources<'a>(
+		&'a self,
 		cx: &Context<'_>,
 		main: &Stream,
 		size: Option<(u32, u32)>,
-	) -> Result<VideoResources<'_>, JobError> {
-		(cx.on_event)(JobEvent::Stage(Stage::Queued));
-		let slot = tokio::select! {
-			slot = self.video_slots.semaphore.acquire() => slot.expect("the semaphore is never closed"),
-			() = cx.cancel.cancelled() => return Err(ErrorKind::Cancelled.into()),
+		held: Option<SemaphorePermit<'a>>,
+	) -> Result<VideoResources<'a>, JobError> {
+		let slot = match held {
+			Some(slot) => slot,
+			None => self.video_slot(cx).await?,
 		};
 
 		let decoded = video_plan::memory_estimate(main.width.unwrap_or(0), main.height.unwrap_or(0));
@@ -1067,11 +1221,12 @@ impl Engine {
 	}
 
 	#[allow(clippy::too_many_lines)]
-	async fn produce_video(
-		&self,
+	async fn produce_video<'a>(
+		&'a self,
 		cx: &Context<'_>,
 		workspace: &Workspace,
 		rules: StreamRules,
+		held: Option<SemaphorePermit<'a>>,
 	) -> Result<Produced, JobError> {
 		let source = cx.media;
 
@@ -1119,7 +1274,7 @@ impl Engine {
 			.await
 			.map_err(video_probe_error)?;
 
-		let resources = self.video_resources(cx, main, size).await?;
+		let resources = self.video_resources(cx, main, size, held).await?;
 		let lanes = self.lanes(cx.job, &resources);
 		let analysis = Box::pin(self.analyze_main(cx, main, span, lanes)).await?;
 		let mut video = plan_video(&info, main, &frames, &analysis, cx.job.speed, size);
@@ -1302,11 +1457,12 @@ impl Engine {
 
 	/// The main video, trimmed, deinterlaced, resized and with any subtitles burned in as the video path does it, is
 	/// stored as lossless RGB frames, which the animation path encodes and checks the AVIF against.
-	async fn produce_video_animation(
-		&self,
+	async fn produce_video_animation<'a>(
+		&'a self,
 		cx: &Context<'_>,
 		workspace: &Workspace,
 		burn: Option<Burn>,
+		held: Option<SemaphorePermit<'a>>,
 	) -> Result<Produced, JobError> {
 		let source = cx.media;
 
@@ -1328,7 +1484,7 @@ impl Engine {
 			.await
 			.map_err(video_probe_error)?;
 
-		let resources = self.video_resources(cx, main, size).await?;
+		let resources = self.video_resources(cx, main, size, held).await?;
 		let lanes = self.lanes(cx.job, &resources);
 		let analysis = Box::pin(self.analyze_main(cx, main, span, lanes)).await?;
 		let frame_count = estimated_frames(span, main.fps(), analysis.scan);
@@ -2455,6 +2611,10 @@ fn metadata_mode(job: &Job) -> MetadataMode {
 }
 
 fn check_damage(source: &Path) -> Result<(), JobError> {
+	if source.is_dir() {
+		return Ok(());
+	}
+
 	let damage = integrity::find_damage(source).map_err(|err| JobError::io(IoSide::Source(source), &err))?;
 	match damage {
 		Some(reason) => Err(ErrorKind::SourceDamaged(reason).into()),
@@ -2465,10 +2625,48 @@ fn check_damage(source: &Path) -> Result<(), JobError> {
 fn media_kind(class: &MediaClass) -> Option<MediaKind> {
 	match class {
 		MediaClass::Audio(_) => Some(MediaKind::Audio),
-		MediaClass::Video(_) => Some(MediaKind::Video),
+		MediaClass::Video(_) | MediaClass::Disc(_) => Some(MediaKind::Video),
 		MediaClass::StillImage(_) | MediaClass::AnimatedImage(_) => Some(MediaKind::Image),
 		MediaClass::Kept(_) | MediaClass::Damaged(_) | MediaClass::Other(_) => None,
 	}
+}
+
+fn disc_name(source: &Path) -> String {
+	source
+		.file_stem()
+		.map(|stem| stem.to_string_lossy().into_owned())
+		.unwrap_or_default()
+}
+
+fn title_name(number: u16) -> String {
+	format!("Title {number}")
+}
+
+fn dvd_decision(selection: &Selection) -> DiscDecision {
+	DiscDecision {
+		kind: "DVD".to_owned(),
+		dropped: selection
+			.dropped
+			.iter()
+			.map(|(title, dropped)| (title_name(*title), dropped.reason().to_owned()))
+			.collect(),
+		false_time: selection
+			.kept
+			.iter()
+			.filter(|kept| kept.false_time)
+			.map(|kept| title_name(kept.title))
+			.collect(),
+		..DiscDecision::default()
+	}
+}
+
+fn record_built(disc: &mut DiscDecision, built: &Built) {
+	disc.kept = built
+		.titles
+		.iter()
+		.map(|title| (title_name(title.title), title.length_s))
+		.collect();
+	disc.reencoded = built.reencoded.iter().copied().map(title_name).collect();
 }
 
 fn video_container(job: &Job) -> Container {
@@ -2928,7 +3126,7 @@ fn finish(
 	job: &Job,
 	sink: &dyn OutputSink,
 	work_root: &Path,
-	meta: &Metadata,
+	(meta, source_bytes): (&Metadata, u64),
 	before: SourceTimes,
 	staged: Staged,
 	decision: Box<Decision>,
@@ -2945,7 +3143,7 @@ fn finish(
 	match sink.commit(&artifact) {
 		Ok(output) => Ok(JobOutcome::Encoded {
 			output,
-			src_bytes: staged.source_share.unwrap_or(meta.len()),
+			src_bytes: staged.source_share.unwrap_or(source_bytes),
 			out_bytes: staged.bytes,
 			warnings: staged.warnings,
 			decision,

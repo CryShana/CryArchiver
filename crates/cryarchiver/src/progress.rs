@@ -253,6 +253,7 @@ fn stage_label(stage: Stage) -> &'static str {
 		Stage::Probe => "probing",
 		Stage::Plan => "planning",
 		Stage::Queued => "queued",
+		Stage::Disc => "reading disc",
 		Stage::WaitingForMemory => "waiting for memory",
 		Stage::Analyze => "analysing",
 		Stage::Sample => "sampling",
@@ -744,11 +745,12 @@ mod tests {
 		}
 	}
 
-	const STAGES: [Stage; 12] = [
+	const STAGES: [Stage; 13] = [
 		Stage::Detect,
 		Stage::Probe,
 		Stage::Plan,
 		Stage::Queued,
+		Stage::Disc,
 		Stage::WaitingForMemory,
 		Stage::Analyze,
 		Stage::Sample,

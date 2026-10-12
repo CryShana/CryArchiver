@@ -19,6 +19,7 @@ pub struct Decision {
 	pub video: Option<VideoDecision>,
 	pub image: Option<ImageDecision>,
 	pub audio: Option<AudioDecision>,
+	pub disc: Option<DiscDecision>,
 	pub warnings: Vec<String>,
 	/// The source's size, or under a trim the window's share of it.
 	pub source_bytes: Option<u64>,
@@ -168,6 +169,23 @@ pub struct AudioTrack {
 	pub channels: Option<u32>,
 }
 
+/// How a disc image or folder was read into the one video archived for it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscDecision {
+	/// `DVD` or `Blu-ray`.
+	pub kind: String,
+	/// The titles archived, in order, with their lengths in seconds.
+	pub kept: Vec<(String, f64)>,
+	/// The titles left out, with why.
+	pub dropped: Vec<(String, String)>,
+	/// The titles whose disc time was false, timed by their footage instead.
+	pub false_time: Vec<String>,
+	/// The titles re-encoded to the main title's shape before they were joined.
+	pub reencoded: Vec<String>,
+	pub playlist: Option<u32>,
+}
+
 impl Decision {
 	/// The chosen CRF and the last full check's score: `CRF 36.75, VMAF 93.1 / 87.2`.
 	pub fn crf_and_score(&self) -> Option<String> {
@@ -247,6 +265,7 @@ fn stage_name(stage: Stage) -> &'static str {
 		Stage::Probe => "probe",
 		Stage::Plan => "plan",
 		Stage::Queued => "queued",
+		Stage::Disc => "read disc",
 		Stage::WaitingForMemory => "waiting for memory",
 		Stage::Analyze => "analyse",
 		Stage::Sample => "sample",

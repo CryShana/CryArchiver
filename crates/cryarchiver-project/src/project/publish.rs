@@ -729,6 +729,7 @@ pub(super) fn stage_label(stage: Stage) -> &'static str {
 		Stage::Probe => "probing",
 		Stage::Plan => "planning",
 		Stage::Queued => "queued",
+		Stage::Disc => "reading disc",
 		Stage::WaitingForMemory => "waiting for memory",
 		Stage::Analyze => "analysing",
 		Stage::Sample => "sampling",

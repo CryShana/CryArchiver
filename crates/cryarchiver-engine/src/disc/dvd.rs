@@ -118,6 +118,22 @@ impl Dvd {
 		ranges
 	}
 
+	/// The bytes of footage the kept titles of `selection` read.
+	pub fn footage_bytes(&self, selection: &Selection) -> u64 {
+		selection
+			.kept
+			.iter()
+			.filter_map(|kept| self.titles.iter().find(|title| title.number == kept.title))
+			.flat_map(|title| {
+				title
+					.cells
+					.iter()
+					.flat_map(|cell| self.byte_ranges(title.vts, cell.first_sector, cell.last_sector))
+			})
+			.map(|(_, _, length)| length)
+			.sum()
+	}
+
 	fn readable(&self, title: &DvdTitle) -> Vec<Cell> {
 		let sectors = self.vob_sectors(title.vts);
 		title
@@ -136,6 +152,18 @@ pub enum Dropped {
 	Short,
 	Duplicate,
 	Unreadable,
+}
+
+impl Dropped {
+	pub fn reason(self) -> &'static str {
+		match self {
+			Self::Menu => "menu",
+			Self::Still => "still picture",
+			Self::Short => "under 10 s",
+			Self::Duplicate => "duplicate",
+			Self::Unreadable => "unreadable",
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

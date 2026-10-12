@@ -22,7 +22,7 @@ use cryarchiver_engine::format::{OutputFormat, check_bitrate_cap};
 use cryarchiver_engine::images::plan::ImageRoute;
 use cryarchiver_engine::naming::cli_output_path;
 use cryarchiver_engine::options::{
-	Advanced, BurnSubs, JobOptions, Resize, SubtitlePick, Trim, VideoEncoderChoice, parse_time,
+	Advanced, BluRay, BurnSubs, JobOptions, Resize, SubtitlePick, Trim, VideoEncoderChoice, parse_time,
 };
 use cryarchiver_engine::outcome::{ErrorKind, JobError, JobOutcome};
 use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
@@ -870,6 +870,7 @@ async fn compress(args: CompressArgs) -> u8 {
 				threads,
 				max_bitrate_kbps: args.max_bitrate,
 				resize: args.resize,
+				blu_ray: BluRay::Convert,
 			},
 		})
 		.collect();

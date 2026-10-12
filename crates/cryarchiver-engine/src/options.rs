@@ -156,6 +156,15 @@ pub struct Advanced {
 	pub image_encoder: Option<ImageRoute>,
 }
 
+/// What becomes of a 2D Blu-ray image: kept as it is, or its main feature converted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum BluRay {
+	Keep,
+	#[default]
+	Convert,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobOptions {
 	pub trim: Option<Trim>,
@@ -167,6 +176,7 @@ pub struct JobOptions {
 	pub threads: Option<usize>,
 	pub max_bitrate_kbps: Option<u32>,
 	pub resize: Option<Resize>,
+	pub blu_ray: BluRay,
 }
 
 impl JobOptions {
