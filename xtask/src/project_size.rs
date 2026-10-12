@@ -93,6 +93,7 @@ fn record(index: usize, key: &RelPath) -> FileRecord {
 		window_hash: Some(hash(seed)),
 		full_hash: Some(hash(seed ^ 0xAA)),
 		replaces: None,
+		retrying: None,
 		state,
 	}
 }
