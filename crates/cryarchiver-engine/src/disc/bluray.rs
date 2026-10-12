@@ -25,6 +25,9 @@ const MAX_MPLS_BYTES: u64 = 16 << 20;
 /// libbluray reads every playlist and clip of the disc before it picks one.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 const SELECTED: &str = "selected ";
+/// ffmpeg's bluray protocol logs under this context, so a path the log echoes elsewhere can't look like its message.
+const BLURAY_CONTEXT: &str = "[bluray @ ";
+const ENCRYPTION_WORDS: [&str; 3] = ["AACS", "libaacs", "BD+"];
 
 /// The playlist libbluray picked, from ffmpeg's `selected 00800.mpls` log line.
 fn selected_playlist(log: &[String]) -> Option<u32> {
@@ -219,27 +222,14 @@ impl MainFeature {
 	}
 }
 
-/// Whether ffmpeg's log says libbluray couldn't open a disc for its AACS or BD+ encryption. ffmpeg echoes the disc's
-/// path in its errors, so each of `paths` is cut out of a line before it is matched.
-fn encrypted(log: &[String], paths: &[&str]) -> bool {
-	let mut paths: Vec<String> = paths
-		.iter()
-		.filter(|path| !path.is_empty())
-		.map(|path| slashed(path))
-		.collect();
-	paths.sort_by_key(|path| std::cmp::Reverse(path.len()));
-
+/// Whether ffmpeg's log says libbluray couldn't open a disc for its AACS or BD+ encryption: a message of the bluray
+/// protocol that names either.
+fn encrypted(log: &[String]) -> bool {
 	log.iter().any(|line| {
-		let mut line = slashed(line);
-		for path in &paths {
-			line = line.replace(path.as_str(), "");
-		}
-		line.contains("aacs") || line.contains("bd+") || line.contains("encrypted")
+		line.split_once(BLURAY_CONTEXT)
+			.and_then(|(_, rest)| rest.split_once("] "))
+			.is_some_and(|(_, message)| ENCRYPTION_WORDS.iter().any(|word| message.contains(word)))
 	})
-}
-
-fn slashed(text: &str) -> String {
-	text.replace('\\', "/").to_ascii_lowercase()
 }
 
 /// The main feature of the Blu-ray image, or folder holding `BDMV`, `root`, whose files are `files`: ffmpeg opens it
@@ -267,7 +257,7 @@ pub async fn main_feature(
 
 	let out = match probe::run_ffprobe(&cmd, cancel).await {
 		Ok(out) => out,
-		Err(ProbeError::Failed(log)) if encrypted(&log, &echoed_paths(root, &url)) => return Ok(None),
+		Err(ProbeError::Failed(log)) if encrypted(&log) => return Ok(None),
 		Err(err) => return Err(read::unreadable(err)),
 	};
 	let probed = MediaInfo::parse(&out.stdout).map_err(|err| read::unreadable(err.into()))?;
@@ -299,18 +289,6 @@ pub async fn main_feature(
 		chapters,
 		languages,
 	}))
-}
-
-/// The spellings of the disc's path ffmpeg may echo in a log line.
-fn echoed_paths<'a>(source: &'a Path, url: &'a str) -> Vec<&'a str> {
-	[
-		url.strip_prefix("bluray:"),
-		source.to_str(),
-		source.file_name().and_then(|name| name.to_str()),
-	]
-	.into_iter()
-	.flatten()
-	.collect()
 }
 
 fn read_mpls(files: &DiscFiles, number: u32) -> Result<Mpls, String> {
@@ -554,43 +532,35 @@ mod tests {
 		);
 	}
 
+	fn log(line: &str) -> Vec<String> {
+		vec!["Input #0".to_owned(), line.to_owned()]
+	}
+
 	#[test]
 	fn libbluray_refusing_an_encrypted_disc_is_recognised() {
-		let log = |line: &str| vec!["Input #0".to_owned(), line.to_owned()];
+		for message in [
+			"Media stream encrypted with AACS, install and configure libaacs",
+			"Your libaacs can't decrypt this media",
+			"Media stream encrypted with BD+, install and configure libbdplus",
+			"Unable to decrypt BD+ encrypted media",
+		] {
+			assert!(encrypted(&log(&format!("[bluray @ 0000020c] {message}"))), "{message}");
+		}
 
-		assert!(encrypted(
-			&log("[bluray @ 0000020c] Media stream encrypted with AACS, install and configure libaacs"),
-			&[]
-		));
-		assert!(encrypted(
-			&log("[bluray @ 0000020c] Your libaacs can't decrypt this media"),
-			&[]
-		));
-		assert!(encrypted(
-			&log("[bluray @ 0000020c] Unable to decrypt BD+ encrypted media"),
-			&[]
-		));
-		assert!(!encrypted(&log("[bluray @ 0000020c] bd_open() failed"), &[]));
-		assert!(!encrypted(&log("bluray:F:\\Film.iso: I/O error"), &[]));
+		assert!(!encrypted(&log("[bluray @ 0000020c] bd_open() failed")));
+		assert!(!encrypted(&log(r"bluray:F:\Film.iso: I/O error")));
 	}
 
 	#[test]
 	fn a_path_that_says_encrypted_does_not_make_a_disc_encrypted() {
-		let log = |line: &str| vec!["Input #0".to_owned(), line.to_owned()];
-		let source = r"F:\Encrypted Hearts\Disc.iso";
-		let url = r"bluray:F:\Encrypted Hearts\Disc.iso";
+		let url = r"bluray:F:\AACS Encrypted Hearts\BD+\Disc.iso";
 
-		assert!(!encrypted(
-			&log(&format!("{url}: Invalid data found when processing input")),
-			&echoed_paths(Path::new(source), url)
-		));
-		assert!(!encrypted(
-			&log("f:/encrypted hearts/Disc.iso: I/O error"),
-			&echoed_paths(Path::new(source), url)
-		));
-		assert!(encrypted(
-			&log(&format!("{url}: Media stream encrypted with AACS")),
-			&echoed_paths(Path::new(source), url)
-		));
+		assert!(!encrypted(&log(&format!(
+			"{url}: Invalid data found when processing input"
+		))));
+		assert!(!encrypted(&log("f:/aacs encrypted hearts/bd+/Disc.iso: I/O error")));
+		assert!(encrypted(&log(
+			"[bluray @ 0000020c] Media stream encrypted with AACS, install and configure libaacs"
+		)));
 	}
 }
