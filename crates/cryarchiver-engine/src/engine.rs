@@ -219,6 +219,7 @@ pub struct Engine {
 
 struct Context<'a> {
 	job: &'a Job,
+	media: &'a Path,
 	source_bytes: u64,
 	on_event: &'a (dyn Fn(JobEvent) + Sync),
 	cancel: &'a CancellationToken,
@@ -677,6 +678,7 @@ impl Engine {
 
 		let cx = Context {
 			job,
+			media: &job.source,
 			source_bytes: meta.len(),
 			on_event,
 			cancel,
@@ -786,7 +788,7 @@ impl Engine {
 
 		let image = ImageContext {
 			tools: &self.tools,
-			source: &cx.job.source,
+			source: cx.media,
 			source_bytes: cx.source_bytes,
 			source_is_part: false,
 			speed: cx.job.speed,
@@ -915,7 +917,7 @@ impl Engine {
 		let on_segments = |done, total| (cx.on_event)(JobEvent::Parts { done, total });
 		Box::pin(analyze::analyze_reporting(
 			&self.tools,
-			&cx.job.source,
+			cx.media,
 			main,
 			(span.declared_s, span.window),
 			(segments, lanes),
@@ -948,7 +950,7 @@ impl Engine {
 		if span.window.is_some() {
 			video.expected_frames = None;
 		} else if video.expected_frames.is_some() {
-			let undecoded = undecoded_lead(&self.tools, &cx.job.source, main.index, cx.cancel).await?;
+			let undecoded = undecoded_lead(&self.tools, cx.media, main.index, cx.cancel).await?;
 			video.expected_frames = video_plan::decodable_frames(main, span.declared_s, scan_type, undecoded);
 		}
 		Ok(())
@@ -972,7 +974,7 @@ impl Engine {
 		cx.record.update(|decision| decision.audio = Some(audio_decision(plan)));
 
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
-		let cmd = encode::command(&self.tools.ffmpeg, &cx.job.source, &output, plan);
+		let cmd = encode::command(&self.tools.ffmpeg, cx.media, &output, plan);
 		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
 		let duration_s = plan
 			.options
@@ -1008,7 +1010,7 @@ impl Engine {
 
 		if plan.container.cover == Cover::VorbisPicture
 			&& !plan.options.strip
-			&& let Some(warning) = copy_cover(&cx.job.source, &output, info)
+			&& let Some(warning) = copy_cover(cx.media, &output, info)
 		{
 			(cx.on_event)(JobEvent::Warning(warning.clone()));
 			warnings.push(warning);
@@ -1063,7 +1065,7 @@ impl Engine {
 		workspace: &Workspace,
 		rules: StreamRules,
 	) -> Result<Produced, JobError> {
-		let source = cx.job.source.as_path();
+		let source = cx.media;
 
 		(cx.on_event)(JobEvent::Stage(Stage::Probe));
 		let (info, probe_json) =
@@ -1245,7 +1247,7 @@ impl Engine {
 			return Err(ErrorKind::EncodeFailed("--burn-subs can't be used on transparent video".into()).into());
 		}
 
-		let start_s = burn::prepare(&self.tools, &cx.job.source, workspace, info, chosen, cx.cancel).await?;
+		let start_s = burn::prepare(&self.tools, cx.media, workspace, info, chosen, cx.cancel).await?;
 
 		let size_percent = cx
 			.job
@@ -1298,7 +1300,7 @@ impl Engine {
 		workspace: &Workspace,
 		burn: Option<Burn>,
 	) -> Result<Produced, JobError> {
-		let source = cx.job.source.as_path();
+		let source = cx.media;
 
 		(cx.on_event)(JobEvent::Stage(Stage::Probe));
 		let (info, _) = probe::probe_video(&self.tools, source, cx.source_bytes, counts_packets(cx.job), cx.cancel)
@@ -1409,7 +1411,7 @@ impl Engine {
 				expected_frames: None,
 				..video.clone()
 			};
-			let cmd = video_encode::frames_command(&self.tools.ffmpeg, &cx.job.source, path, &plan);
+			let cmd = video_encode::frames_command(&self.tools.ffmpeg, cx.media, path, &plan);
 
 			let encoded = Box::pin(video_encode::encode_video(
 				&cmd,
@@ -1471,7 +1473,7 @@ impl Engine {
 		let span_s = job.span_s;
 
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
-		let cmd = video_encode::frames_command(&self.tools.ffmpeg, &cx.job.source, &path, video);
+		let cmd = video_encode::frames_command(&self.tools.ffmpeg, cx.media, &path, video);
 		let on_fraction = |fraction: f64| (cx.on_event)(JobEvent::Progress(fraction / 2.0));
 		let encoded = Box::pin(video_encode::encode_video(&cmd, video, span_s, on_fraction, cx.cancel)).await?;
 		let (frames, warning) = self
@@ -1649,7 +1651,7 @@ impl Engine {
 	) -> Scorer<'a> {
 		Scorer {
 			tools: &self.tools,
-			source: &cx.job.source,
+			source: cx.media,
 			workspace,
 			plan: video,
 			threads: self.job_threads(cx.job, self.metric_threads),
@@ -2016,7 +2018,7 @@ impl Engine {
 		let _ = fs::remove_file(&temps.video.path);
 
 		let path = workspace.file(&format!("video.a{attempt}.mkv"));
-		let cmd = video_encode::video_command(&self.tools.ffmpeg, &cx.job.source, &path, video);
+		let cmd = video_encode::video_command(&self.tools.ffmpeg, cx.media, &path, video);
 		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
 		let encoded = Box::pin(video_encode::encode_video(
 			&cmd,
@@ -2094,8 +2096,7 @@ impl Engine {
 			let fraction = video_plan::scanned_frames(frames, source_frames.scan) as f64 / expected as f64;
 			(cx.on_event)(JobEvent::Progress(fraction.clamp(0.0, 1.0)));
 		};
-		let decoded =
-			video_encode::decoded_frames(&self.tools.ffmpeg, &cx.job.source, video, on_frames, cx.cancel).await?;
+		let decoded = video_encode::decoded_frames(&self.tools.ffmpeg, cx.media, video, on_frames, cx.cancel).await?;
 		(cx.on_event)(JobEvent::Stage(Stage::Encode));
 
 		Ok(*source_frames.decoded.get_or_init(|| decoded))
@@ -2126,7 +2127,7 @@ impl Engine {
 		let uncapped = inputs.lanes.uncapped_stage();
 		let encoded = Box::pin(video_encode::encode_samples(
 			&self.tools.ffmpeg,
-			&cx.job.source,
+			cx.media,
 			workspace,
 			video,
 			&samples,
@@ -2162,7 +2163,7 @@ impl Engine {
 			.collect();
 		let paths = cues::cut(
 			&self.tools.ffmpeg,
-			&cx.job.source,
+			cx.media,
 			workspace,
 			&tracks,
 			(window, job.info.format.start_time),
@@ -2184,7 +2185,7 @@ impl Engine {
 		job: &VideoJob<'_>,
 		temps: EncodedTemps,
 	) -> Result<Produced, JobError> {
-		let source = cx.job.source.as_path();
+		let source = cx.media;
 		let mut warnings: Vec<String> = job
 			.video
 			.warnings
