@@ -8,7 +8,7 @@ use std::path::Path;
 use cryarchiver_engine::budget::{Lanes, ThreadBudget, Width};
 use cryarchiver_engine::calibration::tables;
 use cryarchiver_engine::options::{SubtitlePick, TrimWindow};
-use cryarchiver_engine::preset::{Overrides, Speed};
+use cryarchiver_engine::preset::{Overrides, Speed, VmafOverride};
 use cryarchiver_engine::probe::probe;
 use cryarchiver_engine::quality::search::Target;
 use cryarchiver_engine::quality::vmaf::{Score, pool};
@@ -145,7 +145,14 @@ async fn a_long_encode_aims_the_search_above_the_target_from_its_first_probe() {
 	};
 	let plan = plan_video(&info, main, &[], &analysis, Speed::Moderate, None);
 	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
-	let goal = target(Speed::Moderate, false, false, &Overrides::default());
+	let overrides = Overrides {
+		video: Some(VmafOverride {
+			mean: 93.0,
+			floor: 89.0,
+		}),
+		..Overrides::default()
+	};
+	let goal = target(Speed::Moderate, false, false, &overrides);
 	let samples = [Sample {
 		start_s: 0.0,
 		length_s: 3.0,
