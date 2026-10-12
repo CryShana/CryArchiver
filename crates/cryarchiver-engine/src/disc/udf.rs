@@ -52,16 +52,14 @@ pub struct DiscFile {
 
 impl DiscFile {
 	/// The file's bytes, its extents read in order.
-	pub fn read(&self) -> io::Result<Vec<u8>> {
-		let mut source = File::open(&self.source)?;
+	pub fn read(&self, reader: &mut super::Reader) -> io::Result<Vec<u8>> {
 		let mut bytes = Vec::new();
 		for extent in &self.extents {
 			let length = usize::try_from(extent.length)
 				.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the file is too large"))?;
 			let start = bytes.len();
 			bytes.resize(start + length, 0);
-			source.seek(SeekFrom::Start(extent.offset))?;
-			source.read_exact(&mut bytes[start..])?;
+			reader.read(&self.source, extent.offset, &mut bytes[start..])?;
 		}
 		Ok(bytes)
 	}

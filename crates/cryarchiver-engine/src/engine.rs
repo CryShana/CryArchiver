@@ -22,10 +22,10 @@ use crate::decision::{
 	Trim, Vmaf, encoder_text,
 };
 use crate::detect::{self, Detection, DiscKind, MediaClass};
-use crate::disc::bluray;
 use crate::disc::dvd::{self, Selection};
 use crate::disc::read::{self, Built};
 use crate::disc::udf::DiscFiles;
+use crate::disc::{Reader, bluray};
 use crate::format::{OutputFormat, check_bitrate_cap, check_kind};
 use crate::images::animated::{self, Animation};
 use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
@@ -973,16 +973,23 @@ impl Engine {
 		};
 		self.require(MediaKind::Video)?;
 
-		let parsed = blocking(cx.cancel, move || dvd::parse(&files)).await?;
-		let dvd = match parsed {
-			Ok(dvd) => Arc::new(dvd),
+		let read = blocking(cx.cancel, move || {
+			let mut reader = Reader::default();
+			let dvd = dvd::parse(&files, &mut reader)?;
+			let selection = dvd::select(&dvd);
+			let encrypted =
+				(!selection.kept.is_empty() && !dvd.mixed(&selection)).then(|| dvd.encrypted(&selection, &mut reader));
+			Ok::<_, String>((dvd, selection, encrypted))
+		})
+		.await?;
+		let (dvd, selection, encrypted) = match read {
+			Ok(read) => read,
 			Err(reason) => {
 				return Ok(Resolved::Kept(KeepReason::Unsupported(format!(
 					"the DVD's titles can't be read: {reason}"
 				))));
 			}
 		};
-		let selection = dvd::select(&dvd);
 		cx.record
 			.update(|decision| decision.disc = Some(dvd_decision(&selection)));
 		if selection.kept.is_empty() {
@@ -991,13 +998,11 @@ impl Engine {
 		if dvd.mixed(&selection) {
 			return Ok(Resolved::Kept(KeepReason::Unsupported(INTERLEAVED_KEPT.to_owned())));
 		}
-
-		let sampled = Arc::clone(&dvd);
-		let sample = selection.clone();
-		let encrypted = blocking(cx.cancel, move || sampled.encrypted(&sample))
-			.await?
-			.map_err(|err| JobError::io(IoSide::Source(&cx.job.source), &err))?;
-		if encrypted {
+		if encrypted
+			.transpose()
+			.map_err(|err| JobError::io(IoSide::Source(&cx.job.source), &err))?
+			.unwrap_or_default()
+		{
 			return Ok(Resolved::Kept(KeepReason::Unsupported(DVD_ENCRYPTED.to_owned())));
 		}
 

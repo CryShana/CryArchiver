@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use cryarchiver_engine::disc::Reader;
 use cryarchiver_engine::disc::bluray::{build_bluray, main_feature};
 use cryarchiver_engine::disc::dvd::{Dvd, Selection, parse, select};
 use cryarchiver_engine::disc::read::{ANGLES_LEFT_OUT, Built, BuiltTitle, build_dvd, normalise_timestamps};
@@ -22,7 +23,7 @@ const NAME: &str = "Družinski izlet";
 fn disc(dir: &Path, root: &Path, titles: &[Footage]) -> (Dvd, Selection) {
 	dvd::write_folder(root, &dvd::video_ts(dir, titles));
 
-	let dvd = parse(&read_folder(root).unwrap()).unwrap();
+	let dvd = parse(&read_folder(root).unwrap(), &mut Reader::default()).unwrap();
 	let selection = select(&dvd);
 	assert_eq!(selection.kept.len(), titles.len(), "{selection:?}");
 	(dvd, selection)
@@ -492,6 +493,28 @@ async fn a_subtitle_track_that_starts_late_in_its_title_is_still_read() {
 }
 
 #[tokio::test]
+async fn a_title_with_a_false_time_and_a_late_subtitle_is_timed_by_its_counted_packets() {
+	let dir = tempfile::tempdir().unwrap();
+	let late = Footage {
+		size: "352x288",
+		bit_rate: "2M",
+		subtitles: true,
+		subtitle_ms: (70_000, 72_000),
+		..footage(75, &[1, 2])
+	};
+	let (dvd, selection) = disc(dir.path(), &dir.path().join("disc"), &[late]);
+	assert!(selection.kept[0].false_time);
+	let workspace = workspace(dir.path());
+
+	let built = build(&dvd, &selection, &workspace).await.unwrap();
+
+	assert!(built.warnings.is_empty(), "{:?}", built.warnings);
+	assert!(near(built.titles[0].length_s, 75.0, 0.2), "{:?}", built.titles);
+	let info = probed(&built.path).await;
+	assert_eq!(codecs(&info), ["mpeg2video", "ac3", "dvd_subtitle"]);
+}
+
+#[tokio::test]
 async fn tracks_a_title_has_beyond_the_main_title_are_left_out_with_a_warning() {
 	let dir = tempfile::tempdir().unwrap();
 	let more = Footage {
@@ -526,7 +549,7 @@ async fn only_the_first_angle_of_an_interleaved_block_is_read() {
 	let dir = tempfile::tempdir().unwrap();
 	let root = dir.path().join("disc");
 	dvd::write_folder(&root, &dvd::two_angles(dir.path(), footage(12, &[12]), true));
-	let dvd = parse(&read_folder(&root).unwrap()).unwrap();
+	let dvd = parse(&read_folder(&root).unwrap(), &mut Reader::default()).unwrap();
 	let selection = select(&dvd);
 	let workspace = workspace(dir.path());
 
@@ -548,7 +571,7 @@ async fn an_interleaved_block_whose_units_cannot_be_followed_is_mixed() {
 	let root = dir.path().join("disc");
 	dvd::write_folder(&root, &dvd::two_angles(dir.path(), footage(12, &[12]), false));
 
-	let dvd = parse(&read_folder(&root).unwrap()).unwrap();
+	let dvd = parse(&read_folder(&root).unwrap(), &mut Reader::default()).unwrap();
 
 	assert!(dvd.mixed(&select(&dvd)));
 }
@@ -561,7 +584,7 @@ async fn an_interleaved_block_that_cannot_be_read_is_an_error_not_mixed() {
 	let listing = read_folder(&root).unwrap();
 	std::fs::remove_file(root.join("VIDEO_TS").join("VTS_01_1.VOB")).unwrap();
 
-	let reason = parse(&listing).unwrap_err();
+	let reason = parse(&listing, &mut Reader::default()).unwrap_err();
 
 	assert!(reason.contains("can't be read"), "{reason}");
 }

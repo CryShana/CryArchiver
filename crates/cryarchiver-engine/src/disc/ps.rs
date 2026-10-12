@@ -20,35 +20,39 @@ pub struct Packet {
 }
 
 /// The audio, video and private-stream packets of the pack `sector`; none when it isn't an MPEG-2 pack.
-pub fn packets(sector: &[u8]) -> Vec<Packet> {
-	if sector.get(..4) != Some(&PACK_START) || sector.get(4).is_none_or(|marker| marker >> 6 != 1) {
-		return Vec::new();
-	}
+pub fn packets(sector: &[u8]) -> impl Iterator<Item = Packet> + '_ {
+	let pack = sector.get(..4) == Some(&PACK_START) && sector.get(4).is_some_and(|marker| marker >> 6 == 1);
+	let mut at = if pack {
+		14 + usize::from(sector.get(13).map_or(0, |stuffing| stuffing & 7))
+	} else {
+		sector.len()
+	};
 
-	let mut packets = Vec::new();
-	let mut at = 14 + usize::from(sector.get(13).map_or(0, |stuffing| stuffing & 7));
-	while let Some(&[0, 0, 1, code, high, low]) = sector.get(at..at + 6) {
-		let body = at + 6;
-		at = body + usize::from(u16::from_be_bytes([high, low]));
+	std::iter::from_fn(move || {
+		while let Some(&[0, 0, 1, code, high, low]) = sector.get(at..at + 6) {
+			let body = at + 6;
+			at = body + usize::from(u16::from_be_bytes([high, low]));
 
-		let Some(&[flags, _, header]) = sector.get(body..body + 3) else {
-			break;
-		};
-		if flags >> 6 != 2 {
-			continue;
+			let Some(&[flags, _, header]) = sector.get(body..body + 3) else {
+				at = sector.len();
+				return None;
+			};
+			if flags >> 6 != 2 {
+				continue;
+			}
+			let scrambled = flags & 0x30 != 0;
+			let id = match code {
+				PRIVATE_1 => match sector.get(body + 3 + usize::from(header)) {
+					Some(&substream) => u32::from(substream),
+					None => continue,
+				},
+				0xC0..=0xEF => 0x100 | u32::from(code),
+				_ => continue,
+			};
+			return Some(Packet { id, scrambled });
 		}
-		let scrambled = flags & 0x30 != 0;
-		let id = match code {
-			PRIVATE_1 => match sector.get(body + 3 + usize::from(header)) {
-				Some(&substream) => u32::from(substream),
-				None => continue,
-			},
-			0xC0..=0xEF => 0x100 | u32::from(code),
-			_ => continue,
-		};
-		packets.push(Packet { id, scrambled });
-	}
-	packets
+		None
+	})
 }
 
 /// The seamless-playback fields of a nav pack's DSI, when `sector` is the nav pack numbered `lbn`.
@@ -109,21 +113,18 @@ mod tests {
 			(0xC0, 0x80, None),
 		]);
 
-		let ids: Vec<u32> = packets(&sector).iter().map(|packet| packet.id).collect();
+		let ids: Vec<u32> = packets(&sector).map(|packet| packet.id).collect();
 
 		assert_eq!(ids, [0x1E0, 0x80, 0x21, 0x1C0]);
-		assert!(packets(&sector).iter().all(|packet| !packet.scrambled));
-		assert!(packets(&[0; SECTOR_LEN]).is_empty());
+		assert!(packets(&sector).all(|packet| !packet.scrambled));
+		assert_eq!(packets(&[0; SECTOR_LEN]).next(), None);
 	}
 
 	#[test]
 	fn scrambled_payloads_are_flagged() {
 		let sector = pack(&[(0xBF, 0x00, None), (0xE0, 0x81 | 0x10, None), (0xBD, 0xA1, Some(0x80))]);
 
-		let flags: Vec<(u32, bool)> = packets(&sector)
-			.iter()
-			.map(|packet| (packet.id, packet.scrambled))
-			.collect();
+		let flags: Vec<(u32, bool)> = packets(&sector).map(|packet| (packet.id, packet.scrambled)).collect();
 
 		assert_eq!(flags, [(0x1E0, true), (0x80, true)]);
 	}

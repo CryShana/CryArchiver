@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::read::{self, Built, BuiltTitle, Window};
 use super::udf::DiscFiles;
-use super::{be16, be32, byte, get};
+use super::{Reader, be16, be32, byte, get};
 use crate::language;
 use crate::outcome::{ErrorKind, JobError};
 use crate::probe::{self, MediaInfo, ProbeError, Stream};
@@ -340,7 +340,7 @@ fn read_mpls(files: &DiscFiles, number: u32) -> Result<Mpls, String> {
 		}
 
 		match file
-			.read()
+			.read(&mut Reader::default())
 			.map_err(|err| err.to_string())
 			.and_then(|bytes| Mpls::parse(&bytes))
 		{

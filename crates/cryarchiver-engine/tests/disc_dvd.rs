@@ -4,11 +4,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use cryarchiver_engine::disc::SECTOR;
 use cryarchiver_engine::disc::dvd::{
 	AudioAttr, AudioCoding, Cell, Dropped, Dvd, DvdTitle, Kept, Subpicture, VideoAttr, parse, select,
 };
 use cryarchiver_engine::disc::udf::{DiscFiles, read_folder, read_image};
+use cryarchiver_engine::disc::{Reader, SECTOR};
 use support::ifo::{self, Audio, Pgc, Vts};
 use support::udf::{Image, UdfRevision};
 
@@ -202,7 +202,7 @@ fn an_ifo_set_in_an_image_parses_back_to_its_titles() {
 	let dir = tempfile::tempdir().unwrap();
 	let files = image(dir.path(), disc(&ifo::vmg(&[(1, 1), (1, 2)]), &title_set().bytes()));
 
-	let dvd = parse(&files).unwrap();
+	let dvd = parse(&files, &mut Reader::default()).unwrap();
 
 	assert_eq!(dvd.titles, expected_titles());
 	assert_eq!(dvd.vob_sectors(1), 2048);
@@ -225,7 +225,7 @@ fn an_ifo_set_in_an_image_parses_back_to_its_titles() {
 fn byte_ranges_read_the_cells_across_extents_and_vob_parts() {
 	let dir = tempfile::tempdir().unwrap();
 	let files = image(dir.path(), disc(&ifo::vmg(&[(1, 1), (1, 2)]), &title_set().bytes()));
-	let dvd = parse(&files).unwrap();
+	let dvd = parse(&files, &mut Reader::default()).unwrap();
 	let vobs = vobs();
 
 	let ranges = dvd.byte_ranges(1, 1300, 2047);
@@ -241,7 +241,7 @@ fn a_folder_parses_like_an_image() {
 	let dir = tempfile::tempdir().unwrap();
 	let files = folder(dir.path(), &disc(&ifo::vmg(&[(1, 1), (1, 2)]), &title_set().bytes()));
 
-	let dvd = parse(&files).unwrap();
+	let dvd = parse(&files, &mut Reader::default()).unwrap();
 
 	assert_eq!(dvd.titles, expected_titles());
 	assert_eq!(read_ranges(&dvd, 1500, 1600), sectors(&vobs(), 1500, 1600));
@@ -255,7 +255,7 @@ fn damaged_ifos_fall_back_to_their_backups() {
 	files[0].1[..12].copy_from_slice(b"DVDVIDEO-XXX");
 	files[2].1.truncate(100);
 
-	let dvd = parse(&folder(dir.path(), &files)).unwrap();
+	let dvd = parse(&folder(dir.path(), &files), &mut Reader::default()).unwrap();
 
 	assert_eq!(dvd.titles, expected_titles());
 }
@@ -267,7 +267,7 @@ fn a_title_set_whose_ifos_both_fail_leaves_its_titles_unreadable() {
 	files.push(("VIDEO_TS/VTS_02_0.IFO".to_owned(), pattern(4096, 2)));
 	files.push(("VIDEO_TS/VTS_02_1.VOB".to_owned(), pattern(8192, 3)));
 
-	let dvd = parse(&folder(dir.path(), &files)).unwrap();
+	let dvd = parse(&folder(dir.path(), &files), &mut Reader::default()).unwrap();
 
 	assert_eq!(dvd.titles[1].number, 2);
 	assert_eq!(dvd.titles[1].vts, 2);
@@ -282,7 +282,7 @@ fn a_disc_without_a_readable_title_table_is_an_error() {
 	files.retain(|(name, _)| !name.starts_with("VIDEO_TS/VIDEO_TS"));
 	files.push(("VIDEO_TS/VIDEO_TS.IFO".to_owned(), pattern(2048, 4)));
 
-	let reason = parse(&folder(dir.path(), &files)).unwrap_err();
+	let reason = parse(&folder(dir.path(), &files), &mut Reader::default()).unwrap_err();
 
 	assert!(reason.contains("VIDEO_TS.IFO"), "{reason}");
 	assert!(reason.contains("VIDEO_TS.BUP is missing"), "{reason}");
@@ -296,7 +296,11 @@ fn cells_past_the_vobs_are_left_out() {
 	vts.pgcs[0].programs.push(4);
 	vts.titles[0].push((1, 4));
 
-	let dvd = parse(&folder(dir.path(), &disc(&ifo::vmg(&[(1, 1)]), &vts.bytes()))).unwrap();
+	let dvd = parse(
+		&folder(dir.path(), &disc(&ifo::vmg(&[(1, 1)]), &vts.bytes())),
+		&mut Reader::default(),
+	)
+	.unwrap();
 
 	assert_eq!(dvd.titles[0].cells, expected_titles()[0].cells);
 	assert_eq!(
@@ -318,7 +322,11 @@ fn only_the_first_angle_of_an_angle_block_plays() {
 	vts.pgcs[0].cells.insert(3, angle(800, 899, 3));
 	vts.pgcs[0].programs = vec![1, 2, 5];
 
-	let dvd = parse(&folder(dir.path(), &disc(&ifo::vmg(&[(1, 1)]), &vts.bytes()))).unwrap();
+	let dvd = parse(
+		&folder(dir.path(), &disc(&ifo::vmg(&[(1, 1)]), &vts.bytes())),
+		&mut Reader::default(),
+	)
+	.unwrap();
 
 	let firsts: Vec<u32> = dvd.titles[0].cells.iter().map(|cell| cell.first_sector).collect();
 	assert_eq!(firsts, [0, 400, 900]);
@@ -341,7 +349,11 @@ fn the_pgc_stream_controls_give_each_stream_its_id() {
 	vts.pgcs[0].audio_control = vec![0x8000, 0, 0x8000 | 2 << 8];
 	vts.pgcs[0].subpicture_control = vec![0x8000_0000 | 3 << 16 | 1 << 24, 0x8000_0000 | 5 << 16];
 
-	let dvd = parse(&folder(dir.path(), &disc(&ifo::vmg(&[(1, 1), (1, 2)]), &vts.bytes()))).unwrap();
+	let dvd = parse(
+		&folder(dir.path(), &disc(&ifo::vmg(&[(1, 1), (1, 2)]), &vts.bytes())),
+		&mut Reader::default(),
+	)
+	.unwrap();
 
 	let ids = |title: &DvdTitle| {
 		(
@@ -370,7 +382,11 @@ fn a_title_spanning_two_pgcs_joins_their_cells() {
 	let mut vts = title_set();
 	vts.titles = vec![vec![(1, 1), (1, 3), (2, 1)]];
 
-	let dvd = parse(&folder(dir.path(), &disc(&ifo::vmg(&[(1, 1)]), &vts.bytes()))).unwrap();
+	let dvd = parse(
+		&folder(dir.path(), &disc(&ifo::vmg(&[(1, 1)]), &vts.bytes())),
+		&mut Reader::default(),
+	)
+	.unwrap();
 
 	assert_eq!(dvd.titles[0].cells.len(), 4);
 	assert_eq!(dvd.titles[0].chapter_starts_s, [0.0, 50.0, 50.0 + (25.0 + 12.0 / 25.0)]);
@@ -399,7 +415,7 @@ fn damaged_ifos_never_panic() {
 		for (name, _) in &clean[index..index + 2] {
 			std::fs::write(root.join(name), &damaged).unwrap();
 		}
-		if let Ok(dvd) = parse(&read_folder(&root).unwrap()) {
+		if let Ok(dvd) = parse(&read_folder(&root).unwrap(), &mut Reader::default()) {
 			select(&dvd);
 		}
 		for (name, bytes) in &clean[index..index + 2] {

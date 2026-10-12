@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use super::dvd::{Dvd, DvdTitle, Kept, MAX_DVD_MBITS, Selection};
-use super::{Range, Reader, joined, ps};
+use super::{Range, Reader, SECTOR, joined, ps};
 use crate::outcome::{ErrorKind, IoSide, JobError};
 use crate::probe::{self, MediaInfo, PROBE_TIMEOUT, ProbeError, Stream};
 use crate::process::{self, Progress, ToolCommand};
@@ -190,29 +190,25 @@ impl<'a> Title<'a> {
 		let mut input = Input::of(&ranges, &workspace.file(&format!("title-{}.txt", title.number)))?;
 		let counted = kept.false_time.then_some(bytes);
 		let mut found = probe_streams(tools, &input, counted, cancel).await?;
+		let counted_s = footage_s(&found.streams);
 		let mut warnings = Vec::new();
 		let lacking = missing(&found.streams, title);
 		if !lacking.is_empty() {
 			let ids: Vec<u32> = lacking.iter().map(|(id, _)| *id).collect();
 			let firsts = first_packets(&ranges, ids, cancel).await?;
-			let reach = firsts
-				.iter()
-				.map(|(_, at)| *at)
-				.filter(|at| *at < MAX_PROBE_BYTES)
-				.max();
-			if let Some(reach) = reach {
+			if let Some(reach) = firsts.iter().map(|(_, at)| *at).max() {
 				input.window = Window {
 					bytes: (reach + PROBE_MARGIN).max(Window::HEAD.bytes),
 					microseconds: DEEP_PROBE_MICROSECONDS,
 				};
-				found = probe_streams(tools, &input, counted, cancel).await?;
+				found = probe_streams(tools, &input, None, cancel).await?;
 			}
 
 			for (id, name) in missing(&found.streams, title) {
-				let why = match firsts.iter().find(|(first, _)| *first == id) {
-					None => "has no packets",
-					Some((_, at)) if *at >= MAX_PROBE_BYTES => "starts too late in the title to be read",
-					Some(_) => "can't be read",
+				let why = if firsts.iter().any(|(first, _)| *first == id) {
+					"can't be read"
+				} else {
+					"has no packets early enough in the title to be read"
 				};
 				warnings.push(format!("Title {}: {name} {why}", title.number));
 			}
@@ -223,7 +219,7 @@ impl<'a> Title<'a> {
 
 		#[allow(clippy::cast_precision_loss)]
 		let length_s = if kept.false_time {
-			footage_s(&found.streams).unwrap_or(bytes as f64 * 8.0 / (MAX_DVD_MBITS * 1e6))
+			counted_s.unwrap_or(bytes as f64 * 8.0 / (MAX_DVD_MBITS * 1e6))
 		} else {
 			title.cells.iter().map(|cell| cell.time_s).sum()
 		};
@@ -295,7 +291,7 @@ fn missing(streams: &[Stream], title: &DvdTitle) -> Vec<(u32, String)> {
 	audio.chain(subtitles).filter(|(id, _)| !found.contains(id)).collect()
 }
 
-/// Where in `ranges` each of `ids` has its first packet, for those that have one.
+/// Where in `ranges` each of `ids` has its first packet, for those that have one before `MAX_PROBE_BYTES`.
 async fn first_packets(
 	ranges: &[Range],
 	ids: Vec<u32>,
@@ -306,7 +302,8 @@ async fn first_packets(
 	let found = process::blocking(cancel, move || {
 		let mut left = ids;
 		let mut found = Vec::new();
-		let read = Reader::default().each_sector(&ranges, usize::MAX, |position, sector| {
+		let limit = usize::try_from(MAX_PROBE_BYTES / SECTOR).unwrap_or(usize::MAX);
+		let read = Reader::default().each_sector(&ranges, limit, |position, sector| {
 			for packet in ps::packets(sector) {
 				if let Some(index) = left.iter().position(|id| *id == packet.id) {
 					found.push((left.swap_remove(index), position));

@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::udf::{DiscFile, DiscFiles, Extent};
 use super::{Range, Reader, SECTOR, SECTOR_LEN, be16, be32, byte, get, ps};
@@ -145,27 +146,34 @@ impl Dvd {
 
 	/// The `(source, offset, length)` pieces holding sectors `first_sector..=last_sector` of a title set's VOBs.
 	pub fn byte_ranges(&self, vts: u8, first_sector: u32, last_sector: u32) -> Vec<Range> {
-		let Some((_, extents)) = self.vobs.iter().find(|(number, _)| *number == vts) else {
-			return Vec::new();
-		};
+		self.pieces(vts, first_sector, last_sector)
+			.map(|(source, offset, length)| (source.to_path_buf(), offset, length))
+			.collect()
+	}
 
+	fn pieces(&self, vts: u8, first_sector: u32, last_sector: u32) -> impl Iterator<Item = (&Path, u64, u64)> {
+		let extents = self
+			.vobs
+			.iter()
+			.find(|(number, _)| *number == vts)
+			.map_or(&[][..], |(_, extents)| extents.as_slice());
 		let start = u64::from(first_sector) * SECTOR;
 		let end = (u64::from(last_sector) + 1) * SECTOR;
-		let mut ranges = Vec::new();
-		let mut logical = 0;
-		for (source, extent) in extents {
-			let from = start.max(logical);
-			let to = end.min(logical + extent.length);
-			if from < to {
-				ranges.push((source.clone(), extent.offset + (from - logical), to - from));
-			}
 
-			logical += extent.length;
-			if logical >= end {
-				break;
-			}
-		}
-		ranges
+		let mut logical = 0;
+		extents
+			.iter()
+			.map_while(move |(source, extent)| {
+				if logical >= end {
+					return None;
+				}
+
+				let at = logical;
+				logical += extent.length;
+				let (from, to) = (start.max(at), end.min(logical));
+				Some((from < to).then(|| (source.as_path(), extent.offset + (from - at), to - from)))
+			})
+			.flatten()
 	}
 
 	/// The `(source, offset, length)` pieces holding the sectors `cell` plays.
@@ -198,13 +206,12 @@ impl Dvd {
 	}
 
 	/// Whether the kept titles' footage is scrambled (CSS), from the first sectors of their first cells.
-	pub fn encrypted(&self, selection: &Selection) -> io::Result<bool> {
-		let mut reader = Reader::default();
+	pub fn encrypted(&self, selection: &Selection, reader: &mut Reader) -> io::Result<bool> {
 		for title in self.kept(selection) {
 			for cell in title.cells.iter().take(SAMPLED_CELLS) {
 				let mut scrambled = false;
 				reader.each_sector(&self.cell_ranges(title.vts, cell), SAMPLED_SECTORS, |_, sector| {
-					scrambled = ps::packets(sector).iter().any(|packet| packet.scrambled);
+					scrambled = ps::packets(sector).any(|packet| packet.scrambled);
 					!scrambled
 				})?;
 				if scrambled {
@@ -259,13 +266,13 @@ impl Dvd {
 
 	fn read_sector(&self, reader: &mut Reader, vts: u8, number: u32, sector: &mut [u8]) -> io::Result<()> {
 		let mut filled: usize = 0;
-		for (path, offset, length) in self.byte_ranges(vts, number, number) {
+		for (path, offset, length) in self.pieces(vts, number, number) {
 			let end = usize::try_from(length)
 				.ok()
 				.and_then(|length| filled.checked_add(length))
 				.filter(|end| *end <= sector.len())
 				.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
-			reader.read(&path, offset, &mut sector[filled..end])?;
+			reader.read(path, offset, &mut sector[filled..end])?;
 			filled = end;
 		}
 
@@ -390,8 +397,8 @@ fn overlap(a: &[(u64, u64)], b: &[(u64, u64)]) -> u64 {
 
 /// The disc's titles from `VIDEO_TS.IFO` and the `VTS_xx_0.IFO`s, each falling back to its `.BUP`. A title set
 /// whose IFOs both fail leaves its titles without cells. Cells outside their title set's VOBs are left out.
-pub fn parse(files: &DiscFiles) -> Result<Dvd, String> {
-	let entries = with_backup(files, "VIDEO_TS/VIDEO_TS", vmg_titles)?;
+pub fn parse(files: &DiscFiles, reader: &mut Reader) -> Result<Dvd, String> {
+	let entries = with_backup(files, reader, "VIDEO_TS/VIDEO_TS", vmg_titles)?;
 
 	let mut numbers: Vec<u8> = entries.iter().map(|&(vts, _)| vts).filter(|&vts| vts > 0).collect();
 	numbers.sort_unstable();
@@ -401,11 +408,11 @@ pub fn parse(files: &DiscFiles) -> Result<Dvd, String> {
 	let mut sets = BTreeMap::new();
 	for vts in numbers {
 		dvd.vobs.push((vts, vob_extents(files, vts)));
-		let set = with_backup(files, &format!("VIDEO_TS/VTS_{vts:02}_0"), title_set).ok();
+		let set = with_backup(files, reader, &format!("VIDEO_TS/VTS_{vts:02}_0"), title_set).ok();
 		sets.insert(vts, set);
 	}
 
-	let mut reader = Reader::default();
+	let mut units = HashMap::new();
 	let mut titles = Vec::with_capacity(entries.len());
 	for (index, &(vts, vts_title)) in entries.iter().enumerate() {
 		let number = u16::try_from(index + 1).map_err(|_| "the disc lists too many titles".to_owned())?;
@@ -420,9 +427,14 @@ pub fn parse(files: &DiscFiles) -> Result<Dvd, String> {
 			});
 
 		for cell in title.cells.iter_mut().filter(|cell| cell.interleaved) {
-			cell.units = dvd
-				.units(&mut reader, vts, cell)
-				.map_err(|err| format!("an interleaved cell of title {number} can't be read: {err}"))?;
+			let own = match units.entry((vts, cell.first_sector, cell.last_sector)) {
+				Entry::Occupied(known) => known.into_mut(),
+				Entry::Vacant(slot) => slot.insert(
+					dvd.units(reader, vts, cell)
+						.map_err(|err| format!("an interleaved cell of title {number} can't be read: {err}"))?,
+				),
+			};
+			cell.units.clone_from(own);
 		}
 		titles.push(title);
 	}
@@ -442,7 +454,12 @@ fn vob_extents(files: &DiscFiles, vts: u8) -> Vec<(PathBuf, Extent)> {
 	extents
 }
 
-fn with_backup<T>(files: &DiscFiles, stem: &str, parse: fn(&[u8]) -> Result<T, String>) -> Result<T, String> {
+fn with_backup<T>(
+	files: &DiscFiles,
+	reader: &mut Reader,
+	stem: &str,
+	parse: fn(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
 	let mut reasons = Vec::new();
 	for extension in ["IFO", "BUP"] {
 		let name = format!("{stem}.{extension}");
@@ -451,7 +468,7 @@ fn with_backup<T>(files: &DiscFiles, stem: &str, parse: fn(&[u8]) -> Result<T, S
 			continue;
 		};
 
-		match read_file(file).and_then(|bytes| parse(&bytes)) {
+		match read_file(file, reader).and_then(|bytes| parse(&bytes)) {
 			Ok(parsed) => return Ok(parsed),
 			Err(reason) => reasons.push(format!("{name}: {reason}")),
 		}
@@ -459,12 +476,12 @@ fn with_backup<T>(files: &DiscFiles, stem: &str, parse: fn(&[u8]) -> Result<T, S
 	Err(reasons.join("; "))
 }
 
-fn read_file(file: &DiscFile) -> Result<Vec<u8>, String> {
+fn read_file(file: &DiscFile, reader: &mut Reader) -> Result<Vec<u8>, String> {
 	if file.size > MAX_IFO_BYTES {
 		return Err("it is too large for an IFO".to_owned());
 	}
 
-	file.read().map_err(|error| format!("it can't be read: {error}"))
+	file.read(reader).map_err(|error| format!("it can't be read: {error}"))
 }
 
 fn offset(base: usize, relative: u32) -> Result<usize, String> {
