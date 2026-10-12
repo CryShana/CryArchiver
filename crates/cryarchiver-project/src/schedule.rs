@@ -16,7 +16,7 @@ pub const MAX_WAITING_VIDEOS: usize = 2;
 const IDLE_SHARE: f32 = 0.20;
 const VIDEO_EXTENSIONS: &[&str] = &[
 	"mp4", "mov", "m4v", "mkv", "webm", "avi", "mts", "m2ts", "3gp", "wmv", "flv", "mpg", "mpeg", "ts", "vob", "ogv",
-	"asf",
+	"asf", "iso",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -507,6 +507,7 @@ mod tests {
 			"a.b.webm",
 			"film.ogv",
 			"old.ASF",
+			"Film.iso",
 		] {
 			assert!(looks_like_video(OsStr::new(name)), "{name}");
 		}

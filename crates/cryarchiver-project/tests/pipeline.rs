@@ -1,19 +1,23 @@
 mod support;
 
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use cryarchiver_engine::decision::{CrfChoice, Decision, Measured, VideoDecision, Vmaf};
+use cryarchiver_engine::options::BluRay;
 use cryarchiver_engine::outcome::{ErrorKind, KeepReason};
 use cryarchiver_project::issues::{Problem, Verb};
 use cryarchiver_project::keys::RelPath;
 use cryarchiver_project::record::{CopyReason, FileRecord, FileState, How, Output};
+use cryarchiver_project::settings::SettingsChange;
 use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
-use cryarchiver_project::view::RowState;
+use cryarchiver_project::view::{KEPT_LABEL, RowState};
 use cryarchiver_project::{Command, Fault, Project, Target, Tuning};
+use support::udf::{Image, UdfRevision};
 use support::{FakeEncoder, Rule, Snapshot, file_id, jpeg, setup, wait_for, wait_for_state, write};
 
 fn records(setup: &support::Setup) -> Vec<(String, FileRecord)> {
@@ -208,6 +212,86 @@ fn a_kept_file_encoded_on_retry_leaves_only_its_new_output() {
 	);
 	assert_eq!(record.replaces, None);
 	assert!(snapshot.logs.iter().any(|log| log.message == "retrying 1 kept file"));
+}
+
+/// A 2D Blu-ray image: an `index.bdmv` and no `SSIF` folder.
+fn blu_ray_image(path: &Path) {
+	Image {
+		files: vec![
+			("BDMV/index.bdmv".to_owned(), b"INDX0200".repeat(16)),
+			("BDMV/MovieObject.bdmv".to_owned(), b"MOBJ0200".repeat(16)),
+			("BDMV/PLAYLIST/00000.mpls".to_owned(), b"MPLS0200".repeat(16)),
+		],
+		dirs: vec!["BDMV/STREAM".to_owned(), "CERTIFICATE".to_owned()],
+		revision: UdfRevision::V250,
+	}
+	.write(path);
+}
+
+#[test]
+fn a_blu_ray_image_is_kept_until_retried_with_the_setting_to_convert() {
+	let setup = setup(|_| {});
+	blu_ray_image(&setup.source.join("Film.iso"));
+	let encoder = FakeEncoder::new();
+	encoder.rule("Film.iso", Rule::Engine);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+	let file = file_id(&project, &mut snapshot, FolderId::ROOT, "Film.iso");
+
+	project.send(Command::Details(file));
+	wait_for(&project, &mut snapshot, "the details", |s| {
+		s.details.contains_key(&file)
+	});
+	let kept = snapshot.details[&file]
+		.decision
+		.iter()
+		.find(|line| line.label == KEPT_LABEL)
+		.map(|line| line.value.clone());
+	assert_eq!(kept.as_deref(), Some("Blu-ray disc: kept as is"));
+	assert_eq!(archived_names(&setup), ["Film.iso"]);
+
+	encoder.rule("Film.iso", Rule::Encode("mkv"));
+	project.send(Command::ChangeSettings(SettingsChange::BluRay(BluRay::Convert)));
+	wait_for(&project, &mut snapshot, "the new setting", |s| {
+		s.settings
+			.as_ref()
+			.is_some_and(|settings| settings.blu_ray == BluRay::Convert)
+	});
+	std::thread::sleep(Duration::from_millis(200));
+	wait_for_state(&project, &mut snapshot, file, RowState::KeptOriginal);
+	assert_eq!(encoder.calls().len(), 1, "the setting alone archives nothing again");
+
+	project.send(Command::RetryKept(Target::File(file)));
+	wait_for_state(&project, &mut snapshot, file, RowState::Done);
+	drop(project);
+
+	let blu_ray: Vec<BluRay> = encoder.options().iter().map(|options| options.blu_ray).collect();
+	assert_eq!(blu_ray, [BluRay::Keep, BluRay::Convert]);
+	assert_eq!(archived_names(&setup), ["Film.mkv"]);
+}
+
+#[test]
+fn a_disc_image_and_a_video_sharing_a_stem_are_archived_under_distinct_names() {
+	let setup = setup(|_| {});
+	write(&setup.source, "Film.iso", b"disc");
+	write(&setup.source, "Film.mkv", b"video");
+	let encoder = FakeEncoder::new();
+	encoder.rule(".iso", Rule::Encode("mkv"));
+	encoder.rule(".mkv", Rule::Encode("mkv"));
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start(&project);
+	wait_for(&project, &mut snapshot, "everything archived", complete);
+	drop(project);
+
+	assert_eq!(archived_names(&setup), ["Film.iso.mkv", "Film.mkv.mkv"]);
+	assert_eq!(
+		fs::read(setup.destination.join("Film.iso.mkv")).unwrap(),
+		b"encoded Film.iso"
+	);
 }
 
 #[test]

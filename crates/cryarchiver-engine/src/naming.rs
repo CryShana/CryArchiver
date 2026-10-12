@@ -16,7 +16,7 @@ pub const MEDIA_EXTENSIONS: &[&str] = &[
 	"flac", "wav", "wave", "alac", "m4a", "mp3", "aac", "ac3", "eac3", "dts", "ogg", "oga", "opus", "wma", "aif",
 	"aiff", "ape", "wv", "tta", "mka", "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "flv", "mpg", "mpeg", "ts",
 	"m2ts", "mts", "vob", "3gp", "ogv", "asf", "jpg", "jpeg", "jpe", "png", "apng", "gif", "webp", "tif", "tiff",
-	"bmp", "heic", "heif", "avif", "jxl", "jp2", "tga", "ppm", "pgm", "pbm", "pnm", "qoi",
+	"bmp", "heic", "heif", "avif", "jxl", "jp2", "tga", "ppm", "pgm", "pbm", "pnm", "qoi", "iso",
 ];
 
 /// The archival output names of one destination folder (engine spec §17.2). Media files that share a stem keep
@@ -199,6 +199,23 @@ mod tests {
 		assert_eq!(
 			collision_key(OsStr::new("\u{c4}.jpg")),
 			collision_key(OsStr::new("\u{e4}.jpg"))
+		);
+	}
+
+	#[test]
+	fn a_disc_image_and_a_video_sharing_a_stem_get_distinct_names() {
+		let mut folder = ArchivalFolder::default();
+		for name in ["Film.iso", "Film.mkv"] {
+			folder.add(OsStr::new(name));
+		}
+
+		assert_eq!(
+			folder.encoded_name(OsStr::new("Film.iso"), OsStr::new("mkv")),
+			"Film.iso.mkv"
+		);
+		assert_eq!(
+			folder.encoded_name(OsStr::new("Film.mkv"), OsStr::new("mkv")),
+			"Film.mkv.mkv"
 		);
 	}
 

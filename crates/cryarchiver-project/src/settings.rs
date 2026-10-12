@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use cryarchiver_engine::commit::{FileIdentity, file_id};
+use cryarchiver_engine::options::BluRay;
 use cryarchiver_engine::preset::{Overrides, Speed as EngineSpeed};
 use cryarchiver_engine::text::display_path;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,7 @@ pub struct Settings {
 	pub stability_window: Duration,
 	pub keep_auxiliary_images: bool,
 	pub delete_originals: bool,
+	pub blu_ray: BluRay,
 }
 
 impl Default for Settings {
@@ -65,6 +67,7 @@ impl Default for Settings {
 			stability_window: Duration::from_secs(30),
 			keep_auxiliary_images: true,
 			delete_originals: false,
+			blu_ray: BluRay::Keep,
 		}
 	}
 }
@@ -79,6 +82,8 @@ pub enum SettingsChange {
 	PerformanceLimit(Option<u8>),
 	StabilityWindow(Duration),
 	KeepAuxiliaryImages(bool),
+	/// Applies to files archived from now on; a kept Blu-ray is converted through Retry kept.
+	BluRay(BluRay),
 	/// Turning deletion on needs `confirmation` to read `DELETE`; turning it off needs nothing.
 	DeleteOriginals {
 		enabled: bool,
@@ -131,6 +136,7 @@ impl Settings {
 			}
 			SettingsChange::StabilityWindow(_) => return Err(SettingsError::StabilityWindow),
 			SettingsChange::KeepAuxiliaryImages(keep) => self.keep_auxiliary_images = keep,
+			SettingsChange::BluRay(blu_ray) => self.blu_ray = blu_ray,
 			SettingsChange::DeleteOriginals {
 				enabled: true,
 				confirmation,
@@ -356,6 +362,7 @@ mod tests {
 		assert_eq!(settings.stability_window, Duration::from_secs(30));
 		assert!(settings.keep_auxiliary_images);
 		assert!(!settings.delete_originals);
+		assert_eq!(settings.blu_ray, BluRay::Keep);
 	}
 
 	#[test]
@@ -429,6 +436,18 @@ mod tests {
 		assert!(settings.watch);
 		assert_eq!(settings.min_savings, 10);
 		assert!(settings.overrides.is_empty());
+		assert_eq!(settings.blu_ray, BluRay::Keep);
+	}
+
+	#[test]
+	fn the_blu_ray_choice_round_trips_through_the_stored_form() {
+		let mut settings = Settings::default();
+
+		settings.apply(SettingsChange::BluRay(BluRay::Convert)).unwrap();
+		let read: Settings = rmp_serde::from_slice(&rmp_serde::to_vec_named(&settings).unwrap()).unwrap();
+
+		assert_eq!(read.blu_ray, BluRay::Convert);
+		assert_eq!(read, settings);
 	}
 
 	#[test]

@@ -1,4 +1,5 @@
 use indicatif::DecimalBytes;
+use serde::{Deserialize, Serialize};
 
 use crate::format::OutputFormat;
 use crate::images::plan::ImageRoute;
@@ -157,7 +158,7 @@ pub struct Advanced {
 }
 
 /// What becomes of a 2D Blu-ray image: kept as it is, or its main feature converted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum BluRay {
 	Keep,

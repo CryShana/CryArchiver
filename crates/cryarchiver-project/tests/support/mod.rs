@@ -1,21 +1,26 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+#[path = "../../../cryarchiver-engine/tests/support/udf.rs"]
+pub mod udf;
+
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use cryarchiver_engine::commit::{Artifact, OutputSink, SourceTimes};
 use cryarchiver_engine::decision::Decision;
-use cryarchiver_engine::engine::{Encode, Job, JobEvent, MemoryGate, Stage};
+use cryarchiver_engine::engine::{Encode, Engine, Job, JobEvent, MemoryGate, Stage};
 use cryarchiver_engine::naming::is_media_name;
+use cryarchiver_engine::options::JobOptions;
 use cryarchiver_engine::outcome::{ErrorKind, IoSide, JobError, JobOutcome, KeepReason};
 use cryarchiver_engine::quality::memory::QualityMemory;
+use cryarchiver_engine::toolchain::{FfmpegBuild, Toolchain, Version};
 use cryarchiver_engine::workspace::Workspace;
 use cryarchiver_project::issues::IssueId;
 use cryarchiver_project::schedule::looks_like_video;
@@ -55,6 +60,8 @@ pub enum Rule {
 		content: Vec<u8>,
 		modified: SystemTime,
 	},
+	/// Runs the real engine without any tool: only what needs none comes out, such as a Blu-ray kept as it is.
+	Engine,
 }
 
 #[derive(Default)]
@@ -62,6 +69,8 @@ pub struct FakeEncoder {
 	rules: Mutex<Vec<(String, Rule)>>,
 	decisions: Mutex<Vec<(String, Decision)>>,
 	pub calls: Mutex<Vec<String>>,
+	options: Mutex<Vec<JobOptions>>,
+	engine: OnceLock<Engine>,
 	running: AtomicUsize,
 	pub peak: AtomicUsize,
 	pub quality: Mutex<Option<Arc<dyn QualityMemory>>>,
@@ -91,6 +100,11 @@ impl FakeEncoder {
 
 	pub fn calls(&self) -> Vec<String> {
 		self.calls.lock().unwrap().clone()
+	}
+
+	/// The options of each job, in the order of [`calls`](Self::calls).
+	pub fn options(&self) -> Vec<JobOptions> {
+		self.options.lock().unwrap().clone()
 	}
 
 	/// Files whose name ends with `suffix` report `decision`, as an event and on an encoded outcome, as the engine
@@ -140,6 +154,7 @@ impl Encode for FakeEncoder {
 		Box::pin(async move {
 			let name = job.source.file_name().unwrap().to_string_lossy().into_owned();
 			self.calls.lock().unwrap().push(name.clone());
+			self.options.lock().unwrap().push(job.options.clone());
 			let slots = self
 				.video_slots
 				.lock()
@@ -212,11 +227,38 @@ impl Encode for FakeEncoder {
 					on_event(JobEvent::Stage(Stage::Encode));
 					stage(job, sink, "avif", &name, Decision::default())
 				}
+				Rule::Engine => {
+					let engine = self.engine.get_or_init(|| Engine::new(no_tools()));
+					engine.run(job, sink, on_event, cancel).await
+				}
 			};
 
 			self.running.fetch_sub(1, Ordering::SeqCst);
 			outcome
 		})
+	}
+}
+
+fn no_tools() -> Toolchain {
+	Toolchain {
+		ffmpeg: PathBuf::from("no-ffmpeg"),
+		ffprobe: PathBuf::from("no-ffprobe"),
+		build: FfmpegBuild::Release(Version { major: 0, minor: 0 }),
+		build_id: String::new(),
+		encoders: BTreeSet::new(),
+		decoders: BTreeSet::new(),
+		filters: BTreeSet::new(),
+		svt_av1: None,
+		svt_av1_release: None,
+		libvpx_release: None,
+		svt_settings: false,
+		colour_tags: false,
+		vp9_alpha: false,
+		soxr: false,
+		opus_surround: false,
+		vmaf: false,
+		demuxers: BTreeSet::new(),
+		protocols: BTreeSet::new(),
 	}
 }
 

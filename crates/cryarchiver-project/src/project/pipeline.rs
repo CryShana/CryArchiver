@@ -483,6 +483,7 @@ impl Owner {
 				overrides: self.settings.overrides,
 				options: JobOptions {
 					threads: self.pipeline.retry_threads.get(&file).copied(),
+					blu_ray: self.settings.blu_ray,
 					..JobOptions::default()
 				},
 			})),
@@ -1210,6 +1211,7 @@ pub(super) mod tests {
 	use std::sync::mpsc::Receiver;
 	use std::time::Duration;
 
+	use cryarchiver_engine::options::BluRay;
 	use cryarchiver_engine::preset::Overrides;
 	use tokio::sync::mpsc::UnboundedReceiver;
 	use tokio::sync::oneshot;
@@ -1432,6 +1434,24 @@ pub(super) mod tests {
 		assert_eq!(before, Overrides::default());
 		assert_eq!(after, custom);
 		assert_eq!(fixture.owner.settings.overrides, custom);
+	}
+
+	#[test]
+	fn a_job_carries_the_blu_ray_setting() {
+		let mut fixture = Fixture::named("Film.iso", b"disc");
+		let blu_ray_of = |owner: &mut Owner, file: FileId| match owner.task_for(file, Work::Encode) {
+			Some(Task::Encode(job)) => job.options.blu_ray,
+			_ => panic!("an encode task was expected"),
+		};
+
+		let before = blu_ray_of(&mut fixture.owner, fixture.file);
+		fixture
+			.owner
+			.change_settings(&crate::settings::SettingsChange::BluRay(BluRay::Convert));
+		let after = blu_ray_of(&mut fixture.owner, fixture.file);
+
+		assert_eq!(before, BluRay::Keep);
+		assert_eq!(after, BluRay::Convert);
 	}
 
 	#[test]

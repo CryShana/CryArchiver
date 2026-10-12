@@ -5,7 +5,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 
-use cryarchiver_engine::text::display_name;
+use cryarchiver_engine::text::{display_name, display_path};
 
 use super::duplicates::is_lost;
 use super::owner::{Message, Owner};
@@ -15,6 +15,9 @@ use crate::record::{CycleRecord, FileRecord, FileState, FolderRecord, Identity, 
 use crate::scan::{self, EntryKind, Listing};
 use crate::tree::{FileId, FolderId};
 use crate::view::{LogKind, NoticeLevel, Update};
+
+/// A disc's own folder, the file that makes it one, and the kind of disc.
+const DISC_FOLDERS: [(&str, &str, &str); 2] = [("VIDEO_TS", "VIDEO_TS.IFO", "DVD"), ("BDMV", "index.bdmv", "Blu-ray")];
 
 #[derive(Debug, Default)]
 pub(crate) struct ScanState {
@@ -212,6 +215,7 @@ impl Owner {
 			entry.identity = listing.identity;
 			entry.record.mtime_ns = listing.mtime_ns;
 		}
+		self.warn_disc_folder(folder, listing);
 
 		let stored: HashMap<OsString, (u64, i64)> = self
 			.tree
@@ -294,6 +298,40 @@ impl Owner {
 		for child in vanished {
 			self.subtree_missing(child);
 		}
+	}
+
+	/// A DVD or Blu-ray folder is archived file by file like any other; the user is told once, ever, how to get one MKV.
+	fn warn_disc_folder(&mut self, folder: FolderId, listing: &Listing) {
+		if self.tree.folder(folder).record.disc_folder_warned {
+			return;
+		}
+
+		let key = &self.tree.folder(folder).key;
+		let (name, shown) = if key.is_root() {
+			let source = &self.settings.source;
+			(source.file_name().unwrap_or_default(), display_path(source))
+		} else {
+			(self.tree.folder(folder).name.as_os_str(), key.display())
+		};
+		let holds = |marker: &str| {
+			listing
+				.entries
+				.iter()
+				.any(|entry| matches!(entry.kind, EntryKind::File { .. }) && entry.name.eq_ignore_ascii_case(marker))
+		};
+		let Some((_, _, kind)) = DISC_FOLDERS
+			.iter()
+			.find(|(folder_name, marker, _)| name.eq_ignore_ascii_case(folder_name) && holds(marker))
+		else {
+			return;
+		};
+
+		let text = format!(
+			"\"{shown}\" is a {kind} folder: its files are archived one by one; use the CLI or make an ISO for one MKV"
+		);
+		self.tree.folder_mut(folder).record.disc_folder_warned = true;
+		self.log(LogKind::Action, text.clone());
+		self.notice(NoticeLevel::Warning, text);
 	}
 
 	fn after_listing(&mut self) {
@@ -712,6 +750,67 @@ pub(super) mod tests {
 		list_queued(&mut owner);
 		let b = owner.tree.folder_id(&key("A/B")).unwrap();
 		assert!(!owner.tree.folder(b).vanished);
+	}
+
+	fn warnings(updates: &Receiver<Update>) -> (Vec<String>, Vec<String>) {
+		let (mut notices, mut logs) = (Vec::new(), Vec::new());
+		for update in updates.try_iter() {
+			match update {
+				Update::Notice(notice) if notice.level == NoticeLevel::Warning => notices.push(notice.text),
+				Update::Log(entry) if entry.message.contains(" folder: ") => logs.push(entry.message),
+				_ => {}
+			}
+		}
+		(notices, logs)
+	}
+
+	#[test]
+	fn a_disc_folder_is_warned_about_once_ever_and_its_files_are_archived_as_usual() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		let video_ts = source.join("Film").join("VIDEO_TS");
+		let bdmv = source.join("Show").join("bdmv");
+		fs::create_dir_all(&video_ts).unwrap();
+		fs::create_dir_all(&bdmv).unwrap();
+		fs::create_dir_all(source.join("Notes").join("VIDEO_TS")).unwrap();
+		for name in ["VIDEO_TS.IFO", "VIDEO_TS.BUP", "VTS_01_1.VOB"] {
+			fs::write(video_ts.join(name), b"dvd").unwrap();
+		}
+		fs::write(bdmv.join("INDEX.BDMV"), b"bd").unwrap();
+		fs::write(source.join("Notes").join("VIDEO_TS").join("readme.txt"), b"not a disc").unwrap();
+		let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
+
+		list(&mut owner, &RelPath::root(), true);
+		list_queued(&mut owner);
+		let first = warnings(&updates);
+		list(&mut owner, &RelPath::root(), true);
+		list_queued(&mut owner);
+		let second = warnings(&updates);
+
+		owner.store.flush().unwrap();
+		let project = owner.project_file.clone();
+		drop(owner);
+		let (mut reopened, updates) = reopen(&project);
+		list(&mut reopened, &RelPath::root(), true);
+		list_queued(&mut reopened);
+		let after_reopen = warnings(&updates);
+
+		let tail = "folder: its files are archived one by one; use the CLI or make an ISO for one MKV";
+		let dvd = format!("\"Film/VIDEO_TS\" is a DVD {tail}");
+		let blu_ray = format!("\"Show/bdmv\" is a Blu-ray {tail}");
+		let mut notices = first.0.clone();
+		notices.sort();
+		assert_eq!(notices, [dvd, blu_ray]);
+		assert_eq!(first.0.len(), first.1.len(), "{first:?}");
+		assert_eq!(second, (Vec::new(), Vec::new()));
+		assert_eq!(after_reopen, (Vec::new(), Vec::new()));
+		for path in [
+			"Film/VIDEO_TS/VIDEO_TS.IFO",
+			"Film/VIDEO_TS/VTS_01_1.VOB",
+			"Show/bdmv/INDEX.BDMV",
+		] {
+			assert!(reopened.tree.file_id(&key(path)).is_some(), "{path}");
+		}
 	}
 
 	#[test]

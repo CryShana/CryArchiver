@@ -92,7 +92,8 @@ impl Owner {
 			SettingsChange::Speed(_)
 			| SettingsChange::Overrides(_)
 			| SettingsChange::MinSavings(_)
-			| SettingsChange::KeepAuxiliaryImages(_) => {}
+			| SettingsChange::KeepAuxiliaryImages(_)
+			| SettingsChange::BluRay(_) => {}
 		}
 	}
 

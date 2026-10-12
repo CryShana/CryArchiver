@@ -194,6 +194,7 @@ pub enum IssueKind {
 	OutputMissing,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FolderRecord {
@@ -203,6 +204,8 @@ pub struct FolderRecord {
 	pub cycle: Option<CycleRecord>,
 	/// The user acknowledged that the folder can't be read: it is left out until a listing of it succeeds.
 	pub unreadable_acknowledged: bool,
+	/// The folder is a DVD's `VIDEO_TS` or a Blu-ray's `BDMV`, and the user was told it is archived file by file.
+	pub disc_folder_warned: bool,
 }
 
 impl FolderRecord {
