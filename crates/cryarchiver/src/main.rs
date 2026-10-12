@@ -121,7 +121,7 @@ enum ProjectCommand {
 struct CompressArgs {
 	#[arg(
 		value_name = "INPUT",
-		help = "Files, folders (not recursive) or wildcards such as *.flac"
+		help = "Files, folders (not recursive) or wildcards such as *.flac; a DVD or Blu-ray folder is one disc"
 	)]
 	inputs: Vec<PathBuf>,
 	#[arg(
@@ -222,6 +222,14 @@ struct CompressArgs {
 		help = "Scale video, animations and images to W:H; W:-1 or -1:H keeps the aspect ratio. A resized output is always written"
 	)]
 	resize: Option<Resize>,
+	#[arg(
+		long = "bluray",
+		value_name = "MODE",
+		value_enum,
+		default_value_t,
+		help = "Blu-ray discs: convert the main feature, or keep the disc as it is"
+	)]
+	blu_ray: BluRay,
 	#[arg(long, value_name = "PATH", help = "ffmpeg binary or the folder containing it")]
 	ffmpeg: Option<PathBuf>,
 	#[arg(short, long, help = "Only print failures and the summary")]
@@ -870,7 +878,7 @@ async fn compress(args: CompressArgs) -> u8 {
 				threads,
 				max_bitrate_kbps: args.max_bitrate,
 				resize: args.resize,
-				blu_ray: BluRay::Convert,
+				blu_ray: args.blu_ray,
 			},
 		})
 		.collect();
@@ -1485,6 +1493,22 @@ mod tests {
 
 		let err = refusal(&["a.flac", "--threads", "0"]);
 		assert_eq!(err.exit_code(), 2);
+	}
+
+	#[test]
+	fn blu_ray_discs_are_converted_unless_kept() {
+		for (given, expected) in [
+			(&["Film"][..], BluRay::Convert),
+			(&["Film", "--bluray", "convert"][..], BluRay::Convert),
+			(&["Film", "--bluray", "keep"][..], BluRay::Keep),
+		] {
+			let Launch::Compress(compress) = launch_from(args(given)) else {
+				panic!("not a compress run");
+			};
+
+			assert_eq!(compress.blu_ray, expected, "{given:?}");
+		}
+		assert_eq!(refusal(&["Film", "--bluray", "maybe"]).exit_code(), 2);
 	}
 
 	#[test]

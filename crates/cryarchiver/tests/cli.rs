@@ -616,6 +616,40 @@ fn compresses_a_video_next_to_the_source() {
 }
 
 #[test]
+fn a_dvd_folder_is_archived_as_one_mkv_named_after_it() {
+	let dir = tempfile::tempdir().unwrap();
+	let work = tempfile::tempdir().unwrap();
+	let disc = dir.path().join("Trip");
+	support::dvd::write_folder(
+		&disc,
+		&support::dvd::video_ts(
+			work.path(),
+			&[support::dvd::footage(12, &[6, 6]), support::dvd::footage(11, &[11])],
+		),
+	);
+	let before = fs::read(disc.join("VIDEO_TS").join("VTS_01_1.VOB")).unwrap();
+
+	let out = cryarchiver(dir.path(), &["-s", "fast", "Trip"]);
+
+	assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+	assert!(stdout(&out).contains("✓ Trip → Trip.cry.mkv"), "{}", stdout(&out));
+	assert!(dir.path().join("Trip.cry.mkv").is_file());
+	assert_eq!(fs::read(disc.join("VIDEO_TS").join("VTS_01_1.VOB")).unwrap(), before);
+	assert!(!dir.path().join(".cry-work").exists());
+
+	let from_inside = cryarchiver(dir.path(), &["-s", "fast", "Trip/VIDEO_TS", "-o", "out"]);
+
+	assert_eq!(
+		from_inside.status.code(),
+		Some(0),
+		"{}{}",
+		stdout(&from_inside),
+		stderr(&from_inside)
+	);
+	assert!(dir.path().join("out").join("Trip.cry.mkv").is_file());
+}
+
+#[test]
 fn rerun_skips_existing_video_outputs() {
 	let dir = tempfile::tempdir().unwrap();
 	support::mpeg4(dir.path(), "clip.mp4", 3);

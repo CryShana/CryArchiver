@@ -26,6 +26,8 @@ pub fn expand(args: &[PathBuf]) -> Inputs {
 	for arg in args {
 		if arg.is_file() {
 			inputs.files.push(arg.clone());
+		} else if let Some(root) = disc_root(arg) {
+			inputs.files.push(root);
 		} else if arg.is_dir() {
 			match list_files(arg) {
 				Ok(files) => {
@@ -45,6 +47,40 @@ pub fn expand(args: &[PathBuf]) -> Inputs {
 	inputs.files.sort();
 	inputs.files.dedup();
 	inputs
+}
+
+const DISC_ROOTS: [&str; 2] = ["VIDEO_TS", "BDMV"];
+
+/// The folder holding `VIDEO_TS` or `BDMV` when `dir` is that folder or directly holds it.
+fn disc_root(dir: &Path) -> Option<PathBuf> {
+	if !dir.is_dir() {
+		return None;
+	}
+
+	let dir = named_folder(dir)?;
+	let is_disc_part = dir
+		.file_name()
+		.is_some_and(|name| DISC_ROOTS.iter().any(|root| name.eq_ignore_ascii_case(root)));
+	if is_disc_part {
+		return dir.parent().map(Path::to_path_buf);
+	}
+
+	DISC_ROOTS.iter().any(|root| dir.join(root).is_dir()).then_some(dir)
+}
+
+/// `dir` with a real name: `.` and `..` become the folder they stand for, and a bare name its absolute path, so the
+/// output can be named after the folder and a parent exists.
+fn named_folder(dir: &Path) -> Option<PathBuf> {
+	let is_bare = dir.parent().is_some_and(|parent| parent.as_os_str().is_empty());
+	if dir.file_name().is_some() && !is_bare {
+		return Some(dir.to_path_buf());
+	}
+
+	let absolute = std::path::absolute(dir).ok()?;
+	if absolute.file_name().is_some() {
+		return Some(absolute);
+	}
+	fs::canonicalize(&absolute).ok()
 }
 
 fn has_wildcard(path: &Path) -> bool {
@@ -155,6 +191,46 @@ mod tests {
 		assert_eq!(inputs.files, vec![dir.path().join("a.flac"), dir.path().join("b.mp3")]);
 		assert!(inputs.notes.is_empty());
 		assert_eq!(inputs.problems, 0);
+	}
+
+	#[test]
+	fn a_folder_holding_video_ts_or_bdmv_is_one_disc() {
+		let dir = tempfile::tempdir().unwrap();
+		touch(&dir.path().join("Trip").join("VIDEO_TS").join("VIDEO_TS.IFO"));
+		touch(&dir.path().join("Trip").join("notes.txt"));
+		touch(&dir.path().join("Film").join("BDMV").join("index.bdmv"));
+
+		let inputs = expand(&[dir.path().join("Trip"), dir.path().join("Film")]);
+
+		assert_eq!(inputs.files, vec![dir.path().join("Film"), dir.path().join("Trip")]);
+		assert!(inputs.notes.is_empty());
+		assert_eq!(inputs.problems, 0);
+	}
+
+	#[test]
+	fn a_video_ts_or_bdmv_folder_is_its_parent_disc() {
+		let dir = tempfile::tempdir().unwrap();
+		touch(&dir.path().join("Trip").join("VIDEO_TS").join("VIDEO_TS.IFO"));
+		touch(&dir.path().join("Film").join("BDMV").join("index.bdmv"));
+
+		let inputs = expand(&[
+			dir.path().join("Trip").join("VIDEO_TS"),
+			dir.path().join("Film").join("BDMV"),
+			dir.path().join("Trip"),
+		]);
+
+		assert_eq!(inputs.files, vec![dir.path().join("Film"), dir.path().join("Trip")]);
+	}
+
+	#[test]
+	fn ordinary_folders_are_not_discs() {
+		let dir = tempfile::tempdir().unwrap();
+		touch(&dir.path().join("Plain").join("a.flac"));
+		touch(&dir.path().join("Plain").join("VIDEO_TS.txt"));
+
+		assert!(disc_root(&dir.path().join("Plain")).is_none());
+		assert!(disc_root(&dir.path().join("missing")).is_none());
+		assert!(disc_root(&dir.path().join("Plain").join("a.flac")).is_none());
 	}
 
 	#[test]
