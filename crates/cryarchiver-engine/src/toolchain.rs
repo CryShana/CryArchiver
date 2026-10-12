@@ -209,8 +209,6 @@ pub struct Toolchain {
 	#[serde(default)]
 	pub vmaf: bool,
 	#[serde(default)]
-	pub demuxers: BTreeSet<String>,
-	#[serde(default)]
 	pub protocols: BTreeSet<String>,
 }
 
@@ -258,7 +256,6 @@ impl Toolchain {
 			soxr: false,
 			opus_surround: false,
 			vmaf: false,
-			demuxers: BTreeSet::new(),
 			protocols: BTreeSet::new(),
 		}
 	}
@@ -269,7 +266,7 @@ impl Toolchain {
 	}
 
 	async fn probe(ffmpeg: PathBuf, ffprobe: PathBuf, cancel: &CancellationToken) -> Result<Self, ToolchainError> {
-		let (version, encoders, decoders, filters, soxr, opus_surround, svt_av1, video, vmaf, demuxers, protocols) = tokio::join!(
+		let (version, encoders, decoders, filters, soxr, opus_surround, svt_av1, video, vmaf, protocols) = tokio::join!(
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-version"], cancel),
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-encoders"], cancel),
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-decoders"], cancel),
@@ -279,7 +276,6 @@ impl Toolchain {
 			svt_version(&ffmpeg, cancel),
 			video_probes(&ffmpeg, &ffprobe, cancel),
 			vmaf_models(&ffmpeg, cancel),
-			run_ffmpeg(&ffmpeg, &["-hide_banner", "-demuxers"], cancel),
 			run_ffmpeg(&ffmpeg, &["-hide_banner", "-protocols"], cancel),
 		);
 
@@ -291,7 +287,6 @@ impl Toolchain {
 		let encoders = parse_codecs(&stdout_text(&encoders?));
 		let decoders = parse_codecs(&stdout_text(&decoders?));
 		let filters = parse_filters(&stdout_text(&filters?));
-		let demuxers = parse_demuxers(&stdout_text(&demuxers?));
 		let protocols = parse_protocols(&stdout_text(&protocols?));
 
 		let soxr = soxr?;
@@ -326,7 +321,6 @@ impl Toolchain {
 			soxr,
 			opus_surround,
 			vmaf,
-			demuxers,
 			protocols,
 		})
 	}
@@ -652,16 +646,6 @@ fn parse_filters(text: &str) -> BTreeSet<String> {
 				&& flags.chars().all(|c| matches!(c, 'T' | 'S' | 'C' | '.'))
 				&& io.contains("->");
 			is_row.then(|| name.to_owned())
-		})
-		.collect()
-}
-
-fn parse_demuxers(text: &str) -> BTreeSet<String> {
-	text.lines()
-		.filter_map(|line| {
-			let (flags, name) = (line.get(..5)?, line.get(5..)?);
-			let is_row = matches!(flags.as_bytes(), [b' ', b'D', b' ', b' ' | b'd', b' ']);
-			is_row.then(|| name.split_whitespace().next().map(str::to_owned))?
 		})
 		.collect()
 }
@@ -999,18 +983,7 @@ mod tests {
 	}
 
 	#[test]
-	fn parses_demuxer_and_protocol_lists() {
-		let demuxers = "File formats:
- D. = Demuxing supported
- .E = Muxing supported
- ..d = Is a device
- ---
- D   dvdvideo        DVD-Video
- D   matroska,webm   Matroska / WebM
- D   mpeg            MPEG-PS (MPEG-2 Program Stream)
- D d lavfi           Libavfilter virtual input device
-  E  mp4              MP4 (MPEG-4 Part 14)
-";
+	fn parses_the_protocol_list() {
 		let protocols = "Supported file protocols:
 Input:
   bluray
@@ -1022,15 +995,6 @@ Output:
   md5
 ";
 
-		assert_eq!(
-			parse_demuxers(demuxers),
-			BTreeSet::from([
-				"dvdvideo".to_owned(),
-				"lavfi".to_owned(),
-				"matroska,webm".to_owned(),
-				"mpeg".to_owned()
-			])
-		);
 		assert_eq!(
 			parse_protocols(protocols),
 			BTreeSet::from([
@@ -1069,12 +1033,10 @@ Output:
 	fn an_older_cached_toolchain_has_no_bluray_until_probed() {
 		let mut value = serde_json::to_value(complete_toolchain()).unwrap();
 		let fields = value.as_object_mut().unwrap();
-		fields.remove("demuxers");
 		fields.remove("protocols");
 
 		let cached: Toolchain = serde_json::from_value(value).unwrap();
 
-		assert!(cached.demuxers.is_empty());
 		assert!(!cached.has_bluray());
 	}
 
@@ -1105,7 +1067,6 @@ Output:
 			soxr: true,
 			opus_surround: true,
 			vmaf: true,
-			demuxers: BTreeSet::from(["dvdvideo".to_owned(), "mpeg".to_owned()]),
 			protocols: ["bluray", "concat", "file", "subfile"]
 				.into_iter()
 				.map(String::from)
