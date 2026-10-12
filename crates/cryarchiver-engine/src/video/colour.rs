@@ -46,6 +46,12 @@ pub struct ColourTags {
 	pub chroma_location: Option<String>,
 }
 
+impl ColourTags {
+	pub fn is_hdr(&self) -> bool {
+		HDR_TRANSFERS.contains(&self.transfer.as_str())
+	}
+}
+
 pub fn output_tags(stream: &Stream) -> ColourTags {
 	let [primaries, transfer, matrix] = inferred(stream);
 	let tagged = |value: Option<&str>, fallback: &str| {
@@ -143,8 +149,7 @@ pub struct FrameFormat {
 
 impl FrameFormat {
 	pub fn of(stream: &Stream, tags: &ColourTags, alpha: bool) -> Self {
-		let deep =
-			stream.pix_fmt.as_deref().is_some_and(deep_pix_fmt) || HDR_TRANSFERS.contains(&tags.transfer.as_str());
+		let deep = stream.pix_fmt.as_deref().is_some_and(deep_pix_fmt) || tags.is_hdr();
 		let (pix_fmt, bytes_per_pixel) = match (deep, alpha) {
 			(false, false) => ("bgr0", 3),
 			(false, true) => ("bgra", 4),

@@ -2045,7 +2045,7 @@ async fn a_missed_check_encodes_the_video_once_more_at_most() {
 	}));
 	let engine = Engine::new(support::toolchain().await).with_quality_memory(careless);
 
-	let (outcome, events) = run_recording(&engine, &job(&clip), dir.path()).await;
+	let (outcome, events) = run_recording(&engine, &targeted(&clip, 93.0, 89.0), dir.path()).await;
 
 	assert_eq!(stages(&events, Stage::Encode), 2, "{events:?}");
 	match outcome {
@@ -2073,6 +2073,17 @@ fn mandelbrot(dir: &Path, name: &str, seconds: u32, codec: &[&str]) -> std::path
 }
 
 const LOSSLESS: &[&str] = &["-c:v", "ffv1"];
+
+/// `job` held to a VMAF target of its own, where the preset's would pass the learned CRF at once.
+fn targeted(source: &Path, mean: f64, floor: f64) -> Job {
+	Job {
+		overrides: Overrides {
+			video: Some(VmafOverride { mean, floor }),
+			..Overrides::default()
+		},
+		..job(source)
+	}
+}
 
 fn strict(source: &Path, mean: f64, floor: f64) -> Job {
 	Job {
@@ -2196,7 +2207,7 @@ async fn a_check_that_misses_by_half_a_point_at_most_is_written_with_a_warning()
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
 	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
 	let careless = |mean: f64, floor: f64| {
-		let key = key.replace("|t93.0/89.0", &format!("|t{mean:.1}/{floor:.1}"));
+		let key = key.replace("|t91.0/86.0", &format!("|t{mean:.1}/{floor:.1}"));
 		Engine::new(tools.clone()).with_quality_memory(Arc::new(SharedMemory::with_entries([(
 			key,
 			GroupStats { setting: 55.0, ..stats },
@@ -2242,7 +2253,7 @@ async fn a_check_that_misses_by_half_a_point_at_most_is_written_with_a_warning()
 		.unwrap();
 
 	let near_retry = |mean: f64, floor: f64| {
-		let key = key.replace("|t93.0/89.0", &format!("|t{mean:.1}/{floor:.1}"));
+		let key = key.replace("|t91.0/86.0", &format!("|t{mean:.1}/{floor:.1}"));
 		Engine::new(tools.clone()).with_quality_memory(Arc::new(SharedMemory::with_entries([(
 			key,
 			GroupStats {
@@ -2571,10 +2582,14 @@ async fn a_trimmed_video_written_below_its_target_says_the_trim_wrote_it() {
 async fn a_retry_never_lands_next_to_the_crf_that_missed() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
-	let memory = Arc::new(learned_group(dir.path(), 55.0).await);
+	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
+	let memory = Arc::new(SharedMemory::with_entries([(
+		key.replace("|t91.0/86.0", "|t93.0/89.0"),
+		stats,
+	)]));
 	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory);
 
-	let (outcome, events) = run_recording(&engine, &job(&clip), dir.path()).await;
+	let (outcome, events) = run_recording(&engine, &targeted(&clip, 93.0, 89.0), dir.path()).await;
 
 	assert_eq!(stages(&events, Stage::Encode), 2, "{outcome:?}");
 	let last_text = match &outcome {
@@ -2603,7 +2618,7 @@ async fn a_repeated_encode_is_announced_with_what_the_check_measured_and_the_new
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
 	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
-	let strict_key = key.replace("|t93.0/89.0", "|t95.0/91.0");
+	let strict_key = key.replace("|t91.0/86.0", "|t95.0/91.0");
 	let memory = SharedMemory::with_entries([(strict_key, GroupStats { setting: 55.0, ..stats })]);
 	let engine = Engine::new(support::toolchain().await).with_quality_memory(Arc::new(memory));
 
@@ -2639,7 +2654,7 @@ async fn the_outcome_records_the_encode_again_with_both_checks_and_both_crfs() {
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
 	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
-	let strict_key = key.replace("|t93.0/89.0", "|t95.0/91.0");
+	let strict_key = key.replace("|t91.0/86.0", "|t95.0/91.0");
 	let memory = SharedMemory::with_entries([(strict_key, GroupStats { setting: 55.0, ..stats })]);
 	let engine = Engine::new(support::toolchain().await).with_quality_memory(Arc::new(memory));
 
@@ -3163,8 +3178,8 @@ async fn a_learned_crf_that_misses_its_check_and_its_retry_is_forgotten() {
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
 	let next = support::mpeg4(dir.path(), "next.mp4", 3);
 	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
-	assert!(key.ends_with("|t93.0/89.0"), "{key}");
-	let strict_key = key.replace("|t93.0/89.0", "|t99.0/98.0");
+	assert!(key.ends_with("|t91.0/86.0"), "{key}");
+	let strict_key = key.replace("|t91.0/86.0", "|t99.0/98.0");
 	let memory = Arc::new(SharedMemory::with_entries([(strict_key, stats)]));
 	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
 	let strict = |source: &Path| Job {
@@ -3337,7 +3352,7 @@ async fn a_search_that_cannot_reach_the_target_keeps_the_original_before_encodin
 	let memory = Arc::new(SharedMemory::default());
 	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
 
-	let (outcome, events) = run_recording(&engine, &job(&faint_noise), dir.path()).await;
+	let (outcome, events) = run_recording(&engine, &targeted(&faint_noise, 93.0, 89.0), dir.path()).await;
 
 	let JobOutcome::KeptOriginal {
 		reason: KeepReason::QualityUnreachable(reason),
@@ -3770,7 +3785,7 @@ async fn a_learned_crf_whose_requested_output_misses_its_check_and_its_retry_is_
 	let dir = tempfile::tempdir().unwrap();
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
 	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
-	let strict_key = key.replace("|t93.0/89.0", "|t99.0/98.0");
+	let strict_key = key.replace("|t91.0/86.0", "|t99.0/98.0");
 	let memory = Arc::new(SharedMemory::with_entries([(strict_key, stats)]));
 	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
 	let strict = Job {
@@ -4196,9 +4211,9 @@ async fn a_capped_video_that_misses_its_check_is_written_without_a_retry() {
 	let clip = support::mpeg4(dir.path(), "clip.mp4", 3);
 	let (key, stats) = learned_group(dir.path(), 55.0).await.entries().remove(0);
 	let capped_key = key
-		.replace("|t93.0/89.0", "|t99.0/98.0")
+		.replace("|t91.0/86.0", "|t99.0/98.0")
 		.replacen("|p5|", "+mbr60|p5|", 1);
-	assert_ne!(capped_key, key.replace("|t93.0/89.0", "|t99.0/98.0"), "{key}");
+	assert_ne!(capped_key, key.replace("|t91.0/86.0", "|t99.0/98.0"), "{key}");
 	let memory = Arc::new(SharedMemory::with_entries([(capped_key, stats)]));
 	let engine = Engine::new(support::toolchain().await).with_quality_memory(memory.clone());
 	let strict = Job {

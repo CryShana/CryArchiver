@@ -245,26 +245,26 @@ impl Candidate {
 
 pub fn ssim_target(speed: Speed) -> f64 {
 	match speed {
-		Speed::Fast => 80.0,
-		Speed::Moderate => 85.0,
-		Speed::Slow => 90.0,
+		Speed::Fast => 75.0,
+		Speed::Moderate => 80.0,
+		Speed::Slow => 85.0,
 	}
 }
 
 pub fn ravif_settings(speed: Speed) -> RavifSettings {
 	let (quality, speed) = match speed {
-		Speed::Fast => (88.0, 9),
-		Speed::Moderate => (92.0, 6),
-		Speed::Slow => (95.0, 4),
+		Speed::Fast => (84.0, 9),
+		Speed::Moderate => (88.0, 6),
+		Speed::Slow => (92.0, 4),
 	};
 	RavifSettings { quality, speed }
 }
 
 pub fn jxl_lossy_settings(speed: Speed) -> JxlSettings {
 	let (distance, effort) = match speed {
-		Speed::Fast => (1.6, 5),
-		Speed::Moderate => (1.0, 7),
-		Speed::Slow => (0.5, 7),
+		Speed::Fast => (2.225, 5),
+		Speed::Moderate => (1.6, 7),
+		Speed::Slow => (1.0, 7),
 	};
 	JxlSettings { distance, effort }
 }
@@ -704,42 +704,42 @@ mod tests {
 		assert_eq!(
 			ravif_settings(Speed::Fast),
 			RavifSettings {
-				quality: 88.0,
+				quality: 84.0,
 				speed: 9
 			}
 		);
 		assert_eq!(
 			ravif_settings(Speed::Moderate),
 			RavifSettings {
-				quality: 92.0,
+				quality: 88.0,
 				speed: 6
 			}
 		);
 		assert_eq!(
 			ravif_settings(Speed::Slow),
 			RavifSettings {
-				quality: 95.0,
+				quality: 92.0,
 				speed: 4
 			}
 		);
 		assert_eq!(
 			jxl_lossy_settings(Speed::Fast),
 			JxlSettings {
-				distance: 1.6,
+				distance: 2.225,
 				effort: 5
 			}
 		);
 		assert_eq!(
 			jxl_lossy_settings(Speed::Moderate),
 			JxlSettings {
-				distance: 1.0,
+				distance: 1.6,
 				effort: 7
 			}
 		);
 		assert_eq!(
 			jxl_lossy_settings(Speed::Slow),
 			JxlSettings {
-				distance: 0.5,
+				distance: 1.0,
 				effort: 7
 			}
 		);
@@ -749,7 +749,7 @@ mod tests {
 				ssim_target(Speed::Moderate),
 				ssim_target(Speed::Slow)
 			),
-			(80.0, 85.0, 90.0)
+			(75.0, 80.0, 85.0)
 		);
 	}
 
@@ -819,22 +819,22 @@ mod tests {
 		}
 
 		assert_eq!(
-			ravif_start(Speed::Moderate, 70.0),
+			ravif_start(Speed::Slow, 70.0),
 			RavifSettings {
 				quality: 80.0,
-				speed: 6
+				speed: 4
 			}
 		);
-		assert_eq!(ravif_start(Speed::Moderate, 95.0).quality, 100.0);
+		assert_eq!(ravif_start(Speed::Slow, 95.0).quality, 100.0);
 		assert_eq!(ravif_start(Speed::Fast, -100.0).quality, 40.0);
 		assert_eq!(
-			jxl_lossy_start(Speed::Moderate, 70.0),
+			jxl_lossy_start(Speed::Slow, 70.0),
 			JxlSettings {
 				distance: 2.875,
 				effort: 7
 			}
 		);
-		assert!((jxl_lossy_start(Speed::Moderate, 95.0).distance - 0.1).abs() < 1e-6);
+		assert!((jxl_lossy_start(Speed::Slow, 95.0).distance - 0.1).abs() < 1e-6);
 		assert_eq!(jxl_lossy_start(Speed::Fast, 0.0).distance, 6.0);
 	}
 
@@ -845,7 +845,7 @@ mod tests {
 			..Overrides::default()
 		};
 		let planned = |overrides: &Overrides, route| {
-			plan_still(&facts(800, 600), Speed::Moderate, overrides, true, route)
+			plan_still(&facts(800, 600), Speed::Slow, overrides, true, route)
 				.unwrap()
 				.candidates[0]
 				.setting()
@@ -861,37 +861,37 @@ mod tests {
 
 	#[test]
 	fn learned_settings_stay_near_the_start() {
-		let ravif = Candidate::Ravif(ravif_settings(Speed::Moderate));
-		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Moderate));
+		let ravif = Candidate::Ravif(ravif_settings(Speed::Slow));
+		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Slow));
 		let lossless = Candidate::JxlLossless(JXL_LOSSLESS);
 
-		assert_eq!(ravif.with_setting(Speed::Moderate, 85.0, 60.0).setting(), Some(84.0));
-		assert_eq!(ravif.with_setting(Speed::Moderate, 85.0, 120.0).setting(), Some(100.0));
-		assert_eq!(ravif.with_setting(Speed::Moderate, 85.0, 90.0).setting(), Some(90.0));
-		assert_eq!(ravif.with_setting(Speed::Moderate, 70.0, 70.0).setting(), Some(72.0));
-		assert_eq!(ravif.with_setting(Speed::Moderate, 70.0, 75.0).setting(), Some(75.0));
-		assert_eq!(jxl.with_setting(Speed::Moderate, 85.0, 5.0).setting(), Some(2.0));
+		assert_eq!(ravif.with_setting(Speed::Slow, 85.0, 60.0).setting(), Some(84.0));
+		assert_eq!(ravif.with_setting(Speed::Slow, 85.0, 120.0).setting(), Some(100.0));
+		assert_eq!(ravif.with_setting(Speed::Slow, 85.0, 90.0).setting(), Some(90.0));
+		assert_eq!(ravif.with_setting(Speed::Slow, 70.0, 70.0).setting(), Some(72.0));
+		assert_eq!(ravif.with_setting(Speed::Slow, 70.0, 75.0).setting(), Some(75.0));
+		assert_eq!(jxl.with_setting(Speed::Slow, 85.0, 5.0).setting(), Some(2.0));
 		assert_eq!(
-			jxl.with_setting(Speed::Moderate, 85.0, 0.0)
+			jxl.with_setting(Speed::Slow, 85.0, 0.0)
 				.setting()
 				.map(|distance| (distance * 10.0).round()),
 			Some(1.0)
 		);
-		assert_eq!(jxl.with_setting(Speed::Moderate, 70.0, 5.0).setting(), Some(3.875));
-		assert_eq!(jxl.with_setting(Speed::Moderate, 70.0, 3.5).setting(), Some(3.5));
-		assert_eq!(lossless.with_setting(Speed::Moderate, 85.0, 3.0), lossless);
+		assert_eq!(jxl.with_setting(Speed::Slow, 70.0, 5.0).setting(), Some(3.875));
+		assert_eq!(jxl.with_setting(Speed::Slow, 70.0, 3.5).setting(), Some(3.5));
+		assert_eq!(lossless.with_setting(Speed::Slow, 85.0, 3.0), lossless);
 		assert_eq!(lossless.setting(), None);
 	}
 
 	#[test]
 	fn only_a_pass_well_above_the_target_steps_down_and_only_by_a_real_change() {
-		let ravif = Candidate::Ravif(ravif_settings(Speed::Moderate));
-		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Moderate));
-		let at_floor = ravif.with_setting(Speed::Moderate, 85.0, 0.0);
-		let at_ceiling = jxl.with_setting(Speed::Moderate, 85.0, 25.0);
+		let ravif = Candidate::Ravif(ravif_settings(Speed::Slow));
+		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Slow));
+		let at_floor = ravif.with_setting(Speed::Slow, 85.0, 0.0);
+		let at_ceiling = jxl.with_setting(Speed::Slow, 85.0, 25.0);
 		let stepped = |candidate: Candidate, score: f64| {
 			candidate
-				.stepped_down(score, 85.0, Speed::Moderate)
+				.stepped_down(score, 85.0, Speed::Slow)
 				.and_then(Candidate::setting)
 		};
 
@@ -905,7 +905,7 @@ mod tests {
 			stepped(
 				Candidate::Ravif(RavifSettings {
 					quality: 84.4,
-					speed: 6
+					speed: 4
 				}),
 				95.0
 			),
@@ -918,7 +918,7 @@ mod tests {
 		assert_eq!(at_ceiling.setting(), Some(2.0));
 		assert_eq!(stepped(at_ceiling, 95.0), None);
 		assert_eq!(
-			Candidate::JxlLossless(JXL_LOSSLESS).stepped_down(99.0, 85.0, Speed::Moderate),
+			Candidate::JxlLossless(JXL_LOSSLESS).stepped_down(99.0, 85.0, Speed::Slow),
 			None
 		);
 	}
@@ -978,22 +978,22 @@ mod tests {
 
 	#[test]
 	fn a_pass_teaches_the_setting_that_would_have_cleared_the_floor_by_one() {
-		let ravif = Candidate::Ravif(ravif_settings(Speed::Moderate));
+		let ravif = Candidate::Ravif(ravif_settings(Speed::Slow));
 
-		let generous = ravif.needed_setting(90.0, 85.0, Speed::Moderate).unwrap();
-		let narrow = ravif.needed_setting(85.5, 85.0, Speed::Moderate).unwrap();
-		let custom = Candidate::Ravif(ravif_start(Speed::Moderate, 70.0))
-			.needed_setting(95.0, 70.0, Speed::Moderate)
+		let generous = ravif.needed_setting(90.0, 85.0, Speed::Slow).unwrap();
+		let narrow = ravif.needed_setting(85.5, 85.0, Speed::Slow).unwrap();
+		let custom = Candidate::Ravif(ravif_start(Speed::Slow, 70.0))
+			.needed_setting(95.0, 70.0, Speed::Slow)
 			.unwrap();
 
 		assert!((generous - 88.8).abs() < 1e-4, "{generous}");
 		assert!((narrow - 92.4).abs() < 1e-4, "{narrow}");
 		assert!((custom - 72.0).abs() < 1e-4, "{custom}");
 		assert_eq!(
-			Candidate::JxlLossless(JXL_LOSSLESS).needed_setting(99.0, 85.0, Speed::Moderate),
+			Candidate::JxlLossless(JXL_LOSSLESS).needed_setting(99.0, 85.0, Speed::Slow),
 			None
 		);
-		assert_eq!(ravif.preset(), 6);
+		assert_eq!(ravif.preset(), 4);
 	}
 
 	#[test]
@@ -1011,14 +1011,14 @@ mod tests {
 
 	#[test]
 	fn only_a_finer_setting_of_the_same_encoder_is_finer() {
-		let ravif = Candidate::Ravif(ravif_settings(Speed::Fast));
-		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Fast));
+		let ravif = Candidate::Ravif(ravif_settings(Speed::Moderate));
+		let jxl = Candidate::JxlLossy(jxl_lossy_settings(Speed::Moderate));
 
-		assert!(ravif.with_setting(Speed::Fast, 80.0, 96.0).finer_than(ravif));
-		assert!(!ravif.with_setting(Speed::Fast, 80.0, 84.0).finer_than(ravif));
+		assert!(ravif.with_setting(Speed::Moderate, 80.0, 96.0).finer_than(ravif));
+		assert!(!ravif.with_setting(Speed::Moderate, 80.0, 84.0).finer_than(ravif));
 		assert!(!ravif.finer_than(ravif));
-		assert!(jxl.with_setting(Speed::Fast, 80.0, 1.0).finer_than(jxl));
-		assert!(!jxl.with_setting(Speed::Fast, 80.0, 2.0).finer_than(jxl));
+		assert!(jxl.with_setting(Speed::Moderate, 80.0, 1.0).finer_than(jxl));
+		assert!(!jxl.with_setting(Speed::Moderate, 80.0, 2.0).finer_than(jxl));
 		assert!(!Candidate::JxlLossless(JXL_LOSSLESS).finer_than(jxl));
 	}
 

@@ -278,7 +278,12 @@ async fn measure_video(
 			continue;
 		}
 
-		let goal = target(speed, plan.encoder.film_grain(), &Overrides::default());
+		let goal = target(
+			speed,
+			plan.encoder.film_grain(),
+			plan.colour.is_hdr(),
+			&Overrides::default(),
+		);
 		let scorer = Scorer {
 			tools,
 			source,

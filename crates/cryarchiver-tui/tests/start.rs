@@ -545,7 +545,7 @@ fn custom_quality_is_collapsed_until_opened_and_shows_what_the_project_gets() {
 	press(&mut menu, KeyCode::Enter);
 
 	assert!(shows(&mut menu, "Video VMAF"));
-	assert!(shows(&mut menu, "preset 93/89"));
+	assert!(shows(&mut menu, "preset 91/86"));
 	assert!(shows(&mut menu, "preset 128 kbps"));
 	press(&mut menu, KeyCode::Tab);
 	press(&mut menu, KeyCode::Tab);

@@ -40,7 +40,8 @@ const SAMPLE_LANE_THREADS: usize = 4;
 const SIDE_BY_SIDE_FROM: usize = 16;
 const NO_MARGIN: Target = Target { mean: 0.0, floor: 0.0 };
 
-const TARGETS: [Target; 3] = [
+/// VMAF, made for SDR, underrates what an HDR video loses, so HDR keeps a step more quality.
+const HDR_TARGETS: [Target; 2] = [
 	Target {
 		mean: 95.0,
 		floor: 91.0,
@@ -48,6 +49,16 @@ const TARGETS: [Target; 3] = [
 	Target {
 		mean: 93.0,
 		floor: 89.0,
+	},
+];
+const TARGETS: [Target; 3] = [
+	Target {
+		mean: 93.0,
+		floor: 89.0,
+	},
+	Target {
+		mean: 91.0,
+		floor: 86.0,
 	},
 	Target {
 		mean: 93.0,
@@ -197,7 +208,7 @@ pub struct Scorer<'a> {
 	pub cancel: &'a CancellationToken,
 }
 
-pub fn target(speed: Speed, film_grain: bool, overrides: &Overrides) -> Target {
+pub fn target(speed: Speed, film_grain: bool, hdr: bool, overrides: &Overrides) -> Target {
 	let custom = overrides.normalized().video.map(|video| Target {
 		mean: video.mean,
 		floor: video.floor,
@@ -205,6 +216,8 @@ pub fn target(speed: Speed, film_grain: bool, overrides: &Overrides) -> Target {
 	let base = match (speed, custom) {
 		(Speed::Fast, _) => TARGETS[2],
 		(Speed::Slow | Speed::Moderate, Some(custom)) => custom,
+		(Speed::Slow, None) if hdr => HDR_TARGETS[0],
+		(Speed::Moderate, None) if hdr => HDR_TARGETS[1],
 		(Speed::Slow, None) => TARGETS[0],
 		(Speed::Moderate, None) => TARGETS[1],
 	};
@@ -924,38 +937,76 @@ mod tests {
 		let preset = Overrides::default();
 
 		assert_eq!(
-			target(Speed::Slow, false, &preset),
-			Target {
-				mean: 95.0,
-				floor: 91.0
-			}
-		);
-		assert_eq!(
-			target(Speed::Slow, true, &preset),
-			Target {
-				mean: 93.0,
-				floor: 88.5
-			}
-		);
-		assert_eq!(
-			target(Speed::Moderate, false, &preset),
+			target(Speed::Slow, false, false, &preset),
 			Target {
 				mean: 93.0,
 				floor: 89.0
 			}
 		);
 		assert_eq!(
-			target(Speed::Moderate, true, &preset),
+			target(Speed::Slow, true, false, &preset),
 			Target {
 				mean: 91.0,
 				floor: 86.5
 			}
 		);
 		assert_eq!(
-			target(Speed::Fast, false, &preset),
+			target(Speed::Moderate, false, false, &preset),
+			Target {
+				mean: 91.0,
+				floor: 86.0
+			}
+		);
+		assert_eq!(
+			target(Speed::Moderate, true, false, &preset),
+			Target {
+				mean: 89.0,
+				floor: 83.5
+			}
+		);
+		assert_eq!(
+			target(Speed::Fast, false, false, &preset),
 			Target {
 				mean: 93.0,
 				floor: 88.0
+			}
+		);
+	}
+
+	#[test]
+	fn hdr_keeps_the_targets_a_step_higher_unless_overridden() {
+		let preset = Overrides::default();
+
+		assert_eq!(
+			target(Speed::Slow, false, true, &preset),
+			Target {
+				mean: 95.0,
+				floor: 91.0
+			}
+		);
+		assert_eq!(
+			target(Speed::Moderate, false, true, &preset),
+			Target {
+				mean: 93.0,
+				floor: 89.0
+			}
+		);
+		assert_eq!(
+			target(Speed::Moderate, true, true, &preset),
+			Target {
+				mean: 91.0,
+				floor: 86.5
+			}
+		);
+		assert_eq!(
+			target(Speed::Fast, false, true, &preset),
+			target(Speed::Fast, false, false, &preset)
+		);
+		assert_eq!(
+			target(Speed::Moderate, false, true, &overridden(90.0, 85.0)),
+			Target {
+				mean: 90.0,
+				floor: 85.0
 			}
 		);
 	}
@@ -972,51 +1023,51 @@ mod tests {
 		let custom = overridden(90.0, 85.0);
 
 		assert_eq!(
-			target(Speed::Moderate, false, &custom),
+			target(Speed::Moderate, false, false, &custom),
 			Target {
 				mean: 90.0,
 				floor: 85.0
 			}
 		);
 		assert_eq!(
-			target(Speed::Moderate, true, &custom),
+			target(Speed::Moderate, true, false, &custom),
 			Target {
 				mean: 88.0,
 				floor: 82.5
 			}
 		);
 		assert_eq!(
-			target(Speed::Slow, false, &custom),
+			target(Speed::Slow, false, false, &custom),
 			Target {
 				mean: 90.0,
 				floor: 85.0
 			}
 		);
 		assert_eq!(
-			target(Speed::Fast, false, &custom),
-			target(Speed::Fast, false, &Overrides::default())
+			target(Speed::Fast, false, false, &custom),
+			target(Speed::Fast, false, false, &Overrides::default())
 		);
 	}
 
 	#[test]
 	fn the_target_reads_the_normalized_override() {
 		assert_eq!(
-			target(Speed::Moderate, false, &overridden(120.0, 60.0)),
+			target(Speed::Moderate, false, false, &overridden(120.0, 60.0)),
 			Target {
 				mean: 99.0,
 				floor: 70.0
 			}
 		);
 		assert_eq!(
-			target(Speed::Slow, false, &overridden(90.04, 85.06)),
+			target(Speed::Slow, false, false, &overridden(90.04, 85.06)),
 			Target {
 				mean: 90.0,
 				floor: 85.1
 			}
 		);
 		assert_eq!(
-			target(Speed::Moderate, false, &overridden(f64::NAN, 85.0)),
-			target(Speed::Moderate, false, &Overrides::default())
+			target(Speed::Moderate, false, false, &overridden(f64::NAN, 85.0)),
+			target(Speed::Moderate, false, false, &Overrides::default())
 		);
 	}
 
@@ -1034,7 +1085,7 @@ mod tests {
 			alpha: false,
 		};
 		let key = |overrides: &Overrides| {
-			let target = target(Speed::Moderate, false, overrides);
+			let target = target(Speed::Moderate, false, false, overrides);
 			CacheKey {
 				group: Group::Video(group),
 				encoder: "svt-av1-4.2".to_owned(),
@@ -1047,10 +1098,10 @@ mod tests {
 
 		let preset = key(&Overrides::default());
 
-		assert!(preset.ends_with("|t93.0/89.0"), "{preset}");
+		assert!(preset.ends_with("|t91.0/86.0"), "{preset}");
 		assert_ne!(key(&overridden(90.0, 85.0)), preset);
-		assert_ne!(key(&overridden(93.0, 85.0)), preset);
-		assert_eq!(key(&overridden(93.0, 89.0)), preset);
+		assert_ne!(key(&overridden(91.0, 85.0)), preset);
+		assert_eq!(key(&overridden(91.0, 86.0)), preset);
 	}
 
 	#[test]
@@ -1647,8 +1698,8 @@ mod tests {
 	const MISSED: Searched = Searched::Unreachable {
 		crf: 10.0,
 		score: Score {
-			mean: 90.1,
-			p5: 84.0,
+			mean: 88.1,
+			p5: 82.0,
 			frames: 300,
 		},
 		sample_bytes: 900_000,
@@ -1683,7 +1734,7 @@ mod tests {
 
 	#[test]
 	fn dropped_grain_is_explained_with_both_searches() {
-		let grain_target = target(Speed::Moderate, true, &Overrides::default());
+		let grain_target = target(Speed::Moderate, true, false, &Overrides::default());
 
 		assert_eq!(
 			dropped_grain_text(14, found(12.0, 600_000), found(29.0, 100_000), grain_target, None),
@@ -1692,8 +1743,8 @@ mod tests {
 		);
 		assert_eq!(
 			dropped_grain_text(20, MISSED, found(29.0, 100_000), grain_target, None),
-			"film grain 20 was left out: with it quality target not reached (VMAF 90.1 / 84.0 at CRF 10, target \
-			 91.0 / 86.5); without it CRF 29 measured VMAF 93.4 / 89.2"
+			"film grain 20 was left out: with it quality target not reached (VMAF 88.1 / 82.0 at CRF 10, target \
+			 89.0 / 83.5); without it CRF 29 measured VMAF 93.4 / 89.2"
 		);
 		assert_eq!(
 			dropped_grain_text(8, MISSED, MISSED, grain_target, None),
@@ -1703,13 +1754,13 @@ mod tests {
 
 	#[test]
 	fn grain_dropped_under_a_bitrate_cap_names_the_cap() {
-		let grain_target = target(Speed::Moderate, true, &Overrides::default());
+		let grain_target = target(Speed::Moderate, true, false, &Overrides::default());
 		let cap = Some(12_500);
 
 		assert_eq!(
 			dropped_grain_text(20, MISSED, found(29.0, 100_000), grain_target, cap),
-			"film grain 20 was left out: with it quality target not reached (VMAF 90.1 / 84.0 at CRF 10, target \
-			 91.0 / 86.5) under the 12.5 Mbit/s cap; without it CRF 29 measured VMAF 93.4 / 89.2"
+			"film grain 20 was left out: with it quality target not reached (VMAF 88.1 / 82.0 at CRF 10, target \
+			 89.0 / 83.5) under the 12.5 Mbit/s cap; without it CRF 29 measured VMAF 93.4 / 89.2"
 		);
 		assert_eq!(
 			dropped_grain_text(8, MISSED, MISSED, grain_target, cap),

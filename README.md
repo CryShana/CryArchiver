@@ -56,8 +56,8 @@ cryarchiver film.mkv --resize 1280:-1         # 1280 pixels wide, aspect ratio k
 - A plain run writes nothing but its outputs: no settings, cache or log files.
 
 **Custom quality.** These replace the preset's targets and keep the rest; the run then names the preset as custom.
-- `--video-vmaf MEAN/FLOOR`: VMAF mean (80–99) and 5th-percentile floor (70 up to the mean). Presets: 93/89 moderate, 95/91 slow. Video with film grain gets 2 off the mean and 2.5 off the floor. Not with `fast`.
-- `--image-target N`: SSIMULACRA2 score, 50–95. Presets: 80, 85 and 90 at fast, moderate and slow.
+- `--video-vmaf MEAN/FLOOR`: VMAF mean (80–99) and 5th-percentile floor (70 up to the mean). Presets: 91/86 moderate, 93/89 slow; HDR video 93/89 and 95/91. Video with film grain gets 2 off the mean and 2.5 off the floor. Not with `fast`.
+- `--image-target N`: SSIMULACRA2 score, 50–95. Presets: 75, 80 and 85 at fast, moderate and slow.
 - `--audio-kbps N`: stereo Opus bitrate, 64–320 in steps of 8; other layouts scale with it. A lossy source below it keeps its own bitrate (at least 96 kbps stereo).
 
 | Option | Meaning | Default |

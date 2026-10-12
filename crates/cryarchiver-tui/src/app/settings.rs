@@ -72,7 +72,7 @@ impl QualityField {
 
 		Some(match self {
 			Self::Video => {
-				let target = quality::target(speed, false, &Overrides::default());
+				let target = quality::target(speed, false, false, &Overrides::default());
 				format!("{}/{}", target.mean, target.floor)
 			}
 			Self::Image => ssim_target(speed).to_string(),
@@ -110,7 +110,7 @@ impl QualityField {
 			Self::Video => {
 				let (mean, floor) = text
 					.split_once('/')
-					.ok_or_else(|| "type MEAN/FLOOR, such as 93/89".to_owned())?;
+					.ok_or_else(|| "type MEAN/FLOOR, such as 91/86".to_owned())?;
 				changed.video = Some(VmafOverride {
 					mean: number(mean)?,
 					floor: number(floor)?,
@@ -412,16 +412,16 @@ mod tests {
 	fn the_preset_values_are_the_engines() {
 		assert_eq!(
 			QualityField::Video.preset_text(PresetSpeed::Moderate).as_deref(),
-			Some("93/89")
+			Some("91/86")
 		);
 		assert_eq!(
 			QualityField::Video.preset_text(PresetSpeed::Slow).as_deref(),
-			Some("95/91")
+			Some("93/89")
 		);
 		assert_eq!(QualityField::Video.preset_text(PresetSpeed::Fast), None);
 		assert_eq!(
 			QualityField::Image.preset_text(PresetSpeed::Fast).as_deref(),
-			Some("80")
+			Some("75")
 		);
 		assert_eq!(
 			QualityField::Audio.preset_text(PresetSpeed::Slow).as_deref(),
@@ -449,7 +449,7 @@ mod tests {
 		assert_eq!(QualityField::Image.with(stored, ""), Ok(Overrides::default()));
 		assert_eq!(
 			QualityField::Video.with(stored, "93"),
-			Err("type MEAN/FLOOR, such as 93/89".to_owned())
+			Err("type MEAN/FLOOR, such as 91/86".to_owned())
 		);
 		assert_eq!(
 			QualityField::Audio.with(stored, "12a"),

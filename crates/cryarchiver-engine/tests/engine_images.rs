@@ -35,6 +35,7 @@ use support::heif::{Coding, avif_grid, heic_grid_coded, heic_still_coded, imir, 
 use support::ultra_hdr::{UltraHdrOptions, gain_map_av1, ultra_hdr_jpeg};
 use tokio_util::sync::CancellationToken;
 
+/// FAST held to the SSIMULACRA2 target of 80 these tests' images were chosen for.
 fn job(source: &Path) -> Job {
 	Job {
 		source: source.to_path_buf(),
@@ -42,7 +43,10 @@ fn job(source: &Path) -> Job {
 		keep_metadata: false,
 		drop_aux: false,
 		min_savings: 0.10,
-		overrides: Overrides::default(),
+		overrides: Overrides {
+			image: Some(80.0),
+			..Overrides::default()
+		},
 		options: JobOptions::default(),
 	}
 }

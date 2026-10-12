@@ -1577,7 +1577,12 @@ impl Engine {
 		video: &VideoPlan,
 		length_s: Option<f64>,
 	) -> VideoQuality {
-		let target = video_quality::target(job.speed, video.encoder.film_grain(), &job.overrides);
+		let target = video_quality::target(
+			job.speed,
+			video.encoder.film_grain(),
+			video.colour.is_hdr(),
+			&job.overrides,
+		);
 		let key = CacheKey {
 			group: Group::Video(VideoGroup::of(main, analysis, video)),
 			encoder: match video.max_bitrate_kbps {
@@ -1622,7 +1627,7 @@ impl Engine {
 	fn apply_learned_grain(job: &Job, video: &mut VideoPlan, quality: &mut VideoQuality) {
 		if quality.stats.is_some_and(|stats| stats.without_grain) && video.encoder.film_grain() {
 			video.encoder = video.encoder.without_grain();
-			quality.target = video_quality::target(job.speed, false, &job.overrides);
+			quality.target = video_quality::target(job.speed, false, video.colour.is_hdr(), &job.overrides);
 			quality.without_grain = true;
 		}
 	}
@@ -1738,7 +1743,7 @@ impl Engine {
 				encoder: video.encoder.without_grain(),
 				..video.clone()
 			};
-			let plain_target = video_quality::target(cx.job.speed, false, &cx.job.overrides);
+			let plain_target = video_quality::target(cx.job.speed, false, video.colour.is_hdr(), &cx.job.overrides);
 			let (start, bytes) = match searched {
 				Searched::Found(found) => (found.crf, Some(found.sample_bytes)),
 				Searched::Unreachable { .. } => (quality.start(), None),

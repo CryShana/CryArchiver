@@ -62,7 +62,7 @@ impl FormField {
 /// What a quality field of the form gives the project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QualityCheck {
-	/// Left empty, so the project uses the preset's value, shown as `preset 93/89`.
+	/// Left empty, so the project uses the preset's value, shown as `preset 91/86`.
 	Preset(String),
 	/// The value the project will store, normalized: `80` for a field typed as `80.04`.
 	Custom(String),
@@ -579,11 +579,11 @@ mod tests {
 
 		assert_eq!(
 			form.quality_check(FormField::VideoVmaf),
-			Some(QualityCheck::Preset("preset 95/91".into()))
+			Some(QualityCheck::Preset("preset 93/89".into()))
 		);
 		assert_eq!(
 			form.quality_check(FormField::ImageTarget),
-			Some(QualityCheck::Preset("preset 90".into()))
+			Some(QualityCheck::Preset("preset 85".into()))
 		);
 		assert_eq!(
 			form.quality_check(FormField::AudioKbps),

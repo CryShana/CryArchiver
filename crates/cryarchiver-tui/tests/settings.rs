@@ -52,11 +52,11 @@ fn quality_rows_show_the_preset_dimmed_until_edited() {
 	let mut app = app();
 	open_row(&mut app, IMAGE);
 
-	assert!(shown_row(&mut app, "Video VMAF").contains("preset · 93/89"));
+	assert!(shown_row(&mut app, "Video VMAF").contains("preset · 91/86"));
 	assert!(shown_row(&mut app, "Audio stereo").contains("preset · 128 kbps"));
 	let terminal = draw(&mut app, 120, 36);
 	let row = find_row(&terminal, "Image SSIMULACRA2").unwrap();
-	assert!(row_text(&terminal, row).contains("preset · 85"));
+	assert!(row_text(&terminal, row).contains("preset · 80"));
 	let preset_cell = &terminal.backend().buffer()[(find_on_row(&terminal, row, "preset").unwrap(), row)];
 	assert!(
 		!preset_cell.modifier.contains(Modifier::BOLD),
@@ -79,7 +79,7 @@ fn quality_rows_show_the_preset_dimmed_until_edited() {
 		custom_cell.modifier.contains(Modifier::BOLD),
 		"a custom value is drawn bold, unlike the dimmed preset"
 	);
-	assert!(shown_row(&mut app, "Video VMAF").contains("preset · 93/89"));
+	assert!(shown_row(&mut app, "Video VMAF").contains("preset · 91/86"));
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn reset_returns_one_row_or_every_row_to_the_preset() {
 	press(&mut app, KeyCode::Char('r'));
 	assert_eq!(overrides(&app).image, None);
 	assert_eq!(overrides(&app).audio_stereo_kbps, Some(160));
-	assert!(shown_row(&mut app, "Image SSIMULACRA2").contains("preset · 85"));
+	assert!(shown_row(&mut app, "Image SSIMULACRA2").contains("preset · 80"));
 	press(&mut app, KeyCode::Esc);
 
 	open_row(&mut app, RESET_QUALITY);

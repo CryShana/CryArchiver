@@ -278,7 +278,7 @@ struct QualityArgs {
 		long,
 		value_name = "MEAN/FLOOR",
 		value_parser = parse_video_vmaf,
-		help = "Video VMAF mean and 5th-percentile floor instead of the preset's, e.g. 93/89 (moderate and slow)"
+		help = "Video VMAF mean and 5th-percentile floor instead of the preset's, e.g. 91/86 (moderate and slow)"
 	)]
 	video_vmaf: Option<VmafOverride>,
 	#[arg(
@@ -319,7 +319,7 @@ fn number<T: std::str::FromStr>(text: &str) -> Result<T, String> {
 fn parse_video_vmaf(text: &str) -> Result<VmafOverride, String> {
 	let (mean, floor) = text
 		.split_once('/')
-		.ok_or_else(|| "expected MEAN/FLOOR, such as 93/89".to_owned())?;
+		.ok_or_else(|| "expected MEAN/FLOOR, such as 91/86".to_owned())?;
 	let video = VmafOverride {
 		mean: number(mean)?,
 		floor: number(floor)?,

@@ -55,7 +55,12 @@ async fn a_search_finds_a_passing_crf_and_the_check_confirms_the_full_encode() {
 	.unwrap();
 	let mut plan = plan_video(&info, main, &[], &analysis, Speed::Moderate, None);
 	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
-	let goal = target(Speed::Moderate, plan.encoder.film_grain(), &Overrides::default());
+	let goal = target(
+		Speed::Moderate,
+		plan.encoder.film_grain(),
+		plan.colour.is_hdr(),
+		&Overrides::default(),
+	);
 	let span = info
 		.format
 		.duration
@@ -140,7 +145,7 @@ async fn a_long_encode_aims_the_search_above_the_target_from_its_first_probe() {
 	};
 	let plan = plan_video(&info, main, &[], &analysis, Speed::Moderate, None);
 	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
-	let goal = target(Speed::Moderate, false, &Overrides::default());
+	let goal = target(Speed::Moderate, false, false, &Overrides::default());
 	let samples = [Sample {
 		start_s: 0.0,
 		length_s: 3.0,
@@ -218,7 +223,7 @@ async fn samples_searched_side_by_side_give_the_same_crf_and_scores_as_one_at_a_
 	.unwrap();
 	let plan = plan_video(&info, main, &[], &analysis, Speed::Moderate, None);
 	let workspace = Workspace::create(&dir.path().join("work"), &clip).unwrap();
-	let goal = target(Speed::Moderate, false, &Overrides::default());
+	let goal = target(Speed::Moderate, false, false, &Overrides::default());
 	let samples = [0.5, 2.5, 4.5, 6.5].map(|start_s| Sample { start_s, length_s: 1.0 });
 	let searched = async |lanes: Lanes<'_>, aim: Aim| {
 		let scorer = Scorer {
