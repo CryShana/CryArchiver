@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const SECTOR: usize = 2048;
+use cryarchiver_engine::disc::SECTOR_LEN as SECTOR;
+
 const PARTITION_START: u32 = 272;
 const MAIN_VDS: u32 = 32;
 const RESERVE_VDS: u32 = 48;

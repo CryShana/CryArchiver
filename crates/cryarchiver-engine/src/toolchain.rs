@@ -238,6 +238,31 @@ pub enum ToolchainError {
 }
 
 impl Toolchain {
+	/// These binaries with nothing found in them: for an engine that never runs a tool, or a test that adds what it
+	/// needs.
+	pub fn bare(ffmpeg: PathBuf, ffprobe: PathBuf, build: FfmpegBuild) -> Self {
+		Self {
+			ffmpeg,
+			ffprobe,
+			build,
+			build_id: String::new(),
+			encoders: BTreeSet::new(),
+			decoders: BTreeSet::new(),
+			filters: BTreeSet::new(),
+			svt_av1: None,
+			svt_av1_release: None,
+			libvpx_release: None,
+			svt_settings: false,
+			colour_tags: false,
+			vp9_alpha: false,
+			soxr: false,
+			opus_surround: false,
+			vmaf: false,
+			demuxers: BTreeSet::new(),
+			protocols: BTreeSet::new(),
+		}
+	}
+
 	pub async fn detect(config: &ToolConfig, cancel: &CancellationToken) -> Result<Self, ToolchainError> {
 		let (ffmpeg, ffprobe) = locate(config.ffmpeg.as_deref())?;
 		Box::pin(Self::probe(ffmpeg, ffprobe, cancel)).await

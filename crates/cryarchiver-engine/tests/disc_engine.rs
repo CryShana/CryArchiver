@@ -9,12 +9,13 @@ use cryarchiver_engine::format::OutputFormat;
 use cryarchiver_engine::options::{BluRay, JobOptions};
 use cryarchiver_engine::outcome::{ErrorKind, JobOutcome, KeepReason};
 use cryarchiver_engine::preset::{Overrides, Speed};
-use cryarchiver_engine::probe::{MediaInfo, probe};
+use cryarchiver_engine::probe::MediaInfo;
 use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
 use support::bluray::{self, Playlist};
 use support::dvd::{self, Footage, footage};
 use support::udf::{Image, UdfRevision};
+use support::{chapter_titles, near, probed};
 use tokio_util::sync::CancellationToken;
 
 const THREE_D: &str = "3D disc: the second view can't be encoded; kept so 3D survives";
@@ -82,28 +83,6 @@ fn blu_ray_image(path: &Path, three_d: bool) -> PathBuf {
 		dirs.push("BDMV/STREAM/SSIF");
 	}
 	image(path, files, &dirs, UdfRevision::V250)
-}
-
-async fn probed(path: &Path) -> MediaInfo {
-	probe(&support::toolchain().await, path, &CancellationToken::new())
-		.await
-		.unwrap()
-}
-
-fn chapter_titles(info: &MediaInfo) -> Vec<(f64, String)> {
-	info.chapters
-		.iter()
-		.map(|chapter| {
-			(
-				chapter["start_time"].as_str().unwrap().parse().unwrap(),
-				chapter["tags"]["title"].as_str().unwrap_or_default().to_owned(),
-			)
-		})
-		.collect()
-}
-
-fn near(actual: f64, expected: f64, tolerance: f64) -> bool {
-	(actual - expected).abs() <= tolerance
 }
 
 fn stage_at(events: &[JobEvent], stage: Stage) -> Vec<usize> {
@@ -221,13 +200,7 @@ async fn a_title_with_a_false_time_is_archived_at_its_real_length() {
 #[tokio::test]
 async fn images_that_hold_no_dvd_or_blu_ray_are_skipped() {
 	let dir = tempfile::tempdir().unwrap();
-	let mut state = 7u32;
-	let noise: Vec<u8> = (0..200_000)
-		.map(|_| {
-			state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-			state.to_be_bytes()[1]
-		})
-		.collect();
+	let noise = support::pattern(200_000, 7);
 	let random = dir.path().join("random.ISO");
 	std::fs::write(&random, noise).unwrap();
 	let plain = image(

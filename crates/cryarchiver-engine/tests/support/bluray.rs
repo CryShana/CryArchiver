@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Mutex;
 
 const TICKS: f64 = 45_000.0;
 const ALIGNED_UNIT: usize = 6144;
@@ -36,7 +37,24 @@ pub fn bdmv(dir: &Path, seconds: u32, playlists: &[Playlist]) -> Vec<(String, Ve
 	files
 }
 
+/// The clip of `seconds`, made once per test binary.
 fn m2ts(dir: &Path, seconds: u32) -> Vec<u8> {
+	static MADE: Mutex<Vec<(u32, Vec<u8>)>> = Mutex::new(Vec::new());
+
+	let made = MADE
+		.lock()
+		.unwrap()
+		.iter()
+		.find(|(own, _)| *own == seconds)
+		.map(|(_, bytes)| bytes.clone());
+	made.unwrap_or_else(|| {
+		let bytes = encoded_m2ts(dir, seconds);
+		MADE.lock().unwrap().push((seconds, bytes.clone()));
+		bytes
+	})
+}
+
+fn encoded_m2ts(dir: &Path, seconds: u32) -> Vec<u8> {
 	let picture = format!("testsrc2=s=320x240:r=25:d={seconds}");
 	let tone = format!("sine=frequency=440:sample_rate=48000:duration={seconds}");
 	let subtitles = super::pgs_box(dir, 1000, 3000);

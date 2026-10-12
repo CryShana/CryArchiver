@@ -1598,24 +1598,12 @@ mod tests {
 
 	fn toolchain_without_libaom() -> Toolchain {
 		Toolchain {
-			ffmpeg: PathBuf::from("ffmpeg"),
-			ffprobe: PathBuf::from("ffprobe"),
-			build: FfmpegBuild::Release(Version { major: 9, minor: 0 }),
-			build_id: String::new(),
 			encoders: BTreeSet::from(["libsvtav1".to_owned()]),
-			decoders: BTreeSet::new(),
-			filters: BTreeSet::new(),
-			svt_av1: None,
-			svt_av1_release: None,
-			libvpx_release: None,
-			svt_settings: false,
-			colour_tags: false,
-			vp9_alpha: false,
-			soxr: false,
-			opus_surround: false,
-			vmaf: false,
-			demuxers: BTreeSet::new(),
-			protocols: BTreeSet::new(),
+			..Toolchain::bare(
+				PathBuf::from("ffmpeg"),
+				PathBuf::from("ffprobe"),
+				FfmpegBuild::Release(Version { major: 9, minor: 0 }),
+			)
 		}
 	}
 

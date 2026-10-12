@@ -10,11 +10,12 @@ use cryarchiver_engine::disc::dvd::{Dvd, Selection, parse, select};
 use cryarchiver_engine::disc::read::{ANGLES_LEFT_OUT, Built, BuiltTitle, build_dvd, normalise_timestamps};
 use cryarchiver_engine::disc::udf::{read_folder, read_image};
 use cryarchiver_engine::outcome::{ErrorKind, JobError};
-use cryarchiver_engine::probe::{MediaInfo, probe};
+use cryarchiver_engine::probe::MediaInfo;
 use cryarchiver_engine::workspace::Workspace;
 use support::bluray::{self, Playlist};
 use support::dvd::{self, Footage, footage};
 use support::udf::{Image, UdfRevision};
+use support::{chapter_titles, near, probed};
 use tokio_util::sync::CancellationToken;
 
 const NAME: &str = "Družinski izlet";
@@ -43,30 +44,8 @@ async fn build(dvd: &Dvd, selection: &Selection, workspace: &Workspace) -> Resul
 	.await
 }
 
-async fn probed(path: &Path) -> MediaInfo {
-	probe(&support::toolchain().await, path, &CancellationToken::new())
-		.await
-		.unwrap()
-}
-
 fn workspace(dir: &Path) -> Workspace {
 	Workspace::create(&dir.join("work"), &dir.join("disc")).unwrap()
-}
-
-fn near(actual: f64, expected: f64, tolerance: f64) -> bool {
-	(actual - expected).abs() <= tolerance
-}
-
-fn chapter_starts(info: &MediaInfo) -> Vec<(f64, String)> {
-	info.chapters
-		.iter()
-		.map(|chapter| {
-			(
-				chapter["start_time"].as_str().unwrap().parse().unwrap(),
-				chapter["tags"]["title"].as_str().unwrap_or_default().to_owned(),
-			)
-		})
-		.collect()
 }
 
 fn stream_durations(info: &MediaInfo) -> Vec<f64> {
@@ -173,7 +152,7 @@ async fn two_titles_of_one_layout_join_into_one_mkv_with_their_chapters() {
 	assert!(near(info.format.duration.unwrap(), 23.0, 0.1), "{:?}", info.format);
 	assert_eq!(info.format.tags.get("title").map(String::as_str), Some(NAME));
 
-	let chapters = chapter_starts(&info);
+	let chapters = chapter_titles(&info);
 	let titles: Vec<&str> = chapters.iter().map(|(_, title)| title.as_str()).collect();
 	assert_eq!(titles, ["Title 1", "Chapter 2", "Title 2"]);
 	for ((start, _), expected) in chapters.iter().zip([0.0, 6.0, 12.0]) {
@@ -257,7 +236,7 @@ async fn a_title_of_another_shape_is_reencoded_to_the_main_one() {
 
 	let info = probed(&built.path).await;
 	assert!(near(info.format.duration.unwrap(), 23.0, 0.1), "{:?}", info.format);
-	let chapters = chapter_starts(&info);
+	let chapters = chapter_titles(&info);
 	assert_eq!(chapters.len(), 3, "{chapters:?}");
 	assert!(near(chapters[2].0, 12.0, 0.1), "{chapters:?}");
 	assert!(near(built.titles[1].start_s, chapters[2].0, 1e-3), "{:?}", built.titles);
@@ -293,7 +272,7 @@ async fn a_disc_under_a_non_ascii_folder_reads() {
 	);
 	let info = probed(&built.path).await;
 	assert!(near(info.format.duration.unwrap(), 11.0, 0.1), "{:?}", info.format);
-	assert_eq!(chapter_starts(&info).len(), 2);
+	assert_eq!(chapter_titles(&info).len(), 2);
 }
 
 #[tokio::test]
@@ -335,7 +314,7 @@ async fn a_title_with_a_false_time_is_timed_by_its_footage() {
 	assert!(near(built.titles[0].length_s, 12.0, 0.1), "{:?}", built.titles);
 	let info = probed(&built.path).await;
 	assert!(near(info.format.duration.unwrap(), 12.0, 0.1), "{:?}", info.format);
-	let chapters = chapter_starts(&info);
+	let chapters = chapter_titles(&info);
 	assert_eq!(chapters.len(), 1, "{chapters:?}");
 	assert!(near(
 		info.chapters[0]["end_time"].as_str().unwrap().parse().unwrap(),
@@ -402,7 +381,7 @@ async fn a_blu_ray_main_feature_is_copied_with_its_playlists_marks_as_chapters()
 	assert_eq!(info.streams[1].tag("language"), Some("slv"));
 	assert_eq!(info.streams[2].tag("language"), Some("eng"));
 
-	let chapters = chapter_starts(&info);
+	let chapters = chapter_titles(&info);
 	let titles: Vec<&str> = chapters.iter().map(|(_, title)| title.as_str()).collect();
 	assert_eq!(titles, ["Chapter 1", "Chapter 2", "Chapter 3"]);
 	for ((start, _), expected) in chapters.iter().zip([0.0, 3.0, 5.5]) {
@@ -465,7 +444,7 @@ async fn a_blu_ray_image_under_a_non_ascii_folder_reads() {
 	assert_eq!(main.playlist, Some(800));
 	assert!(main.warnings.is_empty(), "{:?}", main.warnings);
 	let info = probed(&built.path).await;
-	assert_eq!(chapter_starts(&info).len(), 3, "{:?}", info.chapters);
+	assert_eq!(chapter_titles(&info).len(), 3, "{:?}", info.chapters);
 	assert!(near(info.format.duration.unwrap(), 8.0, 0.1), "{:?}", info.format);
 }
 

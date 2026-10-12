@@ -10,6 +10,7 @@ use cryarchiver_engine::disc::dvd::{
 use cryarchiver_engine::disc::udf::{DiscFiles, read_folder, read_image};
 use cryarchiver_engine::disc::{Reader, SECTOR};
 use support::ifo::{self, Audio, Pgc, Vts};
+use support::pattern;
 use support::udf::{Image, UdfRevision};
 
 const FIRST_VOB_SECTORS: usize = 1536;
@@ -33,16 +34,6 @@ const PALETTE: [u32; 16] = [
 	0x00A0_8080,
 	0x00E0_8080,
 ];
-
-fn pattern(length: usize, seed: u32) -> Vec<u8> {
-	let mut state = seed;
-	(0..length)
-		.map(|_| {
-			state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-			state.to_be_bytes()[1]
-		})
-		.collect()
-}
 
 fn title_set() -> Vts {
 	Vts {

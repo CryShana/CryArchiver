@@ -5,17 +5,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use cryarchiver_engine::disc::udf::{DiscFile, Extent, is_udf, read_folder, read_image};
+use support::pattern;
 use support::udf::{Image, UdfRevision};
-
-fn pattern(length: usize, seed: u32) -> Vec<u8> {
-	let mut state = seed;
-	(0..length)
-		.map(|_| {
-			state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-			state.to_be_bytes()[1]
-		})
-		.collect()
-}
 
 fn read_back(file: &DiscFile) -> Vec<u8> {
 	let mut source = File::open(&file.source).unwrap();

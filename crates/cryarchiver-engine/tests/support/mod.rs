@@ -11,14 +11,56 @@ pub mod ultra_hdr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use cryarchiver_engine::probe::{MediaInfo, probe};
 use cryarchiver_engine::toolchain::{ToolConfig, Toolchain};
+use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
+/// The tools on `PATH`, detected once per test binary.
 pub async fn toolchain() -> Toolchain {
-	let config = ToolConfig { ffmpeg: None };
-	Toolchain::detect(&config, &CancellationToken::new())
+	static TOOLS: OnceCell<Toolchain> = OnceCell::const_new();
+	TOOLS
+		.get_or_init(|| async {
+			Toolchain::detect(&ToolConfig { ffmpeg: None }, &CancellationToken::new())
+				.await
+				.expect("ffmpeg and ffprobe on PATH")
+		})
 		.await
-		.expect("ffmpeg and ffprobe on PATH")
+		.clone()
+}
+
+pub async fn probed(path: &Path) -> MediaInfo {
+	probe(&toolchain().await, path, &CancellationToken::new())
+		.await
+		.unwrap()
+}
+
+pub fn near(actual: f64, expected: f64, tolerance: f64) -> bool {
+	(actual - expected).abs() <= tolerance
+}
+
+/// Each chapter's start and title.
+pub fn chapter_titles(info: &MediaInfo) -> Vec<(f64, String)> {
+	info.chapters
+		.iter()
+		.map(|chapter| {
+			(
+				chapter["start_time"].as_str().unwrap().parse().unwrap(),
+				chapter["tags"]["title"].as_str().unwrap_or_default().to_owned(),
+			)
+		})
+		.collect()
+}
+
+/// `length` bytes of noise from `seed`.
+pub fn pattern(length: usize, seed: u32) -> Vec<u8> {
+	let mut state = seed;
+	(0..length)
+		.map(|_| {
+			state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+			state.to_be_bytes()[1]
+		})
+		.collect()
 }
 
 pub fn ffmpeg(args: &[&str]) {

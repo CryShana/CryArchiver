@@ -3,7 +3,7 @@
 #[path = "../../../cryarchiver-engine/tests/support/udf.rs"]
 pub mod udf;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
@@ -240,26 +240,11 @@ impl Encode for FakeEncoder {
 }
 
 fn no_tools() -> Toolchain {
-	Toolchain {
-		ffmpeg: PathBuf::from("no-ffmpeg"),
-		ffprobe: PathBuf::from("no-ffprobe"),
-		build: FfmpegBuild::Release(Version { major: 0, minor: 0 }),
-		build_id: String::new(),
-		encoders: BTreeSet::new(),
-		decoders: BTreeSet::new(),
-		filters: BTreeSet::new(),
-		svt_av1: None,
-		svt_av1_release: None,
-		libvpx_release: None,
-		svt_settings: false,
-		colour_tags: false,
-		vp9_alpha: false,
-		soxr: false,
-		opus_surround: false,
-		vmaf: false,
-		demuxers: BTreeSet::new(),
-		protocols: BTreeSet::new(),
-	}
+	Toolchain::bare(
+		PathBuf::from("no-ffmpeg"),
+		PathBuf::from("no-ffprobe"),
+		FfmpegBuild::Release(Version { major: 0, minor: 0 }),
+	)
 }
 
 fn replace_keeping_the_time(path: &Path, content: &[u8], scratch: &Path) {

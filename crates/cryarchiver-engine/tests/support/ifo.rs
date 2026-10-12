@@ -1,4 +1,5 @@
-const SECTOR: usize = 2048;
+use cryarchiver_engine::disc::SECTOR_LEN as SECTOR;
+
 const PGC_HEADER: usize = 0xEC;
 
 /// A cell playback entry: inclusive VTS sectors, a 25 fps time, the still time byte and the category byte (block

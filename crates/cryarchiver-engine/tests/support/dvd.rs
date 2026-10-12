@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use cryarchiver_engine::disc::SECTOR_LEN as SECTOR;
 
 use super::ifo::{self, Audio, Pgc, Vts};
-
-const SECTOR: usize = 2048;
 
 pub const PALETTE: [u32; 16] = [
 	0x0010_8080,
@@ -23,7 +24,7 @@ pub const PALETTE: [u32; 16] = [
 	0x0010_8080,
 ];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Footage {
 	pub size: &'static str,
 	pub seconds: u32,
@@ -51,15 +52,39 @@ pub const fn footage(seconds: u32, cells: &'static [u32]) -> Footage {
 	}
 }
 
-/// An MPEG-2 PS like a DVD's VOB, padded to whole sectors. Its tone's pitch follows `index`.
+/// An MPEG-2 PS like a DVD's VOB, padded to whole sectors, also written unpadded to `title-{index}.vob` in `dir`. Its
+/// tone's pitch follows `index`. Each one is made once per test binary.
 pub fn vob(dir: &Path, index: usize, footage: Footage) -> Vec<u8> {
+	static MADE: Mutex<Vec<(usize, Footage, Vec<u8>)>> = Mutex::new(Vec::new());
+
+	let path = dir.join(format!("title-{index}.vob"));
+	let footage = Footage { cells: &[], ..footage };
+	let made = MADE
+		.lock()
+		.unwrap()
+		.iter()
+		.find(|(own, made, _)| *own == index && *made == footage)
+		.map(|(_, _, bytes)| bytes.clone());
+	let mut bytes = if let Some(bytes) = made {
+		std::fs::write(&path, &bytes).unwrap();
+		bytes
+	} else {
+		let bytes = encoded_vob(dir, &path, index, footage);
+		MADE.lock().unwrap().push((index, footage, bytes.clone()));
+		bytes
+	};
+
+	bytes.resize(bytes.len().next_multiple_of(SECTOR), 0);
+	bytes
+}
+
+fn encoded_vob(dir: &Path, path: &Path, index: usize, footage: Footage) -> Vec<u8> {
 	let picture = format!("testsrc2=s={}:r=25:d={},setfield=tff", footage.size, footage.seconds);
 	let tone = format!(
 		"sine=frequency={}:duration={}:sample_rate=48000",
 		440 + 110 * index,
 		footage.seconds
 	);
-	let path = dir.join(format!("title-{index}.vob"));
 	let (from_ms, to_ms) = footage.subtitle_ms;
 	let subtitles = footage.subtitles.then(|| super::pgs_box(dir, from_ms, to_ms));
 
@@ -96,10 +121,7 @@ pub fn vob(dir: &Path, index: usize, footage: Footage) -> Vec<u8> {
 		path.to_str().unwrap(),
 	]);
 	super::ffmpeg(&args);
-
-	let mut bytes = std::fs::read(&path).unwrap();
-	bytes.resize(bytes.len().next_multiple_of(SECTOR), 0);
-	bytes
+	std::fs::read(path).unwrap()
 }
 
 /// The files of a `VIDEO_TS` folder, as paths from the disc root, whose one title set holds `titles` in order, each
