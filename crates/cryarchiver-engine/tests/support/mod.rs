@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod heif;
+pub mod ifo;
 pub mod tiff;
 pub mod udf;
 pub mod ultra_hdr;
