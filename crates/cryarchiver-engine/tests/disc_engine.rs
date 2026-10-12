@@ -250,14 +250,29 @@ async fn images_that_hold_no_dvd_or_blu_ray_are_skipped() {
 	}
 }
 
+fn decision(events: &[JobEvent]) -> &Decision {
+	events
+		.iter()
+		.rev()
+		.find_map(|event| match event {
+			JobEvent::Decision(decision) => Some(&**decision),
+			_ => None,
+		})
+		.unwrap_or_else(|| panic!("no decision: {events:?}"))
+}
+
 #[tokio::test]
-async fn a_3d_blu_ray_image_is_always_kept() {
+async fn a_3d_blu_ray_image_is_always_kept_with_its_disc_recorded() {
 	let dir = tempfile::tempdir().unwrap();
 	let iso = blu_ray_image(&dir.path().join("3d.iso"), true);
 
-	let outcome = run(&job(&iso), dir.path()).await;
+	let (outcome, events) = run_with_events(&job(&iso), dir.path()).await;
 
 	assert_eq!(kept_reason(&outcome), THREE_D);
+	assert_eq!(
+		decision(&events).disc.as_ref().map(|disc| disc.kind.as_str()),
+		Some("Blu-ray")
+	);
 }
 
 #[tokio::test]
@@ -335,7 +350,7 @@ fn assert_main_feature(decision: &Decision, info: &MediaInfo) {
 #[tokio::test]
 async fn a_blu_ray_folder_becomes_one_av1_mkv_of_its_main_feature() {
 	let dir = tempfile::tempdir().unwrap();
-	let root = dir.path().join("Film");
+	let root = dir.path().join("Film.Disc1");
 	dvd::write_folder(&root, &blu_ray_files(dir.path()));
 
 	let (outcome, events) = run_with_events(&job(&root), dir.path()).await;
@@ -343,7 +358,7 @@ async fn a_blu_ray_folder_becomes_one_av1_mkv_of_its_main_feature() {
 	let JobOutcome::Encoded { output, decision, .. } = outcome else {
 		panic!("{outcome:?}")
 	};
-	assert_eq!(output, dir.path().join("Film.cry.mkv"));
+	assert_eq!(output, dir.path().join("Film.Disc1.cry.mkv"));
 	assert_main_feature(&decision, &probed(&output).await);
 
 	let queued = stage_at(&events, Stage::Queued);
@@ -415,22 +430,15 @@ async fn converting_a_blu_ray_needs_ffmpeg_with_the_bluray_protocol() {
 	assert!(stage_at(&events.into_inner().unwrap(), Stage::Disc).is_empty());
 }
 
-/// An MPEG-PS of `segments` one-second pieces joined byte for byte, each with its own timestamps from zero.
+/// A DVD-like PS of `segments` one-second pieces with LPCM audio joined byte for byte, each with its own
+/// timestamps from zero.
 fn loose_vob(dir: &Path, name: &str, segments: u32) -> PathBuf {
-	let mut bytes = Vec::new();
-	for index in 0..segments {
-		let picture = "testsrc2=s=320x240:r=25:d=1";
-		let tone = format!("sine=frequency={}:duration=1:sample_rate=48000", 440 + 20 * index);
-		let segment = dir.join(format!("segment-{index}.mpg"));
-		support::ffmpeg(&[
-			"-f",
-			"lavfi",
-			"-i",
-			picture,
-			"-f",
-			"lavfi",
-			"-i",
-			&tone,
+	dvd::restarting(
+		dir,
+		name,
+		segments,
+		&[],
+		&[
 			"-c:v",
 			"mpeg2video",
 			"-b:v",
@@ -442,19 +450,11 @@ fn loose_vob(dir: &Path, name: &str, segments: u32) -> PathBuf {
 			"-bufsize",
 			"2M",
 			"-c:a",
-			"mp2",
+			"pcm_dvd",
 			"-f",
-			"mpeg",
-			segment.to_str().unwrap(),
-		]);
-		bytes.extend(std::fs::read(&segment).unwrap());
-		std::fs::remove_file(&segment).unwrap();
-	}
-
-	std::fs::create_dir_all(dir.join("vob")).unwrap();
-	let path = dir.join("vob").join(name);
-	std::fs::write(&path, bytes).unwrap();
-	path
+			"dvd",
+		],
+	)
 }
 
 #[tokio::test]
@@ -468,18 +468,24 @@ async fn a_vob_whose_timestamps_restart_is_rebuilt_and_archived_at_its_real_leng
 
 	let (outcome, events) = run_with_events(&job(&vob), dir.path()).await;
 
-	let JobOutcome::Encoded { output, decision, .. } = outcome else {
+	let JobOutcome::Encoded {
+		output,
+		decision,
+		warnings,
+		..
+	} = outcome
+	else {
 		panic!("{outcome:?}")
 	};
 	assert_eq!(output, dir.path().join("Loose.cry.mkv"));
+	let rebuilt = "the source's timestamps restart; they were rebuilt";
 	assert!(
-		decision
-			.warnings
-			.iter()
-			.any(|warning| warning == "the source's timestamps restart; they were rebuilt"),
+		decision.warnings.iter().any(|warning| warning == rebuilt),
 		"{:?}",
 		decision.warnings
 	);
+	assert!(warnings.iter().any(|warning| warning == rebuilt), "{warnings:?}");
+	assert!(events.contains(&JobEvent::Warning(rebuilt.to_owned())), "{events:?}");
 	assert!(decision.disc.is_none());
 
 	let info = probed(&output).await;
@@ -506,4 +512,87 @@ async fn a_ps_with_continuous_timestamps_is_not_rebuilt() {
 	};
 	assert!(decision.warnings.is_empty(), "{:?}", decision.warnings);
 	assert!(stage_at(&events, Stage::Disc).is_empty(), "{events:?}");
+}
+
+#[tokio::test]
+async fn an_encrypted_dvd_image_is_kept_as_it_is() {
+	let dir = tempfile::tempdir().unwrap();
+	let mut files = dvd::video_ts(dir.path(), &[footage(11, &[11])]);
+	for (name, bytes) in &mut files {
+		if name == "VIDEO_TS/VTS_01_1.VOB" {
+			*bytes = dvd::scrambled(std::mem::take(bytes));
+		}
+	}
+	let iso = image(&dir.path().join("Film.iso"), files, &["AUDIO_TS"], UdfRevision::V102);
+
+	let (outcome, events) = run_with_events(&job(&iso), dir.path()).await;
+
+	assert_eq!(kept_reason(&outcome), "the DVD is encrypted");
+	assert!(stage_at(&events, Stage::Disc).is_empty(), "{events:?}");
+}
+
+#[tokio::test]
+async fn a_dvd_whose_angles_cannot_be_told_apart_is_kept_as_it_is() {
+	let dir = tempfile::tempdir().unwrap();
+	let iso = image(
+		&dir.path().join("Angles.iso"),
+		dvd::two_angles(dir.path(), footage(12, &[12]), false),
+		&["AUDIO_TS"],
+		UdfRevision::V102,
+	);
+
+	let outcome = run(&job(&iso), dir.path()).await;
+
+	assert_eq!(kept_reason(&outcome), "multi-angle or branching titles aren't read yet");
+}
+
+#[tokio::test]
+async fn an_encrypted_blu_ray_is_kept_as_it_is() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("Film");
+	let mut files = blu_ray_files(dir.path());
+	files.push(("AACS/Unit_Key_RO.inf".to_owned(), vec![0; 64]));
+	dvd::write_folder(&root, &files);
+
+	let (outcome, events) = run_with_events(&job(&root), dir.path()).await;
+
+	assert_eq!(kept_reason(&outcome), "the Blu-ray is encrypted");
+	assert!(stage_at(&events, Stage::Disc).is_empty(), "{events:?}");
+}
+
+#[tokio::test]
+async fn a_disc_job_cancelled_while_the_disc_is_read_leaves_no_workspace() {
+	let dir = tempfile::tempdir().unwrap();
+	let iso = dvd_image(dir.path(), &dir.path().join("Film.iso"), &[footage(12, &[6, 6])]);
+	let engine = Engine::new(support::toolchain().await);
+	let sink = CliSink {
+		output_dir: Some(dir.path().to_path_buf()),
+		output_file: None,
+		overwrite: false,
+	};
+	let cancel = CancellationToken::new();
+
+	let outcome = engine
+		.run(
+			&job(&iso),
+			&sink,
+			&|event| {
+				if event == JobEvent::Stage(Stage::Disc) {
+					cancel.cancel();
+				}
+			},
+			&cancel,
+		)
+		.await;
+
+	let JobOutcome::Failed(err) = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(err.kind, ErrorKind::Cancelled);
+	let work = dir.path().join(CLI_WORK_DIR);
+	let left: Vec<_> = std::fs::read_dir(&work)
+		.map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+		.unwrap_or_default();
+	assert!(left.is_empty(), "{left:?}");
+	assert!(!dir.path().join("Film.cry.mkv").exists());
 }

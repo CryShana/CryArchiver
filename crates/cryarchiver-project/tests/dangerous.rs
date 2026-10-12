@@ -11,6 +11,7 @@ use cryarchiver_project::store::Store;
 use cryarchiver_project::tree::FolderId;
 use cryarchiver_project::view::{NoticeLevel, RowState};
 use cryarchiver_project::{Command, Fault, Project, Target};
+use support::udf::{Image, UdfRevision};
 use support::{FakeEncoder, Rule, Snapshot, file_id, jpeg, setup, wait_for, wait_for_state, write};
 
 const BIG: usize = 100_000;
@@ -539,4 +540,42 @@ fn a_source_folder_named_like_the_work_area_is_archived_beside_it_and_survives_r
 			"{state:?}"
 		);
 	}
+}
+
+#[test]
+fn disc_images_are_deleted_once_archived_or_kept_as_they_are() {
+	let setup = setup(|settings| settings.delete_originals = true);
+	let dvd = write(&setup.source, "Trip.iso", b"a DVD image");
+	let blu_ray = setup.source.join("Film.iso");
+	Image {
+		files: vec![
+			("BDMV/index.bdmv".to_owned(), b"INDX0200".repeat(16)),
+			("BDMV/MovieObject.bdmv".to_owned(), b"MOBJ0200".repeat(16)),
+		],
+		dirs: vec!["BDMV/STREAM".to_owned(), "CERTIFICATE".to_owned()],
+		revision: UdfRevision::V250,
+	}
+	.write(&blu_ray);
+	let image = fs::read(&blu_ray).unwrap();
+	let encoder = FakeEncoder::new();
+	encoder.rule("Trip.iso", Rule::Encode("mkv"));
+	encoder.rule("Film.iso", Rule::Engine);
+	let project = support::open(&setup, &encoder);
+	let mut snapshot = Snapshot::default();
+
+	start_deleting(&project);
+	wait_for(&project, &mut snapshot, "both images deleted", |s| deleted(s) == 2);
+	drop(project);
+
+	assert!(!dvd.exists() && !blu_ray.exists());
+	assert_eq!(
+		fs::read(setup.destination.join("Trip.mkv")).unwrap(),
+		b"encoded Trip.iso"
+	);
+	assert_eq!(fs::read(setup.destination.join("Film.iso")).unwrap(), image);
+	assert!(matches!(state(&setup, "Trip.iso"), FileState::OriginalDeleted(output) if output.how == How::Encoded));
+	assert!(matches!(
+		state(&setup, "Film.iso"),
+		FileState::OriginalDeleted(output) if output.how == How::Copied(CopyReason::KeptOriginal)
+	));
 }

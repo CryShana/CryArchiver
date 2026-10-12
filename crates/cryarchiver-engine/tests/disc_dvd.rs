@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use cryarchiver_engine::disc::dvd::{
-	AudioAttr, AudioCoding, Cell, Dropped, Dvd, DvdTitle, Kept, SECTOR, VideoAttr, parse, select,
+	AudioAttr, AudioCoding, Cell, Dropped, Dvd, DvdTitle, Kept, SECTOR, Subpicture, VideoAttr, parse, select,
 };
 use cryarchiver_engine::disc::udf::{DiscFiles, read_folder, read_image};
 use support::ifo::{self, Audio, Pgc, Vts};
@@ -67,11 +67,13 @@ fn title_set() -> Vts {
 				],
 				programs: vec![1, 2, 3],
 				palette: PALETTE,
+				..Pgc::default()
 			},
 			Pgc {
 				cells: vec![ifo::Cell::new(1300, 2047, 40, 0)],
 				programs: vec![1],
 				palette: [0x0080_8080; 16],
+				..Pgc::default()
 			},
 		],
 		titles: vec![vec![(1, 1), (1, 2), (1, 3)], vec![(2, 1)]],
@@ -128,19 +130,25 @@ fn expected_titles() -> Vec<DvdTitle> {
 			coding: AudioCoding::Ac3,
 			channels: 6,
 			language: Some("en".to_owned()),
+			id: Some(0x80),
 		},
 		AudioAttr {
 			coding: AudioCoding::Lpcm { bits: 16 },
 			channels: 2,
 			language: Some("sl".to_owned()),
+			id: Some(0xA1),
 		},
 	];
 	let cell = |first_sector, last_sector, time_s| Cell {
 		first_sector,
 		last_sector,
 		time_s,
-		still: false,
+		..Cell::default()
 	};
+	let subpictures = vec![Subpicture {
+		language: Some("sl".to_owned()),
+		id: Some(0x20),
+	}];
 
 	vec![
 		DvdTitle {
@@ -154,8 +162,9 @@ fn expected_titles() -> Vec<DvdTitle> {
 			chapter_starts_s: vec![0.0, 20.0, 50.0],
 			video,
 			audio: audio.clone(),
-			subpictures: vec![Some("sl".to_owned())],
+			subpictures: subpictures.clone(),
 			palette: PALETTE,
+			angles: false,
 		},
 		DvdTitle {
 			number: 2,
@@ -164,8 +173,9 @@ fn expected_titles() -> Vec<DvdTitle> {
 			chapter_starts_s: vec![0.0],
 			video,
 			audio,
-			subpictures: vec![Some("sl".to_owned())],
+			subpictures,
 			palette: [0x0080_8080; 16],
+			angles: false,
 		},
 	]
 }
@@ -312,6 +322,45 @@ fn only_the_first_angle_of_an_angle_block_plays() {
 	let firsts: Vec<u32> = dvd.titles[0].cells.iter().map(|cell| cell.first_sector).collect();
 	assert_eq!(firsts, [0, 400, 900]);
 	assert_eq!(dvd.titles[0].chapter_starts_s, [0.0, 20.0, 50.0]);
+	assert!(dvd.titles[0].angles);
+}
+
+#[test]
+fn the_pgc_stream_controls_give_each_stream_its_id() {
+	let dir = tempfile::tempdir().unwrap();
+	let mut vts = title_set();
+	vts.audio.insert(
+		1,
+		Audio::Ac3 {
+			channels: 2,
+			language: "de",
+		},
+	);
+	vts.subpictures.push("hr");
+	vts.pgcs[0].audio_control = vec![0x8000, 0, 0x8000 | 2 << 8];
+	vts.pgcs[0].subpicture_control = vec![0x8000_0000 | 3 << 16 | 1 << 24, 0x8000_0000 | 5 << 16];
+
+	let dvd = parse(&folder(dir.path(), &disc(&ifo::vmg(&[(1, 1), (1, 2)]), &vts.bytes()))).unwrap();
+
+	let ids = |title: &DvdTitle| {
+		(
+			title.audio.iter().map(|attr| attr.id).collect::<Vec<_>>(),
+			title
+				.subpictures
+				.iter()
+				.map(|subpicture| subpicture.id)
+				.collect::<Vec<_>>(),
+		)
+	};
+	assert_eq!(
+		ids(&dvd.titles[0]),
+		(vec![Some(0x80), None, Some(0xA2)], vec![Some(0x23), Some(0x25)])
+	);
+	assert_eq!(
+		ids(&dvd.titles[1]),
+		(vec![Some(0x80), Some(0x81), Some(0xA2)], vec![Some(0x20), Some(0x21)]),
+		"a PGC that marks no stream plays each by its index"
+	);
 }
 
 #[test]

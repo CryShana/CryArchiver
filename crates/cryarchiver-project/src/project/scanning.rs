@@ -5,6 +5,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 
+use cryarchiver_engine::detect::DiscFolder;
 use cryarchiver_engine::text::{display_name, display_path};
 
 use super::duplicates::is_lost;
@@ -15,9 +16,6 @@ use crate::record::{CycleRecord, FileRecord, FileState, FolderRecord, Identity, 
 use crate::scan::{self, EntryKind, Listing};
 use crate::tree::{FileId, FolderId};
 use crate::view::{LogKind, NoticeLevel, Update};
-
-/// A disc's own folder, the file that makes it one, and the kind of disc.
-const DISC_FOLDERS: [(&str, &str, &str); 2] = [("VIDEO_TS", "VIDEO_TS.IFO", "DVD"), ("BDMV", "index.bdmv", "Blu-ray")];
 
 #[derive(Debug, Default)]
 pub(crate) struct ScanState {
@@ -319,15 +317,13 @@ impl Owner {
 				.iter()
 				.any(|entry| matches!(entry.kind, EntryKind::File { .. }) && entry.name.eq_ignore_ascii_case(marker))
 		};
-		let Some((_, _, kind)) = DISC_FOLDERS
-			.iter()
-			.find(|(folder_name, marker, _)| name.eq_ignore_ascii_case(folder_name) && holds(marker))
-		else {
+		let Some(kind) = DiscFolder::of(name, holds) else {
 			return;
 		};
 
 		let text = format!(
-			"\"{shown}\" is a {kind} folder: its files are archived one by one; use the CLI or make an ISO for one MKV"
+			"\"{shown}\" is a {} folder: its files are archived one by one; use the CLI or make an ISO for one MKV",
+			kind.label()
 		);
 		self.tree.folder_mut(folder).record.disc_folder_warned = true;
 		self.log(LogKind::Action, text.clone());

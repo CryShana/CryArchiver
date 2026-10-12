@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use cryarchiver_engine::detect;
 use cryarchiver_engine::naming::is_cli_output;
 use cryarchiver_engine::text::display_path;
 use globset::{GlobBuilder, escape};
@@ -27,6 +28,9 @@ pub fn expand(args: &[PathBuf]) -> Inputs {
 		if arg.is_file() {
 			inputs.files.push(arg.clone());
 		} else if let Some(root) = disc_root(arg) {
+			if named_folder(arg).as_ref() == Some(&root) {
+				note_beside_disc(&mut inputs, &root);
+			}
 			inputs.files.push(root);
 		} else if arg.is_dir() {
 			match list_files(arg) {
@@ -49,23 +53,41 @@ pub fn expand(args: &[PathBuf]) -> Inputs {
 	inputs
 }
 
-const DISC_ROOTS: [&str; 2] = ["VIDEO_TS", "BDMV"];
+const LISTED_BESIDE_DISC: usize = 5;
 
-/// The folder holding `VIDEO_TS` or `BDMV` when `dir` is that folder or directly holds it.
+/// The folder a disc sits in when `dir` is its `VIDEO_TS` or `BDMV` folder or directly holds one.
 fn disc_root(dir: &Path) -> Option<PathBuf> {
 	if !dir.is_dir() {
 		return None;
 	}
 
-	let dir = named_folder(dir)?;
-	let is_disc_part = dir
-		.file_name()
-		.is_some_and(|name| DISC_ROOTS.iter().any(|root| name.eq_ignore_ascii_case(root)));
-	if is_disc_part {
-		return dir.parent().map(Path::to_path_buf);
+	detect::disc_root(&named_folder(dir)?)
+}
+
+/// A note naming the files beside the disc in `root`, which aren't part of it and aren't archived.
+fn note_beside_disc(inputs: &mut Inputs, root: &Path) {
+	let Ok(mut files) = list_files(root) else {
+		return;
+	};
+	files.retain(|file| !is_cli_output(file));
+	if files.is_empty() {
+		return;
 	}
 
-	DISC_ROOTS.iter().any(|root| dir.join(root).is_dir()).then_some(dir)
+	files.sort();
+	let mut names: Vec<String> = files
+		.iter()
+		.take(LISTED_BESIDE_DISC)
+		.map(|file| file.file_name().unwrap_or_default().to_string_lossy().into_owned())
+		.collect();
+	if files.len() > LISTED_BESIDE_DISC {
+		names.push(format!("and {} more", files.len() - LISTED_BESIDE_DISC));
+	}
+	inputs.notes.push(format!(
+		"{}: read as one disc; the files beside its disc folder are left out: {} (name them to archive them too)",
+		display_path(root),
+		names.join(", ")
+	));
 }
 
 /// `dir` with a real name: `.` and `..` become the folder they stand for, and a bare name its absolute path, so the
@@ -203,8 +225,35 @@ mod tests {
 		let inputs = expand(&[dir.path().join("Trip"), dir.path().join("Film")]);
 
 		assert_eq!(inputs.files, vec![dir.path().join("Film"), dir.path().join("Trip")]);
-		assert!(inputs.notes.is_empty());
+		assert_eq!(inputs.notes.len(), 1, "{:?}", inputs.notes);
+		assert!(inputs.notes[0].contains("left out: notes.txt"), "{:?}", inputs.notes);
 		assert_eq!(inputs.problems, 0);
+	}
+
+	#[test]
+	fn a_video_ts_folder_of_loose_vobs_is_not_a_disc() {
+		let dir = tempfile::tempdir().unwrap();
+		let video_ts = dir.path().join("Trip").join("VIDEO_TS");
+		touch(&video_ts.join("VTS_01_1.VOB"));
+		touch(&video_ts.join("VTS_01_2.VOB"));
+
+		let inputs = expand(&[video_ts.clone(), dir.path().join("Trip")]);
+
+		assert_eq!(
+			inputs.files,
+			vec![video_ts.join("VTS_01_1.VOB"), video_ts.join("VTS_01_2.VOB")]
+		);
+	}
+
+	#[test]
+	fn disc_folders_are_found_in_any_case() {
+		let dir = tempfile::tempdir().unwrap();
+		touch(&dir.path().join("Trip").join("video_ts").join("video_ts.ifo"));
+
+		let inputs = expand(&[dir.path().join("Trip").join("video_ts")]);
+
+		assert_eq!(inputs.files, vec![dir.path().join("Trip")]);
+		assert!(inputs.notes.is_empty());
 	}
 
 	#[test]

@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use cryarchiver_engine::commit::{OutputSink, check_space};
+use cryarchiver_engine::disc::udf::read_folder;
 use cryarchiver_engine::engine::{Engine, Job, JobEvent, Stage};
 use cryarchiver_engine::format::{OutputFormat, check_bitrate_cap};
 use cryarchiver_engine::images::plan::ImageRoute;
@@ -1019,7 +1020,7 @@ fn record_joined(report: &Report, totals: &mut Totals, joined: Result<(PathBuf, 
 fn prepare_work_roots(files: &[PathBuf], sink: &dyn OutputSink) {
 	let mut per_root: BTreeMap<PathBuf, u64> = BTreeMap::new();
 	for file in files {
-		*per_root.entry(sink.work_root(file)).or_default() += fs::metadata(file).map_or(0, |meta| meta.len());
+		*per_root.entry(sink.work_root(file)).or_default() += source_bytes(file);
 	}
 
 	for (root, total) in &per_root {
@@ -1031,6 +1032,15 @@ fn prepare_work_roots(files: &[PathBuf], sink: &dyn OutputSink) {
 				display_path(root.parent().unwrap_or(root))
 			);
 		}
+	}
+}
+
+/// A file's size, or the size of all a disc folder's files.
+fn source_bytes(source: &Path) -> u64 {
+	if source.is_dir() {
+		read_folder(source).map_or(0, |listing| listing.files.iter().map(|file| file.size).sum())
+	} else {
+		fs::metadata(source).map_or(0, |meta| meta.len())
 	}
 }
 
@@ -1118,6 +1128,19 @@ mod tests {
 	use cryarchiver_engine::toolchain::{FfmpegBuild, Version};
 
 	use super::*;
+
+	#[test]
+	fn a_disc_folder_counts_all_its_files() {
+		let dir = tempfile::tempdir().unwrap();
+		let video_ts = dir.path().join("Trip").join("VIDEO_TS");
+		fs::create_dir_all(&video_ts).unwrap();
+		fs::write(video_ts.join("VIDEO_TS.IFO"), vec![0; 2048]).unwrap();
+		fs::write(video_ts.join("VTS_01_1.VOB"), vec![0; 10_000]).unwrap();
+		fs::write(dir.path().join("clip.mp4"), vec![0; 300]).unwrap();
+
+		assert_eq!(source_bytes(&dir.path().join("Trip")), 12_048);
+		assert_eq!(source_bytes(&dir.path().join("clip.mp4")), 300);
+	}
 
 	#[test]
 	fn at_most_one_batch_of_queued_videos_is_discounted() {

@@ -26,12 +26,15 @@ impl Cell {
 	}
 }
 
-/// A program chain: `programs` holds each program's entry cell number.
-#[derive(Clone)]
+/// A program chain: `programs` holds each program's entry cell number; the controls are its audio and subpicture
+/// stream control words, none when empty.
+#[derive(Clone, Default)]
 pub struct Pgc {
 	pub cells: Vec<Cell>,
 	pub programs: Vec<u8>,
 	pub palette: [u32; 16],
+	pub audio_control: Vec<u16>,
+	pub subpicture_control: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -166,6 +169,12 @@ impl Pgc {
 		pgc[4..8].copy_from_slice(&time(seconds, 0));
 		for (index, entry) in self.palette.iter().enumerate() {
 			put32(&mut pgc, 0xA4 + 4 * index, *entry);
+		}
+		for (index, control) in self.audio_control.iter().enumerate() {
+			put16(&mut pgc, 0x0C + 2 * index, *control);
+		}
+		for (index, control) in self.subpicture_control.iter().enumerate() {
+			put32(&mut pgc, 0x1C + 4 * index, *control);
 		}
 
 		let program_map = pgc.len();

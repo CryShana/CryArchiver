@@ -1,5 +1,6 @@
 #[path = "../../cryarchiver-project/tests/support/mod.rs"]
 mod project;
+#[allow(clippy::duplicate_mod)]
 #[path = "../../cryarchiver-engine/tests/support/mod.rs"]
 mod support;
 

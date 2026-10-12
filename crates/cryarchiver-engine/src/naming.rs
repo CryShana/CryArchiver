@@ -121,8 +121,14 @@ pub fn cli_output_dir(source: &Path, output_dir: Option<&Path>) -> PathBuf {
 	}
 }
 
+/// The CLI output for `source`, named after its stem, or after its whole name when it is a disc folder.
 pub fn cli_output_path(source: &Path, output_dir: Option<&Path>, extension: impl AsRef<OsStr>) -> PathBuf {
-	let mut name = OsString::from(source.file_stem().unwrap_or_default());
+	let stem = if source.is_dir() {
+		source.file_name()
+	} else {
+		source.file_stem()
+	};
+	let mut name = OsString::from(stem.unwrap_or_default());
 	name.push(format!(".{CLI_MARKER}."));
 	name.push(extension);
 
@@ -153,6 +159,24 @@ mod tests {
 			Path::new("out/a.cry.opus")
 		);
 		assert_eq!(cli_output_dir(Path::new("a.flac"), None), Path::new(""));
+	}
+
+	#[test]
+	fn a_disc_folder_with_dots_keeps_its_whole_name() {
+		let dir = tempfile::tempdir().unwrap();
+		let first = dir.path().join("Show.Disc1");
+		let second = dir.path().join("Show.Disc2");
+		std::fs::create_dir(&first).unwrap();
+		std::fs::create_dir(&second).unwrap();
+
+		assert_eq!(
+			cli_output_path(&first, None, "mkv"),
+			dir.path().join("Show.Disc1.cry.mkv")
+		);
+		assert_eq!(
+			cli_output_path(&second, None, "mkv"),
+			dir.path().join("Show.Disc2.cry.mkv")
+		);
 	}
 
 	#[test]

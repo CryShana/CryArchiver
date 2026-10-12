@@ -304,6 +304,18 @@ fn is_text(codec: &str) -> bool {
 	MKV_TEXT.contains(&codec) || TEXT_SUBTITLES.contains(&codec)
 }
 
+/// The codec a subtitle track is written to Matroska in, `copy` when it is held as it is; `None` when Matroska can't
+/// hold it.
+pub(crate) fn matroska_subtitle(codec: &str) -> Option<&'static str> {
+	if MKV_SUBTITLES.contains(&codec) {
+		Some("copy")
+	} else if TEXT_SUBTITLES.contains(&codec) {
+		Some("srt")
+	} else {
+		None
+	}
+}
+
 /// A track Matroska can't hold keeps the original unless the job is `forced`; the other containers always drop what
 /// they can't hold.
 fn subtitle_track(stream: &Stream, target: Target, forced: bool) -> Result<Option<SubtitleTrack>, Refusal> {
@@ -318,12 +330,13 @@ fn subtitle_track(stream: &Stream, target: Target, forced: bool) -> Result<Optio
 	};
 
 	match target {
-		Target::Matroska if MKV_SUBTITLES.contains(&codec) => track(None),
-		Target::Matroska if TEXT_SUBTITLES.contains(&codec) => track(Some("srt")),
-		Target::Matroska if forced => Ok(None),
-		Target::Matroska => Err(Refusal::Keep(KeepReason::Unsupported(format!(
-			"subtitle codec {codec} can't be stored in MKV"
-		)))),
+		Target::Matroska => match matroska_subtitle(codec) {
+			Some(written) => track(Some(written).filter(|written| *written != "copy")),
+			None if forced => Ok(None),
+			None => Err(Refusal::Keep(KeepReason::Unsupported(format!(
+				"subtitle codec {codec} can't be stored in MKV"
+			)))),
+		},
 		Target::Webm if text => track((codec != "webvtt").then_some("webvtt")),
 		Target::Mp4 if text => track((codec != "mov_text").then_some("mov_text")),
 		Target::Webm | Target::Mp4 => Ok(None),

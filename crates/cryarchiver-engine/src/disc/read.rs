@@ -7,6 +7,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use super::dvd::{Dvd, DvdTitle, Kept, MAX_DVD_MBITS, Selection};
+use super::ps::{self, Reader};
 use crate::language;
 use crate::outcome::{ErrorKind, IoSide, JobError};
 use crate::probe::{self, MediaInfo, ProbeError};
@@ -14,6 +15,7 @@ use crate::process::{self, Progress, ToolCommand};
 use crate::toolchain::Toolchain;
 use crate::video::chapters::{self, Chapter};
 use crate::video::run_ffmpeg;
+use crate::video::streams::matroska_subtitle;
 use crate::workspace::Workspace;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -21,6 +23,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 /// and a subtitle track's first packet can come late.
 pub(super) const PROBE_BYTES: &str = "67108864";
 pub(super) const PROBE_MICROSECONDS: &str = "60000000";
+/// ffmpeg holds what it probes in memory: a stream that starts later in its title than this isn't looked for.
+const MAX_PROBE_BYTES: u64 = 1 << 30;
+const PROBE_MARGIN: u64 = 4 << 20;
+const DEEP_PROBE_MICROSECONDS: u64 = 36_000_000_000;
 /// `concat:` splits on `|` and has no escape for it, and the whole URL must fit a command line: other inputs go
 /// through a `concatf:` list.
 const MAX_URL: usize = 8192;
@@ -28,13 +34,17 @@ pub(super) const OUTPUT: &str = "disc.mkv";
 pub(super) const CHAPTERS: &str = "chapters.txt";
 const PIECES: &str = "pieces.txt";
 const REENCODE_QUALITY: &str = "2";
-const KEPT_SUBTITLES: &[&str] = &["dvd_subtitle", "hdmv_pgs_subtitle"];
+/// How far the joined titles may run from the disc's times, per join, before the joins are suspect.
+const JOIN_SLACK_S: f64 = 0.5;
+pub const ANGLES_LEFT_OUT: &str = "angles beyond the first were left out";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Built {
 	pub path: PathBuf,
 	pub titles: Vec<BuiltTitle>,
 	pub reencoded: Vec<u16>,
+	/// What reading the disc fell short of.
+	pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,15 +82,24 @@ pub async fn build_dvd(
 		cancel,
 	};
 
-	if titles.iter().all(|title| title.joins(job.main)) {
-		job.single(&titles, &on_fraction).await
+	let mut built = if titles.iter().all(|title| title.joins(job.main)) {
+		job.single(&titles, &on_fraction).await?
 	} else {
-		job.pieces(&titles, &on_fraction).await
+		job.pieces(&titles, &on_fraction).await?
+	};
+
+	let mut warnings: Vec<String> = titles.iter().flat_map(|title| title.warnings.iter().cloned()).collect();
+	if titles.iter().any(|title| title.dvd.angles) {
+		warnings.push(ANGLES_LEFT_OUT.to_owned());
 	}
+	warnings.append(&mut built.warnings);
+	built.warnings = warnings;
+	Ok(built)
 }
 
 /// `source` stream-copied into a Matroska file in the workspace on timestamps ffmpeg generates, for a PS or TS whose
-/// own timestamps restart. DVD LPCM becomes plain PCM, and data streams and subtitles Matroska can't hold are left out.
+/// own timestamps restart. DVD LPCM becomes plain PCM, text subtitles become SRT, and data streams are left out;
+/// the warnings name the subtitle tracks Matroska can't hold, which are left out too.
 pub async fn normalise_timestamps(
 	tools: &Toolchain,
 	source: &Path,
@@ -88,7 +107,7 @@ pub async fn normalise_timestamps(
 	workspace: &Workspace,
 	on_fraction: impl Fn(f64),
 	cancel: &CancellationToken,
-) -> Result<PathBuf, JobError> {
+) -> Result<(PathBuf, Vec<String>), JobError> {
 	let bytes = fs::metadata(source)
 		.map_err(|err| JobError::io(IoSide::Source(source), &err))?
 		.len();
@@ -100,28 +119,62 @@ pub async fn normalise_timestamps(
 		.args(["-fflags", "+genpts"])
 		.input(None, None, source);
 
-	let mut audio = 0;
+	let mut overrides = Vec::new();
+	let mut warnings = Vec::new();
+	let (mut audio, mut subtitles, mut seen) = (0, 0, 0);
 	for stream in &info.streams {
-		let copied = (stream.is_video() && !stream.is_attached_pic())
-			|| stream.is_audio()
-			|| (stream.is_subtitle() && KEPT_SUBTITLES.contains(&stream.codec_name.as_str()));
-		if !copied {
-			continue;
-		}
-
-		cmd.arg("-map").arg(format!("0:{}", stream.index));
-		if stream.is_audio() {
-			if stream.codec_name == "pcm_dvd" {
-				cmd.arg(format!("-c:a:{audio}")).arg("pcm_s24le");
-			}
+		if stream.is_video() && !stream.is_attached_pic() {
+			cmd.arg("-map").arg(format!("0:{}", stream.index));
+		} else if stream.is_audio() {
+			cmd.arg("-map").arg(format!("0:{}", stream.index));
+			let pcm = pcm_target(
+				&stream.codec_name,
+				stream.bits_per_raw_sample,
+				stream.sample_fmt.as_deref(),
+			);
+			overrides.extend(pcm.map(|codec| (format!("a:{audio}"), codec)));
 			audio += 1;
+		} else if stream.is_subtitle() {
+			seen += 1;
+			let Some(written) = matroska_subtitle(&stream.codec_name) else {
+				warnings.push(format!(
+					"subtitle track {seen} ({}) was left out: MKV can't hold it",
+					stream.codec_name
+				));
+				continue;
+			};
+
+			cmd.arg("-map").arg(format!("0:{}", stream.index));
+			if written != "copy" {
+				overrides.push((format!("s:{subtitles}"), written));
+			}
+			subtitles += 1;
 		}
 	}
 
-	cmd.args(["-c", "copy", "-f", "matroska"])
-		.arg(process::tool_path(&output));
+	copy_with(&mut cmd, overrides);
+	cmd.args(["-f", "matroska"]).arg(process::tool_path(&output));
 	run_ffmpeg(&cmd, |progress| on_fraction(written(progress, bytes)), cancel).await?;
-	Ok(output)
+	Ok((output, warnings))
+}
+
+/// The PCM Matroska holds for DVD or Blu-ray LPCM, of its depth; `None` for any other codec.
+pub(super) fn pcm_target(codec: &str, bits: Option<u32>, sample_fmt: Option<&str>) -> Option<&'static str> {
+	if !matches!(codec, "pcm_dvd" | "pcm_bluray") {
+		return None;
+	}
+
+	let deep = sample_fmt == Some("s32") || bits.is_some_and(|bits| bits > 16);
+	Some(if deep { "pcm_s24le" } else { "pcm_s16le" })
+}
+
+/// `-c copy`, then each `(stream specifier, codec)` of `overrides`: ffmpeg takes the last option that matches a
+/// stream, so the general copy must come first.
+pub(super) fn copy_with(cmd: &mut ToolCommand, overrides: impl IntoIterator<Item = (String, &'static str)>) {
+	cmd.args(["-c", "copy"]);
+	for (specifier, codec) in overrides {
+		cmd.arg(format!("-c:{specifier}")).arg(codec);
+	}
 }
 
 struct Title<'a> {
@@ -132,6 +185,7 @@ struct Title<'a> {
 	bytes: u64,
 	layout: Layout,
 	length_s: f64,
+	warnings: Vec<String>,
 }
 
 type Range = (PathBuf, u64, u64);
@@ -149,21 +203,44 @@ impl<'a> Title<'a> {
 			.iter()
 			.find(|title| title.number == kept.title)
 			.ok_or_else(|| ErrorKind::SourceDamaged(format!("the disc has no title {}", kept.title)))?;
-		let ranges = joined(
-			title
-				.cells
-				.iter()
-				.flat_map(|cell| dvd.byte_ranges(title.vts, cell.first_sector, cell.last_sector)),
-		);
+		let ranges = joined(title.cells.iter().flat_map(|cell| dvd.cell_ranges(title.vts, cell)));
 		let bytes = ranges.iter().map(|(_, _, length)| length).sum();
 		if bytes == 0 {
 			return Err(ErrorKind::SourceDamaged(format!("title {} has no footage", title.number)).into());
 		}
 
-		let input = Input::of(&ranges, &workspace.file(&format!("title-{}.txt", title.number)))?;
+		let mut input = Input::of(&ranges, &workspace.file(&format!("title-{}.txt", title.number)))?;
 		let counted = kept.false_time.then_some(bytes);
-		let streams = probe_streams(tools, &input, counted, cancel).await?;
-		let layout = Layout::of(&streams)
+		let mut streams = probe_streams(tools, &input, counted, cancel).await?;
+		let mut warnings = Vec::new();
+		let lacking = missing(&streams, title);
+		if !lacking.is_empty() {
+			let ids: Vec<u32> = lacking.iter().map(|(id, _)| *id).collect();
+			let firsts = first_packets(&ranges, ids, cancel).await?;
+			let reach = firsts
+				.iter()
+				.map(|(_, at)| *at)
+				.filter(|at| *at < MAX_PROBE_BYTES)
+				.max();
+			if let Some(reach) = reach {
+				input.window = Window {
+					bytes: (reach + PROBE_MARGIN).max(Window::HEAD.bytes),
+					microseconds: DEEP_PROBE_MICROSECONDS,
+				};
+				streams = probe_streams(tools, &input, counted, cancel).await?;
+			}
+
+			for (id, name) in missing(&streams, title) {
+				let why = match firsts.iter().find(|(first, _)| *first == id) {
+					None => "has no packets",
+					Some((_, at)) if *at >= MAX_PROBE_BYTES => "starts too late in the title to be read",
+					Some(_) => "can't be read",
+				};
+				warnings.push(format!("Title {}: {name} {why}", title.number));
+			}
+		}
+
+		let layout = Layout::of(&streams, title)
 			.ok_or_else(|| ErrorKind::SourceDamaged(format!("title {} has no video", title.number)))?;
 
 		#[allow(clippy::cast_precision_loss)]
@@ -181,6 +258,7 @@ impl<'a> Title<'a> {
 			bytes,
 			layout,
 			length_s,
+			warnings,
 		})
 	}
 
@@ -190,7 +268,7 @@ impl<'a> Title<'a> {
 		self.layout.video.same(&main.layout.video)
 			&& self.layout.audio.len() == main.layout.audio.len()
 			&& self.layout.audio.iter().zip(&main.layout.audio).all(|(a, b)| a.same(b))
-			&& self.layout.subtitles == main.layout.subtitles
+			&& self.layout.subtitle_ids() == main.layout.subtitle_ids()
 			&& (main.layout.subtitles.is_empty() || self.dvd.palette == main.dvd.palette)
 	}
 
@@ -204,6 +282,85 @@ impl<'a> Title<'a> {
 				.enumerate()
 				.any(|(index, track)| self.layout.audio.get(index).is_none_or(|own| !own.same(track)))
 	}
+
+	/// The title's tracks beyond the main title's, which its piece leaves out.
+	fn left_out(&self, main: &Title<'_>) -> Vec<String> {
+		let audio =
+			(main.layout.audio.len()..self.layout.audio.len()).map(|index| format!("audio track {}", index + 1));
+		let subtitles = (main.layout.subtitles.len()..self.layout.subtitles.len())
+			.map(|index| format!("subtitle track {}", index + 1));
+		audio
+			.chain(subtitles)
+			.map(|track| {
+				format!(
+					"Title {}: {track} was left out to match the main title",
+					self.dvd.number
+				)
+			})
+			.collect()
+	}
+}
+
+/// The streams the IFO says `title` plays that `streams` lack, as `(PS id, what the track is called)`.
+fn missing(streams: &[ProbedStream], title: &DvdTitle) -> Vec<(u32, String)> {
+	let found: Vec<u32> = streams.iter().filter_map(ProbedStream::id).collect();
+	let audio = title
+		.audio
+		.iter()
+		.enumerate()
+		.filter_map(|(index, attr)| Some((attr.id?, format!("audio track {}", index + 1))));
+	let subtitles = title
+		.subpictures
+		.iter()
+		.enumerate()
+		.filter_map(|(index, subpicture)| Some((subpicture.id?, format!("subtitle track {}", index + 1))));
+	audio.chain(subtitles).filter(|(id, _)| !found.contains(id)).collect()
+}
+
+/// Where in `ranges` each of `ids` has its first packet, for those that have one.
+async fn first_packets(
+	ranges: &[Range],
+	ids: Vec<u32>,
+	cancel: &CancellationToken,
+) -> Result<Vec<(u32, u64)>, JobError> {
+	let ranges = ranges.to_vec();
+	let stop = cancel.clone();
+	let scan = tokio::task::spawn_blocking(move || {
+		let mut left = ids;
+		let mut found = Vec::new();
+		let read = Reader::default().each_sector(&ranges, usize::MAX, |position, sector| {
+			for packet in ps::packets(sector) {
+				if let Some(index) = left.iter().position(|id| *id == packet.id) {
+					found.push((left.swap_remove(index), position));
+				}
+			}
+			!left.is_empty() && !stop.is_cancelled()
+		});
+		read.map(|()| found)
+			.map_err(|err| (ranges.first().map(|(path, _, _)| path.clone()), err))
+	});
+
+	let found = scan
+		.await
+		.map_err(|err| ErrorKind::Toolchain(format!("the disc scan stopped: {err}")))?
+		.map_err(|(path, err)| JobError::io(IoSide::Source(path.as_deref().unwrap_or(Path::new(""))), &err))?;
+	if cancel.is_cancelled() {
+		return Err(ErrorKind::Cancelled.into());
+	}
+	Ok(found)
+}
+
+/// A warning when the joined titles' real length is off the disc's times by more than `JOIN_SLACK_S` per join: the
+/// timestamp correction at a join may have gone wrong.
+fn join_gap(actual_s: f64, expected_s: f64, joins: usize) -> Option<String> {
+	#[allow(clippy::cast_precision_loss)]
+	let slack = JOIN_SLACK_S * joins as f64;
+	(joins > 0 && (actual_s - expected_s).abs() > slack).then(|| {
+		format!(
+			"the joined titles last {actual_s:.1} s, not the {expected_s:.1} s the disc gives them: chapters and sync \
+			 after a title join may be off"
+		)
+	})
 }
 
 /// The first of the longest titles.
@@ -229,11 +386,26 @@ fn joined(ranges: impl IntoIterator<Item = Range>) -> Vec<Range> {
 	joined
 }
 
+/// How much of an input ffmpeg reads to find its streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Window {
+	bytes: u64,
+	microseconds: u64,
+}
+
+impl Window {
+	const HEAD: Self = Self {
+		bytes: 64 << 20,
+		microseconds: 60_000_000,
+	};
+}
+
 /// How ffmpeg reads byte ranges of files as one input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Input {
 	url: String,
 	whitelist: &'static str,
+	window: Window,
 }
 
 impl Input {
@@ -256,6 +428,7 @@ impl Input {
 			return Ok(Self {
 				url,
 				whitelist: "file,subfile,concat",
+				window: Window::HEAD,
 			});
 		}
 
@@ -264,12 +437,16 @@ impl Input {
 		Ok(Self {
 			url: format!("concatf:{}", process::tool_path(list).display()),
 			whitelist: "file,subfile,concatf",
+			window: Window::HEAD,
 		})
 	}
 
 	fn args(&self, cmd: &mut ToolCommand) {
 		cmd.args(["-protocol_whitelist", self.whitelist])
-			.args(["-probesize", PROBE_BYTES, "-analyzeduration", PROBE_MICROSECONDS])
+			.arg("-probesize")
+			.arg(self.window.bytes.to_string())
+			.arg("-analyzeduration")
+			.arg(self.window.microseconds.to_string())
 			.args(["-fflags", "+genpts", "-f", "mpeg", "-i"])
 			.arg(&self.url);
 	}
@@ -287,20 +464,28 @@ fn escaped(line: &str) -> String {
 	escaped
 }
 
+/// What ffprobe reports of a disc's footage, a DVD title's PS or a Blu-ray playlist's TS.
 #[derive(Debug, Default, Deserialize)]
-struct Probed {
+pub(super) struct Probed {
 	#[serde(default)]
-	streams: Vec<PsStream>,
+	pub(super) streams: Vec<ProbedStream>,
+	#[serde(default)]
+	pub(super) format: ProbedFormat,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct PsStream {
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ProbedFormat {
+	pub(super) size: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub(super) struct ProbedStream {
 	#[serde(default)]
 	id: String,
 	#[serde(default)]
-	codec_type: String,
+	pub(super) codec_type: String,
 	#[serde(default)]
-	codec_name: String,
+	pub(super) codec_name: String,
 	width: Option<u32>,
 	height: Option<u32>,
 	sample_aspect_ratio: Option<String>,
@@ -310,25 +495,36 @@ struct PsStream {
 	channels: Option<u32>,
 	channel_layout: Option<String>,
 	sample_rate: Option<String>,
+	pub(super) sample_fmt: Option<String>,
 	bits_per_raw_sample: Option<String>,
 	bit_rate: Option<String>,
 	nb_read_packets: Option<String>,
 }
 
-impl PsStream {
-	fn id(&self) -> Option<u32> {
+impl ProbedStream {
+	/// The PS stream id, or the TS PID.
+	pub(super) fn id(&self) -> Option<u32> {
 		u32::from_str_radix(self.id.strip_prefix("0x")?, 16).ok()
+	}
+
+	pub(super) fn bits(&self) -> Option<u32> {
+		self.bits_per_raw_sample.as_deref()?.parse().ok()
+	}
+
+	/// The PCM Matroska holds for the track, when it is DVD or Blu-ray LPCM.
+	pub(super) fn pcm(&self) -> Option<&'static str> {
+		pcm_target(&self.codec_name, self.bits(), self.sample_fmt.as_deref())
 	}
 }
 
-/// The streams ffmpeg finds in a title's head, or with `counted` (the title's bytes) in all of it, with their packets
-/// counted.
+/// The streams ffmpeg finds in a title's probe window, or with `counted` (the title's bytes) in all of it, with their
+/// packets counted.
 async fn probe_streams(
 	tools: &Toolchain,
 	input: &Input,
 	counted: Option<u64>,
 	cancel: &CancellationToken,
-) -> Result<Vec<PsStream>, JobError> {
+) -> Result<Vec<ProbedStream>, JobError> {
 	let timeout = counted.map_or(PROBE_TIMEOUT, process::scaled_timeout);
 	let mut cmd = ToolCommand::new(&tools.ffprobe, timeout);
 	cmd.args(["-v", "error", "-hide_banner", "-print_format", "json", "-show_streams"]);
@@ -356,7 +552,7 @@ pub(super) fn unreadable(err: ProbeError) -> JobError {
 
 /// How long the video's counted packets last at its frame rate.
 #[allow(clippy::cast_precision_loss)]
-fn footage_s(streams: &[PsStream]) -> Option<f64> {
+fn footage_s(streams: &[ProbedStream]) -> Option<f64> {
 	let video = streams.iter().find(|stream| stream.codec_type == "video")?;
 	let packets: u64 = video.nb_read_packets.as_deref()?.parse().ok()?;
 	let fps = video
@@ -373,12 +569,13 @@ fn ratio(text: &str) -> Option<f64> {
 	(numerator > 0.0 && denominator > 0.0).then(|| numerator / denominator)
 }
 
-/// A title's streams as the PS numbers them: video, then audio and subpictures each in stream-id order.
+/// A title's streams: its video, and its audio and subpictures each in the disc's logical order with their IFO
+/// languages, then any the IFO doesn't name in stream-id order.
 #[derive(Debug, Clone, PartialEq)]
 struct Layout {
 	video: Picture,
 	audio: Vec<Track>,
-	subtitles: Vec<u32>,
+	subtitles: Vec<Subtitle>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -399,13 +596,21 @@ struct Track {
 	channels: Option<u32>,
 	channel_layout: Option<String>,
 	sample_rate: Option<u32>,
+	sample_fmt: Option<String>,
 	bits: Option<u32>,
 	bit_rate: Option<u64>,
+	language: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Subtitle {
+	id: u32,
+	language: Option<String>,
 }
 
 impl Layout {
-	fn of(streams: &[PsStream]) -> Option<Self> {
-		let mut streams: Vec<&PsStream> = streams.iter().filter(|stream| stream.id().is_some()).collect();
+	fn of(streams: &[ProbedStream], title: &DvdTitle) -> Option<Self> {
+		let mut streams: Vec<&ProbedStream> = streams.iter().filter(|stream| stream.id().is_some()).collect();
 		streams.sort_by_key(|stream| stream.id());
 
 		let video = streams.iter().find(|stream| stream.codec_type == "video")?;
@@ -428,8 +633,10 @@ impl Layout {
 					channels: stream.channels,
 					channel_layout: stream.channel_layout.clone(),
 					sample_rate: stream.sample_rate.as_deref().and_then(|rate| rate.parse().ok()),
-					bits: stream.bits_per_raw_sample.as_deref().and_then(|bits| bits.parse().ok()),
+					sample_fmt: stream.sample_fmt.clone(),
+					bits: stream.bits(),
 					bit_rate: stream.bit_rate.as_deref().and_then(|rate| rate.parse().ok()),
+					language: None,
 				})
 			})
 			.collect();
@@ -437,14 +644,63 @@ impl Layout {
 			.iter()
 			.filter(|stream| stream.codec_type == "subtitle")
 			.filter_map(|stream| stream.id())
+			.map(|id| Subtitle { id, language: None })
 			.collect();
 
+		let audio_listed = title.audio.iter().map(|attr| (attr.id, &attr.language));
+		let subtitles_listed = title
+			.subpictures
+			.iter()
+			.map(|subpicture| (subpicture.id, &subpicture.language));
 		Some(Self {
 			video,
-			audio,
-			subtitles,
+			audio: in_disc_order(
+				audio,
+				audio_listed,
+				|track| track.id,
+				|track, language| track.language = language,
+			),
+			subtitles: in_disc_order(
+				subtitles,
+				subtitles_listed,
+				|subtitle| subtitle.id,
+				|subtitle, language| {
+					subtitle.language = language;
+				},
+			),
 		})
 	}
+
+	fn subtitle_ids(&self) -> Vec<u32> {
+		self.subtitles.iter().map(|subtitle| subtitle.id).collect()
+	}
+}
+
+/// `found` in the order of `listed`, `(PS id, language)` pairs, each given its language; those `listed` doesn't name
+/// follow in their own order.
+fn in_disc_order<'a, T>(
+	found: Vec<T>,
+	listed: impl IntoIterator<Item = (Option<u32>, &'a Option<String>)>,
+	id: impl Fn(&T) -> u32,
+	name: impl Fn(&mut T, Option<String>),
+) -> Vec<T> {
+	let mut left: Vec<Option<T>> = found.into_iter().map(Some).collect();
+	let mut ordered = Vec::with_capacity(left.len());
+	for (listed_id, language) in listed {
+		let Some(listed_id) = listed_id else {
+			continue;
+		};
+		let slot = left
+			.iter_mut()
+			.find(|slot| slot.as_ref().is_some_and(|found| id(found) == listed_id));
+		if let Some(mut found) = slot.and_then(Option::take) {
+			name(&mut found, language.clone());
+			ordered.push(found);
+		}
+	}
+
+	ordered.extend(left.into_iter().flatten());
+	ordered
 }
 
 fn fields(order: &str) -> Option<&'static str> {
@@ -506,11 +762,7 @@ impl Track {
 
 	/// How the track is written: Matroska can't hold DVD LPCM, which becomes plain PCM of its depth.
 	fn copied_as(&self) -> &'static str {
-		match self.codec.as_str() {
-			"pcm_dvd" if self.bits.unwrap_or(16) > 16 => "pcm_s24le",
-			"pcm_dvd" => "pcm_s16le",
-			_ => "copy",
-		}
+		pcm_target(&self.codec, self.bits, self.sample_fmt.as_deref()).unwrap_or("copy")
 	}
 
 	fn encoder(&self) -> &str {
@@ -620,7 +872,8 @@ impl Job<'_> {
 
 		let ranges = joined(titles.iter().flat_map(|title| title.ranges.iter().cloned()));
 		let total: u64 = titles.iter().map(|title| title.bytes).sum();
-		let input = Input::of(&ranges, &self.workspace.file("disc.txt"))?;
+		let mut input = Input::of(&ranges, &self.workspace.file("disc.txt"))?;
+		input.window = titles.first().map_or(Window::HEAD, |first| first.input.window);
 		let chapters = self.chapters(titles, &built)?;
 		let output = self.workspace.file(OUTPUT);
 
@@ -635,10 +888,20 @@ impl Job<'_> {
 		self.finish(&mut cmd, &output);
 
 		run_ffmpeg(&cmd, |progress| on_fraction(written(progress, total)), self.cancel).await?;
+		let read_s = probe::probe(self.tools, &output, self.cancel)
+			.await
+			.map_err(unreadable)?
+			.format
+			.duration;
+		let warnings = read_s
+			.and_then(|read_s| join_gap(read_s, start_s, titles.len().saturating_sub(1)))
+			.into_iter()
+			.collect();
 		Ok(Built {
 			path: output,
 			titles: built,
 			reencoded: Vec::new(),
+			warnings,
 		})
 	}
 
@@ -650,6 +913,7 @@ impl Job<'_> {
 		let mut pieces = Vec::with_capacity(titles.len());
 		let mut built = Vec::with_capacity(titles.len());
 		let mut reencoded = Vec::new();
+		let mut warnings = Vec::new();
 		let mut start_s = 0.0;
 
 		for title in titles {
@@ -657,6 +921,7 @@ impl Job<'_> {
 			if converted {
 				reencoded.push(title.dvd.number);
 			}
+			warnings.extend(title.left_out(self.main));
 
 			let piece = self.workspace.file(&format!("title-{}.mkv", title.dvd.number));
 			let cmd = self.piece(title, &piece);
@@ -716,10 +981,15 @@ impl Job<'_> {
 			on_fraction((total as f64 + written(progress, piece_bytes) * total as f64) / work);
 		};
 		run_ffmpeg(&cmd, report, self.cancel).await?;
+		for piece in &pieces {
+			let _ = fs::remove_file(piece);
+		}
+
 		Ok(Built {
 			path: output,
 			titles: built,
 			reencoded,
+			warnings,
 		})
 	}
 
@@ -824,8 +1094,8 @@ impl Job<'_> {
 		}
 
 		let subtitles = &title.layout.subtitles[..title.layout.subtitles.len().min(main.subtitles.len())];
-		for id in subtitles {
-			cmd.arg("-map").arg(format!("0:i:{id:#x}"));
+		for subtitle in subtitles {
+			cmd.arg("-map").arg(format!("0:i:{:#x}", subtitle.id));
 		}
 		if !subtitles.is_empty() {
 			cmd.args(["-c:s", "dvdsub", "-palette"])
@@ -839,21 +1109,16 @@ impl Job<'_> {
 			.arg(format!("title={}", self.name));
 
 		let main = &self.main.layout;
-		let ifo = self.main.dvd;
-		if ifo.audio.len() == main.audio.len() {
-			for (index, attr) in ifo.audio.iter().enumerate() {
-				if let Some(code) = &attr.language {
-					cmd.arg(format!("-metadata:s:a:{index}"))
-						.arg(format!("language={}", language::normalized(code)));
-				}
+		for (index, track) in main.audio.iter().enumerate() {
+			if let Some(code) = &track.language {
+				cmd.arg(format!("-metadata:s:a:{index}"))
+					.arg(format!("language={}", language::normalized(code)));
 			}
 		}
-		if ifo.subpictures.len() == main.subtitles.len() {
-			for (index, code) in ifo.subpictures.iter().enumerate() {
-				if let Some(code) = code {
-					cmd.arg(format!("-metadata:s:s:{index}"))
-						.arg(format!("language={}", language::normalized(code)));
-				}
+		for (index, subtitle) in main.subtitles.iter().enumerate() {
+			if let Some(code) = &subtitle.language {
+				cmd.arg(format!("-metadata:s:s:{index}"))
+					.arg(format!("language={}", language::normalized(code)));
 			}
 		}
 
@@ -884,6 +1149,7 @@ pub(super) fn written(progress: &Progress, bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::disc::dvd::{AudioAttr, AudioCoding, Subpicture};
 
 	#[test]
 	fn the_ifo_palette_becomes_rgb() {
@@ -1017,13 +1283,140 @@ mod tests {
 
 	#[test]
 	fn footage_time_comes_from_the_counted_video_packets() {
-		let streams = [PsStream {
+		let streams = [ProbedStream {
 			codec_type: "video".into(),
 			avg_frame_rate: Some("25/1".into()),
 			nb_read_packets: Some("1500".into()),
-			..PsStream::default()
+			..ProbedStream::default()
 		}];
 
 		assert_eq!(footage_s(&streams), Some(60.0));
+	}
+
+	fn stream(id: &str, codec_type: &str, codec_name: &str) -> ProbedStream {
+		ProbedStream {
+			id: id.into(),
+			codec_type: codec_type.into(),
+			codec_name: codec_name.into(),
+			width: Some(720),
+			height: Some(576),
+			..ProbedStream::default()
+		}
+	}
+
+	fn audio(coding: AudioCoding, language: &str, id: u32) -> AudioAttr {
+		AudioAttr {
+			coding,
+			channels: 2,
+			language: Some(language.into()),
+			id: Some(id),
+		}
+	}
+
+	#[test]
+	fn mixed_codings_keep_the_disc_order_and_languages() {
+		let title = DvdTitle {
+			audio: vec![
+				audio(AudioCoding::Ac3, "en", 0x80),
+				audio(AudioCoding::Mpeg, "de", 0x1C0),
+				audio(AudioCoding::Ac3, "fr", 0x81),
+			],
+			subpictures: vec![
+				Subpicture {
+					language: Some("sl".into()),
+					id: Some(0x21),
+				},
+				Subpicture {
+					language: Some("hr".into()),
+					id: Some(0x20),
+				},
+			],
+			..DvdTitle::default()
+		};
+		let streams = [
+			stream("0x1e0", "video", "mpeg2video"),
+			stream("0x80", "audio", "ac3"),
+			stream("0x81", "audio", "ac3"),
+			stream("0x1c0", "audio", "mp2"),
+			stream("0x89", "audio", "dts"),
+			stream("0x20", "subtitle", "dvd_subtitle"),
+			stream("0x21", "subtitle", "dvd_subtitle"),
+		];
+
+		let layout = Layout::of(&streams, &title).unwrap();
+
+		let audio: Vec<(u32, Option<&str>)> = layout
+			.audio
+			.iter()
+			.map(|track| (track.id, track.language.as_deref()))
+			.collect();
+		assert_eq!(
+			audio,
+			[
+				(0x80, Some("en")),
+				(0x1C0, Some("de")),
+				(0x81, Some("fr")),
+				(0x89, None)
+			]
+		);
+		let subtitles: Vec<(u32, Option<&str>)> = layout
+			.subtitles
+			.iter()
+			.map(|subtitle| (subtitle.id, subtitle.language.as_deref()))
+			.collect();
+		assert_eq!(subtitles, [(0x21, Some("sl")), (0x20, Some("hr"))]);
+	}
+
+	#[test]
+	fn the_streams_a_title_should_play_but_lacks_are_named() {
+		let title = DvdTitle {
+			audio: vec![audio(AudioCoding::Ac3, "en", 0x80), audio(AudioCoding::Ac3, "de", 0x81)],
+			subpictures: vec![
+				Subpicture {
+					language: None,
+					id: Some(0x20),
+				},
+				Subpicture::default(),
+			],
+			..DvdTitle::default()
+		};
+		let streams = [stream("0x1e0", "video", "mpeg2video"), stream("0x80", "audio", "ac3")];
+
+		assert_eq!(
+			missing(&streams, &title),
+			[
+				(0x81, "audio track 2".to_owned()),
+				(0x20, "subtitle track 1".to_owned())
+			]
+		);
+	}
+
+	#[test]
+	fn lpcm_becomes_pcm_of_its_depth_whichever_disc_it_is_from() {
+		assert_eq!(pcm_target("pcm_dvd", Some(16), Some("s16")), Some("pcm_s16le"));
+		assert_eq!(pcm_target("pcm_dvd", Some(20), Some("s32")), Some("pcm_s24le"));
+		assert_eq!(pcm_target("pcm_dvd", None, None), Some("pcm_s16le"));
+		assert_eq!(pcm_target("pcm_bluray", None, Some("s32")), Some("pcm_s24le"));
+		assert_eq!(pcm_target("ac3", Some(24), None), None);
+	}
+
+	#[test]
+	fn the_general_copy_comes_before_each_streams_own_codec() {
+		let mut cmd = ToolCommand::new(Path::new("ffmpeg"), Duration::from_secs(1));
+
+		copy_with(&mut cmd, [("a:1".to_owned(), "pcm_s24le"), ("s:0".to_owned(), "srt")]);
+
+		assert_eq!(cmd.args, ["-c", "copy", "-c:a:1", "pcm_s24le", "-c:s:0", "srt"]);
+	}
+
+	#[test]
+	fn joins_that_drift_from_the_disc_times_are_warned_about() {
+		assert_eq!(join_gap(23.3, 23.0, 1), None);
+		assert_eq!(join_gap(30.0, 23.0, 0), None);
+		let warning = join_gap(24.2, 23.0, 2).unwrap();
+		assert!(
+			warning.starts_with("the joined titles last 24.2 s, not the 23.0 s"),
+			"{warning}"
+		);
 	}
 }

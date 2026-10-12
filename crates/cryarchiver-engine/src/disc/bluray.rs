@@ -2,14 +2,13 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use super::read::{self, Built, BuiltTitle, PROBE_BYTES, PROBE_MICROSECONDS};
+use super::read::{self, Built, BuiltTitle, PROBE_BYTES, PROBE_MICROSECONDS, Probed, ProbedStream};
 use super::udf::DiscFiles;
 use crate::language;
 use crate::outcome::{ErrorKind, IoSide, JobError};
-use crate::probe;
+use crate::probe::{self, ProbeError};
 use crate::process::{self, ToolCommand};
 use crate::toolchain::Toolchain;
 use crate::video::chapters::{self, Chapter};
@@ -227,66 +226,20 @@ pub struct MainFeature {
 	/// Why it has no chapters, when it hasn't.
 	pub warnings: Vec<String>,
 	url: String,
-	streams: Vec<TsStream>,
+	streams: Vec<ProbedStream>,
 	chapters: Vec<Chapter>,
 	languages: Vec<(u16, String)>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct Probed {
-	#[serde(default)]
-	streams: Vec<TsStream>,
-	#[serde(default)]
-	format: ProbedFormat,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ProbedFormat {
-	size: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-struct TsStream {
-	#[serde(default)]
-	id: String,
-	#[serde(default)]
-	codec_type: String,
-	#[serde(default)]
-	codec_name: String,
-	sample_fmt: Option<String>,
-	bits_per_raw_sample: Option<String>,
-}
-
-impl TsStream {
-	fn pid(&self) -> Option<u16> {
-		u16::from_str_radix(self.id.strip_prefix("0x")?, 16).ok()
-	}
-
-	/// The PCM a Blu-ray LPCM track becomes: Matroska can't hold it as it is.
-	fn pcm(&self) -> Option<&'static str> {
-		if self.codec_name != "pcm_bluray" {
-			return None;
-		}
-
-		let deep = self.sample_fmt.as_deref() == Some("s32")
-			|| self
-				.bits_per_raw_sample
-				.as_deref()
-				.and_then(|bits| bits.parse::<u32>().ok())
-				.is_some_and(|bits| bits > 16);
-		Some(if deep { "pcm_s24le" } else { "pcm_s16le" })
-	}
-}
-
 impl MainFeature {
-	fn streams_of<'a>(&'a self, codec_type: &'a str) -> impl Iterator<Item = &'a TsStream> {
+	fn streams_of<'a>(&'a self, codec_type: &'a str) -> impl Iterator<Item = &'a ProbedStream> {
 		self.streams
 			.iter()
 			.filter(move |stream| stream.codec_type == codec_type)
 	}
 
-	fn language(&self, stream: &TsStream) -> Option<String> {
-		let pid = stream.pid()?;
+	fn language(&self, stream: &ProbedStream) -> Option<String> {
+		let pid = u16::try_from(stream.id()?).ok()?;
 		self.languages
 			.iter()
 			.find(|(own, _)| *own == pid)
@@ -294,15 +247,23 @@ impl MainFeature {
 	}
 }
 
+/// Whether ffmpeg's log says libbluray couldn't open a disc for its AACS or BD+ encryption.
+pub fn encrypted(log: &[String]) -> bool {
+	log.iter().any(|line| {
+		let line = line.to_ascii_lowercase();
+		line.contains("aacs") || line.contains("bd+") || line.contains("encrypted")
+	})
+}
+
 /// The main feature of the Blu-ray image or folder `source`, whose files are `files`: ffmpeg opens it through
 /// libbluray with no playlist, and the one libbluray picks is read from its log. That playlist's entry marks become
-/// the chapters.
+/// the chapters. `None` when the disc is encrypted.
 pub async fn main_feature(
 	tools: &Toolchain,
 	source: &Path,
 	files: &DiscFiles,
 	cancel: &CancellationToken,
-) -> Result<MainFeature, JobError> {
+) -> Result<Option<MainFeature>, JobError> {
 	let url = disc_url(source, files)?;
 	let mut cmd = ToolCommand::new(&tools.ffprobe, PROBE_TIMEOUT);
 	cmd.args([
@@ -317,7 +278,11 @@ pub async fn main_feature(
 	.args(["-probesize", PROBE_BYTES, "-analyzeduration", PROBE_MICROSECONDS, "-i"])
 	.arg(&url);
 
-	let out = probe::run_ffprobe(&cmd, cancel).await.map_err(read::unreadable)?;
+	let out = match probe::run_ffprobe(&cmd, cancel).await {
+		Ok(out) => out,
+		Err(ProbeError::Failed(log)) if encrypted(&log) => return Ok(None),
+		Err(err) => return Err(read::unreadable(err)),
+	};
 	let probed: Probed = serde_json::from_slice(&out.stdout)
 		.map_err(|err| JobError::from(ErrorKind::Toolchain(format!("ffprobe returned unreadable JSON: {err}"))))?;
 
@@ -344,7 +309,7 @@ pub async fn main_feature(
 		|mpls| (chapter_list(&mpls.marks_s(), mpls.length_s()), mpls.languages),
 	);
 
-	Ok(MainFeature {
+	Ok(Some(MainFeature {
 		playlist,
 		bytes,
 		warnings,
@@ -352,7 +317,7 @@ pub async fn main_feature(
 		streams: probed.streams,
 		chapters,
 		languages,
-	})
+	}))
 }
 
 /// The `bluray:` URL of the image, or of the root of the folder that holds `BDMV`.
@@ -441,11 +406,14 @@ pub async fn build_bluray(
 		cmd.arg("-i").arg(process::tool_path(chapters));
 	}
 
-	cmd.args(["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy"]);
+	cmd.args(["-map", "0:v?", "-map", "0:a?", "-map", "0:s?"]);
+	read::copy_with(
+		&mut cmd,
+		main.streams_of("audio")
+			.enumerate()
+			.filter_map(|(index, stream)| Some((format!("a:{index}"), stream.pcm()?))),
+	);
 	for (index, stream) in main.streams_of("audio").enumerate() {
-		if let Some(codec) = stream.pcm() {
-			cmd.arg(format!("-c:a:{index}")).arg(codec);
-		}
 		if let Some(code) = main.language(stream) {
 			cmd.arg(format!("-metadata:s:a:{index}"))
 				.arg(format!("language={code}"));
@@ -488,6 +456,7 @@ pub async fn build_bluray(
 			length_s,
 		}],
 		reencoded: Vec::new(),
+		warnings: Vec::new(),
 	})
 }
 
@@ -623,22 +592,19 @@ mod tests {
 	}
 
 	#[test]
-	fn blu_ray_lpcm_becomes_pcm_of_its_depth() {
-		let lpcm = |sample_fmt: &str| TsStream {
-			codec_name: "pcm_bluray".into(),
-			sample_fmt: Some(sample_fmt.into()),
-			..TsStream::default()
-		};
+	fn libbluray_refusing_an_encrypted_disc_is_recognised() {
+		let log = |line: &str| vec!["Input #0".to_owned(), line.to_owned()];
 
-		assert_eq!(lpcm("s16").pcm(), Some("pcm_s16le"));
-		assert_eq!(lpcm("s32").pcm(), Some("pcm_s24le"));
-		assert_eq!(
-			TsStream {
-				codec_name: "truehd".into(),
-				..TsStream::default()
-			}
-			.pcm(),
-			None
-		);
+		assert!(encrypted(&log(
+			"[bluray @ 0000020c] Media stream encrypted with AACS, install and configure libaacs"
+		)));
+		assert!(encrypted(&log(
+			"[bluray @ 0000020c] Your libaacs can't decrypt this media"
+		)));
+		assert!(encrypted(&log(
+			"[bluray @ 0000020c] Unable to decrypt BD+ encrypted media"
+		)));
+		assert!(!encrypted(&log("[bluray @ 0000020c] bd_open() failed")));
+		assert!(!encrypted(&log("bluray:F:\\Film.iso: I/O error")));
 	}
 }

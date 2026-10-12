@@ -85,6 +85,9 @@ const SUBTITLES_DROPPED: &str =
 const BLU_RAY_KEPT: &str = "Blu-ray disc: kept as is";
 const NO_FOOTAGE: &str = "no real footage on the disc";
 const TIMESTAMPS_REBUILT: &str = "the source's timestamps restart; they were rebuilt";
+const INTERLEAVED_KEPT: &str = "multi-angle or branching titles aren't read yet";
+const DVD_ENCRYPTED: &str = "the DVD is encrypted";
+const BLU_RAY_ENCRYPTED: &str = "the Blu-ray is encrypted";
 const MAIN_FEATURE: &str = "Main feature";
 const FRAMES_SPACE_HINT: &str = "an animated AVIF is made from lossless frames stored in the work folder: use \
                                  --ss/--to for a shorter clip or --resize for smaller frames";
@@ -593,6 +596,9 @@ impl Engine {
 					detection,
 					warnings,
 				} = *read;
+				for warning in &warnings {
+					on_event(JobEvent::Warning(warning.clone()));
+				}
 				disc_warnings = warnings;
 				(detection.class, detection.probe_log, Some((slot, workspace, media)))
 			}
@@ -788,9 +794,11 @@ impl Engine {
 			}
 		};
 		let learned = std::mem::take(&mut staged.learned);
+		disc_warnings.append(&mut staged.warnings);
+		staged.warnings = disc_warnings;
 
 		recorder.update(|decision| {
-			decision.warnings = disc_warnings.iter().chain(&staged.warnings).cloned().collect();
+			decision.warnings.clone_from(&staged.warnings);
 			decision.source_bytes = Some(staged.source_share.unwrap_or(cx.source_bytes));
 			decision.output_bytes = Some(staged.bytes);
 			decision.attempts = decision.attempts.max(1);
@@ -986,6 +994,16 @@ impl Engine {
 		if selection.kept.is_empty() {
 			return Ok(Resolved::Kept(KeepReason::Unsupported(NO_FOOTAGE.to_owned())));
 		}
+		if dvd.mixed(&selection) {
+			return Ok(Resolved::Kept(KeepReason::Unsupported(INTERLEAVED_KEPT.to_owned())));
+		}
+
+		let encrypted = dvd
+			.encrypted(&selection)
+			.map_err(|err| JobError::io(IoSide::Source(&cx.job.source), &err))?;
+		if encrypted {
+			return Ok(Resolved::Kept(KeepReason::Unsupported(DVD_ENCRYPTED.to_owned())));
+		}
 
 		let slot = self.video_slot(cx).await?;
 		let need = cx.source_bytes.saturating_add(dvd.footage_bytes(&selection));
@@ -1007,7 +1025,7 @@ impl Engine {
 		cx.record
 			.update(|decision| record_built(decision.disc.get_or_insert_default(), &built));
 
-		self.detect_read(cx, slot, workspace, built.path, Vec::new()).await
+		self.detect_read(cx, slot, workspace, built.path, built.warnings).await
 	}
 
 	/// A Blu-ray's main feature read into one video, or why the disc is kept as it is: on request, and always for 3D.
@@ -1035,12 +1053,11 @@ impl Engine {
 		self.require(MediaKind::Video)?;
 		self.check_bluray()?;
 
-		let main = bluray::main_feature(&self.tools, &cx.job.source, files, cx.cancel).await?;
+		let Some(main) = bluray::main_feature(&self.tools, &cx.job.source, files, cx.cancel).await? else {
+			return Ok(Resolved::Kept(KeepReason::Unsupported(BLU_RAY_ENCRYPTED.to_owned())));
+		};
 		cx.record
 			.update(|decision| decision.disc.get_or_insert_default().playlist = main.playlist);
-		for warning in &main.warnings {
-			(cx.on_event)(JobEvent::Warning(warning.clone()));
-		}
 
 		let slot = self.video_slot(cx).await?;
 		let need = cx.source_bytes.saturating_add(main.bytes);
@@ -1086,12 +1103,13 @@ impl Engine {
 
 		(cx.on_event)(JobEvent::Stage(Stage::Disc));
 		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
-		let media = read::normalise_timestamps(&self.tools, &cx.job.source, info, &workspace, on_fraction, cx.cancel)
-			.await
-			.map_err(|err| disk_full(err, work_root, need))?;
+		let (media, left_out) =
+			read::normalise_timestamps(&self.tools, &cx.job.source, info, &workspace, on_fraction, cx.cancel)
+				.await
+				.map_err(|err| disk_full(err, work_root, need))?;
 
-		self.detect_read(cx, slot, workspace, media, vec![TIMESTAMPS_REBUILT.to_owned()])
-			.await
+		let warnings = std::iter::once(TIMESTAMPS_REBUILT.to_owned()).chain(left_out).collect();
+		self.detect_read(cx, slot, workspace, media, warnings).await
 	}
 
 	/// The footage read into `media`, detected again: always a video.
@@ -2734,11 +2752,14 @@ fn media_kind(class: &MediaClass) -> Option<MediaKind> {
 	}
 }
 
+/// An image's name without its extension, or a disc folder's whole name.
 fn disc_name(source: &Path) -> String {
-	source
-		.file_stem()
-		.map(|stem| stem.to_string_lossy().into_owned())
-		.unwrap_or_default()
+	let name = if source.is_dir() {
+		source.file_name()
+	} else {
+		source.file_stem()
+	};
+	name.map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 fn title_name(number: u16) -> String {

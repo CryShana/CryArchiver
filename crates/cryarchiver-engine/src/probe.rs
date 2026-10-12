@@ -67,6 +67,10 @@ pub struct Stream {
 	pub channels: Option<u32>,
 	#[serde(default)]
 	pub channel_layout: Option<String>,
+	#[serde(default)]
+	pub sample_fmt: Option<String>,
+	#[serde(default, deserialize_with = "number")]
+	pub bits_per_raw_sample: Option<u32>,
 	#[serde(default, deserialize_with = "number")]
 	pub bit_rate: Option<u64>,
 	#[serde(default)]

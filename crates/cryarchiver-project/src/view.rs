@@ -410,7 +410,7 @@ fn disc_lines(disc: &DiscDecision, lines: &mut Vec<DecisionLine>) {
 	if !disc.reencoded.is_empty() {
 		lines.push(plain(
 			"Converted",
-			format!("{} to the main picture shape", disc.reencoded.join(", ")),
+			format!("{} to the main title's layout", disc.reencoded.join(", ")),
 		));
 	}
 
@@ -825,7 +825,7 @@ mod tests {
 				line("Disc", "DVD · 2 titles kept (1:02:13, 4:10)", false),
 				line("Dropped", "1 menu, 2 under 10 s, 1 duplicate", false),
 				line("Rebuilt", "Title 4: the disc's time was wrong", false),
-				line("Converted", "Title 4 to the main picture shape", false),
+				line("Converted", "Title 4 to the main title's layout", false),
 			]
 		);
 	}

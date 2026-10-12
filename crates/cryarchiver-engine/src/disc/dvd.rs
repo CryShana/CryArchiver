@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::io;
 use std::path::PathBuf;
 
+use super::ps::{self, Reader};
 use super::udf::{DiscFile, DiscFiles, Extent};
 
 pub const MAX_DVD_MBITS: f64 = 10.08;
@@ -17,18 +19,44 @@ const MAX_AUDIO: u16 = 8;
 const MAX_SUBPICTURES: u16 = 32;
 const ANGLE_BLOCK: u8 = 1;
 const FIRST_IN_BLOCK: u8 = 1;
+const INTERLEAVED: u8 = 0x04;
+const AVAILABLE_AUDIO: u16 = 0x8000;
+const AVAILABLE_SUBPICTURE: u32 = 0x8000_0000;
+const SAMPLED_CELLS: usize = 3;
+const SAMPLED_SECTORS: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Cell {
 	pub first_sector: u32,
 	pub last_sector: u32,
 	pub time_s: f64,
 	pub still: bool,
+	/// The cell is in an interleaved block: its sectors hold other angles' or branches' units between its own.
+	pub interleaved: bool,
+	/// An interleaved cell's own units as inclusive sector ranges, in order: empty when they couldn't be followed.
+	pub units: Vec<(u32, u32)>,
 }
 
 impl Cell {
+	/// The inclusive sector ranges the cell plays.
+	pub fn ranges(&self) -> Vec<(u32, u32)> {
+		if self.units.is_empty() {
+			vec![(self.first_sector, self.last_sector)]
+		} else {
+			self.units.clone()
+		}
+	}
+
 	pub fn sectors(&self) -> u64 {
-		u64::from(self.last_sector.saturating_sub(self.first_sector)) + 1
+		self.ranges()
+			.iter()
+			.map(|(first, last)| u64::from(last.saturating_sub(*first)) + 1)
+			.sum()
+	}
+
+	/// An interleaved cell whose own units couldn't be followed: read whole, it would mix in other angles or branches.
+	pub fn mixed(&self) -> bool {
+		self.interleaved && self.units.is_empty()
 	}
 }
 
@@ -44,15 +72,43 @@ pub struct VideoAttr {
 pub enum AudioCoding {
 	Ac3,
 	Mpeg,
-	Lpcm { bits: u8 },
+	Lpcm {
+		bits: u8,
+	},
 	Dts,
+	/// A coding ffmpeg doesn't read from a DVD, such as SDDS.
+	Other,
 }
 
+impl AudioCoding {
+	/// The id ffmpeg gives stream `number` of this coding.
+	fn id(self, number: u8) -> Option<u32> {
+		let base = match self {
+			Self::Ac3 => 0x80,
+			Self::Dts => 0x88,
+			Self::Lpcm { .. } => 0xA0,
+			Self::Mpeg => 0x1C0,
+			Self::Other => return None,
+		};
+		Some(base + u32::from(number))
+	}
+}
+
+/// An audio stream of a title set, in its logical order. `id` is the stream ffmpeg finds for it in a title's
+/// footage, when the title plays it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioAttr {
 	pub coding: AudioCoding,
 	pub channels: u8,
 	pub language: Option<String>,
+	pub id: Option<u32>,
+}
+
+/// A subpicture stream of a title set, in its logical order, like `AudioAttr`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Subpicture {
+	pub language: Option<String>,
+	pub id: Option<u32>,
 }
 
 /// A title of the VTS title domain. `palette` holds the IFO's `0x00YYCrCb` entries.
@@ -64,8 +120,10 @@ pub struct DvdTitle {
 	pub chapter_starts_s: Vec<f64>,
 	pub video: VideoAttr,
 	pub audio: Vec<AudioAttr>,
-	pub subpictures: Vec<Option<String>>,
+	pub subpictures: Vec<Subpicture>,
 	pub palette: [u32; 16],
+	/// The title has a multi-angle block: only its first angle is read.
+	pub angles: bool,
 }
 
 /// A disc's titles and, per title set, the extents of `VTS_xx_1.VOB`..`VTS_xx_N.VOB` in order: cell sectors count
@@ -116,20 +174,51 @@ impl Dvd {
 		ranges
 	}
 
-	/// The bytes of footage the kept titles of `selection` read.
-	pub fn footage_bytes(&self, selection: &Selection) -> u64 {
+	/// The `(source, offset, length)` pieces holding the sectors `cell` plays.
+	pub fn cell_ranges(&self, vts: u8, cell: &Cell) -> Vec<(PathBuf, u64, u64)> {
+		cell.ranges()
+			.into_iter()
+			.flat_map(|(first, last)| self.byte_ranges(vts, first, last))
+			.collect()
+	}
+
+	/// The kept titles of `selection`, in order.
+	pub fn kept<'a>(&'a self, selection: &'a Selection) -> impl Iterator<Item = &'a DvdTitle> {
 		selection
 			.kept
 			.iter()
 			.filter_map(|kept| self.titles.iter().find(|title| title.number == kept.title))
-			.flat_map(|title| {
-				title
-					.cells
-					.iter()
-					.flat_map(|cell| self.byte_ranges(title.vts, cell.first_sector, cell.last_sector))
-			})
+	}
+
+	/// The bytes of footage the kept titles of `selection` read.
+	pub fn footage_bytes(&self, selection: &Selection) -> u64 {
+		self.kept(selection)
+			.flat_map(|title| title.cells.iter().flat_map(|cell| self.cell_ranges(title.vts, cell)))
 			.map(|(_, _, length)| length)
 			.sum()
+	}
+
+	/// Whether a kept title of `selection` has an interleaved cell whose own units couldn't be followed.
+	pub fn mixed(&self, selection: &Selection) -> bool {
+		self.kept(selection).any(|title| title.cells.iter().any(Cell::mixed))
+	}
+
+	/// Whether the kept titles' footage is scrambled (CSS), from the first sectors of their first cells.
+	pub fn encrypted(&self, selection: &Selection) -> io::Result<bool> {
+		let mut reader = Reader::default();
+		for title in self.kept(selection) {
+			for cell in title.cells.iter().take(SAMPLED_CELLS) {
+				let mut scrambled = false;
+				reader.each_sector(&self.cell_ranges(title.vts, cell), SAMPLED_SECTORS, |_, sector| {
+					scrambled = ps::packets(sector).iter().any(|packet| packet.scrambled);
+					!scrambled
+				})?;
+				if scrambled {
+					return Ok(true);
+				}
+			}
+		}
+		Ok(false)
 	}
 
 	fn readable(&self, title: &DvdTitle) -> Vec<Cell> {
@@ -137,9 +226,60 @@ impl Dvd {
 		title
 			.cells
 			.iter()
-			.copied()
 			.filter(|cell| cell.first_sector <= cell.last_sector && u64::from(cell.last_sector) < sectors)
+			.cloned()
 			.collect()
+	}
+
+	/// An interleaved cell's own units, each found from the DSI of the nav pack that starts the one before it;
+	/// empty when the chain breaks or leaves the cell.
+	fn units(&self, reader: &mut Reader, vts: u8, cell: &Cell) -> Vec<(u32, u32)> {
+		let mut units = Vec::new();
+		let mut at = cell.first_sector;
+		let mut sector = vec![0; ps::SECTOR];
+		for _ in 0..=cell.last_sector.saturating_sub(cell.first_sector) {
+			let dsi = self
+				.read_sector(reader, vts, at, &mut sector)
+				.ok()
+				.and_then(|()| ps::interleave(&sector, at))
+				.filter(|dsi| dsi.in_unit);
+			let Some(dsi) = dsi else {
+				return Vec::new();
+			};
+			let Some(end) = at.checked_add(dsi.unit_end).filter(|end| *end <= cell.last_sector) else {
+				return Vec::new();
+			};
+
+			units.push((at, end));
+			if end == cell.last_sector {
+				return units;
+			}
+
+			match at.checked_add(dsi.next_unit) {
+				Some(next) if next > end && next <= cell.last_sector => at = next,
+				_ => return Vec::new(),
+			}
+		}
+		Vec::new()
+	}
+
+	fn read_sector(&self, reader: &mut Reader, vts: u8, number: u32, sector: &mut [u8]) -> io::Result<()> {
+		let mut filled: usize = 0;
+		for (path, offset, length) in self.byte_ranges(vts, number, number) {
+			let end = usize::try_from(length)
+				.ok()
+				.and_then(|length| filled.checked_add(length))
+				.filter(|end| *end <= sector.len())
+				.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+			reader.read(&path, offset, &mut sector[filled..end])?;
+			filled = end;
+		}
+
+		if filled == sector.len() {
+			Ok(())
+		} else {
+			Err(io::ErrorKind::UnexpectedEof.into())
+		}
 	}
 }
 
@@ -211,7 +351,8 @@ pub fn select(dvd: &Dvd) -> Selection {
 		let ranges = merge(
 			cells
 				.iter()
-				.map(|cell| (u64::from(cell.first_sector), u64::from(cell.last_sector) + 1)),
+				.flat_map(Cell::ranges)
+				.map(|(first, last)| (u64::from(first), u64::from(last) + 1)),
 		);
 		let kept = covered.entry(title.vts).or_default();
 		let total: u64 = ranges.iter().map(|(from, to)| to - from).sum();
@@ -284,6 +425,15 @@ pub fn parse(files: &DiscFiles) -> Result<Dvd, String> {
 			});
 		dvd.titles.push(title);
 	}
+
+	let mut titles = std::mem::take(&mut dvd.titles);
+	let mut reader = Reader::default();
+	for title in &mut titles {
+		for cell in title.cells.iter_mut().filter(|cell| cell.interleaved) {
+			cell.units = dvd.units(&mut reader, title.vts, cell);
+		}
+	}
+	dvd.titles = titles;
 	Ok(dvd)
 }
 
@@ -383,7 +533,7 @@ fn vmg_titles(ifo: &[u8]) -> Result<Vec<(u8, u8)>, String> {
 struct TitleSet {
 	video: VideoAttr,
 	audio: Vec<AudioAttr>,
-	subpictures: Vec<Option<String>>,
+	subpictures: Vec<Subpicture>,
 	ptts: Vec<Vec<(u16, u16)>>,
 	pgcs: Vec<Pgc>,
 }
@@ -392,6 +542,35 @@ struct Pgc {
 	programs: Vec<u8>,
 	cells: Vec<PgcCell>,
 	palette: [u32; 16],
+	audio_control: [u16; 8],
+	subpicture_control: [u32; 32],
+}
+
+impl Pgc {
+	/// The stream number logical audio stream `index` plays as; every stream its index when the PGC marks none.
+	fn audio_stream(&self, index: usize) -> Option<u8> {
+		if self.audio_control.iter().all(|control| control & AVAILABLE_AUDIO == 0) {
+			return u8::try_from(index).ok();
+		}
+
+		let control = *self.audio_control.get(index)?;
+		(control & AVAILABLE_AUDIO != 0).then_some(control.to_be_bytes()[0] & 7)
+	}
+
+	/// Like `audio_stream`, for subpictures: a wide picture plays each one's wide variant.
+	fn subpicture_stream(&self, index: usize, wide: bool) -> Option<u8> {
+		if self
+			.subpicture_control
+			.iter()
+			.all(|control| control & AVAILABLE_SUBPICTURE == 0)
+		{
+			return u8::try_from(index).ok();
+		}
+
+		let control = self.subpicture_control.get(index)?.to_be_bytes();
+		let number = if wide { control[1] } else { control[0] };
+		(control[0] & 0x80 != 0).then_some(number & 0x1F)
+	}
 }
 
 struct PgcCell {
@@ -412,13 +591,16 @@ fn title_set(ifo: &[u8]) -> Result<TitleSet, String> {
 
 	let mut audio = Vec::new();
 	for index in 0..be16(ifo, 0x202)?.min(MAX_AUDIO) {
-		audio.extend(audio_attr(get(ifo, 0x204 + 8 * usize::from(index))?));
+		audio.push(audio_attr(get(ifo, 0x204 + 8 * usize::from(index))?));
 	}
 
 	let mut subpictures = Vec::new();
 	for index in 0..be16(ifo, 0x254)?.min(MAX_SUBPICTURES) {
 		let attr: [u8; 6] = get(ifo, 0x256 + 6 * usize::from(index))?;
-		subpictures.push(language(attr[0] & 3, [attr[2], attr[3]]));
+		subpictures.push(Subpicture {
+			language: language(attr[0] & 3, [attr[2], attr[3]]),
+			id: None,
+		});
 	}
 
 	Ok(TitleSet {
@@ -447,7 +629,7 @@ fn video_attr(attr: [u8; 2]) -> VideoAttr {
 	}
 }
 
-fn audio_attr(attr: [u8; 8]) -> Option<AudioAttr> {
+fn audio_attr(attr: [u8; 8]) -> AudioAttr {
 	let coding = match attr[0] >> 5 {
 		0 => AudioCoding::Ac3,
 		2 | 3 => AudioCoding::Mpeg,
@@ -459,13 +641,14 @@ fn audio_attr(attr: [u8; 8]) -> Option<AudioAttr> {
 			},
 		},
 		6 => AudioCoding::Dts,
-		_ => return None,
+		_ => AudioCoding::Other,
 	};
-	Some(AudioAttr {
+	AudioAttr {
 		coding,
 		channels: (attr[1] & 7) + 1,
 		language: language((attr[0] >> 2) & 3, [attr[2], attr[3]]),
-	})
+		id: None,
+	}
 }
 
 fn language(kind: u8, code: [u8; 2]) -> Option<String> {
@@ -519,6 +702,15 @@ fn pgc(ifo: &[u8], at: usize) -> Result<Pgc, String> {
 		*entry = be32(ifo, at + 0xA4 + 4 * index)?;
 	}
 
+	let mut audio_control = [0; 8];
+	for (index, control) in audio_control.iter_mut().enumerate() {
+		*control = be16(ifo, at + 0x0C + 2 * index)?;
+	}
+	let mut subpicture_control = [0; 32];
+	for (index, control) in subpicture_control.iter_mut().enumerate() {
+		*control = be32(ifo, at + 0x1C + 4 * index)?;
+	}
+
 	let program_map = offset(at, u32::from(be16(ifo, at + 0xE6)?))?;
 	let mut programs = Vec::with_capacity(program_count);
 	for index in 0..program_count {
@@ -536,6 +728,8 @@ fn pgc(ifo: &[u8], at: usize) -> Result<Pgc, String> {
 				last_sector: be32(ifo, entry + 20)?,
 				time_s: playback_time(get(ifo, entry + 4)?),
 				still: byte(ifo, entry + 2)? != 0 || (still && cell_count == 1),
+				interleaved: category & INTERLEAVED != 0,
+				units: Vec::new(),
 			},
 			block_mode: category >> 6,
 			block_type: (category >> 4) & 3,
@@ -546,6 +740,8 @@ fn pgc(ifo: &[u8], at: usize) -> Result<Pgc, String> {
 		programs,
 		cells,
 		palette,
+		audio_control,
+		subpicture_control,
 	})
 }
 
@@ -584,18 +780,20 @@ impl TitleSet {
 		let mut cells = Vec::new();
 		let mut chapter_starts_s: Vec<f64> = Vec::new();
 		let mut elapsed = 0.0;
-		let mut palette = None;
+		let mut first = None;
+		let mut angles = false;
 		for pgcn in pgc_numbers {
 			let pgc = self.pgcs.get(usize::from(pgcn).checked_sub(1)?)?;
-			palette.get_or_insert(pgc.palette);
+			first.get_or_insert(pgc);
 
 			let mut cell_starts = Vec::with_capacity(pgc.cells.len());
 			for entry in &pgc.cells {
 				cell_starts.push(elapsed);
-				let cell = entry.cell;
+				angles |= entry.block_type == ANGLE_BLOCK;
+				let cell = &entry.cell;
 				if entry.plays() && cell.first_sector <= cell.last_sector && u64::from(cell.last_sector) < sectors {
-					cells.push(cell);
 					elapsed += cell.time_s;
+					cells.push(cell.clone());
 				}
 			}
 
@@ -611,15 +809,38 @@ impl TitleSet {
 
 		chapter_starts_s.sort_by(f64::total_cmp);
 		chapter_starts_s.dedup();
+
+		let first = first?;
+		let audio = self
+			.audio
+			.iter()
+			.enumerate()
+			.map(|(index, attr)| AudioAttr {
+				id: first.audio_stream(index).and_then(|number| attr.coding.id(number)),
+				..attr.clone()
+			})
+			.collect();
+		let subpictures = self
+			.subpictures
+			.iter()
+			.enumerate()
+			.map(|(index, subpicture)| Subpicture {
+				id: first
+					.subpicture_stream(index, self.video.wide)
+					.map(|number| 0x20 + u32::from(number)),
+				..subpicture.clone()
+			})
+			.collect();
 		Some(DvdTitle {
 			number,
 			vts,
 			cells,
 			chapter_starts_s,
 			video: self.video,
-			audio: self.audio.clone(),
-			subpictures: self.subpictures.clone(),
-			palette: palette.unwrap_or_default(),
+			audio,
+			subpictures,
+			palette: first.palette,
+			angles,
 		})
 	}
 }
@@ -635,7 +856,7 @@ mod tests {
 			first_sector,
 			last_sector,
 			time_s,
-			still: false,
+			..Cell::default()
 		}
 	}
 
@@ -790,7 +1011,7 @@ mod tests {
 
 	#[test]
 	fn a_long_single_cell_title_that_holds_its_last_frame_is_kept() {
-		let mut held = first().cells[0];
+		let mut held = first().cells[0].clone();
 		held.still = true;
 
 		let selection = select(&disc(200 * u64::from(MBYTE_SECTORS), vec![title(1, vec![held])]));
