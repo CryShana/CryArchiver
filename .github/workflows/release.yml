@@ -58,6 +58,9 @@ jobs:
           - os: ubuntu-22.04
             platform: linux-x64
             binary: cryarchiver
+          - os: ubuntu-22.04-arm
+            platform: linux-arm64
+            binary: cryarchiver
     runs-on: ${{ matrix.os }}
 
     steps:
