@@ -6,6 +6,7 @@ Compresses image/video/audio files without having to worry about the right setti
 
 Dynamically probes the media files, determinest best format, encodes, verifies, retries if needed with better settings to reach the target quality rating. Easy presets to choose from and can be overriden.
 
+With option to lower CPU usage for when you just want to put it into background and still use your device.
 
 ![The archive dashboard](assets/dashboard.svg)
 
@@ -24,7 +25,7 @@ Originals are never changed. Video quality is measured with VMAF and images with
 
 You need ffmpeg 8.1 or newer with libsvtav1, libdav1d, libopus and soxr. libvmaf, libvpx, libjxl and libaom unlock quality checks, transparent video, JPEG XL and animated images. On Windows the gyan.dev "full" build has everything; on Linux use a BtbN static build or your distribution's ffmpeg.
 
-```
+```sh
 cargo build --release
 cryarchiver doctor          # shows what your ffmpeg can do
 ```
