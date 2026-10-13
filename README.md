@@ -31,7 +31,7 @@ cryarchiver doctor          # shows what your ffmpeg can do
 
 ## Converting files (CLI mode)
 
-```
+```sh
 cryarchiver holiday.mp4                  # writes holiday.cry.mkv next to it
 cryarchiver photos/ -o small/            # every file in photos/, written to small/
 cryarchiver album/ --speed slow          # slower, a bit more quality
@@ -93,7 +93,7 @@ Select SOURCE and DESTINATION folder.
 - duplicates become small text placeholders
 - progress is saved as it goes, so you can stop at any time and continue later.
 
-```
+```sh
 cryarchiver                                       # enter TUI mode
 cryarchiver project create D:\Photos E:\Archive   # creates E:\Archive\Photos.cryarchive
 cryarchiver E:\Archive\Photos.cryarchive          # opens the dashboard
