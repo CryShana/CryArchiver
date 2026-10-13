@@ -42,32 +42,47 @@ cryarchiver Wedding.iso                  # a DVD image becomes Wedding.cry.mkv
 
 Three speeds: `fast` uses fixed settings, `moderate` (the default) and `slow` test a few seconds first and then check the whole result. Personal metadata like GPS and camera details is removed unless you add `--keep-metadata`. Running the same command again skips files that are already done.
 
-`cryarchiver --help` lists everything. The options you'll use most:
+All options:
 
-| Option | What it does |
+| Output | |
 |---|---|
-| `-o PATH` | Output folder, or output file for a single input |
-| `-s slow\|moderate\|fast` | Speed versus quality |
-| `-f mkv\|mp4\|webm\|opus\|avif\|jxl\|…` | Force one output format |
+| `-o, --output PATH` | Output folder, or output file for a single input |
+| `-f, --format mkv\|webm\|mp4\|opus\|ogg\|mka\|avif\|jxl` | Force one output format |
+| `--overwrite` | Replace existing outputs (never sources) |
+| `--min-savings PERCENT` | Keep the original unless the output is this much smaller (default 10) |
 | `--keep-metadata` | Keep GPS, camera details and file dates |
-| `--ss TIME --to TIME` | Cut audio or video |
-| `--resize W:H` | Scale video and images (`-1` keeps the aspect ratio) |
-| `--burn-subs[=LANG]` | Draw subtitles into the picture |
-| `--min-savings PERCENT` | Keep the original unless the output is this much smaller (10) |
-| `--bluray keep\|convert` | What to do with Blu-ray discs (convert) |
-| `-j N` | Files in parallel |
-| `--priority low\|idle`, `--cpu-limit PERCENT` | Stay out of the way of other work |
+| `--drop-aux` | Also convert motion photos and photos with other extras, dropping the extras |
+| `--bluray keep\|convert` | Keep Blu-ray discs as they are, or convert the main feature (default convert) |
 
-The presets' quality targets can be overridden:
-
-| Option | What it does |
+| Quality | |
 |---|---|
+| `-s, --speed slow\|moderate\|fast` | Speed versus quality (default moderate) |
 | `--video-vmaf MEAN/FLOOR` | Video target: VMAF mean and 5th-percentile floor (presets 91/86 moderate, 93/89 slow) |
 | `--image-target N` | Image target: SSIMULACRA2 score, 50–95 (presets 75, 80, 85) |
 | `--audio-kbps N` | Stereo Opus bitrate, 64–320 |
 | `--crf N` | Encode video at a fixed CRF, no quality search |
 | `--video-encoder svt-av1\|aom` | AV1 encoder |
 | `--image-encoder avif\|jxl\|jxl-lossless` | Image format and mode |
+| `-c, --codec latest` | Codec family |
+
+| Editing | |
+|---|---|
+| `--ss TIME`, `--to TIME` | Cut audio or video: `90`, `1:30` or `00:01:30.500` |
+| `--merge-audio` | Mix all audio tracks into one |
+| `--strip` | Keep only the main video and the audio |
+| `--burn-subs[=TRACK\|LANG]` | Draw subtitles into the picture |
+| `--sub-size PERCENT` | Height of burned text subtitles (default 5) |
+| `--resize W:H` | Scale video and images (`-1` keeps the aspect ratio) |
+| `--max-bitrate MBPS` | Cap the video bitrate, for sharing |
+
+| Performance | |
+|---|---|
+| `-j, --jobs N` | Files in parallel |
+| `--threads N` | Threads per file |
+| `--priority normal\|low\|idle` | Process priority |
+| `--cpu-limit PERCENT` | Use at most this share of the CPU |
+| `--ffmpeg PATH` | ffmpeg binary or its folder (default: from PATH) |
+| `-q, --quiet` / `-v, --verbose` | Less or more output |
 
 ## Archival Project (TUI mode)
 
