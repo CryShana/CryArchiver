@@ -1,6 +1,11 @@
 # CryArchiver
 
-Shrinks photo, video and music collections without you having to know anything about codecs. Give it files or folders and it picks the right format for each one, checks that the result still looks and sounds the same, and keeps the original whenever the new file wouldn't be much smaller.
+Cross-platform CLI and TUI tool, fast and reliable.
+
+Compresses image/video/audio files without having to worry about the right settings.
+
+Dynamically probes the media files, determinest best format, encodes, verifies, retries if needed with better settings to reach the target quality rating. Easy presets to choose from and can be overriden.
+
 
 ![The archive dashboard](assets/dashboard.svg)
 
@@ -24,7 +29,7 @@ cargo build --release
 cryarchiver doctor          # shows what your ffmpeg can do
 ```
 
-## Converting files
+## Converting files (CLI mode)
 
 ```
 cryarchiver holiday.mp4                  # writes holiday.cry.mkv next to it
@@ -53,21 +58,19 @@ Three speeds: `fast` uses fixed settings, `moderate` (the default) and `slow` te
 | `-j N` | Files in parallel |
 | `--priority low\|idle`, `--cpu-limit PERCENT` | Stay out of the way of other work |
 
-## Archiving a whole folder tree
+## Archival Project (TUI mode)
 
-A project mirrors one folder into another. Media is compressed, everything else is copied, and duplicates become small text files that point at the archived copy. Progress is saved as it goes, so you can stop at any time and continue later.
+Select SOURCE and DESTINATION folder. 
+- folder structure is mirrored
+- media is compressed, everything else is copied
+- file timestamps and metadata copied by default (chapters, EXIF data...)
+- duplicates become small text placeholders
+- progress is saved as it goes, so you can stop at any time and continue later.
 
 ```
+cryarchiver                                       # enter TUI mode
 cryarchiver project create D:\Photos E:\Archive   # creates E:\Archive\Photos.cryarchive
 cryarchiver E:\Archive\Photos.cryarchive          # opens the dashboard
 cryarchiver run E:\Archive\Photos.cryarchive      # runs without the dashboard
 cryarchiver --demo                                # the dashboard on made-up data
 ```
-
-- Archived files keep their folder layout, dates and metadata.
-- Files that are still being copied in are left alone until they stop changing.
-- New files are picked up while the project is open, so you can keep adding to the source.
-- Anything that needs your attention (a failed file, an unreadable folder, a missing drive) shows up as an issue in the dashboard.
-- Deleting originals is off by default. Turning it on asks you to type `DELETE`, and an original is only removed after its archived copy has been read back and verified.
-
-The dashboard needs a terminal of at least 100×30. Press `?` for the keys.
