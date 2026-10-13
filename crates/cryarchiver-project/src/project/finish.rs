@@ -32,6 +32,9 @@ pub(crate) struct FinishState {
 	candidates: HashSet<FolderId>,
 	applying: HashSet<FolderId>,
 	pub(super) completion: Completion,
+	/// The last report logged: the periodic safety pass sets the completion back to pending, and the same result
+	/// found again is not logged again.
+	reported: Option<ParityReport>,
 	walks: u64,
 	tidied_bytes: u64,
 }
@@ -179,21 +182,9 @@ impl Owner {
 		);
 		report.unreadable_folders = self.unreadable_issues().count() as u64;
 
-		self.log(LogKind::Action, format!("complete: {}", report.summary()));
-		for missing in report.missing.iter().take(LISTED_GAPS) {
-			self.log(LogKind::Action, format!("no archived file for {}", missing.display()));
-		}
-		if !report.missing.is_empty() {
-			self.notice(NoticeLevel::Warning, files_without_an_archive(report.missing.len()));
-		}
-		if report.unreadable_folders > 0 {
-			self.notice(
-				NoticeLevel::Warning,
-				match report.unreadable_folders {
-					1 => "1 source folder can't be read, so the archive isn't complete".to_owned(),
-					count => format!("{count} source folders can't be read, so the archive isn't complete"),
-				},
-			);
+		if self.finish.reported.as_ref() != Some(&report) {
+			self.report_completion(&report);
+			self.finish.reported = Some(report.clone());
 		}
 
 		self.remove_empty_work_folders();
@@ -239,6 +230,25 @@ impl Owner {
 		let bytes = fs::metadata(&self.project_file).map_or(0, |meta| meta.len());
 		let since = self.finish.tidied_bytes;
 		bytes > since + TIDY_GROWTH_BYTES.max(since / 10)
+	}
+
+	fn report_completion(&self, report: &ParityReport) {
+		self.log(LogKind::Action, format!("complete: {}", report.summary()));
+		for missing in report.missing.iter().take(LISTED_GAPS) {
+			self.log(LogKind::Action, format!("no archived file for {}", missing.display()));
+		}
+		if !report.missing.is_empty() {
+			self.notice(NoticeLevel::Warning, files_without_an_archive(report.missing.len()));
+		}
+		if report.unreadable_folders > 0 {
+			self.notice(
+				NoticeLevel::Warning,
+				match report.unreadable_folders {
+					1 => "1 source folder can't be read, so the archive isn't complete".to_owned(),
+					count => format!("{count} source folders can't be read, so the archive isn't complete"),
+				},
+			);
+		}
 	}
 
 	pub(super) fn parity(&self) -> Option<&ParityReport> {
@@ -383,5 +393,36 @@ mod tests {
 		owner.on_destination_walked(2, &[]);
 
 		assert_eq!(owner.finish.completion, Completion::Pending);
+	}
+
+	#[test]
+	fn a_safety_pass_that_finds_nothing_logs_the_completion_only_once() {
+		let dir = tempfile::tempdir().unwrap();
+		let source = dir.path().join("source");
+		fs::create_dir_all(&source).unwrap();
+		let (mut owner, updates) = owner(&source, &dir.path().join("archive"));
+		list(&mut owner, &RelPath::root(), true);
+		owner.started = true;
+		owner.finish.candidates.clear();
+		let completed = |updates: &std::sync::mpsc::Receiver<crate::view::Update>| {
+			updates
+				.try_iter()
+				.filter(
+					|update| matches!(update, crate::view::Update::Log(entry) if entry.message.starts_with("complete:")),
+				)
+				.count()
+		};
+
+		for walk in 1..=3 {
+			owner.watching.safety_pass_running = true;
+			owner.check_completion();
+			assert_eq!(owner.finish.completion, Completion::Pending);
+			owner.on_folders_changed(Vec::new());
+			owner.finish.completion = Completion::Checking(walk);
+			owner.on_destination_walked(walk, &[]);
+			assert!(matches!(owner.finish.completion, Completion::Done(_)));
+		}
+
+		assert_eq!(completed(&updates), 1);
 	}
 }
