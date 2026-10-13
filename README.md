@@ -1,6 +1,6 @@
 # CryArchiver
 
-Cross-platform CLI and TUI tool, fast and reliable.
+Cross-platform CLI and TUI tool, fast and reliable, to make your media files smaller while retaining quality.
 
 Compresses image/video/audio files without having to worry about the right settings.
 
