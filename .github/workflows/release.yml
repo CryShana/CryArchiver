@@ -1,0 +1,99 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      ref: ${{ steps.release.outputs.ref }}
+
+    steps:
+      - name: Find or create the draft release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${{ github.ref_name }}"
+            REF="$TAG"
+            if ! gh release view "$TAG" > /dev/null 2>&1; then
+              gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes
+            fi
+          else
+            TAG=$(gh release list --json tagName,isDraft --jq '[.[] | select(.isDraft) | .tagName] | first')
+            if [ -z "$TAG" ]; then
+              echo "No draft release found"
+              exit 1
+            fi
+            REF=$(gh api "repos/$GH_REPO/releases" --jq "[.[] | select(.draft and .tag_name == \"$TAG\")][0].target_commitish")
+          fi
+          echo "Building $TAG from $REF"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+            binary: cryarchiver.exe
+          - os: ubuntu-22.04
+            platform: linux-x64
+            binary: cryarchiver
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.draft.outputs.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked -p cryarchiver
+
+      - name: Zip
+        id: zip
+        shell: bash
+        run: |
+          NAME="CryArchiver-${{ needs.draft.outputs.tag }}-${{ matrix.platform }}"
+          mkdir "$NAME"
+          cp "target/release/${{ matrix.binary }}" README.md "$NAME/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            pwsh -Command "Compress-Archive -Path '$NAME' -DestinationPath '$NAME.zip'"
+          else
+            zip -r "$NAME.zip" "$NAME"
+          fi
+          echo "file=$NAME.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: CryArchiver-${{ needs.draft.outputs.tag }}-${{ matrix.platform }}
+          path: ${{ steps.zip.outputs.file }}
+
+      - name: Attach to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "${{ needs.draft.outputs.tag }}" "${{ steps.zip.outputs.file }}" --clobber

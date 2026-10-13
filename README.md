@@ -58,6 +58,17 @@ Three speeds: `fast` uses fixed settings, `moderate` (the default) and `slow` te
 | `-j N` | Files in parallel |
 | `--priority low\|idle`, `--cpu-limit PERCENT` | Stay out of the way of other work |
 
+The presets' quality targets can be overridden:
+
+| Option | What it does |
+|---|---|
+| `--video-vmaf MEAN/FLOOR` | Video target: VMAF mean and 5th-percentile floor (presets 91/86 moderate, 93/89 slow) |
+| `--image-target N` | Image target: SSIMULACRA2 score, 50–95 (presets 75, 80, 85) |
+| `--audio-kbps N` | Stereo Opus bitrate, 64–320 |
+| `--crf N` | Encode video at a fixed CRF, no quality search |
+| `--video-encoder svt-av1\|aom` | AV1 encoder |
+| `--image-encoder avif\|jxl\|jxl-lossless` | Image format and mode |
+
 ## Archival Project (TUI mode)
 
 Select SOURCE and DESTINATION folder. 
