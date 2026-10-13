@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::fs::{self, DirEntry, File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use super::{SECTOR, array};
+use super::{SECTOR, array, utc_time};
 
 const VRS_START: u64 = 16;
 const VRS_SCAN: u64 = 64;
@@ -27,6 +28,13 @@ const ALLOCATION_EXTENT: u16 = 258;
 const FILE_ENTRY: u16 = 261;
 const EXTENDED_FILE_ENTRY: u16 = 266;
 
+const FE_MODIFIED: usize = 84;
+const EFE_MODIFIED: usize = 92;
+const UTC: u16 = 0;
+const LOCAL: u16 = 1;
+const NO_ZONE: i16 = -2047;
+const MAX_ZONE_MINUTES: i16 = 1440;
+
 const DIRECTORY: u8 = 0x02;
 const DELETED: u8 = 0x04;
 const PARENT: u8 = 0x08;
@@ -48,6 +56,8 @@ pub struct DiscFile {
 	pub size: u64,
 	pub extents: Vec<Extent>,
 	pub source: PathBuf,
+	/// When the file was last written: its File Entry's modification time in an image, its own in a folder.
+	pub modified: Option<SystemTime>,
 }
 
 impl DiscFile {
@@ -204,6 +214,7 @@ fn walk_folder(dir: &Path, prefix: &str, depth: usize, listing: &mut DiscFiles) 
 				size,
 				extents,
 				source,
+				modified: metadata.modified().ok(),
 			});
 		}
 	}
@@ -328,6 +339,7 @@ struct PartitionDescriptor {
 struct Entry {
 	info_len: u64,
 	pieces: Vec<Piece>,
+	modified: Option<SystemTime>,
 }
 
 impl Entry {
@@ -538,9 +550,9 @@ impl Reader {
 	/// The File Entry or Extended File Entry at byte `at`, which lives in partition `own`.
 	fn entry(&mut self, parts: &[Part], own: &Part, at: u64) -> Parsed<Entry> {
 		let descriptor = self.read(at, SECTOR)?;
-		let (header, lengths) = match tag(&descriptor) {
-			Some(FILE_ENTRY) => (176, 168),
-			Some(EXTENDED_FILE_ENTRY) => (216, 208),
+		let (header, lengths, modified) = match tag(&descriptor) {
+			Some(FILE_ENTRY) => (176, 168, FE_MODIFIED),
+			Some(EXTENDED_FILE_ENTRY) => (216, 208, EFE_MODIFIED),
 			_ => return Err(Fail::Bad),
 		};
 
@@ -560,7 +572,11 @@ impl Reader {
 			}],
 			_ => return Err(Fail::Bad),
 		};
-		Ok(Entry { info_len, pieces })
+		Ok(Entry {
+			info_len,
+			pieces,
+			modified: array(&descriptor, modified).and_then(timestamp),
+		})
 	}
 
 	/// The pieces that short (8-byte) or long (16-byte) allocation descriptors record, up to `info_len`, following
@@ -772,11 +788,33 @@ impl Walk {
 					size: child.info_len,
 					extents: child.extents()?,
 					source: self.source.clone(),
+					modified: child.modified,
 				});
 			}
 		}
 		Ok(())
 	}
+}
+
+/// An ECMA-167 timestamp in UTC: a local time is moved by the offset from UTC it records, and one without an offset
+/// is taken as UTC. `None` for another kind of time or a date that doesn't exist.
+fn timestamp(raw: [u8; 12]) -> Option<SystemTime> {
+	let kind_and_zone = u16::from_le_bytes([raw[0], raw[1]]);
+	let year = i64::from(i16::from_le_bytes([raw[2], raw[3]]));
+	let [month, day, hour, minute, second] = [raw[4], raw[5], raw[6], raw[7], raw[8]].map(i64::from);
+	if hour > 23 || minute > 59 || second > 59 {
+		return None;
+	}
+
+	#[allow(clippy::cast_possible_wrap)]
+	let zone = ((kind_and_zone << 4) as i16) >> 4;
+	let offset_s = match kind_and_zone >> 12 {
+		UTC => 0,
+		LOCAL if zone == NO_ZONE => 0,
+		LOCAL if zone.abs() <= MAX_ZONE_MINUTES => i64::from(zone) * 60,
+		_ => return None,
+	};
+	utc_time(year, month, day, hour * 3600 + minute * 60 + second - offset_s)
 }
 
 /// An OSTA CS0 compressed Unicode name: 8-bit code points or UTF-16 big-endian after a compression id.
@@ -798,4 +836,38 @@ fn decode(bytes: &[u8]) -> Option<String> {
 
 fn usable(name: &str) -> bool {
 	!name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0'])
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::{Duration, UNIX_EPOCH};
+
+	use super::*;
+
+	fn raw(kind: u16, zone: i16, year: u16, [month, day, hour, minute, second]: [u8; 5]) -> [u8; 12] {
+		let [low, high] = ((kind << 12) | (zone.cast_unsigned() & 0x0FFF)).to_le_bytes();
+		let [year_low, year_high] = year.to_le_bytes();
+		[
+			low, high, year_low, year_high, month, day, hour, minute, second, 99, 0, 0,
+		]
+	}
+
+	#[test]
+	fn a_local_timestamp_is_moved_to_utc_by_its_offset() {
+		let utc = Some(UNIX_EPOCH + Duration::from_secs(1_058_207_405));
+		let at = |hour| [7, 14, hour, 30, 5];
+
+		assert_eq!(timestamp(raw(LOCAL, 120, 2003, at(20))), utc);
+		assert_eq!(timestamp(raw(LOCAL, -300, 2003, at(13))), utc);
+		assert_eq!(timestamp(raw(LOCAL, NO_ZONE, 2003, at(18))), utc);
+		assert_eq!(timestamp(raw(UTC, 120, 2003, at(18))), utc);
+	}
+
+	#[test]
+	fn other_kinds_of_time_and_impossible_dates_are_not_read() {
+		assert_eq!(timestamp(raw(2, 0, 2003, [7, 14, 18, 30, 5])), None);
+		assert_eq!(timestamp(raw(LOCAL, 0, 2003, [2, 30, 18, 30, 5])), None);
+		assert_eq!(timestamp(raw(LOCAL, 0, 2003, [7, 14, 24, 0, 0])), None);
+		assert_eq!(timestamp([0; 12]), None);
+	}
 }

@@ -2,6 +2,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use super::udf::{DiscFile, DiscFiles, Extent};
 use super::{Range, Reader, SECTOR, SECTOR_LEN, be16, be32, byte, get, ps};
@@ -198,6 +199,28 @@ impl Dvd {
 			.flat_map(|title| title.cells.iter().flat_map(|cell| self.cell_ranges(title.vts, cell)))
 			.map(|(_, _, length)| length)
 			.sum()
+	}
+
+	/// The earliest modification time of the VOB files of `files` that the kept titles of `selection` read.
+	pub fn recorded(&self, selection: &Selection, files: &DiscFiles) -> Option<SystemTime> {
+		let ranges: Vec<Range> = self
+			.kept(selection)
+			.flat_map(|title| title.cells.iter().flat_map(|cell| self.cell_ranges(title.vts, cell)))
+			.collect();
+		let read = |file: &DiscFile| {
+			file.extents.iter().any(|extent| {
+				ranges.iter().any(|(source, offset, length)| {
+					*source == file.source && *offset < extent.offset + extent.length && extent.offset < offset + length
+				})
+			})
+		};
+
+		self.kept(selection)
+			.flat_map(|title| (1..=MAX_VOB_PARTS).map(|part| vob_name(title.vts, part)))
+			.filter_map(|name| files.find(&name))
+			.filter(|file| read(file))
+			.filter_map(|file| file.modified)
+			.min()
 	}
 
 	/// Whether a kept title of `selection` has an interleaved cell whose own units couldn't be followed.
@@ -446,12 +469,16 @@ pub fn parse(files: &DiscFiles, reader: &mut Reader) -> Result<Dvd, String> {
 fn vob_extents(files: &DiscFiles, vts: u8) -> Vec<(PathBuf, Extent)> {
 	let mut extents = Vec::new();
 	for part in 1..=MAX_VOB_PARTS {
-		let Some(file) = files.find(&format!("VIDEO_TS/VTS_{vts:02}_{part}.VOB")) else {
+		let Some(file) = files.find(&vob_name(vts, part)) else {
 			break;
 		};
 		extents.extend(file.extents.iter().map(|extent| (file.source.clone(), *extent)));
 	}
 	extents
+}
+
+fn vob_name(vts: u8, part: u8) -> String {
+	format!("VIDEO_TS/VTS_{vts:02}_{part}.VOB")
 }
 
 fn with_backup<T>(
@@ -1060,6 +1087,43 @@ mod tests {
 		);
 		assert!(dvd.byte_ranges(4, 0, 1).is_empty());
 		assert_eq!(dvd.vob_sectors(3), 12);
+	}
+
+	#[test]
+	fn the_recording_date_is_the_earliest_of_the_vobs_read() {
+		use std::time::{Duration, UNIX_EPOCH};
+
+		let at = |seconds: u64| Some(UNIX_EPOCH + Duration::from_secs(1_000_000_000 + seconds));
+		let file = |path: &str, sector: u64, modified| DiscFile {
+			path: path.to_owned(),
+			size: 4 * SECTOR,
+			extents: vec![Extent {
+				offset: sector * SECTOR,
+				length: 4 * SECTOR,
+			}],
+			source: PathBuf::from("disc.iso"),
+			modified,
+		};
+		let files = DiscFiles {
+			files: vec![
+				file("VIDEO_TS/VTS_01_0.IFO", 50, at(0)),
+				file("VIDEO_TS/VTS_01_1.VOB", 100, at(20)),
+				file("VIDEO_TS/VTS_01_2.VOB", 200, at(10)),
+				file("VIDEO_TS/VTS_01_3.VOB", 300, at(5)),
+			],
+			dirs: vec!["VIDEO_TS".to_owned()],
+		};
+		let dvd = Dvd {
+			titles: vec![title(1, vec![cell(0, 5, 60.0)])],
+			vobs: vec![(1, vob_extents(&files, 1))],
+		};
+		let selection = Selection {
+			kept: vec![kept(1)],
+			dropped: Vec::new(),
+		};
+
+		assert_eq!(dvd.recorded(&selection, &files), at(10));
+		assert_eq!(dvd.recorded(&Selection::default(), &files), None);
 	}
 
 	#[test]

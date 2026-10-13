@@ -14,7 +14,7 @@ use cryarchiver_engine::sink::CliSink;
 use cryarchiver_engine::workspace::CLI_WORK_DIR;
 use support::bluray::{self, Playlist};
 use support::dvd::{self, Footage, footage};
-use support::udf::{Image, UdfRevision};
+use support::udf::{Image, RECORDED, UdfRevision};
 use support::{chapter_titles, near, probed};
 use tokio_util::sync::CancellationToken;
 
@@ -54,6 +54,25 @@ async fn run_with_events(job: &Job, out_dir: &Path) -> (JobOutcome, Vec<JobEvent
 
 async fn run(job: &Job, out_dir: &Path) -> JobOutcome {
 	run_with_events(job, out_dir).await.0
+}
+
+fn keeping_metadata(source: &Path) -> Job {
+	Job {
+		keep_metadata: true,
+		..job(source)
+	}
+}
+
+fn source_metadata(output: &Path, dir: &Path) -> serde_json::Value {
+	serde_json::from_slice(&support::attachment(output, "source-metadata.json", dir)).unwrap()
+}
+
+/// The output's container date, to the second.
+fn recorded(info: &MediaInfo) -> Option<&str> {
+	info.format
+		.tags
+		.get("creation_time")
+		.map(|date| date.get(..19).unwrap_or(date))
 }
 
 fn image(path: &Path, files: Vec<(String, Vec<u8>)>, dirs: &[&str], revision: UdfRevision) -> PathBuf {
@@ -113,7 +132,7 @@ async fn a_two_title_dvd_image_becomes_one_av1_mkv_with_a_chapter_per_title() {
 	);
 	let iso_bytes = std::fs::metadata(&iso).unwrap().len();
 
-	let (outcome, events) = run_with_events(&job(&iso), dir.path()).await;
+	let (outcome, events) = run_with_events(&keeping_metadata(&iso), dir.path()).await;
 
 	let JobOutcome::Encoded {
 		output,
@@ -147,6 +166,15 @@ async fn a_two_title_dvd_image_becomes_one_av1_mkv_with_a_chapter_per_title() {
 		.unwrap_or_else(|| panic!("{chapters:?}"));
 	assert!(near(title_two.0, 12.0, 0.2), "{chapters:?}");
 	assert_eq!(chapters[0].1, "Title 1");
+	assert_eq!(recorded(&info), Some(&RECORDED[..19]), "{:?}", info.format.tags);
+
+	let metadata = source_metadata(&output, dir.path());
+	let format = &metadata["ffprobe"]["format"];
+	assert_eq!(format["filename"], iso.display().to_string());
+	assert_eq!(format["size"], iso_bytes.to_string());
+	assert_eq!(metadata["disc"]["kind"], "DVD");
+	assert_eq!(metadata["disc"]["kept"][1][0], "Title 2");
+	assert_eq!(metadata["disc"]["warnings"], serde_json::json!([]));
 
 	let queued = stage_at(&events, Stage::Queued);
 	let read = stage_at(&events, Stage::Read);
@@ -354,7 +382,7 @@ async fn a_blu_ray_image_is_converted_by_default() {
 	.write_mastered(&iso);
 	let iso_bytes = std::fs::metadata(&iso).unwrap().len();
 
-	let outcome = run(&job(&iso), dir.path()).await;
+	let outcome = run(&keeping_metadata(&iso), dir.path()).await;
 
 	let JobOutcome::Encoded {
 		output,
@@ -367,7 +395,14 @@ async fn a_blu_ray_image_is_converted_by_default() {
 	};
 	assert_eq!(output, dir.path().join("Film.cry.mkv"));
 	assert_eq!(src_bytes, iso_bytes);
-	assert_main_feature(&decision, &probed(&output).await);
+	let info = probed(&output).await;
+	assert_main_feature(&decision, &info);
+	assert_eq!(recorded(&info), Some(&RECORDED[..19]), "{:?}", info.format.tags);
+
+	let metadata = source_metadata(&output, dir.path());
+	assert_eq!(metadata["ffprobe"]["format"]["filename"], iso.display().to_string());
+	assert_eq!(metadata["disc"]["kind"], "Blu-ray");
+	assert_eq!(metadata["disc"]["playlist"], 800);
 }
 
 #[tokio::test]
@@ -439,7 +474,7 @@ async fn a_vob_whose_timestamps_restart_is_rebuilt_and_archived_at_its_real_leng
 		"the fixture must declare a short duration"
 	);
 
-	let (outcome, events) = run_with_events(&job(&vob), dir.path()).await;
+	let (outcome, events) = run_with_events(&keeping_metadata(&vob), dir.path()).await;
 
 	let JobOutcome::Encoded {
 		output,
@@ -467,6 +502,11 @@ async fn a_vob_whose_timestamps_restart_is_rebuilt_and_archived_at_its_real_leng
 
 	let info = probed(&output).await;
 	assert!(near(info.format.duration.unwrap(), 12.0, 0.3), "{:?}", info.format);
+	let metadata = source_metadata(&output, dir.path());
+	let format = &metadata["ffprobe"]["format"];
+	assert_eq!(format["filename"], vob.display().to_string());
+	assert_eq!(format["size"], std::fs::metadata(&vob).unwrap().len().to_string());
+	assert!(metadata.get("disc").is_none(), "{metadata}");
 	assert_eq!(stage_at(&events, Stage::Queued).len(), 1, "{events:?}");
 	assert_eq!(stage_at(&events, Stage::Read).len(), 1, "{events:?}");
 	assert!(!dir.path().join(CLI_WORK_DIR).exists());

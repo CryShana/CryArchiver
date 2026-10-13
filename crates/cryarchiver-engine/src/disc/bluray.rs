@@ -1,9 +1,9 @@
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio_util::sync::CancellationToken;
 
-use super::read::{self, Built, BuiltTitle, Window};
+use super::read::{self, Built, BuiltTitle, Tags, Window};
 use super::udf::DiscFiles;
 use super::{Reader, be16, be32, byte, get};
 use crate::language;
@@ -28,6 +28,7 @@ const SELECTED: &str = "selected ";
 /// ffmpeg's bluray protocol logs under this context, so a path the log echoes elsewhere can't look like its message.
 const BLURAY_CONTEXT: &str = "[bluray @ ";
 const ENCRYPTION_WORDS: [&str; 3] = ["AACS", "libaacs", "BD+"];
+const CLIP_EXTENSIONS: [&str; 2] = ["m2ts", "mts"];
 
 /// The playlist libbluray picked, from ffmpeg's `selected 00800.mpls` log line.
 fn selected_playlist(log: &[String]) -> Option<u32> {
@@ -54,6 +55,8 @@ struct Mpls {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PlayItem {
+	/// The five digits that name the item's clip, `BDMV/STREAM/<clip>.m2ts`.
+	clip: [u8; 5],
 	in_time: u32,
 	out_time: u32,
 }
@@ -84,6 +87,7 @@ impl Mpls {
 			}
 
 			items.push(PlayItem {
+				clip: get(mpls, item)?,
 				in_time: be32(mpls, item + 12)?,
 				out_time: be32(mpls, item + 16)?,
 			});
@@ -123,6 +127,20 @@ impl Mpls {
 
 	fn length_s(&self) -> f64 {
 		seconds(self.items.iter().map(|item| item.ticks()).sum())
+	}
+
+	/// The earliest modification time of the clip files of `files` the playlist plays.
+	fn recorded(&self, files: &DiscFiles) -> Option<SystemTime> {
+		self.items
+			.iter()
+			.filter_map(|item| {
+				let clip = std::str::from_utf8(&item.clip).ok()?;
+				CLIP_EXTENSIONS
+					.iter()
+					.find_map(|extension| files.find(&format!("BDMV/STREAM/{clip}.{extension}")))
+			})
+			.filter_map(|file| file.modified)
+			.min()
 	}
 }
 
@@ -198,6 +216,8 @@ pub struct MainFeature {
 	pub playlist: Option<u32>,
 	/// The bytes ffmpeg reads for it.
 	pub bytes: u64,
+	/// The earliest modification time of its clip files.
+	pub recorded: Option<SystemTime>,
 	/// Why it has no chapters, when it hasn't.
 	pub warnings: Vec<String>,
 	url: String,
@@ -275,14 +295,19 @@ pub async fn main_feature(
 	let warnings = mpls.as_ref().err().cloned().into_iter().collect();
 
 	let bytes = probed.format.size.unwrap_or_else(|| files.bytes_under("BDMV/STREAM/"));
-	let (chapters, languages) = mpls.map_or_else(
+	let (chapters, languages, recorded) = mpls.map_or_else(
 		|_| Default::default(),
-		|mpls| (chapter_list(&mpls.marks_s(), mpls.length_s()), mpls.languages),
+		|mpls| {
+			let chapters = chapter_list(&mpls.marks_s(), mpls.length_s());
+			let recorded = mpls.recorded(files);
+			(chapters, mpls.languages, recorded)
+		},
 	);
 
 	Ok(Some(MainFeature {
 		playlist,
 		bytes,
+		recorded,
 		warnings,
 		url,
 		streams: probed.streams,
@@ -320,11 +345,11 @@ fn read_mpls(files: &DiscFiles, number: u32) -> Result<Mpls, String> {
 }
 
 /// The main feature stream-copied into one Matroska file in the workspace, with its chapters, its stream languages
-/// from the playlist and `name` as its title. Blu-ray LPCM becomes plain PCM.
+/// from the playlist and `tags`. Blu-ray LPCM becomes plain PCM.
 pub async fn build_bluray(
 	tools: &Toolchain,
 	main: &MainFeature,
-	name: &str,
+	tags: &Tags<'_>,
 	workspace: &Workspace,
 	on_fraction: impl Fn(f64),
 	cancel: &CancellationToken,
@@ -370,10 +395,8 @@ pub async fn build_bluray(
 	if chapters.is_some() {
 		cmd.args(["-map_chapters", "1"]);
 	}
-	cmd.arg("-metadata")
-		.arg(format!("title={name}"))
-		.args(["-f", "matroska"])
-		.arg(process::tool_path(&output));
+	tags.apply(&mut cmd);
+	cmd.args(["-f", "matroska"]).arg(process::tool_path(&output));
 
 	run_ffmpeg(
 		&cmd,
@@ -481,6 +504,35 @@ mod tests {
 			parsed.languages,
 			[(0x1100, "slv".to_owned()), (0x1200, "eng".to_owned())]
 		);
+	}
+
+	#[test]
+	fn the_recording_date_is_the_earliest_of_the_clips_played() {
+		use std::path::PathBuf;
+		use std::time::UNIX_EPOCH;
+
+		use crate::disc::udf::DiscFile;
+
+		let at = |seconds: u64| Some(UNIX_EPOCH + Duration::from_secs(1_000_000_000 + seconds));
+		let file = |path: &str, modified| DiscFile {
+			path: path.to_owned(),
+			size: 0,
+			extents: Vec::new(),
+			source: PathBuf::from(path),
+			modified,
+		};
+		let files = DiscFiles {
+			files: vec![
+				file("BDMV/STREAM/00001.m2ts", at(30)),
+				file("BDMV/STREAM/00002.MTS", at(10)),
+				file("BDMV/STREAM/00003.m2ts", at(1)),
+			],
+			dirs: Vec::new(),
+		};
+		let played = Mpls::parse(&mpls(&[(0, SECOND), (0, SECOND)], &[])).unwrap();
+
+		assert_eq!(played.recorded(&files), at(10));
+		assert_eq!(played.recorded(&DiscFiles::default()), None);
 	}
 
 	#[test]

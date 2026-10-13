@@ -7,7 +7,7 @@ use std::process::Command;
 use cryarchiver_engine::disc::Reader;
 use cryarchiver_engine::disc::bluray::{build_bluray, main_feature};
 use cryarchiver_engine::disc::dvd::{Dvd, Selection, parse, select};
-use cryarchiver_engine::disc::read::{ANGLES_LEFT_OUT, Built, BuiltTitle, build_dvd, normalise_timestamps};
+use cryarchiver_engine::disc::read::{ANGLES_LEFT_OUT, Built, BuiltTitle, Tags, build_dvd, normalise_timestamps};
 use cryarchiver_engine::disc::udf::{read_folder, read_image};
 use cryarchiver_engine::outcome::{ErrorKind, JobError};
 use cryarchiver_engine::probe::MediaInfo;
@@ -19,6 +19,10 @@ use support::{chapter_titles, near, probed};
 use tokio_util::sync::CancellationToken;
 
 const NAME: &str = "Družinski izlet";
+const TAGS: Tags<'static> = Tags {
+	title: NAME,
+	recorded: None,
+};
 
 /// A `VIDEO_TS` folder in `root` whose one title set holds `titles` in order, each in its own PGC.
 fn disc(dir: &Path, root: &Path, titles: &[Footage]) -> (Dvd, Selection) {
@@ -36,7 +40,7 @@ async fn build(dvd: &Dvd, selection: &Selection, workspace: &Workspace) -> Resul
 		&tools,
 		dvd,
 		selection,
-		NAME,
+		&TAGS,
 		workspace,
 		|_| {},
 		&CancellationToken::new(),
@@ -213,7 +217,7 @@ async fn a_title_of_another_shape_is_reencoded_to_the_main_one() {
 		&support::toolchain().await,
 		&dvd,
 		&selection,
-		NAME,
+		&TAGS,
 		&workspace,
 		|fraction| fractions.borrow_mut().push(fraction),
 		&CancellationToken::new(),
@@ -287,7 +291,7 @@ async fn a_cancelled_build_stops() {
 		&support::toolchain().await,
 		&dvd,
 		&selection,
-		NAME,
+		&TAGS,
 		&workspace,
 		|_| {},
 		&cancel,
@@ -358,7 +362,7 @@ async fn a_blu_ray_main_feature_is_copied_with_its_playlists_marks_as_chapters()
 	let built = build_bluray(
 		&tools,
 		&main,
-		NAME,
+		&TAGS,
 		&workspace,
 		|fraction| fractions.borrow_mut().push(fraction),
 		&cancel,
@@ -404,7 +408,7 @@ async fn a_blu_ray_playlist_that_cannot_be_read_leaves_the_main_feature_without_
 		.await
 		.unwrap()
 		.expect("a disc that is not encrypted");
-	let built = build_bluray(&tools, &main, NAME, &workspace, |_| {}, &cancel)
+	let built = build_bluray(&tools, &main, &TAGS, &workspace, |_| {}, &cancel)
 		.await
 		.unwrap();
 
@@ -437,7 +441,7 @@ async fn a_blu_ray_image_under_a_non_ascii_folder_reads() {
 		.await
 		.unwrap()
 		.expect("a disc that is not encrypted");
-	let built = build_bluray(&tools, &main, NAME, &workspace, |_| {}, &cancel)
+	let built = build_bluray(&tools, &main, &TAGS, &workspace, |_| {}, &cancel)
 		.await
 		.unwrap();
 

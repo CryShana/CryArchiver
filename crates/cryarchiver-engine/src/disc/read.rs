@@ -1,13 +1,13 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use super::dvd::{Dvd, DvdTitle, Kept, MAX_DVD_MBITS, Selection};
-use super::{Range, Reader, SECTOR, joined, ps};
+use super::{Range, Reader, SECTOR, joined, ps, rfc3339};
 use crate::outcome::{ErrorKind, IoSide, JobError};
 use crate::probe::{self, MediaInfo, PROBE_TIMEOUT, ProbeError, Stream};
 use crate::process::{self, Progress, ToolCommand};
@@ -43,6 +43,22 @@ pub struct Built {
 	pub warnings: Vec<String>,
 }
 
+/// What the video read from a disc is titled, and when the disc's footage was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tags<'a> {
+	pub title: &'a str,
+	pub recorded: Option<SystemTime>,
+}
+
+impl Tags<'_> {
+	pub(super) fn apply(&self, cmd: &mut ToolCommand) {
+		cmd.arg("-metadata").arg(format!("title={}", self.title));
+		if let Some(recorded) = self.recorded.and_then(rfc3339) {
+			cmd.arg("-metadata").arg(format!("creation_time={recorded}"));
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BuiltTitle {
 	pub title: u16,
@@ -57,7 +73,7 @@ pub async fn build_dvd(
 	tools: &Toolchain,
 	dvd: &Dvd,
 	selection: &Selection,
-	name: &str,
+	tags: &Tags<'_>,
 	workspace: &Workspace,
 	on_fraction: impl Fn(f64),
 	cancel: &CancellationToken,
@@ -73,7 +89,7 @@ pub async fn build_dvd(
 		tools,
 		workspace,
 		main: &titles[main],
-		name,
+		tags,
 		total,
 		timeout: process::scaled_timeout(total),
 		cancel,
@@ -781,9 +797,9 @@ fn rgb(y: u8, cr: u8, cb: u8) -> [u8; 3] {
 /// A chapter per title, named after its disc number, with the disc's own chapters after its first inside it. A title
 /// whose IFO time is false gets only its title chapter.
 fn chapter_list(titles: &[(&DvdTitle, bool, BuiltTitle)]) -> Vec<Chapter> {
-	let mut list = Vec::new();
+	let mut starts = Vec::new();
 	for (dvd, false_time, built) in titles {
-		let mut starts = vec![(built.start_s, format!("Title {}", dvd.number))];
+		starts.push((built.start_s, format!("Title {}", dvd.number)));
 		if !false_time {
 			starts.extend(
 				dvd.chapter_starts_s
@@ -793,9 +809,12 @@ fn chapter_list(titles: &[(&DvdTitle, bool, BuiltTitle)]) -> Vec<Chapter> {
 					.map(|(index, start)| (built.start_s + start, format!("Chapter {}", index + 1))),
 			);
 		}
-		list.extend(chapters::from_starts(starts, built.start_s + built.length_s));
 	}
-	list
+
+	let end_s = titles
+		.last()
+		.map_or(0.0, |(_, _, built)| built.start_s + built.length_s);
+	chapters::from_starts(starts, end_s)
 }
 
 /// How each of the main layout's audio tracks is fed from a title.
@@ -809,7 +828,7 @@ struct Job<'a> {
 	tools: &'a Toolchain,
 	workspace: &'a Workspace,
 	main: &'a Title<'a>,
-	name: &'a str,
+	tags: &'a Tags<'a>,
 	/// The bytes of the titles' footage.
 	total: u64,
 	timeout: Duration,
@@ -1060,10 +1079,10 @@ impl Job<'_> {
 		}
 	}
 
-	/// The chapters, title, languages and output of the command that writes the intermediate.
+	/// The chapters, tags, languages and output of the command that writes the intermediate.
 	fn finish(&self, cmd: &mut ToolCommand, output: &Path) {
-		cmd.args(["-map_chapters", "1", "-metadata"])
-			.arg(format!("title={}", self.name));
+		cmd.args(["-map_chapters", "1"]);
+		self.tags.apply(cmd);
 
 		let main = &self.main.layout;
 		language_tags(cmd, 'a', main.audio.iter().map(|track| track.language.as_deref()));

@@ -10,6 +10,12 @@ const ANCHOR: u32 = 256;
 const CHUNK: usize = 1 << 20;
 const EMBEDDED: usize = 1024;
 const METADATA_PIECE: usize = 8 * SECTOR;
+/// 2003-07-14 20:30:05 local time at UTC+2, as an ECMA-167 timestamp.
+const MODIFIED: [u8; 12] = [0x78, 0x10, 0xD3, 0x07, 7, 14, 20, 30, 5, 0, 0, 0];
+
+/// The modification time every entry an `Image` writes records, in UTC.
+pub const RECORDED: &str = "2003-07-14T18:30:05Z";
+pub const RECORDED_UNIX_S: u64 = 1_058_207_405;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdfRevision {
@@ -21,7 +27,7 @@ pub enum UdfRevision {
 /// DVD; `V250` adds a metadata partition with Extended File Entries and long allocation descriptors, as on a Blu-ray.
 /// Files over 1 MiB are split into 1 MiB extents with a free block between them, files up to 1 KiB are embedded in
 /// their entry, and the metadata file is split into 8-block pieces the same way (`write_mastered` keeps it whole, as
-/// libudfread needs).
+/// libudfread needs). Every entry records `RECORDED` as its modification time.
 pub struct Image {
 	pub files: Vec<(String, Vec<u8>)>,
 	pub dirs: Vec<String>,
@@ -226,9 +232,11 @@ impl Writer {
 		if self.extended() {
 			entry[64..72].copy_from_slice(&length.to_le_bytes());
 			entry[72..80].copy_from_slice(&blocks.to_le_bytes());
+			entry[92..104].copy_from_slice(&MODIFIED);
 			entry[212..216].copy_from_slice(&ad_length);
 		} else {
 			entry[64..72].copy_from_slice(&blocks.to_le_bytes());
+			entry[84..96].copy_from_slice(&MODIFIED);
 			entry[172..176].copy_from_slice(&ad_length);
 		}
 		entry.extend_from_slice(descriptors);

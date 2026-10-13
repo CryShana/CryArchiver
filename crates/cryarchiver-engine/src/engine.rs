@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
@@ -25,7 +25,7 @@ use crate::detect::{self, Detected, Detection, Disc, DiscFolder, MediaClass};
 use crate::disc::Reader;
 use crate::disc::bluray::{self, MainFeature};
 use crate::disc::dvd::{self, Dvd, Selection};
-use crate::disc::read::{self, Built};
+use crate::disc::read::{self, Built, Tags};
 use crate::format::{OutputFormat, check_bitrate_cap, check_kind};
 use crate::images::animated::{self, Animation};
 use crate::images::job::{self as image_job, ImageCaps, ImageContext, ImageInput, ImageOutcome};
@@ -274,7 +274,8 @@ struct ReadSource<'a> {
 
 /// What a disc, or a source whose timestamps restart, is read from.
 enum Reading<'r> {
-	Dvd(&'r Dvd, &'r Selection),
+	/// A DVD, its titles to read, and when the footage they read was recorded.
+	Dvd(&'r Dvd, &'r Selection, Option<SystemTime>),
 	BluRay(&'r MainFeature),
 	Timestamps(&'r MediaInfo),
 }
@@ -283,7 +284,7 @@ impl Reading<'_> {
 	/// The free space reading takes: the source's size, and room for the video read from it.
 	fn need(&self, source_bytes: u64) -> u64 {
 		match self {
-			Self::Dvd(dvd, selection) => source_bytes.saturating_add(dvd.footage_bytes(selection)),
+			Self::Dvd(dvd, selection, _) => source_bytes.saturating_add(dvd.footage_bytes(selection)),
 			Self::BluRay(main) => source_bytes.saturating_add(main.bytes),
 			Self::Timestamps(_) => source_bytes.saturating_mul(2),
 		}
@@ -1011,10 +1012,11 @@ impl Engine {
 			let selection = dvd::select(&dvd);
 			let encrypted =
 				(!selection.kept.is_empty() && !dvd.mixed(&selection)).then(|| dvd.encrypted(&selection, &mut reader));
-			Ok::<_, String>((dvd, selection, encrypted))
+			let recorded = dvd.recorded(&selection, &files);
+			Ok::<_, String>((dvd, selection, encrypted, recorded))
 		})
 		.await?;
-		let (dvd, selection, encrypted) = match read {
+		let (dvd, selection, encrypted, recorded) = match read {
 			Ok(read) => read,
 			Err(reason) => return Ok(kept(&format!("the DVD's titles can't be read: {reason}"))),
 		};
@@ -1034,7 +1036,7 @@ impl Engine {
 			return Ok(kept(DVD_ENCRYPTED));
 		}
 
-		self.read_into(cx, sink, work_root, Reading::Dvd(&dvd, &selection))
+		self.read_into(cx, sink, work_root, Reading::Dvd(&dvd, &selection, recorded))
 			.await
 	}
 
@@ -1090,11 +1092,16 @@ impl Engine {
 		let on_fraction = |fraction| (cx.on_event)(JobEvent::Progress(fraction));
 		let name = source_name(&cx.job.source).to_string_lossy();
 		let built = match reading {
-			Reading::Dvd(dvd, selection) => {
-				read::build_dvd(&self.tools, dvd, selection, &name, &workspace, on_fraction, cx.cancel).await
+			Reading::Dvd(dvd, selection, recorded) => {
+				let tags = Tags { title: &name, recorded };
+				read::build_dvd(&self.tools, dvd, selection, &tags, &workspace, on_fraction, cx.cancel).await
 			}
 			Reading::BluRay(main) => {
-				bluray::build_bluray(&self.tools, main, &name, &workspace, on_fraction, cx.cancel).await
+				let tags = Tags {
+					title: &name,
+					recorded: main.recorded,
+				};
+				bluray::build_bluray(&self.tools, main, &tags, &workspace, on_fraction, cx.cancel).await
 			}
 			Reading::Timestamps(info) => {
 				read::normalise_timestamps(&self.tools, &cx.job.source, info, &workspace, on_fraction, cx.cancel).await
@@ -2475,7 +2482,11 @@ impl Engine {
 			));
 		}
 
-		let metadata = (cx.job.keep_metadata && keeps_files && !strip).then_some((job.probe_json, job.first_frame));
+		let metadata = (cx.job.keep_metadata && keeps_files && !strip).then(|| SourceMetadata {
+			probe_json: job.probe_json,
+			first_frame: job.first_frame,
+			read_from: read_from(cx),
+		});
 		let attachments = collect_attachments(workspace, &job.streams.extracted, metadata, &mut warnings)?;
 
 		let chapter_file = workspace.file(CHAPTER_FILE);
@@ -3141,10 +3152,40 @@ fn copy_cover(source: &Path, output: &Path, info: &MediaInfo) -> Option<String> 
 		.map(|err| format!("cover art not copied: {err}"))
 }
 
+/// What the source metadata attachment holds: the probe of the video encoded and its first frame's side data.
+struct SourceMetadata<'a> {
+	probe_json: &'a [u8],
+	first_frame: Option<&'a probe::Frame>,
+	read_from: Option<ReadFrom<'a>>,
+}
+
+/// The source a disc or a rebuilt video was read from, which the probe of what was read names in its place.
+struct ReadFrom<'a> {
+	path: &'a Path,
+	bytes: u64,
+	disc: Option<DiscDecision>,
+	warnings: &'a [String],
+}
+
+fn read_from<'a>(cx: &Context<'a>) -> Option<ReadFrom<'a>> {
+	if cx.media == cx.job.source {
+		return None;
+	}
+
+	let mut disc = None;
+	cx.record.update(|decision| disc.clone_from(&decision.disc));
+	Some(ReadFrom {
+		path: &cx.job.source,
+		bytes: cx.source_bytes,
+		disc,
+		warnings: cx.read_warnings,
+	})
+}
+
 fn collect_attachments(
 	workspace: &Workspace,
 	extracted: &[Extracted],
-	metadata: Option<(&[u8], Option<&probe::Frame>)>,
+	metadata: Option<SourceMetadata<'_>>,
 	warnings: &mut Vec<String>,
 ) -> Result<Vec<Attachment>, JobError> {
 	let mut attachments = Vec::new();
@@ -3161,20 +3202,28 @@ fn collect_attachments(
 		}
 	}
 
-	if let Some((probe_json, first_frame)) = metadata {
-		attachments.push(write_source_metadata(workspace, probe_json, first_frame)?);
+	if let Some(metadata) = metadata {
+		attachments.push(write_source_metadata(workspace, &metadata)?);
 	}
 	Ok(attachments)
 }
 
-fn write_source_metadata(
-	workspace: &Workspace,
-	probe_json: &[u8],
-	first_frame: Option<&probe::Frame>,
-) -> Result<Attachment, JobError> {
-	let ffprobe: serde_json::Value = serde_json::from_slice(probe_json).unwrap_or_default();
-	let side_data = first_frame.map(|frame| &frame.side_data_list);
-	let document = serde_json::json!({ "ffprobe": ffprobe, "frame_side_data": side_data });
+fn write_source_metadata(workspace: &Workspace, metadata: &SourceMetadata<'_>) -> Result<Attachment, JobError> {
+	let ffprobe: serde_json::Value = serde_json::from_slice(metadata.probe_json).unwrap_or_default();
+	let side_data = metadata.first_frame.map(|frame| &frame.side_data_list);
+	let mut document = serde_json::json!({ "ffprobe": ffprobe, "frame_side_data": side_data });
+
+	if let Some(read_from) = &metadata.read_from {
+		let format = &mut document["ffprobe"]["format"];
+		format["filename"] = read_from.path.display().to_string().into();
+		format["size"] = read_from.bytes.to_string().into();
+
+		if let Some(disc) = &read_from.disc {
+			let mut disc = serde_json::to_value(disc).unwrap_or_default();
+			disc["warnings"] = read_from.warnings.into();
+			document["disc"] = disc;
+		}
+	}
 
 	let path = workspace.file(SOURCE_METADATA);
 	fs::write(&path, document.to_string()).map_err(|err| JobError::io(IoSide::Destination(&path), &err))?;

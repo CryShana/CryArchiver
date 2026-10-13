@@ -72,6 +72,21 @@ pub fn ffmpeg(args: &[&str]) {
 	assert!(status.success(), "ffmpeg {args:?} failed");
 }
 
+/// The attachment of `media` named `name`, dumped into `dir`. ffmpeg exits with an error after dumping, as it is given
+/// no output.
+pub fn attachment(media: &Path, name: &str, dir: &Path) -> Vec<u8> {
+	let dumped = dir.join(format!("dumped-{name}"));
+	Command::new("ffmpeg")
+		.args(["-hide_banner", "-v", "quiet", "-y"])
+		.arg(format!("-dump_attachment:m:filename:{name}"))
+		.arg(&dumped)
+		.arg("-i")
+		.arg(media)
+		.status()
+		.unwrap();
+	std::fs::read(&dumped).unwrap_or_else(|err| panic!("{name} not dumped from {}: {err}", media.display()))
+}
+
 pub fn tone(dir: &Path, name: &str, layout: &str, channels: u32, seconds: u32, codec_args: &[&str]) -> PathBuf {
 	let expr = (0..channels)
 		.map(|i| format!("0.3*sin(2*PI*{}*t)", 220 + i * 110))

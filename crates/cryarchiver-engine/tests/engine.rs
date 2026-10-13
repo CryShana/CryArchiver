@@ -1641,6 +1641,14 @@ async fn keep_metadata_attaches_the_source_probe() {
 			.any(|stream| stream.tag("filename") == Some("source-metadata.json")),
 		"{info:?}"
 	);
+
+	let metadata: serde_json::Value =
+		serde_json::from_slice(&support::attachment(&output, "source-metadata.json", dir.path())).unwrap();
+	let format = &metadata["ffprobe"]["format"];
+	assert!(format["filename"].as_str().unwrap().ends_with("meta.mp4"), "{format}");
+	assert_eq!(format["size"], std::fs::metadata(&clip).unwrap().len().to_string());
+	assert!(format["format_name"].as_str().unwrap().contains("mp4"), "{format}");
+	assert!(metadata.get("disc").is_none(), "{metadata}");
 }
 
 #[tokio::test]

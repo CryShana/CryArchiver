@@ -3,10 +3,11 @@ mod support;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cryarchiver_engine::disc::udf::{DiscFile, Extent, is_udf, read_folder, read_image};
 use support::pattern;
-use support::udf::{Image, UdfRevision};
+use support::udf::{Image, RECORDED_UNIX_S, UdfRevision};
 
 fn read_back(file: &DiscFile) -> Vec<u8> {
 	let mut source = File::open(&file.source).unwrap();
@@ -18,6 +19,10 @@ fn read_back(file: &DiscFile) -> Vec<u8> {
 		bytes.extend(chunk);
 	}
 	bytes
+}
+
+fn recorded() -> SystemTime {
+	UNIX_EPOCH + Duration::from_secs(RECORDED_UNIX_S)
 }
 
 fn written(path: &Path, image: &Image) -> Vec<u8> {
@@ -55,6 +60,7 @@ fn a_dvd_image_lists_its_files_with_exact_sizes_and_extents() {
 	assert_eq!(listed.size, 3 << 20);
 	assert!(listed.extents.len() > 1, "{:?}", listed.extents);
 	assert_eq!(read_back(listed), vob);
+	assert_eq!(listed.modified, Some(recorded()));
 
 	assert!(files.dir_exists("VIDEO_TS"));
 	assert!(files.dir_exists("audio_ts"));
@@ -87,6 +93,10 @@ fn a_blu_ray_image_with_a_metadata_partition_lists_its_files_and_folders() {
 	assert_eq!(listed.files.len(), 42);
 	assert_eq!(read_back(listed.find("BDMV/index.bdmv").unwrap()), index);
 	assert_eq!(read_back(listed.find("bdmv/stream/00000.M2TS").unwrap()), stream);
+	assert_eq!(
+		listed.find("BDMV/STREAM/00000.m2ts").unwrap().modified,
+		Some(recorded())
+	);
 	for (name, bytes) in &playlists {
 		assert_eq!(&read_back(listed.find(name).unwrap()), bytes, "{name}");
 	}
@@ -206,6 +216,13 @@ fn a_folder_lists_its_nested_files_as_whole_extents() {
 	std::fs::write(root.join("BDMV/index.bdmv"), pattern(100, 13)).unwrap();
 	std::fs::write(root.join("BDMV/PLAYLIST/00000.mpls"), pattern(2500, 14)).unwrap();
 	std::fs::write(root.join("Čžš.txt"), b"").unwrap();
+	let modified = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+	std::fs::File::options()
+		.write(true)
+		.open(root.join("BDMV/PLAYLIST/00000.mpls"))
+		.unwrap()
+		.set_modified(modified)
+		.unwrap();
 
 	let listed = read_folder(&root).unwrap();
 	assert_eq!(listed.files.len(), 3);
@@ -222,6 +239,7 @@ fn a_folder_lists_its_nested_files_as_whole_extents() {
 	);
 	assert_eq!(playlist.source, root.join("BDMV").join("PLAYLIST").join("00000.mpls"));
 	assert_eq!(read_back(playlist), pattern(2500, 14));
+	assert_eq!(playlist.modified, Some(modified));
 
 	assert_eq!(listed.find("Čžš.txt").unwrap().size, 0);
 	assert!(listed.dir_exists("BDMV/STREAM/SSIF"));

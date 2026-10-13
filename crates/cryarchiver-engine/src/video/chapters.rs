@@ -9,6 +9,8 @@ use crate::workspace::write_work_file;
 
 /// How near a chapter may start to its title's edges, or to another chapter, and still be one.
 pub const EDGE_S: f64 = 0.05;
+/// A chapter shorter than this, as a disc's tiny last cell makes, is merged into its neighbour.
+pub const MIN_CHAPTER_S: f64 = 1.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chapter {
@@ -31,7 +33,8 @@ pub fn clip(chapters: &[Value], window: TrimWindow) -> Vec<Chapter> {
 		.collect()
 }
 
-/// A chapter from each of `starts`, named, to the next, the last to `end_s`.
+/// A chapter from each of `starts`, named, to the next, the last to `end_s`. A chapter under `MIN_CHAPTER_S` joins
+/// the one before it; a first one that short takes in the one after it, keeping its own start and name.
 pub fn from_starts(starts: Vec<(f64, String)>, end_s: f64) -> Vec<Chapter> {
 	let stops: Vec<f64> = starts
 		.iter()
@@ -39,15 +42,21 @@ pub fn from_starts(starts: Vec<(f64, String)>, end_s: f64) -> Vec<Chapter> {
 		.map(|(start_s, _)| *start_s)
 		.chain([end_s])
 		.collect();
-	starts
-		.into_iter()
-		.zip(stops)
-		.map(|((start_s, title), end_s)| Chapter {
+	let short = |chapter: &Chapter| chapter.end_s - chapter.start_s < MIN_CHAPTER_S;
+
+	let mut chapters: Vec<Chapter> = Vec::with_capacity(starts.len());
+	for ((start_s, title), end_s) in starts.into_iter().zip(stops) {
+		let chapter = Chapter {
 			start_s,
 			end_s,
 			title: Some(title),
-		})
-		.collect()
+		};
+		match chapters.last_mut() {
+			Some(last) if short(&chapter) || short(last) => last.end_s = chapter.end_s,
+			_ => chapters.push(chapter),
+		}
+	}
+	chapters
 }
 
 pub fn write(path: &Path, chapters: &[Chapter]) -> Result<(), JobError> {
@@ -126,6 +135,48 @@ mod tests {
 				},
 			]
 		);
+	}
+
+	fn spans(chapters: &[Chapter]) -> Vec<(f64, f64, &str)> {
+		chapters
+			.iter()
+			.map(|chapter| (chapter.start_s, chapter.end_s, chapter.title.as_deref().unwrap()))
+			.collect()
+	}
+
+	fn named(starts: &[(f64, &str)]) -> Vec<(f64, String)> {
+		starts
+			.iter()
+			.map(|(start_s, title)| (*start_s, (*title).to_owned()))
+			.collect()
+	}
+
+	#[test]
+	fn a_chapter_under_a_second_joins_the_one_before_it() {
+		let chapters = from_starts(named(&[(0.0, "Title 1"), (3009.64, "Chapter 2")]), 3010.04);
+
+		assert_eq!(spans(&chapters), [(0.0, 3010.04, "Title 1")]);
+
+		let chapters = from_starts(
+			named(&[(0.0, "A"), (10.0, "B"), (10.5, "C"), (10.9, "D"), (30.0, "E")]),
+			40.0,
+		);
+
+		assert_eq!(
+			spans(&chapters),
+			[(0.0, 10.9, "A"), (10.9, 30.0, "D"), (30.0, 40.0, "E")]
+		);
+	}
+
+	#[test]
+	fn a_first_chapter_under_a_second_takes_in_the_next() {
+		let chapters = from_starts(
+			named(&[(0.0, "Title 1"), (0.4, "Chapter 2"), (20.0, "Chapter 3")]),
+			30.0,
+		);
+
+		assert_eq!(spans(&chapters), [(0.0, 20.0, "Title 1"), (20.0, 30.0, "Chapter 3")]);
+		assert_eq!(spans(&from_starts(named(&[(0.0, "Only")]), 0.5)), [(0.0, 0.5, "Only")]);
 	}
 
 	#[test]
