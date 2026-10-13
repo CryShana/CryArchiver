@@ -1,5 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1136.8" height="676" viewBox="0 0 1136.8 676" font-family="Cascadia Mono, Consolas, Menlo, 'DejaVu Sans Mono', monospace" font-size="14">
-<rect width="100%" height="100%" rx="10" fill="#14161b"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1192.8" height="738.0" viewBox="0 0 1192.8 738.0" font-family="Cascadia Mono, Consolas, Menlo, 'DejaVu Sans Mono', monospace" font-size="14">
+<defs>
+<filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+<feDropShadow dx="0" dy="8" stdDeviation="11" flood-color="#000" flood-opacity="0.45"/>
+</filter>
+<clipPath id="window"><rect width="1136.8" height="676.0" rx="12"/></clipPath>
+</defs>
+<g transform="translate(28,28)">
+<rect width="1136.8" height="676.0" rx="12" fill="#14161b" filter="url(#shadow)"/>
+<g clip-path="url(#window)">
 <rect x="14.0" y="14.0" width="109.2" height="18" fill="#3cc4ce"/>
 <text x="14.0" y="27.5" textLength="109.2" lengthAdjust="spacingAndGlyphs" fill="#0b0f13" xml:space="preserve" font-weight="bold"> CryArchiver </text>
 <rect x="123.2" y="14.0" width="8.4" height="18" fill="#121920"/>
@@ -691,4 +699,7 @@
 <rect x="1013.6" y="644.0" width="67.2" height="18" fill="#121920"/>
 <text x="1013.6" y="657.5" textLength="67.2" lengthAdjust="spacingAndGlyphs" fill="#66727d" xml:space="preserve">settings</text>
 <rect x="1080.8" y="644.0" width="42.0" height="18" fill="#121920"/>
+</g>
+<rect x="0.5" y="0.5" width="1135.8" height="675.0" rx="11.5" fill="none" stroke="#3a3f4b" stroke-width="1"/>
+</g>
 </svg>
