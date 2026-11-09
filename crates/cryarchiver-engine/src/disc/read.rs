@@ -28,8 +28,6 @@ pub(super) const OUTPUT: &str = "disc.mkv";
 pub(super) const CHAPTERS: &str = "chapters.txt";
 const PIECES: &str = "pieces.txt";
 const REENCODE_QUALITY: &str = "2";
-/// How far the joined titles may run from the disc's times, per join, before the joins are suspect.
-const JOIN_SLACK_S: f64 = 0.5;
 pub const ANGLES_LEFT_OUT: &str = "angles beyond the first were left out";
 
 /// A video read from a disc or rebuilt from a source.
@@ -66,9 +64,12 @@ pub struct BuiltTitle {
 	pub length_s: f64,
 }
 
-/// The kept titles joined into one Matroska file in the workspace: stream-copied where every title has the main
-/// (longest) title's layout, otherwise title by title with the odd ones re-encoded to it. DVD LPCM becomes plain PCM,
-/// subpictures carry their IFO palette, and the chapters are a chapter per title with the disc's own inside it.
+/// The kept titles joined into one Matroska file in the workspace, read title by title and stream-copied where a
+/// title has the main (longest) title's layout, otherwise re-encoded to it. DVD LPCM becomes plain PCM, subpictures
+/// carry their IFO palette, and the chapters are a chapter per title with the disc's own inside it.
+///
+/// Titles are never read as one PS: each restarts its timestamps, and `+genpts` then looks for the next title to
+/// time the last frames of the one before, buffering all of it when it is the shorter one.
 pub async fn build_dvd(
 	tools: &Toolchain,
 	dvd: &Dvd,
@@ -95,8 +96,8 @@ pub async fn build_dvd(
 		cancel,
 	};
 
-	let mut built = if titles.iter().all(|title| title.joins(job.main)) {
-		job.single(&titles, &on_fraction).await?
+	let mut built = if let [title] = titles.as_slice() {
+		job.single(title, &on_fraction).await?
 	} else {
 		job.pieces(&titles, &on_fraction).await?
 	};
@@ -212,7 +213,6 @@ pub(super) fn copy_with(cmd: &mut ToolCommand, overrides: impl IntoIterator<Item
 struct Title<'a> {
 	dvd: &'a DvdTitle,
 	false_time: bool,
-	ranges: Vec<Range>,
 	input: Input,
 	bytes: u64,
 	layout: Layout,
@@ -279,23 +279,12 @@ impl<'a> Title<'a> {
 		Ok(Self {
 			dvd: title,
 			false_time: kept.false_time,
-			ranges,
 			input,
 			bytes,
 			layout,
 			length_s,
 			warnings,
 		})
-	}
-
-	/// Whether the title can be read in one run with the main title: one picture and track layout, and one palette
-	/// for the subpictures.
-	fn joins(&self, main: &Title<'_>) -> bool {
-		self.layout.video.same(&main.layout.video)
-			&& self.layout.audio.len() == main.layout.audio.len()
-			&& self.layout.audio.iter().zip(&main.layout.audio).all(|(a, b)| a.same(b))
-			&& self.layout.subtitle_ids() == main.layout.subtitle_ids()
-			&& (main.layout.subtitles.is_empty() || self.dvd.palette == main.dvd.palette)
 	}
 
 	/// Whether the title's picture or audio must be re-encoded to join the main title.
@@ -372,19 +361,6 @@ async fn first_packets(
 		return Err(ErrorKind::Cancelled.into());
 	}
 	Ok(found)
-}
-
-/// A warning when the joined titles' real length is off the disc's times by more than `JOIN_SLACK_S` per join: the
-/// timestamp correction at a join may have gone wrong.
-fn join_gap(actual_s: f64, expected_s: f64, joins: usize) -> Option<String> {
-	#[allow(clippy::cast_precision_loss)]
-	let slack = JOIN_SLACK_S * joins as f64;
-	(joins > 0 && (actual_s - expected_s).abs() > slack).then(|| {
-		format!(
-			"the joined titles last {actual_s:.1} s, not the {expected_s:.1} s the disc gives them: chapters and sync \
-			 after a title join may be off"
-		)
-	})
 }
 
 /// The first of the longest titles.
@@ -655,10 +631,6 @@ impl Layout {
 			),
 		})
 	}
-
-	fn subtitle_ids(&self) -> Vec<u32> {
-		self.subtitles.iter().map(|subtitle| subtitle.id).collect()
-	}
 }
 
 /// `found` in the order of `listed`, `(PS id, language)` pairs, each given its language; those `listed` doesn't name
@@ -836,48 +808,32 @@ struct Job<'a> {
 }
 
 impl Job<'_> {
-	async fn single(&self, titles: &[Title<'_>], on_fraction: &impl Fn(f64)) -> Result<Built, JobError> {
-		let mut built = Vec::with_capacity(titles.len());
-		let mut start_s = 0.0;
-		for title in titles {
-			built.push(BuiltTitle {
-				title: title.dvd.number,
-				start_s,
-				length_s: title.length_s,
-			});
-			start_s += title.length_s;
-		}
-
-		let ranges = joined(titles.iter().flat_map(|title| title.ranges.iter().cloned()));
-		let mut input = Input::of(&ranges, &self.workspace.file("disc.txt"))?;
-		input.window = titles.first().map_or(Window::HEAD, |first| first.input.window);
-		let chapters = self.chapters(titles, &built)?;
+	async fn single(&self, title: &Title<'_>, on_fraction: &impl Fn(f64)) -> Result<Built, JobError> {
+		let built = vec![BuiltTitle {
+			title: title.dvd.number,
+			start_s: 0.0,
+			length_s: title.length_s,
+		}];
+		let chapters = self.chapters(std::slice::from_ref(title), &built)?;
 		let output = self.workspace.file(OUTPUT);
 
 		let mut cmd = ToolCommand::new(&self.tools.ffmpeg, self.timeout);
 		cmd.args(["-hide_banner", "-nostdin", "-y"]);
-		if !self.main.layout.subtitles.is_empty() {
-			cmd.arg("-palette").arg(rgb_palette(&self.main.dvd.palette));
+		if !title.layout.subtitles.is_empty() {
+			cmd.arg("-palette").arg(rgb_palette(&title.dvd.palette));
 		}
-		input.args(&mut cmd);
+		title.input.args(&mut cmd);
 		cmd.arg("-i").arg(process::tool_path(&chapters));
-		self.map(&mut cmd, self.main, &[]);
+		self.map(&mut cmd, title, &[]);
 		self.finish(&mut cmd, &output);
 
 		run_ffmpeg(&cmd, |progress| on_fraction(written(progress, self.total)), self.cancel).await?;
-		let info = built_info(self.tools, &output, self.cancel).await?;
-		let warnings = info
-			.format
-			.duration
-			.and_then(|read_s| join_gap(read_s, start_s, titles.len().saturating_sub(1)))
-			.into_iter()
-			.collect();
 		Ok(Built {
+			info: built_info(self.tools, &output, self.cancel).await?,
 			path: output,
-			info,
 			titles: built,
 			reencoded: Vec::new(),
-			warnings,
+			warnings: Vec::new(),
 		})
 	}
 
@@ -1371,16 +1327,5 @@ mod tests {
 		copy_with(&mut cmd, [("a:1".to_owned(), "pcm_s24le"), ("s:0".to_owned(), "srt")]);
 
 		assert_eq!(cmd.args, ["-c", "copy", "-c:a:1", "pcm_s24le", "-c:s:0", "srt"]);
-	}
-
-	#[test]
-	fn joins_that_drift_from_the_disc_times_are_warned_about() {
-		assert_eq!(join_gap(23.3, 23.0, 1), None);
-		assert_eq!(join_gap(30.0, 23.0, 0), None);
-		let warning = join_gap(24.2, 23.0, 2).unwrap();
-		assert!(
-			warning.starts_with("the joined titles last 24.2 s, not the 23.0 s"),
-			"{warning}"
-		);
 	}
 }

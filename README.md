@@ -35,6 +35,7 @@ cryarchiver doctor          # shows what your ffmpeg can do
 ```sh
 cryarchiver holiday.mp4                  # writes holiday.cry.mkv next to it
 cryarchiver photos/ -o small/            # every file in photos/, written to small/
+cryarchiver movies/                      # also every DVD or Blu-ray folder directly in movies/
 cryarchiver album/ --speed slow          # slower, a bit more quality
 cryarchiver film.mkv --ss 1:00 --to 2:30 # cut a part out
 cryarchiver clip.mp4 -o clip.avif        # looping animated AVIF

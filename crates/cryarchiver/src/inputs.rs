@@ -41,6 +41,11 @@ pub fn expand(args: &[PathBuf]) -> Inputs {
 				}
 				Err(err) => inputs.problem(format!("{}: cannot read the folder: {err}", display_path(arg))),
 			}
+
+			for disc in disc_folders(arg) {
+				note_beside_disc(&mut inputs, &disc);
+				inputs.files.push(disc);
+			}
 		} else if has_wildcard(arg) {
 			expand_wildcard(&mut inputs, arg);
 		} else {
@@ -174,19 +179,33 @@ fn expand_wildcard(inputs: &mut Inputs, arg: &Path) {
 	}
 }
 
-fn list_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
-	let read_from = if dir.as_os_str().is_empty() {
-		Path::new(".")
-	} else {
-		dir
+/// The folders directly in `dir` that each hold a disc's `VIDEO_TS` or `BDMV` folder.
+fn disc_folders(dir: &Path) -> Vec<PathBuf> {
+	let Ok(entries) = read_dir(dir) else {
+		return Vec::new();
 	};
-	let entries = fs::read_dir(read_from)?;
 
-	Ok(entries
+	entries
+		.flatten()
+		.map(|entry| dir.join(entry.file_name()))
+		.filter(|path| path.is_dir() && detect::disc_root(path).as_ref() == Some(path))
+		.collect()
+}
+
+fn list_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+	Ok(read_dir(dir)?
 		.flatten()
 		.map(|entry| dir.join(entry.file_name()))
 		.filter(|path| path.is_file())
 		.collect())
+}
+
+fn read_dir(dir: &Path) -> io::Result<fs::ReadDir> {
+	if dir.as_os_str().is_empty() {
+		fs::read_dir(".")
+	} else {
+		fs::read_dir(dir)
+	}
 }
 
 #[cfg(test)]
@@ -224,6 +243,37 @@ mod tests {
 		let inputs = expand(&[dir.path().join("Trip"), dir.path().join("Film")]);
 
 		assert_eq!(inputs.files, vec![dir.path().join("Film"), dir.path().join("Trip")]);
+		assert_eq!(inputs.notes.len(), 1, "{:?}", inputs.notes);
+		assert!(inputs.notes[0].contains("left out: notes.txt"), "{:?}", inputs.notes);
+		assert_eq!(inputs.problems, 0);
+	}
+
+	#[test]
+	fn a_folder_expands_to_the_disc_folders_directly_in_it() {
+		let dir = tempfile::tempdir().unwrap();
+		touch(&dir.path().join("a.iso"));
+		touch(&dir.path().join("Trip").join("VIDEO_TS").join("VIDEO_TS.IFO"));
+		touch(&dir.path().join("Trip").join("notes.txt"));
+		touch(&dir.path().join("Film").join("BDMV").join("index.bdmv"));
+		touch(&dir.path().join("Plain").join("b.flac"));
+		touch(
+			&dir.path()
+				.join("Deeper")
+				.join("Trip")
+				.join("VIDEO_TS")
+				.join("VIDEO_TS.IFO"),
+		);
+
+		let inputs = expand(&[dir.path().to_path_buf()]);
+
+		assert_eq!(
+			inputs.files,
+			vec![
+				dir.path().join("Film"),
+				dir.path().join("Trip"),
+				dir.path().join("a.iso")
+			]
+		);
 		assert_eq!(inputs.notes.len(), 1, "{:?}", inputs.notes);
 		assert!(inputs.notes[0].contains("left out: notes.txt"), "{:?}", inputs.notes);
 		assert_eq!(inputs.problems, 0);
