@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,8 @@ use crate::workspace::{Workspace, write_work_file};
 /// ffmpeg holds what it probes in memory: a stream that starts later in its title than this isn't looked for.
 const MAX_PROBE_BYTES: u64 = 1 << 30;
 const PROBE_MARGIN: u64 = 4 << 20;
+/// About ten seconds of footage at the mux maximum.
+const RETIMED_BYTES: u64 = 12 << 20;
 const DEEP_PROBE_MICROSECONDS: u64 = 36_000_000_000;
 /// `concat:` splits on `|` and has no escape for it, and the whole URL must fit a command line: other inputs go
 /// through a `concatf:` list.
@@ -96,7 +99,9 @@ pub async fn build_dvd(
 		cancel,
 	};
 
-	let mut built = if let [title] = titles.as_slice() {
+	let mut built = if let [title] = titles.as_slice()
+		&& title.runs.len() == 1
+	{
 		job.single(title, &on_fraction).await?
 	} else {
 		job.pieces(&titles, &on_fraction).await?
@@ -217,7 +222,22 @@ struct Title<'a> {
 	bytes: u64,
 	layout: Layout,
 	length_s: f64,
+	runs: Vec<Run>,
 	warnings: Vec<String>,
+}
+
+/// A stretch of a title written as a piece of its own. Where a title's video decoding times go back, `+genpts` gives
+/// the frames on either side the same times, so it is read in runs that each go forward.
+#[derive(Debug)]
+struct Run {
+	input: Input,
+	bytes: u64,
+	length_s: f64,
+	/// Its picture is re-encoded on frame times counted from its first frame: ffmpeg's times for the frames just
+	/// before a split can't be trusted, and a short run is cheap to re-encode.
+	retime: bool,
+	/// The streams ffmpeg finds in it.
+	found: Vec<u32>,
 }
 
 impl<'a> Title<'a> {
@@ -276,6 +296,20 @@ impl<'a> Title<'a> {
 			title.cells.iter().map(|cell| cell.time_s).sum()
 		};
 
+		let whole = Run {
+			input: input.clone(),
+			bytes,
+			length_s,
+			retime: false,
+			found: layout.ids(),
+		};
+		let runs = if kept.false_time {
+			vec![whole]
+		} else {
+			let list = |run: usize| workspace.file(&format!("title-{}-{run}.txt", title.number));
+			runs(tools, &ranges, whole, &layout, list, cancel).await?
+		};
+
 		Ok(Self {
 			dvd: title,
 			false_time: kept.false_time,
@@ -283,6 +317,7 @@ impl<'a> Title<'a> {
 			bytes,
 			layout,
 			length_s,
+			runs,
 			warnings,
 		})
 	}
@@ -361,6 +396,227 @@ async fn first_packets(
 		return Err(ErrorKind::Cancelled.into());
 	}
 	Ok(found)
+}
+
+/// The runs `whole`, a title of `ranges` laid out as `layout`, is read in: a run ends before the sector where ffmpeg
+/// gives a frame a time it gave an earlier frame. A run whose picture or a subtitle track ffmpeg can't find can't be
+/// written like the others and stays joined to its neighbour; an audio track it can't find is silence there. `list`
+/// names the work file of a run's `concatf:` list.
+async fn runs(
+	tools: &Toolchain,
+	ranges: &[Range],
+	whole: Run,
+	layout: &Layout,
+	list: impl Fn(usize) -> PathBuf,
+	cancel: &CancellationToken,
+) -> Result<Vec<Run>, JobError> {
+	let mut cmd = ToolCommand::new(&tools.ffprobe, process::scaled_timeout(whole.bytes).max(PROBE_TIMEOUT));
+	cmd.args([
+		"-v",
+		"error",
+		"-hide_banner",
+		"-show_entries",
+		"stream=index,id:packet=stream_index,pts,pos",
+		"-of",
+		"csv",
+	]);
+	whole.input.args(&mut cmd);
+	let out = probe::run_ffprobe(&cmd, cancel).await.map_err(unreadable)?;
+
+	let ids = layout.ids();
+	let needed = layout.needed();
+	let holds = |run: &Scanned| needed.iter().all(|id| run.firsts.iter().any(|(first, _)| first == id));
+	let mut kept: Vec<Scanned> = Vec::new();
+	for run in scan(&String::from_utf8_lossy(&out.stdout), layout.video.id) {
+		match kept.last_mut() {
+			Some(before) if !holds(before) || !holds(&run) => before.absorb(run),
+			_ => kept.push(run),
+		}
+	}
+
+	while kept.len() > 1 {
+		let mut runs = cut_runs(ranges, &kept, &whole, &ids, layout.video.fps(), &list)?;
+		let mut lacking = None;
+		for (index, run) in runs.iter_mut().enumerate() {
+			run.found = match probe_streams(tools, &run.input, None, cancel).await {
+				Ok(found) => found.streams.iter().filter_map(Stream::stream_id).collect(),
+				Err(_) if !cancel.is_cancelled() => Vec::new(),
+				Err(err) => return Err(err),
+			};
+			if !needed.iter().all(|id| run.found.contains(id)) {
+				lacking = Some(index);
+				break;
+			}
+		}
+
+		let Some(index) = lacking else {
+			let before_last = runs.len() - 1;
+			for run in &mut runs[..before_last] {
+				run.retime = run.bytes <= RETIMED_BYTES;
+			}
+			return Ok(runs);
+		};
+		let joined = kept.remove(index.max(1));
+		kept[index.max(1) - 1].absorb(joined);
+	}
+	Ok(vec![whole])
+}
+
+/// `ranges` cut into the `kept` runs of `whole`, each read with a window that reaches the first packet of each of
+/// `ids`, and lasting its frames at `fps`.
+fn cut_runs(
+	ranges: &[Range],
+	kept: &[Scanned],
+	whole: &Run,
+	ids: &[u32],
+	fps: Option<f64>,
+	list: &impl Fn(usize) -> PathBuf,
+) -> Result<Vec<Run>, JobError> {
+	let starts: Vec<u64> = kept.iter().skip(1).map(|run| run.start).collect();
+	let mut runs = Vec::with_capacity(kept.len());
+	for (index, (run, ranges)) in kept.iter().zip(cut(ranges, &starts)).enumerate() {
+		let bytes: u64 = ranges.iter().map(|(_, _, length)| length).sum();
+		let mut input = Input::of(&ranges, &list(index))?;
+		let reach = run
+			.firsts
+			.iter()
+			.filter(|(id, _)| ids.contains(id))
+			.map(|(_, at)| *at + PROBE_MARGIN)
+			.max()
+			.unwrap_or(0);
+		if reach > Window::HEAD.bytes {
+			input.window = Window {
+				bytes: reach,
+				microseconds: DEEP_PROBE_MICROSECONDS,
+			};
+		}
+
+		#[allow(clippy::cast_precision_loss)]
+		let length_s = match fps {
+			Some(fps) => run.frames as f64 / fps,
+			None => whole.length_s * bytes as f64 / whole.bytes.max(1) as f64,
+		};
+		runs.push(Run {
+			input,
+			bytes,
+			length_s,
+			retime: false,
+			found: Vec::new(),
+		});
+	}
+	Ok(runs)
+}
+
+/// Where a title's run starts in its footage, where in the run each stream has its first packet, and how many frames
+/// of video it holds.
+#[derive(Debug, Default, PartialEq)]
+struct Scanned {
+	start: u64,
+	firsts: Vec<(u32, u64)>,
+	frames: u64,
+}
+
+impl Scanned {
+	/// `next`, which follows this run, joined to it.
+	fn absorb(&mut self, next: Self) {
+		self.frames += next.frames;
+		for (id, at) in next.firsts {
+			if !self.firsts.iter().any(|(own, _)| *own == id) {
+				self.firsts.push((id, next.start - self.start + at));
+			}
+		}
+	}
+}
+
+/// The runs of an ffprobe CSV `listing` of a title's streams and packets: a new run starts at the sector of each packet
+/// of `video` whose time an earlier packet of the run already has. A packet without a position is where the last one
+/// with a position was.
+fn scan(listing: &str, video: u32) -> Vec<Scanned> {
+	let fields = |line: &'_ str| line.split(',').map(str::to_owned).collect::<Vec<_>>();
+	let ids: HashMap<String, u32> = listing
+		.lines()
+		.filter_map(|line| line.strip_prefix("stream,"))
+		.filter_map(|line| {
+			let fields = fields(line);
+			let id = u32::from_str_radix(fields.get(1)?.trim_start_matches("0x"), 16).ok()?;
+			Some((fields.first()?.clone(), id))
+		})
+		.collect();
+
+	let mut runs = vec![Scanned::default()];
+	let mut shown = HashSet::new();
+	let mut at = 0;
+	for line in listing.lines().filter_map(|line| line.strip_prefix("packet,")) {
+		let fields = fields(line);
+		let Some(&id) = fields.first().and_then(|index| ids.get(index)) else {
+			continue;
+		};
+		if let Some(position) = fields.get(2).and_then(|position| position.parse::<u64>().ok()) {
+			at = position;
+		}
+
+		let run = runs.last_mut().expect("a scan always has a run");
+		if id == video
+			&& let Some(pts) = fields.get(1).and_then(|pts| pts.parse::<i64>().ok())
+			&& !shown.insert(pts)
+			&& at / SECTOR * SECTOR > run.start
+		{
+			let (base, start) = (run.start, at / SECTOR * SECTOR);
+			let (moved, own): (Vec<_>, Vec<_>) = std::mem::take(&mut run.firsts)
+				.into_iter()
+				.partition(|(_, first)| base + first >= start);
+			run.firsts = own;
+			let firsts = moved
+				.into_iter()
+				.map(|(id, first)| (id, base + first - start))
+				.collect();
+			runs.push(Scanned {
+				start,
+				firsts,
+				frames: 0,
+			});
+			shown = HashSet::from([pts]);
+		}
+
+		let run = runs.last_mut().expect("a scan always has a run");
+		if id == video {
+			run.frames += 1;
+		}
+		if !run.firsts.iter().any(|(own, _)| *own == id) {
+			run.firsts.push((id, at - run.start));
+		}
+	}
+	runs
+}
+
+/// `ranges` cut at each of the ascending byte positions `cuts`.
+fn cut(ranges: &[Range], cuts: &[u64]) -> Vec<Vec<Range>> {
+	let mut pieces = vec![Vec::new()];
+	let mut cuts = cuts.iter().copied().peekable();
+	let mut position = 0;
+	for (path, offset, length) in ranges {
+		let (mut offset, mut length) = (*offset, *length);
+		while let Some(at) = cuts.next_if(|at| *at < position + length) {
+			let before = at.saturating_sub(position);
+			if before > 0 {
+				pieces
+					.last_mut()
+					.expect("there is always a piece")
+					.push((path.clone(), offset, before));
+			}
+			pieces.push(Vec::new());
+			position += before;
+			offset += before;
+			length -= before;
+		}
+
+		pieces
+			.last_mut()
+			.expect("there is always a piece")
+			.push((path.clone(), offset, length));
+		position += length;
+	}
+	pieces
 }
 
 /// The first of the longest titles.
@@ -538,6 +794,8 @@ struct Picture {
 	sar: Option<String>,
 	rate: Option<String>,
 	fields: Option<&'static str>,
+	/// The MPEG-2 colour description codes of its first sequence header: primaries, transfer and matrix.
+	colour: [u8; 3],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -561,6 +819,24 @@ struct Subtitle {
 }
 
 impl Layout {
+	fn ids(&self) -> Vec<u32> {
+		let audio = self.audio.iter().map(|track| track.id);
+		[self.video.id]
+			.into_iter()
+			.chain(audio)
+			.chain(self.subtitle_ids())
+			.collect()
+	}
+
+	/// The streams a piece can't be written without: audio it lacks can be silence.
+	fn needed(&self) -> Vec<u32> {
+		[self.video.id].into_iter().chain(self.subtitle_ids()).collect()
+	}
+
+	fn subtitle_ids(&self) -> impl Iterator<Item = u32> + '_ {
+		self.subtitles.iter().map(|subtitle| subtitle.id)
+	}
+
 	fn of(found: &Found, title: &DvdTitle) -> Option<Self> {
 		let mut streams: Vec<&Stream> = found
 			.streams
@@ -583,6 +859,11 @@ impl Layout {
 				.and_then(|shape| shape.r_frame_rate.clone())
 				.filter(|_| video.r_frame_rate.is_some()),
 			fields: video.field_order.as_deref().and_then(fields),
+			colour: [
+				colour_code(video.color_primaries.as_deref()),
+				colour_code(video.color_transfer.as_deref()),
+				colour_code(video.color_space.as_deref()),
+			],
 		};
 		let audio = streams
 			.iter()
@@ -678,6 +959,12 @@ impl Picture {
 			&& self.fields == other.fields
 	}
 
+	fn fps(&self) -> Option<f64> {
+		let (num, den) = self.rate.as_deref()?.split_once('/')?;
+		let (num, den) = (num.parse::<f64>().ok()?, den.parse::<f64>().ok()?);
+		(num > 0.0 && den > 0.0).then(|| num / den)
+	}
+
 	/// The filters that make another title's picture this one: its field order, size (by field where both are
 	/// interlaced), frame rate and pixel shape.
 	fn filters_from(&self, other: &Self) -> String {
@@ -738,6 +1025,18 @@ impl Track {
 				6 => "5.1".to_owned(),
 				channels => format!("{channels}c"),
 			})
+	}
+}
+
+/// The MPEG-2 code of a colour primaries, transfer or matrix that ffmpeg names `name`: 2 is unspecified.
+fn colour_code(name: Option<&str>) -> u8 {
+	match name {
+		Some("bt709") => 1,
+		Some("bt470m" | "gamma22" | "fcc") => 4,
+		Some("bt470bg" | "gamma28") => 5,
+		Some("smpte170m") => 6,
+		Some("smpte240m") => 7,
+		_ => 2,
 	}
 }
 
@@ -824,7 +1123,7 @@ impl Job<'_> {
 		}
 		title.input.args(&mut cmd);
 		cmd.arg("-i").arg(process::tool_path(&chapters));
-		self.map(&mut cmd, title, &[]);
+		self.map(&mut cmd, title, &[], false);
 		self.finish(&mut cmd, &output);
 
 		run_ffmpeg(&cmd, |progress| on_fraction(written(progress, self.total)), self.cancel).await?;
@@ -854,35 +1153,39 @@ impl Job<'_> {
 			}
 			warnings.extend(title.left_out(self.main));
 
-			let piece = self.workspace.file(&format!("title-{}.mkv", title.dvd.number));
-			let cmd = self.piece(title, &piece);
-			#[allow(clippy::cast_precision_loss)]
-			let report = |progress: &Progress| {
-				let fraction = if converted {
-					progress
-						.out_time
-						.map_or(0.0, |time| (time.as_secs_f64() / title.length_s.max(1.0)).min(1.0))
-				} else {
-					written(progress, title.bytes)
+			let mut length_s = 0.0;
+			for (index, run) in title.runs.iter().enumerate() {
+				let piece = self.workspace.file(&format!("title-{}-{index}.mkv", title.dvd.number));
+				let cmd = self.piece(title, run, &piece);
+				#[allow(clippy::cast_precision_loss)]
+				let report = |progress: &Progress| {
+					let fraction = if converted {
+						progress
+							.out_time
+							.map_or(0.0, |time| (time.as_secs_f64() / run.length_s.max(1.0)).min(1.0))
+					} else {
+						written(progress, run.bytes)
+					};
+					on_fraction((done as f64 + fraction * run.bytes as f64) / work);
 				};
-				on_fraction((done as f64 + fraction * title.bytes as f64) / work);
-			};
-			run_ffmpeg(&cmd, report, self.cancel).await?;
-			done += title.bytes;
+				run_ffmpeg(&cmd, report, self.cancel).await?;
+				done += run.bytes;
 
-			let length_s = probe::probe(self.tools, &piece, self.cancel)
-				.await
-				.map_err(unreadable)?
-				.format
-				.duration
-				.unwrap_or(title.length_s);
+				length_s += probe::probe(self.tools, &piece, self.cancel)
+					.await
+					.map_err(unreadable)?
+					.format
+					.duration
+					.unwrap_or(run.length_s);
+				pieces.push(piece);
+			}
+
 			built.push(BuiltTitle {
 				title: title.dvd.number,
 				start_s,
 				length_s,
 			});
 			start_s += length_s;
-			pieces.push(piece);
 		}
 
 		let list = self.workspace.file(PIECES);
@@ -925,16 +1228,16 @@ impl Job<'_> {
 		})
 	}
 
-	/// The command that writes `title` alone in the main layout to `piece`.
-	fn piece(&self, title: &Title<'_>, piece: &Path) -> ToolCommand {
+	/// The command that writes `run` of `title` alone in the main layout to `piece`.
+	fn piece(&self, title: &Title<'_>, run: &Run, piece: &Path) -> ToolCommand {
 		let mut cmd = ToolCommand::new(&self.tools.ffmpeg, self.timeout);
 		cmd.args(["-hide_banner", "-nostdin", "-y"]);
 		if !title.layout.subtitles.is_empty() && !self.main.layout.subtitles.is_empty() {
 			cmd.arg("-palette").arg(rgb_palette(&title.dvd.palette));
 		}
-		title.input.args(&mut cmd);
+		run.input.args(&mut cmd);
 
-		let feeds = self.feeds(title);
+		let feeds = self.feeds(title, run);
 		for (index, feed) in feeds.iter().enumerate() {
 			if matches!(feed, Feed::Silence) {
 				let track = &self.main.layout.audio[index];
@@ -944,24 +1247,25 @@ impl Job<'_> {
 					track.layout()
 				);
 				cmd.arg("-t")
-					.arg(format!("{:.3}", title.length_s))
+					.arg(format!("{:.3}", run.length_s))
 					.args(["-f", "lavfi", "-i"])
 					.arg(source);
 			}
 		}
 
-		self.map(&mut cmd, title, &feeds);
+		self.map(&mut cmd, title, &feeds, run.retime);
 		cmd.args(["-f", "matroska"]).arg(process::tool_path(piece));
 		cmd
 	}
 
-	fn feeds<'t>(&self, title: &'t Title<'_>) -> Vec<Feed<'t>> {
+	fn feeds<'t>(&self, title: &'t Title<'_>, run: &Run) -> Vec<Feed<'t>> {
 		self.main
 			.layout
 			.audio
 			.iter()
 			.enumerate()
 			.map(|(index, main)| match title.layout.audio.get(index) {
+				Some(own) if !run.found.contains(&own.id) => Feed::Silence,
 				Some(own) if own.same(main) => Feed::Copy(own),
 				Some(own) => Feed::Convert(own),
 				None => Feed::Silence,
@@ -970,13 +1274,17 @@ impl Job<'_> {
 	}
 
 	/// The streams of input 0, which holds `title`, mapped to the main layout. `feeds` are from `feeds`, or empty
-	/// for a title of the main layout.
-	fn map(&self, cmd: &mut ToolCommand, title: &Title<'_>, feeds: &[Feed<'_>]) {
+	/// for a title of the main layout. A `retime`d picture is re-encoded on frame times counted from its first frame.
+	fn map(&self, cmd: &mut ToolCommand, title: &Title<'_>, feeds: &[Feed<'_>], retime: bool) {
 		let main = &self.main.layout;
 		cmd.arg("-map").arg(format!("0:i:{:#x}", title.layout.video.id));
-		if main.video.same(&title.layout.video) {
+		if main.video.same(&title.layout.video) && !retime {
 			cmd.args(["-c:v", "copy"]);
 		} else {
+			let mut filters = main.video.filters_from(&title.layout.video);
+			if retime {
+				filters.insert_str(0, "setpts=STARTPTS+N/FRAME_RATE/TB,");
+			}
 			cmd.args([
 				"-c:v",
 				"mpeg2video",
@@ -986,10 +1294,18 @@ impl Job<'_> {
 				"yuv420p",
 				"-filter:v",
 			])
-			.arg(main.video.filters_from(&title.layout.video));
+			.arg(filters);
 			if main.video.fields.is_some() {
 				cmd.args(["-flags:v", "+ilme+ildct"]);
 			}
+		}
+
+		// A change of colour description mid-stream makes ffmpeg rebuild its filters, which restarts `-t`.
+		if main.video.codec == "mpeg2video" {
+			let [primaries, transfer, matrix] = main.video.colour;
+			cmd.arg("-bsf:v").arg(format!(
+				"mpeg2_metadata=colour_primaries={primaries}:transfer_characteristics={transfer}:matrix_coefficients={matrix}"
+			));
 		}
 
 		let mut silence = 0;
@@ -1188,6 +1504,7 @@ mod tests {
 			sar: Some("64:45".into()),
 			rate: Some("25/1".into()),
 			fields: Some("tff"),
+			colour: [2, 2, 2],
 		};
 		let small = Picture {
 			width: 352,
@@ -1203,6 +1520,64 @@ mod tests {
 		);
 		assert!(!main.same(&small));
 		assert!(main.same(&main.clone()));
+	}
+
+	#[test]
+	fn a_run_ends_where_ffmpeg_gives_a_frame_an_earlier_frames_time() {
+		let sector = SECTOR;
+		let listing = format!(
+			"packet,1,5400,{}\npacket,2,5400,{}\npacket,1,9000,N/A\npacket,1,9000,{}\npacket,2,12600,{}\n\
+			 packet,1,12600,N/A\nstream,0,0x1bf\nstream,1,0x1e0,\nstream,2,0x80\n",
+			sector + 14,
+			2 * sector + 14,
+			5 * sector + 30,
+			6 * sector + 14,
+		);
+
+		let runs = scan(&listing, 0x1e0);
+
+		assert_eq!(
+			runs,
+			[
+				Scanned {
+					start: 0,
+					firsts: vec![(0x1e0, sector + 14), (0x80, 2 * sector + 14)],
+					frames: 2,
+				},
+				Scanned {
+					start: 5 * sector,
+					firsts: vec![(0x1e0, 30), (0x80, sector + 14)],
+					frames: 2,
+				},
+			]
+		);
+	}
+
+	#[test]
+	fn ranges_are_cut_across_files() {
+		let (a, b) = (PathBuf::from("a"), PathBuf::from("b"));
+		let ranges = vec![(a.clone(), 100, 50), (b.clone(), 0, 30)];
+
+		let pieces = cut(&ranges, &[20, 50, 60]);
+
+		assert_eq!(
+			pieces,
+			[
+				vec![(a.clone(), 100, 20)],
+				vec![(a, 120, 30)],
+				vec![(b.clone(), 0, 10)],
+				vec![(b, 10, 20)],
+			]
+		);
+	}
+
+	#[test]
+	fn colour_names_become_mpeg2_codes() {
+		assert_eq!(colour_code(Some("smpte170m")), 6);
+		assert_eq!(colour_code(Some("bt470bg")), 5);
+		assert_eq!(colour_code(Some("bt709")), 1);
+		assert_eq!(colour_code(Some("unknown")), 2);
+		assert_eq!(colour_code(None), 2);
 	}
 
 	#[test]

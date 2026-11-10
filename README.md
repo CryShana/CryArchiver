@@ -42,7 +42,7 @@ cryarchiver clip.mp4 -o clip.avif        # looping animated AVIF
 cryarchiver Wedding.iso                  # a DVD image becomes Wedding.cry.mkv
 ```
 
-Three speeds: `fast` uses fixed settings, `moderate` (the default) and `slow` test a few seconds first and then check the whole result. Personal metadata like GPS and camera details is removed unless you add `--keep-metadata`. Running the same command again skips files that are already done.
+Three speeds: `fast` uses fixed settings, `moderate` (the default) and `slow` test a few seconds first and then check the whole result. Personal metadata like GPS and camera details is removed unless you add `--keep-metadata`. Running the same command again skips files that are already done. When a DVD or Blu-ray can't be made smaller at the target quality, it is still written as one MKV, copied from the disc without encoding.
 
 All options:
 

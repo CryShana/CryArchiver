@@ -37,6 +37,8 @@ pub struct Footage {
 	/// Each cell's IFO playback time.
 	pub cells: &'static [u32],
 	pub bit_rate: &'static str,
+	/// The colour primaries, transfer and matrix its sequence headers name, when they name one.
+	pub colour: Option<&'static str>,
 }
 
 pub const fn footage(seconds: u32, cells: &'static [u32]) -> Footage {
@@ -49,6 +51,7 @@ pub const fn footage(seconds: u32, cells: &'static [u32]) -> Footage {
 		subtitle_ms: (1000, 3000),
 		cells,
 		bit_rate: "4M",
+		colour: None,
 	}
 }
 
@@ -98,6 +101,9 @@ fn encoded_vob(dir: &Path, path: &Path, index: usize, footage: Footage) -> Vec<u
 	}
 	if subtitles.is_some() {
 		args.extend(["-map", "2:s", "-c:s", "dvdsub"]);
+	}
+	if let Some(colour) = footage.colour {
+		args.extend(["-color_primaries", colour, "-color_trc", colour, "-colorspace", colour]);
 	}
 	args.extend([
 		"-c:v",

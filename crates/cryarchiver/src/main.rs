@@ -879,6 +879,7 @@ async fn compress(args: CompressArgs) -> u8 {
 				max_bitrate_kbps: args.max_bitrate,
 				resize: args.resize,
 				blu_ray: args.blu_ray,
+				write_kept_discs: true,
 			},
 		})
 		.collect();

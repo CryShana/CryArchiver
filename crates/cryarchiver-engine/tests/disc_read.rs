@@ -185,6 +185,50 @@ async fn two_titles_of_one_layout_join_into_one_mkv_with_their_chapters() {
 }
 
 #[tokio::test]
+async fn every_title_takes_the_main_titles_colour_description() {
+	let dir = tempfile::tempdir().unwrap();
+	let main = Footage {
+		colour: Some("smpte170m"),
+		..footage(12, &[12])
+	};
+	let untagged = footage(11, &[11]);
+	let other = Footage {
+		colour: Some("bt709"),
+		..footage(10, &[10])
+	};
+	let (dvd, selection) = disc(dir.path(), &dir.path().join("disc"), &[untagged, main, other]);
+	let workspace = workspace(dir.path());
+
+	let built = build(&dvd, &selection, &workspace).await.unwrap();
+
+	let out = Command::new("ffprobe")
+		.args([
+			"-v",
+			"error",
+			"-select_streams",
+			"v:0",
+			"-show_entries",
+			"frame=color_primaries,color_transfer,color_space",
+			"-of",
+			"csv=p=0",
+		])
+		.arg(&built.path)
+		.output()
+		.unwrap();
+	let mut colours: Vec<String> = String::from_utf8_lossy(&out.stdout)
+		.lines()
+		.map(|line| line.trim().trim_end_matches(',').to_owned())
+		.collect();
+	let frames = colours.len();
+	colours.dedup();
+	assert!(frames >= 32 * 25, "{frames} frames");
+	assert!(
+		colours.len() == 1 && colours[0].starts_with("smpte170m,"),
+		"{colours:?}"
+	);
+}
+
+#[tokio::test]
 async fn dvd_lpcm_becomes_plain_pcm() {
 	let dir = tempfile::tempdir().unwrap();
 	let lpcm = Footage {

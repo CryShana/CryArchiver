@@ -186,6 +186,48 @@ async fn a_two_title_dvd_image_becomes_one_av1_mkv_with_a_chapter_per_title() {
 }
 
 #[tokio::test]
+async fn a_dvd_whose_encode_is_kept_back_is_written_as_read() {
+	let dir = tempfile::tempdir().unwrap();
+	let iso = dvd_image(
+		dir.path(),
+		&dir.path().join("Film.iso"),
+		&[footage(12, &[6, 6]), footage(11, &[11])],
+	);
+	let unreachable = |write_kept_discs| Job {
+		min_savings: 0.999,
+		options: JobOptions {
+			write_kept_discs,
+			..JobOptions::default()
+		},
+		..job(&iso)
+	};
+
+	let left = run(&unreachable(false), dir.path()).await;
+	assert!(matches!(left, JobOutcome::KeptOriginal { .. }), "{left:?}");
+	assert!(!dir.path().join("Film.cry.mkv").exists());
+
+	let outcome = run(&unreachable(true), dir.path()).await;
+
+	let JobOutcome::Encoded { output, warnings, .. } = outcome else {
+		panic!("{outcome:?}")
+	};
+	assert_eq!(output, dir.path().join("Film.cry.mkv"));
+	assert!(
+		warnings
+			.iter()
+			.any(|warning| warning.starts_with("written as read from the disc, not encoded: ")),
+		"{warnings:?}"
+	);
+
+	let info = probed(&output).await;
+	assert_eq!(info.streams[0].codec_name, "mpeg2video");
+	assert!(near(info.format.duration.unwrap(), 23.0, 0.2), "{:?}", info.format);
+	let chapters = chapter_titles(&info);
+	assert!(chapters.iter().any(|(_, title)| title == "Title 2"), "{chapters:?}");
+	assert!(!dir.path().join(CLI_WORK_DIR).exists());
+}
+
+#[tokio::test]
 async fn a_dvd_image_under_a_non_ascii_folder_is_archived() {
 	let dir = tempfile::tempdir().unwrap();
 	let iso = dvd_image(

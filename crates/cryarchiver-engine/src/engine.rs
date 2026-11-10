@@ -270,6 +270,8 @@ struct ReadSource<'a> {
 	media: PathBuf,
 	/// What reading the source fell short of.
 	warnings: Vec<String>,
+	/// Read from a disc, which can't be kept as one file the way a source whose timestamps restart can.
+	disc: bool,
 }
 
 /// What a disc, or a source whose timestamps restart, is read from.
@@ -780,21 +782,23 @@ impl Engine {
 		let before =
 			SourceTimes::from_metadata(&meta).map_err(|err| JobError::io(IoSide::Source(&job.source), &err))?;
 		// The workspace must outlive `finish`: dropping it deletes the staged output.
-		let (workspace, media, mut held, read_warnings) = match read {
+		let (workspace, media, mut held, read_warnings, disc) = match read {
 			Some(read) => {
 				let ReadSource {
 					slot,
 					workspace,
 					media,
 					warnings,
+					disc,
 				} = *read;
-				(workspace, media, Some(slot), warnings)
+				(workspace, media, Some(slot), warnings, disc)
 			}
 			None => (
 				open_workspace(sink, &work_root, &job.source, source_bytes)?,
 				job.source.clone(),
 				None,
 				Vec::new(),
+				false,
 			),
 		};
 
@@ -824,6 +828,10 @@ impl Engine {
 		let produced = produced.map_err(|err| disk_full(err, &work_root, cx.source_bytes).ran_on(ran_on));
 		let mut staged = match produced? {
 			Produced::Output(staged) => staged,
+			Produced::Kept(reason) if disc && job.options.write_kept_discs && job.options.trim.is_none() => {
+				remuxed(&media, &reason, &read_warnings)
+					.map_err(|err| JobError::io(IoSide::Destination(&work_root), &err))?
+			}
 			Produced::Kept(reason) => {
 				recorder.update(|decision| {
 					decision.source_bytes.get_or_insert(cx.source_bytes);
@@ -1123,6 +1131,7 @@ impl Engine {
 				workspace,
 				media: built.path,
 				warnings: built.warnings,
+				disc: !matches!(reading, Reading::Timestamps(_)),
 			}),
 		})
 	}
@@ -3263,6 +3272,23 @@ fn open_workspace(
 ) -> Result<Workspace, JobError> {
 	check_space(work_root, source_bytes)?;
 	Workspace::for_sink(sink, source).map_err(|err| JobError::io(IoSide::Destination(work_root), &err))
+}
+
+/// The video read from a disc, `media`, staged as the output when its encode was kept back for `reason`: a disc is
+/// only kept as a folder of files no player outside a disc menu reads, so it is written as the video read from it.
+fn remuxed(media: &Path, reason: &KeepReason, read_warnings: &[String]) -> std::io::Result<Staged> {
+	let mut warnings = read_warnings.to_vec();
+	warnings.push(format!(
+		"written as read from the disc, not encoded: {}",
+		reason.description()
+	));
+	Ok(Staged {
+		path: media.to_path_buf(),
+		bytes: fs::metadata(media)?.len(),
+		source_share: None,
+		warnings,
+		learned: Vec::new(),
+	})
 }
 
 fn finish(

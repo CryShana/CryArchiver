@@ -178,6 +178,8 @@ pub struct JobOptions {
 	pub max_bitrate_kbps: Option<u32>,
 	pub resize: Option<Resize>,
 	pub blu_ray: BluRay,
+	/// A disc whose encode isn't kept is written as the video read from it, instead of left as it is.
+	pub write_kept_discs: bool,
 }
 
 impl JobOptions {
